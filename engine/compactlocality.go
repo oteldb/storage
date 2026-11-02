@@ -88,8 +88,12 @@ func orderedMergeRanges(eligible []*part) []mergeSeriesRange {
 
 // Bounds estimate overlap without reading indexes. They never determine which samples survive.
 func preferSeriesLocalRun(eligible, current []*part, capBytes int64) []*part {
+	return preferSeriesLocalRunLimited(eligible, current, capBytes, maxMergeParts)
+}
+
+func preferSeriesLocalRunLimited(eligible, current []*part, capBytes int64, maxInputs int) []*part {
 	density, multiplier, ok := mergeRunLocality(current)
-	if !ok || density*minMergeLocalityGain > maxMergeParts {
+	if !ok || density*minMergeLocalityGain > float64(maxInputs) {
 		return current
 	}
 	minimumDensity := max(float64(minMergeLocalityGain), density*minMergeLocalityGain)
@@ -102,7 +106,7 @@ func preferSeriesLocalRun(eligible, current []*part, capBytes int64) []*part {
 		var total, largest int64
 		smallest := maxInt64
 		last := ranges[i].last
-		for j := i; j < min(i+maxMergeParts, len(ranges)); j++ {
+		for j := i; j < min(i+maxInputs, len(ranges)); j++ {
 			r := ranges[j]
 			bytes := r.part.sizeBytes()
 			total += bytes

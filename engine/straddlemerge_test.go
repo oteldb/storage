@@ -116,7 +116,7 @@ func TestSplitAcrossAgeBands(t *testing.T) {
 	}
 }
 
-// TestStraddlerMergeHoldsResidentShare bounds what one large series spread over many days makes the
+// TestStraddlerMergeHoldsResidentShare isolates OUTPUT state: one large series spread over many days makes the
 // day writers hold together: the merge's resident share, overshot by at most one day's run, not a
 // writer's worth per day.
 //
@@ -142,8 +142,8 @@ func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
 			}
 
 			require.NoError(t, e.Flush(ctx))
-			// Isolate the day-writer share from compression's separately priced encoder workspace.
-			require.NoError(t, e.MergeWith(ctx, engine.MergeOptions{Recompress: &engine.RecompressSpec{
+			// Isolate output day writers from source and codec admission.
+			require.NoError(t, e.MergeStreamOutputForTest(ctx, engine.MergeOptions{Recompress: &engine.RecompressSpec{
 				Before: math.MaxInt64, Algorithm: compress.AlgorithmNone,
 			}}))
 

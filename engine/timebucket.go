@@ -33,8 +33,9 @@ func splitsOutput(src []*part, start int64) bool { return timebucket.SplitsFrom(
 // selectStraddlers returns the straddlers to split this cycle, at most maxMergeParts of them. A
 // straddler crosses a top-level boundary, which one late sample makes since flush does not split by
 // time, so it fits no level and joins no ladder group.
-func selectStraddlers(src []*part, capBytes int64) []*part {
-	return timebucket.Straddlers(src, partSpan, (*part).sizeBytes, capBytes, maxMergeParts)
+
+func selectStraddlersLimited(src []*part, capBytes int64, maxInputs int) []*part {
+	return timebucket.Straddlers(src, partSpan, (*part).sizeBytes, capBytes, maxInputs)
 }
 
 // newestSample supplies the data watermark used to defer promotion of fine parts.
@@ -89,6 +90,10 @@ func selectLadderRun(src []*part, capBytes int64, idle int) []*part {
 }
 
 func ladderRun(src []*part, capBytes int64, idle int, newest int64) []*part {
+	return ladderRunLimited(src, capBytes, idle, newest, maxMergeParts)
+}
+
+func ladderRunLimited(src []*part, capBytes int64, idle int, newest int64, maxInputs int) []*part {
 	for _, level := range mergeLadder {
 		_, groups := partitionGroupsBefore(src, level, newest)
 
@@ -98,7 +103,7 @@ func ladderRun(src []*part, capBytes int64, idle int, newest int64) []*part {
 				continue
 			}
 
-			if run := pickMergeRun(group, capBytes, idle); len(run) > 0 {
+			if run := pickMergeRunLimited(group, capBytes, idle, maxInputs); len(run) > 0 {
 				return run
 			}
 		}
@@ -111,15 +116,19 @@ func ladderRun(src []*part, capBytes int64, idle int, newest int64) []*part {
 // precision) must touch this cycle: one bucket's worth, up to the cap and maxMergeParts
 // ([timebucket.Forced]).
 func selectForced(src []*part, opts MergeOptions, capBytes int64) []*part {
+	return selectForcedLimited(src, opts, capBytes, maxMergeParts)
+}
+
+func selectForcedLimited(src []*part, opts MergeOptions, capBytes int64, maxInputs int) []*part {
 	if !opts.retentionNow.IsZero() {
 		if selected := timebucket.Forced(src, partSpan, (*part).sizeBytes,
 			func(p *part) bool { return retentionForces(p, opts) },
-			func(*part) bool { return true }, capBytes, maxMergeParts); len(selected) > 0 {
+			func(*part) bool { return true }, capBytes, maxInputs); len(selected) > 0 {
 			return selected
 		}
 	}
 	return timebucket.Forced(src, partSpan, (*part).sizeBytes,
 		func(p *part) bool { return forcedRewrite(p, opts) },
 		func(p *part) bool { return sealed(p, capBytes) },
-		capBytes, maxMergeParts)
+		capBytes, maxInputs)
 }

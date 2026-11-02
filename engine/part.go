@@ -55,9 +55,10 @@ type rowRange struct{ start, end int }
 //     reading the part. Because a paged lookup may read through the backend, the index methods
 //     take a context and can fail; the resident form never errors.
 type partIndex struct {
-	ids    []signal.SeriesID
-	starts []int32 // len == len(ids)+1; starts[0] == 0, starts[len(ids)] == total rows
-	paged  *pagedIndex
+	ids     []signal.SeriesID
+	starts  []int32 // len == len(ids)+1; starts[0] == 0, starts[len(ids)] == total rows
+	paged   *pagedIndex
+	maxRows int
 }
 
 func (idx partIndex) selectedIDRange(ids []signal.SeriesID) (first, end int) {
@@ -309,6 +310,7 @@ func buildPartIndex(ids []chunk.U128) partIndex {
 
 		idx.ids[k] = u128ToID(ids[i])
 		idx.starts[k] = int32(i)
+		idx.maxRows = max(idx.maxRows, j-i)
 		k++
 		i = j
 	}
