@@ -38,8 +38,9 @@ conformance suite all of them pass under `-race`.
 
 `backendtest` also holds the test wrappers every package would otherwise copy, and each states which
 capabilities it forwards, because tests measure exactly that: `WithoutCapabilities` and `Counting`
-(per-key reads, n-th write failure) forward none; `StreamingMemory` adds only `ObjectCreator`;
-`ByteCounter` serves `Viewer` and `ReaderAt` and hides `Sizer`, which `SizedByteCounter` adds back.
+(per-key reads, n-th write failure) forward none; `StreamingMemory` adds `ObjectCreator`, ranged
+reads and `NativeSizer`; `ByteCounter` serves views, ranged reads and native size hints but hides
+`Sizer`, which `SizedByteCounter` adds back. Fault injection also forwards metadata-only hints.
 `Matrix` is the table of read paths a merge golden must be identical over (memory, file, cached file,
 s3, whole-object); the caller passes the file and s3 cases. `backendtest` imports only `backend` and
 `internal/partid`, since block's internal tests use it; the in-process S3 server, which needs the AWS
@@ -390,11 +391,16 @@ a demonstration.
   Wrappers forward it, and the read cache answers for its inner store, which serves every ranged miss. S3
   answers by its store: `ReaderAt` is always present there, but without `RangeObjectStore` it reads
   the whole object.
-- **`backend.Sizer`** — optional `Size(ctx,key)` for byte accounting without reading (used by
-  `PartsDetailed`); `backend.SizeOf` falls back to a full read. **That fallback is a trap on the
+- **`backend.Sizer`** — optional `Size(ctx,key)` for byte accounting (used by `PartsDetailed`);
+  `backend.SizeOf` and forwarding wrappers may fall back to a full read. **That fallback is a trap on the
   ranged read path**: a wrapper that hides `Sizer` would make opening a column read the whole
   column to learn its length, silently undoing the ranging. The manifest records each column's size
   (`flagBytes`) so the common path never asks.
+- **`backend.NativeSizer`** — optional metadata-only `NativeSize(ctx,key)` with an explicit known
+  flag. `NativeSizeOf` returns unknown without reading when absent; neither `Sizer` nor ranged-read
+  support proves that promise. File stats and Memory lengths answer natively. Cache, instrumentation
+  and test wrappers forward the inner answer, including unknown, without consulting `SizeOf`.
+  Admission planning uses this before reserving memory; ordinary `SizeOf` keeps its read fallback.
 - **`backend.ObjectCreator`** — optional `CreateObject(ctx,key) → ObjectWriter`, an object built
   incrementally: `Write` appends, `Commit` publishes atomically (nothing is visible under the key
   before it), `Abort` discards and is a no-op after a commit. `file` implements it with the same

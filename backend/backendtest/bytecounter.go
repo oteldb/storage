@@ -15,8 +15,8 @@ import (
 // ByteCounter counts the calls and bytes of every Read, ReadView and ReadAt, in total and per key.
 // It serves [backend.Viewer] and [backend.ReaderAt] through [backend.ReadView] and [backend.ReadAt],
 // so an inner backend without them falls back to a whole read, and forwards [backend.RangeHinter]
-// to say so. Every other capability is hidden, [backend.Sizer] included: a size probe falls back to
-// a counted Read. [SizedByteCounter] forwards Size.
+// to say so. [backend.NativeSizer] forwards metadata-only hints; [backend.Sizer] stays hidden,
+// so SizeOf still falls back to a counted Read. [SizedByteCounter] forwards Size.
 type ByteCounter struct {
 	backend.Backend
 
@@ -89,6 +89,11 @@ func (b *ByteCounter) ReadAt(ctx context.Context, key string, off, n int64) ([]b
 // backend does. Implements [backend.RangeHinter].
 func (b *ByteCounter) RangesNatively(ctx context.Context, key string) bool {
 	return backend.RangesNatively(ctx, b.Backend, key)
+}
+
+// NativeSize forwards [backend.NativeSizer] without a counted read fallback.
+func (b *ByteCounter) NativeSize(ctx context.Context, key string) (int64, bool, error) {
+	return backend.NativeSizeOf(ctx, b.Backend, key)
 }
 
 func (b *ByteCounter) note(key string, n int) {

@@ -314,6 +314,11 @@ func (c *cachedBackend) Size(ctx context.Context, key string) (int64, error) {
 	return SizeOf(ctx, c.inner, key)
 }
 
+// NativeSize forwards the inner metadata-only hint, including unknown answers.
+func (c *cachedBackend) NativeSize(ctx context.Context, key string) (int64, bool, error) {
+	return NativeSizeOf(ctx, c.inner, key)
+}
+
 // Stats returns a snapshot of cache effectiveness (for benchmarks and operator visibility). It
 // settles pending maintenance first, so the resident figures reflect the writes already made rather
 // than the policy's backlog.
