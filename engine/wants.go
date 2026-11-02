@@ -25,9 +25,18 @@ func (e *Engine) WantOverlaps(start, end int64) bool {
 // HasWants reports whether any repair obligation is outstanding, without a window — the read seam's
 // build-time check, so a fully repaired shard keeps the bare engine as its fetcher.
 func (e *Engine) HasWants() bool {
+	if e.mu.TryLockCatalog() {
+		defer e.mu.UnlockCatalog()
+		return e.hasWantsLocked()
+	}
+
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+	return e.hasWantsLocked()
+}
 
+// Catalog ownership or state read ownership protects these slice headers.
+func (e *Engine) hasWantsLocked() bool {
 	return len(e.wants)+len(e.pendingWants)+len(e.adoptedWants) > 0
 }
 

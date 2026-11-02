@@ -11,6 +11,10 @@ The order is catalog → writer → state. Append, replica apply and WAL operati
 ordering; catalog/reload/repair operations take all three. Queries take the state read lock;
 lazy postings sorting takes only state exclusion. None of these locks is reentrant.
 
+Metrics `HasWants` first tries catalog ownership to read all three obligation sets; ingestion
+never mutates them. A busy catalog falls back to the state read lock, preserving reader progress
+during catalog I/O. Windowed repair checks, read gaps, fences, and acknowledged holes are unchanged.
+
 | operation | ordering |
 |---|---|
 | append | bounded private grouping before writer ownership; metrics staged admission, encoding and WAL I/O admit readers; apply after success |
