@@ -197,6 +197,12 @@ func FuzzSeriesIndexParse(f *testing.F) {
 		}
 
 		if validSidxEntries(ents, n, total) {
+			maxRows, valid := sidxRunBounds(ents, n, total)
+			require.True(t, valid)
+			require.LessOrEqual(t, maxRows, total)
+			if n > 0 {
+				require.Positive(t, maxRows)
+			}
 			for k := range n {
 				_ = sidxEntryID(ents, k)
 				if s := sidxEntryStart(ents, k); s < 0 || s >= total {

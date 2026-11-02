@@ -661,6 +661,37 @@ distinct series — a paged index feeds it straight out of the sidecar entries.
 Splitting at row boundaries is safe: parts are independent, and a series spanning two is merged back
 by the read seam.
 
+Input residency is priced before `mergeKeys` maps whole SIDX objects or watermark reads allocate.
+It includes the 20-byte SIDX entries, decoded watermark capacities (24 bytes per entry), decoder
+windows and maximum-series range/fold scratch. Maximum series length is recorded during the existing
+SIDX validation or resident-index build, without another read or an on-disk format change.
+
+The selected set reserves the sum of those resident terms plus the largest sidecar-read or decoder
+opening transient. Under that captured grant, watermark preflight validates sidecars into local
+arrays. Valid sidecars need no whole-timestamp contingency. Missing/corrupt sidecars trigger
+repricing and full reselection before fallback decoding. Rejected arrays are released; only the
+finally accepted set populates part caches. Local arrays and concurrent cache fills are both priced.
+Unbounded legacy columns fail before decoding. Whole-column singleton rewrites additionally price
+their columns, identity capture/encoding and codec workspace. Arithmetic saturates rather than wrapping.
+
+Range scratch uses the validated per-source series maxima. Possible rollup-map work prices actual
+bucket/key/representative types, conservative map capacity and backing-array growth, including
+recorded representatives when the current policy has no tiers. Raw untagged series keep the small
+gather-only bound. The allowance is captured once and carried through selection, admission,
+watermark validation and output routing; a new engine changes future shares, not an existing grant.
+
+A merge reruns the complete cohort/time-bucket/rollup-policy selector with a smaller private input
+limit until the inputs leave room for output staging and codec state. It never truncates an already
+resolved run. More than two inputs normally use at most half the share; the minimum pair may use
+the remaining total after the output floor. An unaffordable minimum fails explicitly, not as a busy
+admission deferral, so catch-up ends its turn and a later maintenance tick can retry.
+
+Explicit NativeSizer backends stat actual sidecar sizes without reading them. Opaque backends
+retain the immutable format's canonical-size assumption; the Backend.Read interface cannot bound an
+arbitrarily oversized corrupt object before receiving it. NativeSizeOf never falls through to SizeOf
+or Read; Sizer or native ranges alone do not establish that guarantee. The output-router residency test uses a test-only seam to isolate its
+256 KiB writer target from these separate input terms; normal Engine.Merge has no bypass.
+
 ```
 concurrency   = clamp( mergeMemory / 64 MiB, 1, MergeConcurrency )   ← memory decides, cores cap
 mergeCapBytes = min( MergeCeilingBytes,
