@@ -209,6 +209,9 @@ to fail over to: a read overlapping a want fails.
   matched series (the metric engine and the fan-out `Merge` both hold one series at a time). The
   producer therefore holds the iteration's resources (pinned parts, decode-memory reservation, child
   iterators) until `Close`, which every caller owes it; `fetch.Drain` closes what it drains.
+- **Independent read producers must not wait on their consumers' decode reservations.**
+  Optional `fetch.TryFetcher` declines busy or unsupported admission without reserving memory;
+  the embedder can fall back to its ordinary query-owned scope. See `query/ARCH.md`.
 - **Count grids use presence.** Optional `fetch.GridCounter` answers uniform windows from
   identity, existence proofs and timestamps. It shares query scope and memory admission with
   fetches, omits value decoding, and requires explicit fanout support for exact distributed counts.

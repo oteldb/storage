@@ -69,6 +69,18 @@ func (s *Scope) Enter() (holding bool) {
 	return s.held > 0
 }
 
+// TryEnter is [Scope.Enter] without waiting for another read's admission decision.
+// On success, the caller must finish with [Scope.Charge] or [Scope.Abort].
+func (s *Scope) TryEnter() (holding, ok bool) {
+	if s == nil {
+		return false, true
+	}
+	if !s.mu.TryLock() {
+		return false, false
+	}
+	return s.held > 0, true
+}
+
 // Charge records n as reserved and unlocks the scope, ending the [Scope.Enter] section.
 func (s *Scope) Charge(n int64) {
 	if s == nil {

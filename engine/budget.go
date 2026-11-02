@@ -249,6 +249,30 @@ func (b *DecodeBudget) acquireFor(ctx context.Context, s *fetch.Scope, n int64) 
 	return false, nil
 }
 
+// tryAcquireFor preserves scoped growth but never queues or force-admits a new owner.
+func (b *DecodeBudget) tryAcquireFor(ctx context.Context, s *fetch.Scope, n int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if b == nil || b.maxBytes <= 0 || n <= 0 {
+		return nil
+	}
+	holding, ok := s.TryEnter()
+	if !ok {
+		return fetch.ErrDecodeBusy
+	}
+	b.mu.Lock()
+	if !holding && (len(b.waiters) != 0 || !b.fitsLocked(n)) {
+		b.mu.Unlock()
+		s.Abort()
+		return fetch.ErrDecodeBusy
+	}
+	b.used += n
+	b.mu.Unlock()
+	s.Charge(n)
+	return nil
+}
+
 // releaseFor returns n bytes charged through [DecodeBudget.acquireFor].
 func (b *DecodeBudget) releaseFor(s *fetch.Scope, n int64) {
 	s.Release(n)

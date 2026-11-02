@@ -1791,3 +1791,11 @@ without it a restarted node recovers only flushed parts and then answers as a ri
 everything written since its last flush as absent. `ApplyReplicated` does **not** log: a secondary
 neither flushes nor checkpoints, so its log would grow without bound: its head is memory-resident,
 recovered by catching up rather than by replay.
+
+`Engine.TryFetch` uses the same plan and iterator as `Fetch`, with nonblocking decode admission.
+A new owner respects the FIFO queue and returns `fetch.ErrDecodeBusy` rather than waiting or
+force-admitting; a failed attempt releases its part references and charges nothing. Scope admission
+also uses a try-lock, since another first read may be waiting while holding that scope's lock.
+Already-owned scopes retain their ordinary charged growth, and an oversized read may still run alone.
+The facade forwards this capability only through its read-budget/observability seed wrapper;
+routing, fan-out, gap and scale wrappers conservatively return `fetch.ErrTryUnsupported`.

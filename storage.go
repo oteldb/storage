@@ -829,6 +829,16 @@ func (f seedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator
 	return f.inner.Fetch(ctx, r)
 }
 
+// TryFetch preserves the outer read budget and declines unsupported routing/decorator paths.
+func (f seedFetcher) TryFetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
+	inner, ok := f.inner.(fetch.TryFetcher)
+	if !ok {
+		return nil, fetch.ErrTryUnsupported
+	}
+	ctx = withReadBudget(f.obs.Base(ctx), f.maxQueryBytes)
+	return inner.TryFetch(ctx, r)
+}
+
 // Unwrap exposes the decorated fetcher so [fetch.CounterOf] can reach the engine's Count through
 // the seed layer (which only adds observability) for the count() pushdown.
 func (f seedFetcher) Unwrap() fetch.Fetcher { return f.inner }
