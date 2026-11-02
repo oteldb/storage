@@ -3,6 +3,7 @@ package faultfs
 import (
 	"io"
 	"io/fs"
+	"path"
 	"slices"
 	"time"
 )
@@ -77,6 +78,19 @@ func (h *handle) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	return n, nil
+}
+
+// Stat implements [vfs.File] over the opened node, even after its name is replaced or removed.
+func (h *handle) Stat() (fs.FileInfo, error) {
+	if err := h.fs.enter(Call{Op: OpStat, Name: h.name}); err != nil {
+		return nil, err
+	}
+	h.fs.mu.Lock()
+	defer h.fs.mu.Unlock()
+	if h.closed {
+		return nil, &fs.PathError{Op: "stat", Path: h.name, Err: fs.ErrClosed}
+	}
+	return &dirEntry{name: path.Base(h.name), size: int64(len(h.node.data)), mode: h.node.perm, mod: h.node.mod}, nil
 }
 
 // Sync implements [vfs.File]: it commits the bytes written so far. The directory entry naming them

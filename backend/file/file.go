@@ -260,9 +260,18 @@ func (f *File) ReadAt(_ context.Context, key string, off, n int64) ([]byte, erro
 	}
 	defer func() { _ = root.Close() }()
 
-	// Sized against the file so a clamped request allocates what it can actually return, not what it
-	// asked for: callers take an object's trailer by asking for more than may be there.
-	fi, err := root.Stat(p)
+	file, err := root.OpenFile(p, os.O_RDONLY, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, errors.Wrapf(backend.ErrNotExist, "read %q", key)
+		}
+
+		return nil, errors.Wrapf(err, "open %q", key)
+	}
+	defer func() { _ = file.Close() }()
+
+	// Clamp against the same opened object: a rename can replace the pathname at any time.
+	fi, err := file.Stat()
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, errors.Wrapf(backend.ErrNotExist, "read %q", key)
@@ -274,16 +283,6 @@ func (f *File) ReadAt(_ context.Context, key string, off, n int64) ([]byte, erro
 	if off >= fi.Size() {
 		return []byte{}, nil
 	}
-
-	file, err := root.OpenFile(p, os.O_RDONLY, 0)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, errors.Wrapf(backend.ErrNotExist, "read %q", key)
-		}
-
-		return nil, errors.Wrapf(err, "open %q", key)
-	}
-	defer func() { _ = file.Close() }()
 
 	buf := make([]byte, min(n, fi.Size()-off))
 

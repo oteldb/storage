@@ -105,6 +105,8 @@ a demonstration.
   `Crash()` keeps only what a directory sync committed, `Kill()` (process death) keeps everything,
   and a `Gate` on `SyncDir` puts the crash *between* a rename and its sync. The handle stays
   per-operation, as it was with `os.Root`, for the Windows reason recorded in `file.go`.
+  Ranged reads open the object before sizing it through that same handle: atomic replacement cannot
+  mix one version's size with another version's bytes. No path lookup follows that open.
 - **`backend/s3`** — store-specific calls sit behind a small `ObjectStore` interface so the
   contract logic (root prefixing, sorted listing, 404→`ErrNotExist`, conditional put, idempotent
   delete) is testable over a fake. `CompareAndSwap` is `If-Match` on the object's ETag (and
