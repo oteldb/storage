@@ -23,6 +23,7 @@ type New func(t *testing.T) vfs.FS
 // Conformance runs the suite against the filesystems newFS builds.
 func Conformance(t *testing.T, newFS New) {
 	t.Helper()
+	runFileStat(t, newFS)
 
 	t.Run("WriteReadBack", func(t *testing.T) {
 		f := newFS(t)

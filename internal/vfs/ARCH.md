@@ -12,6 +12,9 @@ drift from the real directory it stands in for:
   elsewhere).
 - `faultfs` — in memory, with a durability model and rule-driven fault injection.
 
+`File.Stat` reads the opened object, including after pathname replacement or removal.
+Ranged reads use that metadata to size a read from the same handle.
+
 ## What `faultfs` tracks
 
 Every file holds two byte slices: `data`, what a reader sees now, and `synced`, what its last

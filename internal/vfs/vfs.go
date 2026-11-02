@@ -60,6 +60,9 @@ type File interface {
 	io.Writer
 	io.Closer
 
+	// Stat returns metadata for the open file, independent of its current pathname.
+	Stat() (fs.FileInfo, error)
+
 	// Sync commits the file's written bytes to stable storage. It does not commit the directory
 	// entry naming the file — see [FS.SyncDir].
 	Sync() error
