@@ -90,9 +90,8 @@ type Rule struct {
 // Backend is a [backend.Backend] that applies [Rule]s to the operations passing through it, and
 // records them. The zero value is not usable; call [Wrap].
 //
-// It deliberately forwards none of the optional backend capabilities ([backend.Viewer],
-// [backend.Sizer], ReaderAt, ObjectCreator): every one of them has a mandatory fallback, so a
-// wrapped backend exercises the same code as an unwrapped one, only slower.
+// Optional read/write capabilities are hidden so faults intercept their mandatory fallbacks.
+// The exception is NativeSizer, whose metadata-only answer must never materialize an object.
 type Backend struct {
 	backend.Backend
 
@@ -103,6 +102,11 @@ type Backend struct {
 
 // Wrap returns b with fault injection attached.
 func Wrap(b backend.Backend) *Backend { return &Backend{Backend: b} }
+
+// NativeSize forwards the inner metadata-only size hint.
+func (b *Backend) NativeSize(ctx context.Context, key string) (int64, bool, error) {
+	return backend.NativeSizeOf(ctx, b.Backend, key)
+}
 
 // Add installs a rule. Rules are consulted in the order they were added, and the first one to match
 // an operation decides it.

@@ -221,6 +221,15 @@ func (b *instrumentedBackend) Size(ctx context.Context, key string) (int64, erro
 	return n, err
 }
 
+func (b *instrumentedBackend) NativeSize(ctx context.Context, key string) (int64, bool, error) {
+	start := time.Now()
+	n, known, err := backend.NativeSizeOf(ctx, b.inner, key)
+	if known || err != nil {
+		b.m.Record(ctx, "size", result(err), time.Since(start), 0)
+	}
+	return n, known, err
+}
+
 func (b *instrumentedBackend) Delete(ctx context.Context, key string) error {
 	start := time.Now()
 	err := b.inner.Delete(ctx, key)

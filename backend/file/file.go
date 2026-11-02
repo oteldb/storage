@@ -321,6 +321,15 @@ func (f *File) Size(_ context.Context, key string) (int64, error) {
 	return fi.Size(), nil
 }
 
+// NativeSize implements [backend.NativeSizer] using filesystem metadata alone.
+func (f *File) NativeSize(ctx context.Context, key string) (int64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, true, err
+	}
+	n, err := f.Size(ctx, key)
+	return n, true, err
+}
+
 // List returns, sorted ascending, every key with the given prefix.
 //
 // The prefix bounds the work, not just the result: keys map to paths, so only the subtree

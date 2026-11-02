@@ -197,6 +197,8 @@ to fail over to: a read overlapping a want fails.
   must work with no disk or object store. Optional capabilities (`Viewer`, `Sizer`, `ReaderAt`,
   `NodeLocal`, `LocalDir`, `SpaceReporter`, `InodeReporter`) are type assertions with mandatory fallbacks, so a
   wrapper that does not forward one silently disables the behavior it feeds.
+  `NativeSizer` instead returns unknown when unsupported: admission must never materialize an
+  object merely to discover its size, even through a wrapper's ordinary `Sizer` fallback.
 - **A node never accepts what it cannot store.** Out of bytes or out of inodes is a distinct,
   latched, observable state that rejects writes with `backend.ErrNoSpace` and keeps serving reads —
   not a stream of failed flushes behind an unbounded head.
