@@ -28,8 +28,8 @@ jobs:
         id: go-env
         shell: bash
         run: |
-          echo "cache=$(go env GOCACHE)" >> $GITHUB_ENV
-          echo "modcache=$(go env GOMODCACHE)" >> $GITHUB_ENV
+          echo "cache=$(go env GOCACHE)" >> "$GITHUB_ENV"
+          echo "modcache=$(go env GOMODCACHE)" >> "$GITHUB_ENV"
 
       - name: Set up cache
         uses: actions/cache@v6
@@ -45,7 +45,8 @@ jobs:
         env:
           E2E: "1"
           TESTCONTAINERS_RYUK_DISABLED: "true"
-        run: go test -timeout 15m -race -v -coverpkg=./... -coverprofile=profile.out ./...
+        # Keep instrumented packages from competing on the hosted runner.
+        run: go test -p 1 -timeout 15m -race -v -coverpkg=./... -coverprofile=profile.out ./...
 
       - name: Emit coverage
         run: go tool cover -func profile.out
