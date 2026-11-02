@@ -11,6 +11,10 @@ The order is catalog → writer → state. Append, replica apply and WAL operati
 ordering; catalog/reload/repair operations take all three. Queries take the state read lock;
 lazy postings sorting takes only state exclusion. None of these locks is reentrant.
 
+Metrics `HasWants` first tries catalog ownership to read all three obligation sets; ingestion
+never mutates them. A busy catalog falls back to the state read lock, preserving reader progress
+during catalog I/O. Windowed repair checks, read gaps, fences, and acknowledged holes are unchanged.
+
 | operation | ordering |
 |---|---|
 | append | bounded private grouping before writer ownership; metrics staged admission, encoding and WAL I/O admit readers; apply after success |
@@ -1492,6 +1496,11 @@ an evicted, unpinned buffer recirculates through a bounded freelist, cutting mis
 without enlarging the resident set. Cache-off, or constant/unblocked columns, decodes per fetch,
 series-skipped to the blocks the matched row ranges touch. With the cache on a fetch also prefetches
 the parts it will touch.
+
+Each block reader owns one numeric pin per `(block, column)`, kept sorted in its existing pin
+slice. A scan borrows an already-owned pin before consulting the shared cache, including private
+or evicted prefetch blocks. This prevents prefetch and scan from retaining two decoded copies
+against a reservation for one; decoder metadata pins remain separate. No lookup map is retained.
 
 Key/LRU shards share atomic byte credits, so a large decoder prototype can still use the whole
 cache allowance. Insertion reserves credits before locking its shard; a trim coordinator evicts

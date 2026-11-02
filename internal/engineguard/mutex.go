@@ -17,6 +17,13 @@ func (m *Mutex) Lock() {
 	m.LockWriter()
 }
 
+// TryLockCatalog acquires metadata ownership without waiting for writer or state ownership.
+// The caller must release it with [Mutex.UnlockCatalog].
+func (m *Mutex) TryLockCatalog() bool { return m.catalog.TryLock() }
+
+// UnlockCatalog releases metadata-only ownership.
+func (m *Mutex) UnlockCatalog() { m.catalog.Unlock() }
+
 // LockWriter orders ingestion and WAL operations without joining catalog publication.
 func (m *Mutex) LockWriter() {
 	m.writer.Lock()

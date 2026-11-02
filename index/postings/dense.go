@@ -33,11 +33,24 @@ func (p *densePostings) Seek(id signal.SeriesID) bool {
 	if p.i >= len(p.ids) {
 		return false
 	}
-	if uint64(p.ids[p.i]) >= id.Lo {
+	target := uint32(id.Lo)
+	if p.ids[p.i] >= target {
 		return true
 	}
 	base := p.i
-	p.i += sort.Search(len(p.ids)-base, func(i int) bool { return uint64(p.ids[base+i]) >= id.Lo })
+	remaining := len(p.ids) - base
+	low, high := 1, 1
+	for high < remaining && p.ids[base+high] < target {
+		low = high + 1
+		if high > remaining/2 {
+			high = remaining
+			break
+		}
+		high *= 2
+	}
+	// The upper endpoint is already known to satisfy the target (or is the end).
+	// Search only the bracket, without comparing that endpoint again.
+	p.i = base + low + sort.Search(high-low, func(i int) bool { return p.ids[base+low+i] >= target })
 	return p.i < len(p.ids)
 }
 
