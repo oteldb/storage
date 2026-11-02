@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"slices"
 	"strconv"
 	"testing"
@@ -115,10 +116,69 @@ func FuzzMergeFinishIdentityBound(f *testing.F) {
 		ref, ok := index.Ref(id)
 		require.True(t, ok)
 		var budget mergeFinishBudget
-		budget.add(index.View(), ref)
+		view := index.View()
+		budget.add(view, ref)
 		data := identity.EncodeSorted(nil, 1, func(_ int, dst signal.Attributes) series.Entry {
-			return series.Entry{ID: id, Series: budget.view.At(int(ref), dst)}
+			return series.Entry{ID: id, Series: view.At(int(ref), dst)}
 		})
 		assert.GreaterOrEqual(t, budget.bytes(), int64(len(data)))
 	})
+}
+
+func TestMergeFinishReferencesSurviveRegistryGrowth(t *testing.T) {
+	t.Parallel()
+	e := New(Config{Backend: backend.Memory(), Prefix: "registry-growth",
+		FlushAdmission: func(context.Context, int64) (func(), error) { return func() {}, nil }})
+	unlock := e.lockMerge()
+	defer unlock()
+	entries := make(map[signal.SeriesID]signal.Series)
+	ids := make([]signal.SeriesID, 3)
+	for i := range ids {
+		entry := registryGrowthSeries(i)
+		e.head.registerSeries(entry)
+		ids[i] = entry.Hash()
+		entries[ids[i]] = entry
+	}
+	slices.SortFunc(ids, signal.SeriesID.Compare)
+	w, err := newPartStreamWriter(t.Context(), e, compressProfile{}, 0, false, false, nil)
+	require.NoError(t, err)
+	defer w.abort()
+	w.mergeFinish = &mergeFinishBudget{}
+	view := e.head.series.View()
+	for _, id := range ids {
+		ref, ok := e.head.series.Ref(id)
+		require.True(t, ok)
+		require.NoError(t, w.appendMergeSeries(view, ref, true, id, []int64{100}, []float64{7}, nil, 100))
+	}
+	for i := len(ids); i < 4099; i++ {
+		_, err := e.Append(registryGrowthSeries(i), 200, 9)
+		require.NoError(t, err)
+	}
+	require.Equal(t, 4099, e.head.series.Len())
+	p, err := w.finish(t.Context())
+	require.NoError(t, err)
+	data, err := e.cfg.Backend.Read(t.Context(), identityKey(p.prefix))
+	require.NoError(t, err)
+	var decodedIDs []signal.SeriesID
+	require.NoError(t, identity.Decode(data, func(id signal.SeriesID, entry signal.Series) error {
+		want, ok := entries[id]
+		assert.True(t, ok)
+		assert.True(t, want.Equal(entry), "finishing must resolve retained references against the grown registry")
+		decodedIDs = append(decodedIDs, id)
+		return nil
+	}))
+	assert.Equal(t, ids, decodedIDs)
+	decoded, err := decodePart(t.Context(), p)
+	require.NoError(t, err)
+	assert.Equal(t, []int64{100, 100, 100}, decoded.ts)
+	assert.Equal(t, []float64{7, 7, 7}, decoded.vals)
+}
+
+func registryGrowthSeries(i int) signal.Series {
+	entry := orderSeries(i)
+	entry.Scope.Name = []byte("scope-" + strconv.Itoa(i))
+	entry.Resource.Attributes = signal.NewAttributes(signal.KeyValue{
+		Key: []byte("resource"), Value: signal.StringValue([]byte("resource-" + strconv.Itoa(i))),
+	})
+	return entry
 }

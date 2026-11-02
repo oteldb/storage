@@ -11,7 +11,6 @@ import (
 )
 
 type mergeFinishBudget struct {
-	view         series.View
 	refs         []uint32
 	symbols      series.EncodingBudget
 	encoded      int64
@@ -19,11 +18,10 @@ type mergeFinishBudget struct {
 }
 
 func (b *mergeFinishBudget) add(view series.View, ref uint32) {
-	b.view = view
 	b.refs = append(b.refs, ref)
-	b.encoded = buildbudget.Add(b.encoded, b.view.EncodingBytes(int(ref)))
-	b.materialized = max(b.materialized, b.view.MaterializationBytes(int(ref)))
-	b.symbols.Add(b.view, int(ref))
+	b.encoded = buildbudget.Add(b.encoded, view.EncodingBytes(int(ref)))
+	b.materialized = max(b.materialized, view.MaterializationBytes(int(ref)))
+	b.symbols.Add(view, int(ref))
 }
 
 type mergeIdentityBatch struct {
@@ -37,6 +35,7 @@ type mergeIdentityBatch struct {
 func (b *mergeIdentityBatch) next(e *Engine, keys *mergestream.Keys) bool {
 	if b.at == b.n {
 		b.at, b.n = 0, 0
+		b.view = series.View{}
 		for b.n < len(b.ids) && keys.Next() {
 			b.ids[b.n] = keys.Key()
 			b.n++

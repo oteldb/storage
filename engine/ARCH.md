@@ -95,6 +95,8 @@ and reused when writing the identity object; there is no tenant-wide reference c
 their separate estimator. One merge shares its frame/object compressors across output writers and
 charges their encoder workspace once, independently of each writer's growing state.
 The existing build barrier prevents registry replacement while the references are held.
+Output writers retain references and scalar estimates, not registry views: finishing captures one
+fresh view, so several day writers cannot each pin a different generation of growing arenas.
 
 Frozen metric sample bytes remain in `HeadBytes` and `MaxInFlightBytes` until publication. They are
 existing input, not additional build workspace; the build pool does not reserve those same bytes

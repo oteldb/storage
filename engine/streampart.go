@@ -239,7 +239,10 @@ func (p *partStreamWriter) weights(sf []float64, n int) []float64 {
 // part would mean a burnt part id and an unreadable prefix.
 func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
 	if b := p.mergeFinish; b != nil {
-		return p.finishWithIdentities(ctx, identitySnapshot{view: b.view, refs: b.refs})
+		p.e.mu.RLock()
+		view := p.e.head.series.View()
+		p.e.mu.RUnlock()
+		return p.finishWithIdentities(ctx, identitySnapshot{view: view, refs: b.refs})
 	}
 	return p.finishWithIdentities(ctx, p.identityEntries())
 }
