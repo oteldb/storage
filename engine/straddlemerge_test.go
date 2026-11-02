@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/timebucket"
 	"github.com/oteldb/storage/signal"
@@ -114,7 +116,7 @@ func TestSplitAcrossAgeBands(t *testing.T) {
 	}
 }
 
-// TestStraddlerMergeHoldsResidentShare bounds what one large series spread over many days makes the
+// TestStraddlerMergeHoldsResidentShare isolates OUTPUT state: one large series spread over many days makes the
 // day writers hold together: the merge's resident share, overshot by at most one day's run, not a
 // writer's worth per day.
 //
@@ -140,7 +142,10 @@ func TestStraddlerMergeHoldsResidentShare(t *testing.T) {
 			}
 
 			require.NoError(t, e.Flush(ctx))
-			require.NoError(t, e.Merge(ctx, 0))
+			// Isolate output day writers from source and codec admission.
+			require.NoError(t, e.MergeStreamOutputForTest(ctx, engine.MergeOptions{Recompress: &engine.RecompressSpec{
+				Before: math.MaxInt64, Algorithm: compress.AlgorithmNone,
+			}}))
 
 			require.Positive(t, limit)
 			assert.LessOrEqual(t, peak, limit+run, "the day writers outgrew the resident share")

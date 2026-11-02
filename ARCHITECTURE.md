@@ -197,6 +197,8 @@ to fail over to: a read overlapping a want fails.
   must work with no disk or object store. Optional capabilities (`Viewer`, `Sizer`, `ReaderAt`,
   `NodeLocal`, `LocalDir`, `SpaceReporter`, `InodeReporter`) are type assertions with mandatory fallbacks, so a
   wrapper that does not forward one silently disables the behavior it feeds.
+  `NativeSizer` instead returns unknown when unsupported: admission must never materialize an
+  object merely to discover its size, even through a wrapper's ordinary `Sizer` fallback.
 - **A node never accepts what it cannot store.** Out of bytes or out of inodes is a distinct,
   latched, observable state that rejects writes with `backend.ErrNoSpace` and keeps serving reads —
   not a stream of failed flushes behind an unbounded head.
@@ -207,6 +209,9 @@ to fail over to: a read overlapping a want fails.
   matched series (the metric engine and the fan-out `Merge` both hold one series at a time). The
   producer therefore holds the iteration's resources (pinned parts, decode-memory reservation, child
   iterators) until `Close`, which every caller owes it; `fetch.Drain` closes what it drains.
+- **Independent read producers must not wait on their consumers' decode reservations.**
+  Optional `fetch.TryFetcher` declines busy or unsupported admission without reserving memory;
+  the embedder can fall back to its ordinary query-owned scope. See `query/ARCH.md`.
 - **Count grids use presence.** Optional `fetch.GridCounter` answers uniform windows from
   identity, existence proofs and timestamps. It shares query scope and memory admission with
   fetches, omits value decoding, and requires explicit fanout support for exact distributed counts.

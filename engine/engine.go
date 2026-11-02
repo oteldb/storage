@@ -25,7 +25,6 @@ import (
 	"github.com/oteldb/storage/internal/repair"
 	"github.com/oteldb/storage/pool"
 	"github.com/oteldb/storage/query/fetch"
-	"github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
 )
@@ -631,91 +630,11 @@ func (e *Engine) Stats() Stats {
 	return s
 }
 
-// Fetch implements [fetch.Fetcher] over the head ∪ flushed parts: it resolves the
-// request's matchers to series (the index spans every series ever seen, flushed or not)
-// and yields one batch per series with its samples in the window, merged across the head
-// buffer and every part by timestamp.
-//
-// The iterator is **streaming**: a series' samples are gathered on the [fetch.Iterator.Next] that
-// yields them, so a consumer that folds and releases each batch stays O(1) in matched series
-// instead of O(matched series x samples). The acquired parts, the decode-memory reservation and
-// the profiling/observability accounting therefore live for the whole iteration and are settled by
-// [fetch.Iterator.Close] — a caller **must** Close (directly or via [fetch.Drain]), otherwise the
-// parts stay pinned and the decode budget stays reserved.
-func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
-	ctx = e.cfg.Obs.Base(ctx)
-	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.fetch",
-		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
-
-	ctx, pf := profile.Begin(ctx, "engine.fetch")
-
-	startNs := time.Now()
-	log := zctx.From(ctx)
-	log.Debug("fetch start",
-		zap.String("prefix", e.cfg.Prefix), zap.Int("matchers", len(r.Matchers)),
-		zap.Int64("start", r.Start), zap.Int64("end", r.End))
-
-	// The label index sorts lazily on first read after a write, mutating in place. Reads run
-	// under the shared lock (concurrent fetches are allowed — e.g. split-by-interval), so do
-	// that one-time sort under the exclusive lock first: hold the read lock, and while the
-	// index is still unsorted, upgrade to sort and re-check. Once we hold the read lock with a
-	// sorted index, no writer can be running, so resolve only reads.
-	e.mu.RLock()
-	for !e.head.indexSorted() {
-		e.mu.RUnlock()
-		e.mu.LockState()
-		e.head.ensureIndexSorted()
-		e.mu.UnlockState()
-		e.mu.RLock()
-	}
-
-	_, rpf := profile.Begin(ctx, "resolve-matchers")
-	ids := e.head.resolve(r.Matchers)
-	rpf.Add("series_matched", int64(len(ids)))
-	rpf.End()
-
-	// Plan under the read lock: acquire the in-window parts to read and snapshot each series' head
-	// (and any mid-flush) samples + identity, so the part reads below run lock-free — appends and
-	// flush/merge proceed concurrently, and the acquired parts can't be reclaimed until released.
-	plan := e.planFetch(ids, r)
-	e.mu.RUnlock()
-
-	// Reserve this fetch's decode footprint from the memory budget (blocks under concurrency
-	// pressure), off the engine lock, before any part is decoded. A fetch materializes ts+value.
-	if err := plan.acquireDecodeBudget(ctx, r, colNeed{values: true}); err != nil {
-		plan.releaseParts()
-		span.RecordError(err)
-		span.End()
-		pf.End()
-
-		return nil, err
-	}
-
-	// Prefetch: decode the parts this fetch will touch concurrently (and cache them), so their
-	// backend reads + decodes overlap instead of happening one part at a time during the merge.
-	e.prefetch(ctx, plan)
-
-	_, spf := profile.Begin(ctx, "scan")
-
-	return &fetchIter{
-		e:       e,
-		plan:    plan,
-		recycle: r.Recycle,
-		ctx:     ctx,
-		span:    span,
-		pf:      pf,
-		spf:     spf,
-		log:     log,
-		startNs: startNs,
-		// Parts actually scanned this fetch — the recent tier may have short-circuited acquisition.
-		partsScanned: len(plan.liveParts),
-	}, nil
-}
-
 // enginePlan is the lock-free-readable plan a fetch builds under the engine read lock: the acquired
 // (ref-held) in-window parts still to read, plus each series' identity and its already-snapshotted head
 // and mid-flush samples. Its [enginePlan.mergeSeries] does the part reads off the lock.
 type enginePlan struct {
+	tryDecode bool
 	ids       []signal.SeriesID
 	series    []signal.Series                  // matched-series identities, parallel to ids (zero value when absent)
 	headB     map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
@@ -947,7 +866,13 @@ func (p *enginePlan) reserveDecodeBudget(ctx context.Context, r fetch.Request, e
 	p.budgetBytes = est
 	p.budgetScope = scope
 
-	forced, err := p.engine.budget.acquireFor(ctx, scope, p.budgetBytes)
+	var forced bool
+	var err error
+	if p.tryDecode {
+		err = p.engine.budget.tryAcquireFor(ctx, scope, p.budgetBytes)
+	} else {
+		forced, err = p.engine.budget.acquireFor(ctx, scope, p.budgetBytes)
+	}
 	if err != nil {
 		// Nothing was reserved; make releaseParts a no-op on the budget rather than a double release.
 		p.budgetBytes, p.budgetScope = 0, nil

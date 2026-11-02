@@ -161,3 +161,11 @@ Opt-in per query (`profile.WithCollector(ctx)`; nil collector ⇒ no-op, the def
 timed nodes onto a concurrency-safe tree. **Distributed:** the read RPC sets a header when a
 collector is active, the peer runs under its own collector and prepends its encoded tree
 (bounds-checked, fuzzed) to the response, which the requester grafts as a `remote {addr}` subtree.
+
+`fetch.TryFetcher` is an optional local read capability for independently owned query producers.
+It preserves fetch results and iterator cleanup, but decode admission never queues or force-admits:
+contention returns `ErrDecodeBusy` with no reservation; unsupported decorators return
+`ErrTryUnsupported`. Capability discovery must not unwrap routing or read-policy decorators.
+An independent producer owns its own `fetch.Scope`; borrowing a waiting caller's scope would mix
+lifetimes and defeat admission. Already-owned scope growth and oversized-alone admission retain
+ordinary accounting. This is not a nonblocking I/O or engine-lock guarantee.

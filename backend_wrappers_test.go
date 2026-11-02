@@ -81,6 +81,17 @@ var capabilityProbes = []struct {
 
 		return counted.Reads() == 0
 	}},
+	{"NativeSizer", func(t *testing.T, wrap wrapFunc) bool {
+		t.Helper()
+		counted := backendtest.NewByteCounter(seeded(t, backend.Memory()))
+		n, known, err := backend.NativeSizeOf(t.Context(), wrap(counted), probeKey)
+		require.NoError(t, err)
+		if !known {
+			return false
+		}
+		require.Equal(t, int64(len(probePayload)), n)
+		return counted.Reads() == 0
+	}},
 	{"ObjectCreator", func(t *testing.T, wrap wrapFunc) bool {
 		t.Helper()
 
@@ -173,10 +184,10 @@ func TestWrappersForwardExactlyTheirInnerCapabilities(t *testing.T) {
 		{"instrumented", instrumented, all},
 		// A converted part's commit marker is its EC sidecar, so a deferred delete a power cut
 		// undoes could resurrect a part; the EC wrapper deletes synchronously on purpose.
-		{"ec", ecWrap, without("DeleteDeferred")},
+		{"ec", ecWrap, without("DeleteDeferred", "NativeSizer")},
 		{"ec/cached/instrumented", func(b backend.Backend) backend.Backend {
 			return ecWrap(cached(instrumented(b)))
-		}, without("DeleteDeferred")},
+		}, without("DeleteDeferred", "NativeSizer")},
 		// Takes the streaming write path over any backend while answering StreamsWrites for it.
 		{"backendtest.Deferred", func(b backend.Backend) backend.Backend {
 			return backendtest.WithDeferred(b)

@@ -99,6 +99,8 @@ func downsample(ts []int64, values, sf []float64, tiers []DownsampleTier) ([]int
 	return ts, values, sf
 }
 
+type rollupBucketKey struct{ interval, start int64 }
+
 // downsampleCovering is [downsample] over samples tagged with what they stand for (tags nil: all
 // raw), returning also each output sample's newest source timestamp: a representative can sit before
 // samples it rolled up (First, Min, Max, and every bucket-start aggregation), and the watermark a
@@ -137,18 +139,16 @@ func downsampleCovering(
 	// rare case where two tiers' aligned starts coincide across a misaligned Before boundary;
 	// raw samples use interval 0 and their own ts, and never collide with a bucket start (a
 	// bucket start is strictly below every Before, hence below every raw sample).
-	type key struct{ interval, start int64 }
-
-	buckets := make(map[key]*bucketAcc, len(ts))
-	order := make([]key, 0, len(ts))
+	buckets := make(map[rollupBucketKey]*bucketAcc, len(ts))
+	order := make([]rollupBucketKey, 0, len(ts))
 
 	for i, t := range ts {
 		tag := tagAt(tags, i)
 		interval, agg, fixed := rollTarget(active, t, tag)
 
-		k := key{interval: 0, start: t} // raw, pass through
+		k := rollupBucketKey{interval: 0, start: t} // raw, pass through
 		if interval > 0 {
-			k = key{interval: interval, start: alignDown(t, interval)}
+			k = rollupBucketKey{interval: interval, start: alignDown(t, interval)}
 		}
 
 		b := buckets[k]

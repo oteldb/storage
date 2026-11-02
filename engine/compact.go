@@ -106,15 +106,19 @@ func selectMergeParts(src []*part, opts MergeOptions, capBytes int64, idle int) 
 // still-filling ladder bucket being the one holding newest, the newest sample of all of them: a
 // cohort that stops receiving data would otherwise hold its own newest bucket open for ever.
 func selectMergePartsBefore(src []*part, opts MergeOptions, capBytes int64, idle int, newest int64) []*part {
-	if forced := selectForced(src, opts, capBytes); len(forced) > 0 {
+	return selectMergePartsBeforeLimited(src, opts, capBytes, idle, newest, maxMergeParts)
+}
+
+func selectMergePartsBeforeLimited(src []*part, opts MergeOptions, capBytes int64, idle int, newest int64, maxInputs int) []*part {
+	if forced := selectForcedLimited(src, opts, capBytes, maxInputs); len(forced) > 0 {
 		return forced
 	}
 
-	if run := ladderRun(src, capBytes, idle, newest); len(run) > 0 {
+	if run := ladderRunLimited(src, capBytes, idle, newest, maxInputs); len(run) > 0 {
 		return run
 	}
 
-	return selectStraddlers(src, capBytes)
+	return selectStraddlersLimited(src, capBytes, maxInputs)
 }
 
 // pickMergeRun returns the unsealed parts to compact for size reduction, or nil when none are worth
@@ -134,12 +138,16 @@ func selectMergePartsBefore(src []*part, opts MergeOptions, capBytes int64, idle
 // rewriting a large part once to absorb a stray costs far less than carrying that stray in every
 // query for the lifetime of the engine.
 func pickMergeRun(src []*part, capBytes int64, idle int) []*part {
+	return pickMergeRunLimited(src, capBytes, idle, maxMergeParts)
+}
+
+func pickMergeRunLimited(src []*part, capBytes int64, idle, maxInputs int) []*part {
 	bySize, order := eligibleBySize(src, capBytes)
 	if len(bySize) < minMergeParts {
 		return nil
 	}
 
-	best, fallback, _ := scanRuns(bySize, capBytes)
+	best, fallback, _ := scanRunsLimited(bySize, capBytes, maxInputs)
 	if best == nil {
 		if idle < mergeIdleRounds {
 			return nil
@@ -148,7 +156,7 @@ func pickMergeRun(src []*part, capBytes int64, idle int) []*part {
 		best = fallback
 	}
 
-	return inSrcOrder(preferSeriesLocalRun(bySize, best, capBytes), order)
+	return inSrcOrder(preferSeriesLocalRunLimited(bySize, best, capBytes, maxInputs), order)
 }
 
 // eligibleBySize returns the unsealed parts ordered by size, plus each part's position in src so
@@ -180,9 +188,13 @@ func eligibleBySize(src []*part, capBytes int64) ([]*part, map[*part]int) {
 // returns the best qualifying run, the best run ignoring the guards (what the idle escape falls
 // back on), and that run's score.
 func scanRuns(bySize []*part, capBytes int64) (best, fallback []*part, fallbackM float64) {
+	return scanRunsLimited(bySize, capBytes, maxMergeParts)
+}
+
+func scanRunsLimited(bySize []*part, capBytes int64, maxInputs int) (best, fallback []*part, fallbackM float64) {
 	bestM := 0.0
 
-	for n := minMergeParts; n <= min(maxMergeParts, len(bySize)); n++ {
+	for n := minMergeParts; n <= min(maxInputs, len(bySize)); n++ {
 		for i := 0; i+n <= len(bySize); i++ {
 			run := bySize[i : i+n]
 

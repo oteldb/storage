@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"slices"
@@ -74,6 +75,31 @@ func (e *Engine) PartPrefixes() []string {
 
 // SetMergeReadWindow sets how much of each source column a merge reads ahead.
 func (e *Engine) SetMergeReadWindow(n int64) { e.mergeReadWindow = n }
+
+// MergeStreamOutputForTest isolates output-router residency from source admission and decoding.
+// The test owns an idle engine and a small input fixture; this is not a production budget bypass.
+func (e *Engine) MergeStreamOutputForTest(ctx context.Context, opts MergeOptions) error {
+	unlock := e.lockMerge()
+	defer unlock()
+	e.mu.Lock()
+	src, release, err := e.pinMergeSourcesLocked(ctx)
+	e.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	defer release()
+	plan, err := e.planRollup(ctx, src, minInt64, opts.Downsample)
+	if err != nil {
+		return err
+	}
+	out, err := e.compactStream(ctx, src, minInt64, e.mergeCapBytes(ctx), plan, opts)
+	if err != nil {
+		return err
+	}
+	planMergeBlocks(src, out)
+	_, err = e.publishMerge(ctx, src, out, src, e.term(), plan)
+	return err
+}
 
 // LoadState snapshots every field an index load replaces, so a test can tell that a failed load
 // changed none of them. Part handles compare by identity.

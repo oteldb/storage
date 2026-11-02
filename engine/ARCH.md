@@ -87,6 +87,17 @@ or unordered series takes a larger reservation and can run exclusively. Whole-ob
 also seal output parts on a workspace-derived row limit because encoded columns remain resident.
 These estimates are not a hard RSS or allocator bound. Record flushes retain their own estimate.
 
+Metric merge writers also price finishing before sealing an output part: the selected identity
+references at their retained capacity, shared symbol/context encoding workspace, the largest
+reusable attribute materialization, identity body/destination growth, encoded sidecars, reopening
+and the block writer's finish buffers. Identity references are resolved in 256-entry lock sections
+and reused when writing the identity object; there is no tenant-wide reference cache. Flushes keep
+their separate estimator. One merge shares its frame/object compressors across output writers and
+charges their encoder workspace once, independently of each writer's growing state.
+The existing build barrier prevents registry replacement while the references are held.
+Output writers retain references and scalar estimates, not registry views: finishing captures one
+fresh view, so several day writers cannot each pin a different generation of growing arenas.
+
 Frozen metric sample bytes remain in `HeadBytes` and `MaxInFlightBytes` until publication. They are
 existing input, not additional build workspace; the build pool does not reserve those same bytes
 again. Completed output handles grow with the number of output parts until atomic publication.
@@ -649,6 +660,37 @@ distinct series — a paged index feeds it straight out of the sidecar entries.
 
 Splitting at row boundaries is safe: parts are independent, and a series spanning two is merged back
 by the read seam.
+
+Input residency is priced before `mergeKeys` maps whole SIDX objects or watermark reads allocate.
+It includes the 20-byte SIDX entries, decoded watermark capacities (24 bytes per entry), decoder
+windows and maximum-series range/fold scratch. Maximum series length is recorded during the existing
+SIDX validation or resident-index build, without another read or an on-disk format change.
+
+The selected set reserves the sum of those resident terms plus the largest sidecar-read or decoder
+opening transient. Under that captured grant, watermark preflight validates sidecars into local
+arrays. Valid sidecars need no whole-timestamp contingency. Missing/corrupt sidecars trigger
+repricing and full reselection before fallback decoding. Rejected arrays are released; only the
+finally accepted set populates part caches. Local arrays and concurrent cache fills are both priced.
+Unbounded legacy columns fail before decoding. Whole-column singleton rewrites additionally price
+their columns, identity capture/encoding and codec workspace. Arithmetic saturates rather than wrapping.
+
+Range scratch uses the validated per-source series maxima. Possible rollup-map work prices actual
+bucket/key/representative types, conservative map capacity and backing-array growth, including
+recorded representatives when the current policy has no tiers. Raw untagged series keep the small
+gather-only bound. The allowance is captured once and carried through selection, admission,
+watermark validation and output routing; a new engine changes future shares, not an existing grant.
+
+A merge reruns the complete cohort/time-bucket/rollup-policy selector with a smaller private input
+limit until the inputs leave room for output staging and codec state. It never truncates an already
+resolved run. More than two inputs normally use at most half the share; the minimum pair may use
+the remaining total after the output floor. An unaffordable minimum fails explicitly, not as a busy
+admission deferral, so catch-up ends its turn and a later maintenance tick can retry.
+
+Explicit NativeSizer backends stat actual sidecar sizes without reading them. Opaque backends
+retain the immutable format's canonical-size assumption; the Backend.Read interface cannot bound an
+arbitrarily oversized corrupt object before receiving it. NativeSizeOf never falls through to SizeOf
+or Read; Sizer or native ranges alone do not establish that guarantee. The output-router residency test uses a test-only seam to isolate its
+256 KiB writer target from these separate input terms; normal Engine.Merge has no bypass.
 
 ```
 concurrency   = clamp( mergeMemory / 64 MiB, 1, MergeConcurrency )   ← memory decides, cores cap
@@ -1749,3 +1791,11 @@ without it a restarted node recovers only flushed parts and then answers as a ri
 everything written since its last flush as absent. `ApplyReplicated` does **not** log: a secondary
 neither flushes nor checkpoints, so its log would grow without bound: its head is memory-resident,
 recovered by catching up rather than by replay.
+
+`Engine.TryFetch` uses the same plan and iterator as `Fetch`, with nonblocking decode admission.
+A new owner respects the FIFO queue and returns `fetch.ErrDecodeBusy` rather than waiting or
+force-admitting; a failed attempt releases its part references and charges nothing. Scope admission
+also uses a try-lock, since another first read may be waiting while holding that scope's lock.
+Already-owned scopes retain their ordinary charged growth, and an oversized read may still run alone.
+The facade forwards this capability only through its read-budget/observability seed wrapper;
+routing, fan-out, gap and scale wrappers conservatively return `fetch.ErrTryUnsupported`.

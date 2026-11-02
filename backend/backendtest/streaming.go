@@ -41,6 +41,11 @@ func (b *StreamingMemory) ReadAt(ctx context.Context, key string, off, n int64) 
 	return backend.ReadAt(ctx, b.Backend, key, off, n)
 }
 
+// NativeSize forwards the inner metadata-only size hint.
+func (b *StreamingMemory) NativeSize(ctx context.Context, key string) (int64, bool, error) {
+	return backend.NativeSizeOf(ctx, b.Backend, key)
+}
+
 // StreamsWrites implements [backend.ObjectCreator].
 func (*StreamingMemory) StreamsWrites() bool { return true }
 

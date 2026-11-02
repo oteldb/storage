@@ -14,6 +14,7 @@ import (
 
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
+	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/timebucket"
 	"github.com/oteldb/storage/signal"
@@ -154,15 +155,14 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 			zap.String("prefix", e.cfg.Prefix), zap.Int("cohorts", len(cohorts)))
 	}
 
-	selected, tiers, conflicting := cohortRun(cohorts, readable, opts, capBytes, e.mergeIdle(opts), e.cohortTurn.Add(1)-1)
-	opts.Downsample = tiers
-
-	if len(conflicting) > 0 && e.conflictWarned.CompareAndSwap(false, true) {
-		zctx.From(ctx).Warn("downsample tier not applied: its interval does not nest with, or its aggregation "+
-			"differs from, a tier a part already records",
-			zap.String("prefix", e.cfg.Prefix), zap.Int64("interval", conflicting[0].Interval),
-			zap.Stringer("agg", conflicting[0].Agg))
+	allowance := e.mergeMemoryBudgetBytes()
+	turn := e.cohortTurn.Add(1) - 1
+	selection, err := e.selectBoundedMergeWithAllowance(ctx, cohorts, readable, opts, capBytes, e.mergeIdle(opts), turn, allowance)
+	if err != nil {
+		e.mergeDeferred.Store(false)
+		return mergeResult{parts: dropped}, err
 	}
+	selected := selection.parts
 
 	if len(selected) == 0 {
 		if dropped == 0 {
@@ -188,7 +188,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 
 	// Past here the merge decodes and buffers, so this is where its memory allowance must be one it
 	// actually holds rather than one it assumed.
-	release, admitted, err := e.admitMerge(ctx, opts.Background)
+	release, admitted, err := e.admitMergeBytes(ctx, opts.Background, allowance)
 	if err != nil {
 		e.mergeDeferred.Store(false)
 
@@ -212,6 +212,19 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	e.mergeDeferred.Store(false)
 
 	defer release()
+
+	selection, err = e.prepareMergeWatermarks(ctx, cohorts, readable, opts, capBytes, e.mergeIdle(opts), turn, selection)
+	if err != nil {
+		return mergeResult{parts: dropped}, err
+	}
+	selected = selection.parts
+	opts.Downsample = selection.tiers
+	if len(selection.conflicting) > 0 && e.conflictWarned.CompareAndSwap(false, true) {
+		zctx.From(ctx).Warn("downsample tier not applied: its interval does not nest with, or its aggregation "+
+			"differs from, a tier a part already records",
+			zap.String("prefix", e.cfg.Prefix), zap.Int64("interval", selection.conflicting[0].Interval),
+			zap.Stringer("agg", selection.conflicting[0].Agg))
+	}
 
 	// Only now: a merge that selected a run but could not get the memory to run it has not broken
 	// the fixed point, and zeroing the counter here would make the idle waiver climb from scratch
@@ -253,7 +266,9 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		if newParts, err = e.writeColumns(ctx, single, rowCapFor(selected[0], capBytes), opts, plan.marker); err != nil {
 			return mergeResult{parts: dropped}, err
 		}
-	} else if newParts, err = e.compactStream(ctx, selected, start, capBytes, plan, opts); err != nil {
+	} else if newParts, err = e.compactStreamWithInputs(
+		ctx, selected, start, capBytes, plan, opts, selection.inputBytes, allowance,
+	); err != nil {
 		return mergeResult{parts: dropped}, err
 	}
 
@@ -589,6 +604,12 @@ var mergeResidentObserver func(peak, run, limit int64)
 func (e *Engine) compactStream(
 	ctx context.Context, src []*part, start, capBytes int64, plan rollupPlan, opts MergeOptions,
 ) ([]*part, error) {
+	return e.compactStreamWithInputs(ctx, src, start, capBytes, plan, opts, 0, e.mergeBudget(capBytes).ResidentBytes)
+}
+
+func (e *Engine) compactStreamWithInputs(
+	ctx context.Context, src []*part, start, capBytes int64, plan rollupPlan, opts MergeOptions, inputBytes, allowance int64,
+) ([]*part, error) {
 	var keys mergestream.Keys
 	if err := mergeKeys(ctx, src, &keys); err != nil {
 		return nil, err
@@ -607,13 +628,20 @@ func (e *Engine) compactStream(
 
 	scratch := make([]rangeBuf, len(src))
 	comp, precision, withSF := mergeEncoding(src, capBytes, opts, plan.tiers)
-	budget := e.mergeBudget(capBytes)
+	coders := newMetricMergeCoders(src, comp)
+	budget := mergestream.Budget{DiskBytes: capBytes, ResidentBytes: allowance}
+	held := buildbudget.Add(inputBytes, coders.workspace())
 
 	var newParts []*part
 
 	router := timebucket.Router[*partStreamWriter]{
 		Open: func(int64) (*partStreamWriter, error) {
-			return newPartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker)
+			w, err := newPartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker, coders.options()...)
+			if err != nil {
+				return nil, err
+			}
+			w.mergeFinish = &mergeFinishBudget{}
+			return w, nil
 		},
 		Finish: func(w *partStreamWriter) error {
 			p, err := w.finish(ctx)
@@ -625,7 +653,8 @@ func (e *Engine) compactStream(
 
 			return nil
 		},
-		Resident:      (*partStreamWriter).residentBytes,
+		Resident:      (*partStreamWriter).mergeResidentBytes,
+		Held:          func() int64 { return held },
 		MaxOpen:       timebucket.MaxOpenWriters,
 		ResidentLimit: budget.ResidentBytes,
 	}
@@ -634,8 +663,10 @@ func (e *Engine) compactStream(
 	// but Close must release them rather than strand them.
 	defer router.Drop((*partStreamWriter).abort)
 
-	for keys.Next() {
-		id := keys.Key()
+	var identities mergeIdentityBatch
+	for identities.next(e, &keys) {
+		i := identities.at - 1
+		id, view, ref, found := identities.ids[i], identities.view, identities.refs[i], identities.found[i]
 
 		m, err := mergeStreamedSeries(ctx, src, streams, scratch, id, start)
 		if err != nil {
@@ -650,12 +681,10 @@ func (e *Engine) compactStream(
 		rs := rolledSeries{srcCovered: srcCovered}
 		rs.ts, rs.values, rs.sf, rs.covered = rollSeries(&m, plan.tiers)
 
-		u := idToU128(id)
-
 		err = timebucket.Runs(rs.ts, func(lo, hi int) error {
 			return router.Append(rs.ts[lo], func(w *partStreamWriter) (bool, error) {
 				ts, values, sf, watermark := rs.run(lo, hi)
-				if err := w.appendSeries(u, ts, values, sf, watermark); err != nil {
+				if err := w.appendMergeSeries(view, ref, found, id, ts, values, sf, watermark); err != nil {
 					return false, err
 				}
 
@@ -667,7 +696,7 @@ func (e *Engine) compactStream(
 				// The second bound is the part's resident footprint, which is not a function of
 				// its size on disk: the per-series sidecars grow with distinct series, so a merge
 				// of very short series reaches the memory budget long before the disk cap.
-				return budget.Reached(w.encodedBytes(), w.residentBytes()), nil
+				return budget.Reached(w.encodedBytes(), buildbudget.Add(held, w.mergeResidentBytes())), nil
 			})
 		})
 		if err != nil {

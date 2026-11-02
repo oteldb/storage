@@ -63,7 +63,7 @@ func (e *Engine) mergeConcurrency() int {
 	return memlimit.MergeConcurrency(e.cfg.MergeMemoryBytes, e.mergeFanout())
 }
 
-// admitMerge reserves the memory this merge intends to hold. It is called once the merge knows it
+// admitMergeBytes reserves the memory this merge intends to hold. It is called once the merge knows it
 // has work, so a no-op cycle never consults the budget at all.
 //
 // A [MergeOptions.Background] merge does not wait: the facade cannot service a size-triggered flush
@@ -76,12 +76,12 @@ func (e *Engine) mergeConcurrency() int {
 // waiting merge delays its own engine's flush for as long as it queues. The pool admits no new
 // holders while anyone is queued, so the wait is bounded by the merges already running plus
 // whatever is queued ahead.
-func (e *Engine) admitMerge(ctx context.Context, background bool) (func(), bool, error) {
+func (e *Engine) admitMergeBytes(ctx context.Context, background bool, allowance int64) (func(), bool, error) {
 	if e.cfg.MergeAdmission == nil {
 		return func() {}, true, nil
 	}
 
-	release, ok, err := e.cfg.MergeAdmission(ctx, e.mergeMemoryBudgetBytes(), !background)
+	release, ok, err := e.cfg.MergeAdmission(ctx, allowance, !background)
 	switch {
 	case err != nil:
 		return nil, false, err

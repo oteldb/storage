@@ -23,6 +23,7 @@ type MergeShape struct {
 	// merge would. Candidates 0 with ForceCandidates above it is a run the score guard declines
 	// until the idle waiver; both 0 with a non-zero Backlog is every unsealed part alone in its time
 	// bucket, the ladder's resting state, which no merge reduces without widening a part.
+	// These are structural candidates; input-memory pricing can narrow or reject the actual run.
 	Candidates      int
 	ForceCandidates int
 	// CapBytes is the seal threshold in effect, in bytes on disk. It is derived per merge from free

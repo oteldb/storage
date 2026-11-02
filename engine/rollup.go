@@ -339,6 +339,12 @@ func mergeCohorts(own, readable []*part) []mergeCohort {
 func cohortRun(
 	cohorts []mergeCohort, readable []*part, opts MergeOptions, capBytes int64, idle int, start uint64,
 ) (selected []*part, tiers, dropped []DownsampleTier) {
+	return cohortRunLimited(cohorts, readable, opts, capBytes, idle, start, maxMergeParts)
+}
+
+func cohortRunLimited(
+	cohorts []mergeCohort, readable []*part, opts MergeOptions, capBytes int64, idle int, start uint64, maxInputs int,
+) (selected []*part, tiers, dropped []DownsampleTier) {
 	newest := newestSample(readable)
 
 	for i := range cohorts {
@@ -347,7 +353,7 @@ func cohortRun(
 		o := opts
 		o.Downsample, dropped = resolvePolicy(c.history, readable, opts.Downsample)
 
-		if sel := selectMergePartsBefore(c.parts, o, capBytes, idle, newest); len(sel) > 0 {
+		if sel := selectMergePartsBeforeLimited(c.parts, o, capBytes, idle, newest, maxInputs); len(sel) > 0 {
 			return sel, o.Downsample, dropped
 		}
 	}

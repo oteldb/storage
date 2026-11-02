@@ -187,6 +187,7 @@ type pagedIndex struct {
 	be          backend.Backend
 	key         string
 	n           int // distinct series
+	maxRows     int // largest series range, captured while validating the index.
 	total       int // rows
 	keep        bool
 	offset      int64
@@ -276,25 +277,32 @@ func (p *pagedIndex) rangeAt(entries []byte, k int) rowRange {
 // [start(k), start(k+1)) never slices out of a decoded column) — rejecting a CRC-valid but
 // wrongly-written sidecar rather than trusting it on the read path. One linear pass at part open.
 func validSidxEntries(entries []byte, n, total int) bool {
+	_, valid := sidxRunBounds(entries, n, total)
+	return valid
+}
+
+func sidxRunBounds(entries []byte, n, total int) (maxRows int, valid bool) {
 	if n == 0 {
-		return total == 0
+		return 0, total == 0
 	}
 
 	if sidxEntryStart(entries, 0) != 0 {
-		return false
+		return 0, false
 	}
 
 	for k := 1; k < n; k++ {
 		if sidxEntryID(entries, k-1).Compare(sidxEntryID(entries, k)) >= 0 {
-			return false
+			return 0, false
 		}
 
 		if sidxEntryStart(entries, k-1) >= sidxEntryStart(entries, k) {
-			return false
+			return 0, false
 		}
+		maxRows = max(maxRows, sidxEntryStart(entries, k)-sidxEntryStart(entries, k-1))
 	}
 
-	return sidxEntryStart(entries, n-1) < total
+	last := total - sidxEntryStart(entries, n-1)
+	return max(maxRows, last), last > 0
 }
 
 // openPagedIndex reads and fully validates the part's series-index sidecar, returning ok=false
@@ -317,7 +325,12 @@ func openPagedIndex(
 	}
 
 	ents, n, total, err := parseSeriesIndex(data, true)
-	if err != nil || total != manifestRows || !validSidxEntries(ents, n, total) {
+	if err != nil || total != manifestRows {
+		corrupt.Detected(ctx, "series_index", obs.CorruptTolerated)
+		return nil, false
+	}
+	maxRows, valid := sidxRunBounds(ents, n, total)
+	if !valid {
 		corrupt.Detected(ctx, "series_index", obs.CorruptTolerated)
 
 		return nil, false
@@ -325,7 +338,7 @@ func openPagedIndex(
 
 	_, viewer := b.(backend.Viewer)
 
-	p := &pagedIndex{be: b, key: key, n: n, total: total, keep: !viewer}
+	p := &pagedIndex{be: b, key: key, n: n, maxRows: maxRows, total: total, keep: !viewer}
 	if n > 0 {
 		p.first, p.last = sidxEntryID(ents, 0), sidxEntryID(ents, n-1)
 		p.bounded = true

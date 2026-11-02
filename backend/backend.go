@@ -107,19 +107,15 @@ func ReadView(ctx context.Context, b Backend, key string) ([]byte, error) {
 	return b.Read(ctx, key)
 }
 
-// Sizer is an optional [Backend] capability: report an object's stored byte size without reading
-// its contents. Backends that can answer cheaply implement it (memory: the in-RAM length; file:
-// os.Stat). Use [SizeOf] rather than asserting directly — it falls back to a full Read for backends
-// that do not implement Sizer, so callers stay correct everywhere.
+// Sizer reports stored byte sizes; wrappers may delegate through [SizeOf]'s whole-read fallback.
+// Use [NativeSizer] when materializing contents before admission is forbidden.
 type Sizer interface {
 	// Size returns the stored byte size of key, or an [ErrNotExist]-wrapping error if absent.
 	Size(ctx context.Context, key string) (int64, error)
 }
 
-// SizeOf returns key's stored byte size. It uses the backend's [Sizer] fast path when available and
-// otherwise falls back to reading the whole object and measuring it — so it is correct over any
-// backend, and cheap over those (and the wrappers) that implement Sizer. It is intended for
-// introspection (part byte accounting), not the hot path.
+// SizeOf returns stored bytes through [Sizer] or a full Read. A wrapper's Sizer may also read whole.
+// Use [NativeSizeOf] for admission; SizeOf is intended for introspection.
 func SizeOf(ctx context.Context, b Backend, key string) (int64, error) {
 	if s, ok := b.(Sizer); ok {
 		return s.Size(ctx, key)
@@ -313,6 +309,14 @@ func (m *memoryBackend) Size(_ context.Context, key string) (int64, error) {
 	}
 
 	return int64(len(v)), nil
+}
+
+func (m *memoryBackend) NativeSize(ctx context.Context, key string) (int64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, true, err
+	}
+	n, err := m.Size(ctx, key)
+	return n, true, err
 }
 
 func (m *memoryBackend) Delete(_ context.Context, key string) error {
