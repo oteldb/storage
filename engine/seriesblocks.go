@@ -1,7 +1,9 @@
 package engine
 
 import (
+	"cmp"
 	"context"
+	"slices"
 
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
@@ -48,8 +50,8 @@ type seriesBlockReader struct {
 	// pins holds every cache entry this reader has taken a reference on. The reader adds the touched
 	// blocks to the merge as *views*, so the entries must stay unrecycled until the fetch's collect
 	// has copied the samples out — the fetch releases them per series (releaseSeriesPins) and sweeps
-	// the rest at teardown (releasePins). One entry may appear more than once (a block revisited
-	// after the memo moved on); each pin has one release.
+	// the rest at teardown (releasePins). Entries are sorted by (block, column), with one owned
+	// reference per key, so a block warmed privately can be reused without decoding it again.
 	pins        []*blockEntry
 	decoderPins []*blockEntry
 }
@@ -185,9 +187,16 @@ func (r *seriesBlockReader) tsBlock(ctx context.Context, b int) ([]int64, error)
 		return r.uncachedTimestampBlock(ctx, b)
 	}
 
+	at, found := r.pinIndex(b, colTsID)
+	if found {
+		ent := r.pins[at]
+		r.tsB, r.tsHeld, r.tsEnt = b, ent.i64, ent
+		return ent.i64, nil
+	}
+
 	key := blockKey{prefix: r.part.prefix, col: colTsID, blk: b}
 	if ent, ok := r.engine.blockCache.get(key); ok {
-		r.pins = append(r.pins, ent)
+		r.pins = slices.Insert(r.pins, at, ent)
 		r.tsB, r.tsHeld, r.tsEnt = b, ent.i64, ent
 
 		return ent.i64, nil
@@ -210,7 +219,7 @@ func (r *seriesBlockReader) tsBlock(ctx context.Context, b int) ([]int64, error)
 	// Read (and memo) the canonical buffer insert returns — a concurrent decode may have won the key,
 	// in which case ours was recycled and the winner's slice is the one that stays valid.
 	ent := r.engine.blockCache.insert(&blockEntry{key: key, i64: blk, bytes: int64(len(blk)) * 8})
-	r.pins = append(r.pins, ent)
+	r.pins = slices.Insert(r.pins, at, ent)
 	r.tsB, r.tsHeld, r.tsEnt = b, ent.i64, ent
 
 	return ent.i64, nil
@@ -253,9 +262,15 @@ func (r *seriesBlockReader) sfBlock(ctx context.Context, b int) ([]float64, erro
 func (r *seriesBlockReader) floatBlock(
 	ctx context.Context, dec **block.Decoder, name string, cid colID, b int,
 ) ([]float64, *blockEntry, error) {
+	at, found := r.pinIndex(b, cid)
+	if found {
+		ent := r.pins[at]
+		return ent.f64, ent, nil
+	}
+
 	key := blockKey{prefix: r.part.prefix, col: cid, blk: b}
 	if ent, ok := r.engine.blockCache.get(key); ok {
-		r.pins = append(r.pins, ent)
+		r.pins = slices.Insert(r.pins, at, ent)
 
 		return ent.f64, ent, nil
 	}
@@ -275,9 +290,18 @@ func (r *seriesBlockReader) floatBlock(
 	}
 
 	ent := r.engine.blockCache.insert(&blockEntry{key: key, f64: blk, bytes: int64(len(blk)) * 8})
-	r.pins = append(r.pins, ent)
+	r.pins = slices.Insert(r.pins, at, ent)
 
 	return ent.f64, ent, nil
+}
+
+func (r *seriesBlockReader) pinIndex(b int, col colID) (int, bool) {
+	return slices.BinarySearchFunc(r.pins, blockKey{blk: b, col: col}, func(entry *blockEntry, key blockKey) int {
+		if order := cmp.Compare(entry.key.blk, key.blk); order != 0 {
+			return order
+		}
+		return cmp.Compare(entry.key.col, key.col)
+	})
 }
 
 // releaseSeriesPins drops the pins taken while merging one series, keeping exactly one pin per

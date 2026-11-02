@@ -1497,6 +1497,11 @@ without enlarging the resident set. Cache-off, or constant/unblocked columns, de
 series-skipped to the blocks the matched row ranges touch. With the cache on a fetch also prefetches
 the parts it will touch.
 
+Each block reader owns one numeric pin per `(block, column)`, kept sorted in its existing pin
+slice. A scan borrows an already-owned pin before consulting the shared cache, including private
+or evicted prefetch blocks. This prevents prefetch and scan from retaining two decoded copies
+against a reservation for one; decoder metadata pins remain separate. No lookup map is retained.
+
 Key/LRU shards share atomic byte credits, so a large decoder prototype can still use the whole
 cache allowance. Insertion reserves credits before locking its shard; a trim coordinator evicts
 one shard entry at a time and prevents newer misses from stealing freed credits. Pending unlinked
