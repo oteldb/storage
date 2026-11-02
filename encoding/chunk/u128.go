@@ -2,6 +2,7 @@ package chunk
 
 import (
 	"encoding/binary"
+	"slices"
 )
 
 // U128 is an unsigned 128-bit value (a SeriesID at the storage boundary). Comparable, so
@@ -48,14 +49,17 @@ type U128Run struct {
 // it again. Zero-count runs are skipped and adjacent equal runs coalesced, so the output is
 // byte-identical to EncodeU128 over the expanded column.
 func EncodeU128Runs(dst []byte, runs []U128Run) []byte {
-	rows := 0
-	for _, r := range runs {
-		if r.Count > 0 {
-			rows += r.Count
-		}
+	rows, size, groups, first := u128RunsSize(runs, len(dst))
+	dst = slices.Grow(dst, size)
+	dst = binary.AppendUvarint(dst, uint64(rows))
+	if groups == 0 {
+		return dst
 	}
-
-	w, _ := writeHeader(dst, rows)
+	if groups == 1 {
+		dst = binary.BigEndian.AppendUint64(dst, first.Hi)
+		dst = binary.BigEndian.AppendUint64(dst, first.Lo)
+		return binary.AppendUvarint(dst, uint64(rows))
+	}
 
 	for i := 0; i < len(runs); {
 		if runs[i].Count <= 0 {
@@ -72,17 +76,47 @@ func EncodeU128Runs(dst []byte, runs []U128Run) []byte {
 			j++
 		}
 
-		b := w.AppendBytes(16)
-		binary.BigEndian.PutUint64(b[:8], runs[i].Value.Hi)
-		binary.BigEndian.PutUint64(b[8:], runs[i].Value.Lo)
-		w.WriteUvarint(uint64(n))
+		dst = binary.BigEndian.AppendUint64(dst, runs[i].Value.Hi)
+		dst = binary.BigEndian.AppendUint64(dst, runs[i].Value.Lo)
+		dst = binary.AppendUvarint(dst, uint64(n))
 
 		i = j
 	}
 
-	w.PadToByte()
+	return dst
+}
 
-	return w.Bytes()
+func u128RunsSize(runs []U128Run, prefix int) (rows, size, groups int, first U128) {
+	const maxInt = int(^uint(0) >> 1)
+	available := maxInt - prefix
+	for i := 0; i < len(runs); {
+		if runs[i].Count <= 0 {
+			i++
+			continue
+		}
+		if groups == 0 {
+			first = runs[i].Value
+		}
+		groups++
+		n := runs[i].Count
+		j := i + 1
+		for j < len(runs) && (runs[j].Count <= 0 || runs[j].Value == runs[i].Value) {
+			n += max(runs[j].Count, 0)
+			j++
+		}
+		bytes := 16 + uvarintLen(uint64(n))
+		if bytes > available-size {
+			panic("chunk: U128 run encoding exceeds addressable size")
+		}
+		size += bytes
+		rows += n
+		i = j
+	}
+	header := uvarintLen(uint64(rows))
+	if header > available-size {
+		panic("chunk: U128 run encoding exceeds addressable size")
+	}
+	return rows, size + header, groups, first
 }
 
 // DecodeU128 decodes a [U128] column into dst (reusing its capacity), returning the result and bytes
