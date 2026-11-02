@@ -1,7 +1,6 @@
 package vfstest
 
 import (
-	"io/fs"
 	"os"
 	"testing"
 
@@ -28,8 +27,10 @@ func runFileStat(t *testing.T, newFS New) {
 		require.EqualValues(t, 3, before.Size(), "FileInfo is a metadata snapshot")
 		require.EqualValues(t, 7, after.Size(), "Stat observes current handle contents")
 		require.NoError(t, file.Close())
-		_, err = file.Stat()
-		require.ErrorIs(t, err, fs.ErrClosed)
+		// Windows reports ERROR_INVALID_HANDLE rather than fs.ErrClosed.
+		closed, err := file.Stat()
+		require.Error(t, err)
+		require.Nil(t, closed)
 	})
 	t.Run("FileStatAfterReplacementAndRemoval", func(t *testing.T) {
 		f := newFS(t)
