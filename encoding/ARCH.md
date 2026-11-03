@@ -113,3 +113,15 @@ Decimal candidates must reconstruct every original float bit, including signed z
 `FloatGroupEncoder` retains decimal conversion and verification scratch across fragments.
 Group boundaries affect encoding only: row order, timestamps, duplicates and sample weights retain
 their existing meanings.
+
+`CodecAdaptiveTimestamps` encodes a bounded timestamp chunk as either an exact first value and
+stride, or a scaled delta-of-delta stream. Bulk and cursor readers check the declared row count;
+regular streams preserve int64 wrapping arithmetic and irregular streams retain their old codec.
+
+Independent chunks use `FloatGroupEncoder.EncodeGroupWithCost` to compare complete, bit-exact
+single-group packets through the caller's compression cost. Candidate and compressed-size scratch
+are reused and charged; the existing packed writer retains its original selection policy.
+
+Adaptive timestamp mode 0 stores `(mode byte, row count uvarint, first varint, stride varint)`;
+empty chunks omit first and stride. Mode 1 prefixes an existing scaled delta-of-delta stream.
+Counts are capped at 1M rows, and readers reject extra bytes in either mode.

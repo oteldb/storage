@@ -15,7 +15,7 @@ func (e *Engine) assembleFromBlocks(ctx context.Context, dp *decodedPart, p *par
 	blockRows := p.reader.Manifest().GranuleSize
 
 	tsDesc, ok := p.reader.ColumnDescByName(colTs)
-	if ranges == nil || !ok || blockRows <= 0 || !tsDesc.Blocked {
+	if p.variable || ranges == nil || !ok || blockRows <= 0 || !tsDesc.Blocked {
 		_, err := p.decodeRangesInto(ctx, dp, need, ranges)
 
 		return err

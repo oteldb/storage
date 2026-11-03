@@ -206,7 +206,7 @@ func buildColumnWith(c Column, comp *compress.Compressor, l columnLayout) (Colum
 		return ColumnDesc{}, nil, errors.Errorf("block: column %q has invalid kind %d", c.Name, c.Kind)
 	}
 
-	if c.Codec == chunk.CodecFloatGroups && l.blockRows > chunk.MaxFloatGroupRows {
+	if (c.Codec == chunk.CodecFloatGroups || c.Codec == chunk.CodecAdaptiveTimestamps) && l.blockRows > chunk.MaxFloatGroupRows {
 		return ColumnDesc{}, nil, errors.New("block: grouped granule exceeds row limit")
 	}
 	if err := c.checkFloatGroups(true); err != nil {
@@ -418,6 +418,8 @@ func encodeStream(c Column, codec chunk.Codec) ([]byte, error) {
 		return chunk.EncodeTimestamps(nil, c.Int64), nil
 	case c.Kind == KindInt64 && codec == chunk.CodecDoDScaled:
 		return chunk.EncodeTimestampsScaled(nil, c.Int64), nil
+	case c.Kind == KindInt64 && codec == chunk.CodecAdaptiveTimestamps:
+		return chunk.EncodeTimestampsAdaptive(nil, c.Int64)
 	case c.Kind == KindInt64 && codec == chunk.CodecT64:
 		return chunk.EncodeIntsT64(nil, c.Int64), nil
 	case c.Kind == KindFloat64 && codec == chunk.CodecGorilla:
@@ -878,7 +880,7 @@ func (r *ColumnReader) TsCursor() (chunk.TsCursor, error) {
 		return chunk.NewConstTsCursor(r.rows, r.desc.ConstInt64), nil
 	}
 
-	if r.desc.Codec != chunk.CodecDoD && r.desc.Codec != chunk.CodecDoDScaled {
+	if r.desc.Codec != chunk.CodecDoD && r.desc.Codec != chunk.CodecDoDScaled && r.desc.Codec != chunk.CodecAdaptiveTimestamps {
 		return nil, errors.Errorf("block: codec %s not a streamable timestamp codec for %q", r.desc.Codec, r.desc.Name)
 	}
 
@@ -1049,6 +1051,8 @@ func (r *ColumnReader) int64Decoder() decodeFunc[int64] {
 		return rowsUnchecked(chunk.DecodeTimestamps)
 	case chunk.CodecDoDScaled:
 		return rowsUnchecked(chunk.DecodeTimestampsScaled)
+	case chunk.CodecAdaptiveTimestamps:
+		return chunk.DecodeTimestampsAdaptiveRows
 	case chunk.CodecT64:
 		return chunk.DecodeIntsT64
 	default:

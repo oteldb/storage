@@ -23,7 +23,7 @@ func (r *PartReader) Int64ScanBound(ctx context.Context, name string) (retained,
 		return 0, 0, false
 	}
 	switch desc.Codec {
-	case chunk.CodecDoD, chunk.CodecDoDScaled, chunk.CodecT64:
+	case chunk.CodecDoD, chunk.CodecDoDScaled, chunk.CodecT64, chunk.CodecAdaptiveTimestamps:
 	default:
 		return 0, 0, false
 	}
@@ -40,7 +40,9 @@ func (r *PartReader) Int64ScanBound(ctx context.Context, name string) (retained,
 	slack := int64(compress.OutputSlack(desc.Compress))
 	retained = satAdd(retained, satMul(2, satAdd(in.MaxFrameRaw, slack)))
 	rows := int64(r.manifest.RowCount)
-	if granules := desc.Sizing.NumGranules; granules > 1 {
+	if desc.MaxBlockRows > 0 {
+		rows = min(rows, int64(desc.MaxBlockRows))
+	} else if granules := desc.Sizing.NumGranules; granules > 1 {
 		rows = satAdd(rows/(granules-1), 1)
 	}
 	// T64's reused destination can double while it grows; an old cursor may retain its predecessor.
@@ -68,7 +70,7 @@ func (d *Decoder) Int64StreamBound() (retained, transient int64, ok bool) {
 		return 0, 0, false
 	}
 	switch d.codec {
-	case chunk.CodecDoD, chunk.CodecDoDScaled, chunk.CodecT64:
+	case chunk.CodecDoD, chunk.CodecDoDScaled, chunk.CodecT64, chunk.CodecAdaptiveTimestamps:
 	default:
 		return 0, 0, false
 	}

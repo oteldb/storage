@@ -6,8 +6,10 @@ import (
 	"github.com/oteldb/storage/block"
 )
 
-func (e *Engine) writeGroupedColumns(ctx context.Context, cols *flushColumns, comp compressProfile, rollup *block.Rollup) (*part, error) {
-	writer, err := newPartStreamWriter(ctx, e, comp, 0, cols.sf != nil, e.cfg.AggregateStats, rollup)
+func (e *Engine) writeGroupedColumns(
+	ctx context.Context, cols *flushColumns, comp compressProfile, precision uint8, rollup *block.Rollup,
+) (*part, error) {
+	writer, err := newPartStreamWriter(ctx, e, comp, precision, cols.sf != nil, e.cfg.AggregateStats, rollup)
 	if err != nil {
 		return nil, err
 	}

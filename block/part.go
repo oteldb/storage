@@ -33,14 +33,15 @@ func columnKey(prefix string, i int) string {
 // [PartWriter] and the incremental [StreamWriter] so both accept the same options and lay a part
 // out identically.
 type partConfig struct {
-	sortKey       string
-	granuleSize   int
-	compressBytes int
-	defaultComp   compress.Algorithm
-	level         compress.Level
-	dictCap       int64
-	sizing        bool
-	rollup        *Rollup
+	sortKey           string
+	granuleSize       int
+	compressBytes     int
+	defaultComp       compress.Algorithm
+	level             compress.Level
+	dictCap           int64
+	sizing            bool
+	independentGroups bool
+	rollup            *Rollup
 
 	// given are compressors the caller hands in to share across writers; comps is what this writer
 	// compresses through, per algorithm. givenFrames are the ones a [StreamWriter] compresses its
@@ -77,6 +78,12 @@ type PartWriter struct {
 
 // PartOption configures a [PartWriter] or a [StreamWriter].
 type PartOption func(*partConfig)
+
+// WithIndependentGroups makes streaming numeric groups independently readable.
+// Call [StreamWriter.EndGroup] between groups.
+func WithIndependentGroups() PartOption {
+	return func(c *partConfig) { c.independentGroups = true; c.sizing = true }
+}
 
 // WithGranuleSize sets the sparse-index granularity in rows (default 8192).
 func WithGranuleSize(n int) PartOption { return func(c *partConfig) { c.granuleSize = n } }
@@ -246,6 +253,9 @@ type builtPart struct {
 }
 
 func (w *PartWriter) build() (builtPart, error) {
+	if w.independentGroups {
+		return builtPart{}, errors.New("block: independent groups require StreamWriter")
+	}
 	if len(w.columns) == 0 {
 		return builtPart{}, errors.New("block: part has no columns")
 	}
@@ -552,13 +562,18 @@ func (r *PartReader) ColumnDescByName(name string) (ColumnDesc, bool) {
 	return r.manifest.Columns[i], true
 }
 
-// Marks reads and decodes the part's sparse granule index.
+// Marks reads the legacy sparse index; variable numeric chunks return an empty index.
+// Use [Decoder.BlockTimeBounds] for their inline bounds.
 func (r *PartReader) Marks(ctx context.Context) (Marks, error) {
+	for i := range r.manifest.Columns {
+		if r.manifest.Columns[i].MaxBlockRows > 0 {
+			return Marks{GranuleSize: r.manifest.GranuleSize}, nil
+		}
+	}
 	raw, err := backend.ReadView(ctx, r.b, marksKey(r.prefix))
 	if err != nil {
 		return Marks{}, errors.Wrap(err, "read marks")
 	}
-
 	return DecodeMarks(raw)
 }
 

@@ -116,10 +116,14 @@ func (w *StreamWriter) AddColumn(c Column) error {
 		return errors.Errorf("block: column %q has invalid kind %d", c.Name, c.Kind)
 	}
 
-	if c.Codec == chunk.CodecFloatGroups && w.granuleSize > chunk.MaxFloatGroupRows {
+	if (c.Codec == chunk.CodecFloatGroups || c.Codec == chunk.CodecAdaptiveTimestamps) && w.granuleSize > chunk.MaxFloatGroupRows {
 		return errors.New("block: grouped granule exceeds row limit")
 	}
 	if err := c.checkFloatGroups(false); err != nil {
+		return err
+	}
+
+	if err := w.checkIndependentColumn(c); err != nil {
 		return err
 	}
 
@@ -151,6 +155,8 @@ func (w *StreamWriter) AddColumn(c Column) error {
 		allSame: true,
 
 		granuleSize: w.granuleSize,
+		variable:    w.independentGroups,
+		timeBounds:  w.independentGroups && c.Kind == KindInt64 && c.Name == w.sortKey,
 	}
 
 	switch c.Kind {
@@ -199,6 +205,8 @@ func (w *StreamWriter) AddColumn(c Column) error {
 	default:
 		return errors.Errorf("block: column %q: kind %s is not streamable; use PartWriter", c.Name, c.Kind)
 	}
+
+	sc.setIndependentGroups()
 
 	w.cols = append(w.cols, sc)
 
@@ -290,8 +298,8 @@ func (w *StreamWriter) Rows() int {
 	return w.cols[0].rows
 }
 
-// Marks returns read-only sort-key bounds after [WriteStreamPart] succeeds.
-// The returned granules remain valid after the writer is discarded.
+// Marks returns legacy sort-key bounds after writing; independent groups return no granules.
+// Returned granules remain valid after the writer is discarded.
 func (w *StreamWriter) Marks() Marks { return w.marks }
 
 // EncodedBytes returns the compressed bytes accumulated so far, what a caller seals a part on when
@@ -343,6 +351,18 @@ func (w *StreamWriter) ResidentBytes() int64 {
 // which stays with the part until it is written.
 func (w *StreamWriter) FinishBytes() int64 {
 	var retained, transient int64
+	if w.independentGroups {
+		// Directory and marks serialization may retain old and grown buffers together.
+		for _, c := range w.cols {
+			if c.blk != nil {
+				n := int64(len(c.blk.gLens) + 1)
+				retained += 3 * (64 + n*(4+4*binary.MaxVarintLen64))
+				if c.kind == KindInt64 {
+					retained += 3 * (64 + n*3*binary.MaxVarintLen64)
+				}
+			}
+		}
+	}
 
 	for _, c := range w.cols {
 		r, t := c.finishBytes()
@@ -506,6 +526,8 @@ type streamColumn struct {
 	comp        *compress.Compressor
 	blocked     bool
 	granuleSize int
+	variable    bool
+	timeBounds  bool
 
 	rows int
 	// raw is the decoded footprint of the rows appended so far, recorded in the manifest because a
@@ -535,6 +557,7 @@ type streamColumn struct {
 	stageF64               []float64
 	groupStarts, groupEnds []int
 	groupEncoder           chunk.FloatGroupEncoder
+	groupCostBuf           []byte
 
 	runs     []chunk.U128Run // KindInt128 only
 	bytes    *streamBytes    // KindBytes only
@@ -596,7 +619,13 @@ func (c *streamColumn) flushGranuleInt64(vals []int64) error {
 		lo, hi = min(lo, v), max(hi, v)
 	}
 
-	c.granules = append(c.granules, Granule{FirstRow: c.encoded, MinKey: lo, MaxKey: hi})
+	if !c.variable {
+		c.granules = append(c.granules, Granule{FirstRow: c.encoded, MinKey: lo, MaxKey: hi})
+	}
+	if c.timeBounds {
+		c.blk.minKeys = append(c.blk.minKeys, lo)
+		c.blk.maxKeys = append(c.blk.maxKeys, hi)
+	}
 	c.encoded += len(vals)
 
 	if err := c.blk.addGranule(func(dst []byte) ([]byte, error) {
@@ -605,6 +634,9 @@ func (c *streamColumn) flushGranuleInt64(vals []int64) error {
 		return err
 	}
 
+	if err := c.sealChunk(len(vals)); err != nil {
+		return err
+	}
 	return c.maybeAttach()
 }
 
@@ -687,7 +719,15 @@ func (c *streamColumn) flushGranuleFloat64(vals []float64, offset int) error {
 			}
 		}
 		c.groupEnds = append(c.groupEnds, len(vals))
-		if err := c.blk.addGranule(func(dst []byte) ([]byte, error) { return c.groupEncoder.Encode(dst, vals, c.groupEnds) }); err != nil {
+		if err := c.blk.addGranule(func(dst []byte) ([]byte, error) {
+			if c.variable && c.comp.Algorithm() != compress.AlgorithmNone {
+				return c.groupEncoder.EncodeGroupWithCost(dst, vals, c.groupCost)
+			}
+			return c.groupEncoder.Encode(dst, vals, c.groupEnds)
+		}); err != nil {
+			return err
+		}
+		if err := c.sealChunk(len(vals)); err != nil {
 			return err
 		}
 		return c.maybeAttach()
@@ -700,6 +740,9 @@ func (c *streamColumn) flushGranuleFloat64(vals []float64, offset int) error {
 	}
 
 	if c.alt == nil || !c.altOK {
+		if err := c.sealChunk(len(vals)); err != nil {
+			return err
+		}
 		return c.maybeAttach()
 	}
 
@@ -715,6 +758,9 @@ func (c *streamColumn) flushGranuleFloat64(vals []float64, offset int) error {
 		c.disableAlt()
 	}
 
+	if err := c.sealChunk(len(vals)); err != nil {
+		return err
+	}
 	return c.maybeAttach()
 }
 
@@ -802,7 +848,7 @@ func (c *streamColumn) residentBytes() int64 {
 	total += int64(cap(c.granules)) * granuleBytes
 	total += c.blk.residentBytes() + c.alt.residentBytes() + c.bytes.residentBytes()
 	total += int64(cap(c.first))
-	total += int64(cap(c.groupStarts)+cap(c.groupEnds))*8 + c.groupEncoder.ResidentBytes()
+	total += int64(cap(c.groupStarts)+cap(c.groupEnds))*8 + c.groupEncoder.ResidentBytes() + int64(cap(c.groupCostBuf))
 
 	return total
 }
@@ -958,7 +1004,7 @@ func (c *streamColumn) finish(ctx context.Context, granuleSize int, sizing bool)
 		c.bytes.release()
 	}
 
-	desc.Blocked, desc.Framed = true, true
+	c.setChunkLayout(&desc, granuleSize)
 
 	acc, loser := c.blk, c.alt
 	if c.autoCodec && c.altOK && c.alt.bytes < c.blk.bytes {
@@ -1022,6 +1068,8 @@ func appendInt64Granule(dst []byte, codec chunk.Codec, vals []int64) ([]byte, er
 		return chunk.EncodeTimestamps(dst, vals), nil
 	case chunk.CodecDoDScaled:
 		return chunk.EncodeTimestampsScaled(dst, vals), nil
+	case chunk.CodecAdaptiveTimestamps:
+		return chunk.EncodeTimestampsAdaptive(dst, vals)
 	case chunk.CodecT64:
 		return chunk.EncodeIntsT64(dst, vals), nil
 	default:
@@ -1055,16 +1103,20 @@ type blockAccum struct {
 	frames [][]byte // retained frames; empty once a sink is attached
 	// Per sealed frame: its granule count and its compressed byte length. Kept apart from frames
 	// because a streamed frame is gone by the time the directory is written.
-	frameGranules []int
-	frameBytes    []int
-	frameCRC      []uint32 // per sealed frame: CRC32C over its compressed bytes
-	frameRaw      []int    // per sealed frame: its decompressed length
-	gLens         []int    // per-granule stream length within its frame
-	pending       []byte
-	packed        []byte
-	inFrame       int
-	bytes         int // compressed bytes sealed so far, the size the codec choice compares on
-	dirLen        int // the directory's encoded length, once finished
+	frameGranules    []int
+	frameBytes       []int
+	frameCRC         []uint32 // per sealed frame: CRC32C over its compressed bytes
+	frameRaw         []int    // per sealed frame: its decompressed length
+	variable         bool
+	timeBounds       bool
+	minKeys, maxKeys []int64
+	chunkRows        []int
+	gLens            []int // per-granule stream length within its frame
+	pending          []byte
+	packed           []byte
+	inFrame          int
+	bytes            int // compressed bytes sealed so far, the size the codec choice compares on
+	dirLen           int // the directory's encoded length, once finished
 
 	sink    backend.ObjectWriter
 	written int64 // bytes handed to the sink
@@ -1089,7 +1141,9 @@ func (a *blockAccum) residentBytes() int64 {
 	}
 
 	// Three ints per frame and one per granule, all in slices that grow amortized.
-	dir := int64(cap(a.frameGranules)+cap(a.frameBytes)+cap(a.frameRaw)+cap(a.gLens))*8 + int64(cap(a.frameCRC))*4
+	slots := cap(a.frameGranules) + cap(a.frameBytes) + cap(a.frameRaw) + cap(a.gLens) + cap(a.chunkRows)
+	slots += cap(a.minKeys) + cap(a.maxKeys)
+	dir := int64(slots)*8 + int64(cap(a.frameCRC))*4
 
 	resident := int64(cap(a.pending)+cap(a.packed)) + dir + int64(cap(a.frames))*8
 	if a.sink == nil {
@@ -1330,5 +1384,21 @@ func (a *blockAccum) encodeDir(blockRows int) []byte {
 		dir = binary.AppendUvarint(dir, uint64(l))
 	}
 
+	if a.variable {
+		var previous int64
+		for i, n := range a.chunkRows {
+			dir = binary.AppendUvarint(dir, uint64(n))
+			if a.timeBounds {
+				dir = binary.AppendVarint(dir, a.minKeys[i]-previous)
+				dir = binary.AppendVarint(dir, a.maxKeys[i]-a.minKeys[i])
+				previous = a.minKeys[i]
+			}
+		}
+	}
 	return binary.LittleEndian.AppendUint32(dir, crc32.Checksum(dir, castagnoli))
+}
+
+func (c *streamColumn) groupCost(data []byte) int {
+	c.groupCostBuf = c.blk.comp.Compress(c.groupCostBuf[:0], data)
+	return len(c.groupCostBuf)
 }

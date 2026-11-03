@@ -77,6 +77,12 @@ func (r *PartReader) ScanBound(ctx context.Context, name string, window int64) (
 
 	n := 4 * (3*sz.NumFrames + 1 + 3*sz.NumGranules)
 	n += desc.DictRaw + (binary.MaxVarintLen32+24)*desc.DictEntries
+	if desc.MaxBlockRows > 0 {
+		n += 8 * (sz.NumGranules + 1)
+	}
+	if desc.TimeBounds {
+		n += 16 * sz.NumGranules
+	}
 
 	switch {
 	case !backend.RangesNatively(ctx, r.b, columnKey(r.prefix, i)):
@@ -93,7 +99,9 @@ func (r *PartReader) ScanBound(ctx context.Context, name string, window int64) (
 
 	// The granule count is ceil(rows / granule rows), so a granule holds fewer than rows / (count-1).
 	rows, granules := int64(r.manifest.RowCount), sz.NumGranules
-	if granules > 1 {
+	if desc.MaxBlockRows > 0 {
+		rows = min(rows, int64(desc.MaxBlockRows))
+	} else if granules > 1 {
 		rows = rows/(granules-1) + 1
 	}
 
@@ -159,7 +167,7 @@ func (d *Decoder) TsCursor() (chunk.TsCursor, error) {
 		return nil, errors.Errorf("block: column is %s, not int64", d.kind)
 	}
 
-	if d.codec != chunk.CodecDoD && d.codec != chunk.CodecDoDScaled {
+	if d.codec != chunk.CodecDoD && d.codec != chunk.CodecDoDScaled && d.codec != chunk.CodecAdaptiveTimestamps {
 		return nil, errors.Errorf("block: codec %s not a streamable timestamp codec", d.codec)
 	}
 

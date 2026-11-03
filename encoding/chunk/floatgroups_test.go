@@ -197,3 +197,64 @@ func TestFloatGroupScratchReuse(t *testing.T) {
 	require.Zero(t, allocations, "bulk decoding reuses output and stack reader state")
 	floatBitsEqual(t, values, dst)
 }
+
+func TestFloatGroupCompressedCost(t *testing.T) {
+	t.Parallel()
+	var encoder FloatGroupEncoder
+	values := []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	cost := func(data []byte) int {
+		_, rest, err := floatGroupHeader(data)
+		require.NoError(t, err)
+		group, err := readFloatGroup(rest)
+		require.NoError(t, err)
+		if group.codec == CodecGorilla {
+			return 1
+		}
+		return 100
+	}
+	data, err := encoder.EncodeGroupWithCost(nil, values, cost)
+	require.NoError(t, err)
+	got, _, err := DecodeFloatGroups(nil, data)
+	require.NoError(t, err)
+	floatBitsEqual(t, values, got)
+	_, rest, err := floatGroupHeader(data)
+	require.NoError(t, err)
+	group, err := readFloatGroup(rest)
+	require.NoError(t, err)
+	require.Equal(t, CodecGorilla, group.codec)
+	for _, special := range [][]float64{{math.Copysign(0, -1), 0}, {1, math.Float64frombits(0x7ff0000000000002)}, {math.Pi, math.E}} {
+		data, err = encoder.EncodeGroupWithCost(nil, special, func(data []byte) int { return len(data) })
+		require.NoError(t, err)
+		got, _, err = DecodeFloatGroups(nil, data)
+		require.NoError(t, err)
+		floatBitsEqual(t, special, got)
+	}
+}
+
+func FuzzFloatGroupCostSelection(f *testing.F) {
+	f.Add([]byte{2, 0, 0, 0, 0, 0, 240, 127})
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		if len(raw) > 4096 {
+			t.Skip()
+		}
+		var values []float64
+		for len(raw) >= 8 {
+			values = append(values, math.Float64frombits(binary.LittleEndian.Uint64(raw)))
+			raw = raw[8:]
+		}
+		var encoder FloatGroupEncoder
+		cost := func(data []byte) int {
+			sum := 0
+			for _, v := range data {
+				sum += int(v & 3)
+			}
+			return sum
+		}
+		data, err := encoder.EncodeGroupWithCost(nil, values, cost)
+		require.NoError(t, err)
+		got, _, err := DecodeFloatGroups(nil, data)
+		require.NoError(t, err)
+		floatBitsEqual(t, values, got)
+	})
+}

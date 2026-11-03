@@ -99,6 +99,12 @@ func sizedInput(desc ColumnDesc, rows int64) ColumnInputSize {
 	}
 
 	in.DirBytes = satAdd(satAdd(4, satMul(perFrame, s.NumFrames)), satMul(12, s.NumGranules))
+	if desc.MaxBlockRows > 0 {
+		in.DirBytes = satAdd(in.DirBytes, satMul(8, s.NumGranules+1))
+	}
+	if desc.TimeBounds {
+		in.DirBytes = satAdd(in.DirBytes, satMul(16, s.NumGranules))
+	}
 
 	switch {
 	case desc.TrailerDict:

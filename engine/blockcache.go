@@ -339,11 +339,13 @@ const blockBufCap = prefetchConcurrency * 4
 // get returns a recycled buffer with room for n rows, or a fresh one when none fits. It scans for
 // a fitting buffer instead of popping blindly: a too-small buffer (a smaller-granule part's) stays
 // pooled for a later smaller request rather than being discarded.
-func (p *bufFreeList[T]) get(n int) []T {
+func (p *bufFreeList[T]) get(n int) []T { return p.getCapacity(n, false) }
+
+func (p *bufFreeList[T]) getCapacity(n int, exact bool) []T {
 	p.mu.Lock()
 
 	for i, s := range slices.Backward(p.free) {
-		if cap(s) < n {
+		if cap(s) < n || exact && cap(s) != n {
 			continue
 		}
 

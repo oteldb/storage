@@ -338,3 +338,7 @@ reliability/          public RetryConfig presets
 `WithMetricFloatGroups` opts new metric parts into bit-exact per-series value compression.
 Deploy readers supporting the new codec to every replica before enabling this writer option.
 Disabling it stops new writes in that codec; existing parts still require compatible readers.
+
+`WithMetricSeriesChunks` opts new metric parts into independently framed series chunks with
+checked row geometry and inline timestamp bounds. Compatible readers must be deployed on every
+replica before enabling the writer. The default layout remains the packed layout.

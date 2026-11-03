@@ -149,6 +149,8 @@ func appendBlockStream(dst []byte, c Column, codec chunk.Codec, budget uint8, lo
 		return chunk.EncodeTimestamps(dst, c.Int64[lo:hi]), nil
 	case c.Kind == KindInt64 && codec == chunk.CodecDoDScaled:
 		return chunk.EncodeTimestampsScaled(dst, c.Int64[lo:hi]), nil
+	case c.Kind == KindInt64 && codec == chunk.CodecAdaptiveTimestamps:
+		return chunk.EncodeTimestampsAdaptive(dst, c.Int64[lo:hi])
 	case c.Kind == KindInt64 && codec == chunk.CodecT64:
 		return chunk.EncodeIntsT64(dst, c.Int64[lo:hi]), nil
 	case c.Kind == KindFloat64 && codec == chunk.CodecGorilla:
@@ -191,13 +193,15 @@ func decimalPrecision(budget uint8) uint8 {
 // layout every granule is its own frame, so the per-granule spans are absent (gFrame is nil) and a
 // granule's stream is the whole decompressed frame.
 type blockDir struct {
-	blockRows int
-	granules  int
-	frameOff  []int32  // cumulative byte offsets into data; len == nFrames+1
-	frameCRC  []uint32 // per frame: CRC32C over its compressed bytes; nil when unchecked
-	gFrame    []int32  // per granule: owning frame; nil in the legacy layout
-	gOff      []int32  // per granule: byte offset within the decompressed frame
-	gLen      []int32  // per granule: byte length within the decompressed frame
+	blockRows        int
+	rowStarts        []int64
+	minKeys, maxKeys []int64
+	granules         int
+	frameOff         []int32  // cumulative byte offsets into data; len == nFrames+1
+	frameCRC         []uint32 // per frame: CRC32C over its compressed bytes; nil when unchecked
+	gFrame           []int32  // per granule: owning frame; nil in the legacy layout
+	gOff             []int32  // per granule: byte offset within the decompressed frame
+	gLen             []int32  // per granule: byte length within the decompressed frame
 	// frameRaw is each frame's decompressed length, the sum of its granules' lengths: the exact
 	// size its decompression is held to. nil in the legacy layout, whose frames are held to
 	// legacyMax instead (unlimited when negative).
@@ -271,7 +275,7 @@ func (d blockDir) decompress(comp *compress.Compressor, dst []byte, f int, raw [
 // residentBytes is what the parsed directory holds.
 func (d blockDir) residentBytes() int64 {
 	return 4*int64(len(d.frameOff)+len(d.frameCRC)+len(d.frameRaw)) +
-		4*int64(len(d.gFrame)+len(d.gOff)+len(d.gLen))
+		4*int64(len(d.gFrame)+len(d.gOff)+len(d.gLen)) + 8*int64(len(d.rowStarts)+len(d.minKeys)+len(d.maxKeys))
 }
 
 // frameOf returns the frame holding granule g.
@@ -303,7 +307,9 @@ const footerLenBytes = 4
 
 // dirCheck is what a directory must agree with beyond its own bytes.
 type dirCheck struct {
-	checked bool
+	rows, maxBlockRows int
+	timeBounds         bool
+	checked            bool
 	// sizing is the manifest's record of the directory, nil when it keeps none. Counts are compared
 	// before any array is allocated, so a directory cannot claim more than the manifest charged.
 	sizing *ColumnSizing
@@ -313,7 +319,10 @@ type dirCheck struct {
 }
 
 func newDirCheck(desc ColumnDesc, lim decodeLimits) dirCheck {
-	chk := dirCheck{checked: desc.Checked, rawMax: lim.frames, rawPerGranule: lim.framesPerGranule}
+	chk := dirCheck{
+		checked: desc.Checked, rawMax: lim.frames, rawPerGranule: lim.framesPerGranule,
+		rows: lim.rows, maxBlockRows: desc.MaxBlockRows, timeBounds: desc.TimeBounds,
+	}
 	if desc.HasSizing {
 		sz := desc.Sizing
 		chk.sizing = &sz
@@ -555,6 +564,9 @@ func parseFramedDirFields(dir []byte, dataMax int, chk dirCheck) (blockDir, int,
 	if blockRows64 == 0 {
 		return blockDir{}, 0, 0, errors.Wrap(ErrCorrupt, "block dir blockRows is 0")
 	}
+	if chk.maxBlockRows > 0 && blockRows64 != uint64(chk.maxBlockRows) {
+		return blockDir{}, 0, 0, errors.Wrap(ErrCorrupt, "variable chunk row cap differs from manifest")
+	}
 
 	nFrames64, err := c.uvarint("nFrames")
 	if err != nil {
@@ -598,6 +610,11 @@ func parseFramedDirFields(dir []byte, dataMax int, chk dirCheck) (blockDir, int,
 
 	if err := readGranuleLens(&c, &d, chk); err != nil {
 		return blockDir{}, 0, 0, err
+	}
+	if chk.maxBlockRows > 0 {
+		if err := readChunkRows(&c, &d, chk); err != nil {
+			return blockDir{}, 0, 0, err
+		}
 	}
 
 	return d, c.pos, total, nil
@@ -1104,7 +1121,8 @@ func rowsUnchecked[T any](dec func([]T, []byte) ([]T, int, error)) decodeFunc[T]
 
 // blockRowsAt returns block blk's row count in a column of rows rows, or 0 for a block past the end.
 func blockRowsAt(dir blockDir, rows, blk int) int {
-	return max(min(dir.blockRows, rows-blk*dir.blockRows), 0)
+	lo, hi := dir.span(blk, rows)
+	return max(hi-lo, 0)
 }
 
 // decodeBlockedColumn decodes every block of a blocked column into dst (sized to rows) in place: each
@@ -1134,7 +1152,8 @@ func decodeBlockedColumn[T any](
 			return nil, errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", i, base, rows)
 		}
 
-		want := min(base+dir.blockRows, rows) - base
+		_, end := dir.span(i, rows)
+		want := end - base
 
 		// cap(out[base:]) == rows-base ≥ this block's row count (blocks partition [0,rows)), so the
 		// decoder fills out[base:base+blkRows] in place without reallocating.
@@ -1173,14 +1192,12 @@ func decodeBlocksInto[T any](
 			return errors.Errorf("block: block %d out of range [0,%d)", b, dir.nBlocks())
 		}
 
-		lo := b * dir.blockRows
+		lo, hi := dir.span(b, rows)
 		// A corrupt/mismatched directory can place a block past the destination's row count; guard
 		// before slicing out[lo:] so a bad object errors rather than panicking.
 		if lo >= rows {
 			return errors.Wrapf(ErrCorrupt, "block %d start %d past rows %d", b, lo, rows)
 		}
-
-		hi := min(lo+dir.blockRows, rows)
 
 		stream, err := streams.granule(b)
 		if err != nil {
@@ -1211,8 +1228,8 @@ func decodeBlockedRange[T any](
 		return nil, errors.Errorf("block: bad range [%d,%d)", lo, hi)
 	}
 
-	first := lo / dir.blockRows
-	last := (hi - 1) / dir.blockRows
+	first := dir.blockAt(lo)
+	last := dir.blockAt(hi - 1)
 
 	if last >= dir.nBlocks() {
 		return nil, errors.Wrapf(ErrCorrupt, "range [%d,%d) past blocks", lo, hi)
@@ -1239,9 +1256,10 @@ func decodeBlockedRange[T any](
 	}
 
 	// out now holds rows [first*blockRows, …); slice out the requested window within it.
-	relLo := lo - first*dir.blockRows
+	base, _ := dir.span(first, rows)
+	relLo := lo - base
 
-	relHi := hi - first*dir.blockRows
+	relHi := hi - base
 	if relHi > len(out) {
 		return nil, errors.Wrapf(ErrCorrupt, "range [%d,%d) past decoded rows", lo, hi)
 	}
@@ -1284,9 +1302,7 @@ func (d *Decoder) BlockRows() int { return d.streams.dir.blockRows }
 
 // BlockSpan returns block blk's half-open row range [lo, hi) in the column.
 func (d *Decoder) BlockSpan(blk int) (lo, hi int) {
-	lo = blk * d.streams.dir.blockRows
-
-	return lo, min(lo+d.streams.dir.blockRows, d.rows)
+	return d.streams.dir.span(blk, d.rows)
 }
 
 // DecodeInt64 decodes block blk into a fresh slice (for an int64 column).
@@ -1415,7 +1431,7 @@ func (c *blockedCursor[T, C]) Next() (T, error) {
 			return zero, errors.Wrapf(err, "block %d", c.blk)
 		}
 
-		if c.codec == chunk.CodecFloatGroups && c.cur.Len() != min(c.streams.dir.blockRows, c.rows-c.blk*c.streams.dir.blockRows) {
+		if (c.codec == chunk.CodecFloatGroups || c.streams.dir.rowStarts != nil) && c.cur.Len() != blockRowsAt(c.streams.dir, c.rows, c.blk) {
 			return zero, errors.New("block: grouped cursor row mismatch")
 		}
 		c.opened = true

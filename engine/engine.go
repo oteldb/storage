@@ -166,6 +166,8 @@ type Config struct {
 	MetricBlockRows int
 	// MetricFloatGroups enables exact per-series value segments in newly written parts.
 	MetricFloatGroups bool
+	// MetricSeriesChunks isolates each series in independently framed numeric chunks.
+	MetricSeriesChunks bool
 	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
 	// still has it, and says whether the part is gone from every owner. The cluster layer supplies
 	// it over its transport; a single-node store supplies one that fetches nothing and answers for
@@ -761,6 +763,10 @@ func (p *enginePlan) blocksFor(ctx context.Context, pt *part, r *seriesBlockRead
 		return blks
 	}
 
+	if pt.variable {
+		blocks, _ := r.variableWindowBlocks(ctx, ranges, p.start, p.end)
+		return blocks
+	}
 	blks, _ := windowBlocks(ranges, r.blockRows, pt.rows(), r.granules(ctx), p.start, p.end)
 
 	return blks
@@ -939,8 +945,11 @@ func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, e
 
 		r := p.blockReaders[pt]
 		if r == nil {
-			total += int64(pt.rows()) * 8 * cols
-
+			footprint, err := p.fallbackDecodeEstimate(ctx, pt, need, cols)
+			if err != nil {
+				return 0, err
+			}
+			total += footprint
 			continue
 		}
 
@@ -957,6 +966,14 @@ func (p *enginePlan) decodeEstimate(ctx context.Context, need colNeed) (int64, e
 		}
 		if len(rngs) == 0 {
 			blocks[pt] = nil
+			continue
+		}
+		if pt.variable {
+			footprint, err := p.variableDecodeEstimate(ctx, pt, rngs, need)
+			if err != nil {
+				return 0, err
+			}
+			total += footprint
 			continue
 		}
 		blks, matched := windowBlocks(rngs, r.blockRows, pt.rows(), r.granules(ctx), p.start, p.end)

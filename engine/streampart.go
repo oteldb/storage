@@ -42,9 +42,10 @@ type partStreamWriter struct {
 	// wmarks is the part's per-series durability watermark sidecar, accumulated with the runs.
 	wmarks []watermark.Entry
 
-	withSF      bool
-	withStats   bool
-	floatGroups bool
+	withSF       bool
+	withStats    bool
+	floatGroups  bool
+	seriesChunks bool
 	// sampled decides both whether the weight column survives (OmitConstColumn) and whether the
 	// aggregate sidecar is written — it holds raw values, so a sampled part must fall back to the
 	// weighted decode path.
@@ -77,6 +78,9 @@ func newPartStreamWriter(
 	}
 
 	opts := append(partOptions(blockRows, comp, rollup), extra...)
+	if e.cfg.MetricSeriesChunks {
+		opts = append(opts, block.WithIndependentGroups())
+	}
 	prefix := e.newPartPrefix()
 	w := block.NewStreamWriterTo(ctx, e.cfg.Backend, prefix, opts...)
 
@@ -84,14 +88,18 @@ func newPartStreamWriter(
 		return nil, err
 	}
 
+	tsCodec := e.tsCodec
+	if e.cfg.MetricSeriesChunks {
+		tsCodec = chunk.CodecAdaptiveTimestamps
+	}
 	if err := w.AddColumn(block.Column{
-		Name: colTs, Kind: block.KindInt64, Codec: e.tsCodec, Block: true,
+		Name: colTs, Kind: block.KindInt64, Codec: tsCodec, Block: true,
 	}); err != nil {
 		return nil, err
 	}
 
 	value := block.Column{Name: colValue, Kind: block.KindFloat64, AutoCodec: true, FloatPrecisionBits: precisionBits, Block: true}
-	grouped := e.cfg.MetricFloatGroups && (precisionBits == 0 || precisionBits >= 64)
+	grouped := (e.cfg.MetricFloatGroups || e.cfg.MetricSeriesChunks) && (precisionBits == 0 || precisionBits >= 64)
 	if grouped {
 		value.Codec = chunk.CodecFloatGroups
 		value.AutoCodec = false
@@ -113,8 +121,9 @@ func newPartStreamWriter(
 
 	return &partStreamWriter{
 		e: e, w: w, prefix: prefix, withSF: withSF, withStats: withStats,
-		buffered:    !backend.StreamsWrites(e.cfg.Backend),
-		floatGroups: grouped,
+		buffered:     !backend.StreamsWrites(e.cfg.Backend),
+		floatGroups:  grouped,
+		seriesChunks: e.cfg.MetricSeriesChunks,
 	}, nil
 }
 
@@ -126,6 +135,11 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 		return nil
 	}
 	sameSeries := len(p.runs) > 0 && p.runs[len(p.runs)-1].Value == id
+	if p.seriesChunks && len(p.runs) > 0 && !sameSeries {
+		if err := p.w.EndGroup(); err != nil {
+			return err
+		}
+	}
 
 	if err := p.w.AppendU128Run(colSeriesIdx, id, len(ts)); err != nil {
 		return err

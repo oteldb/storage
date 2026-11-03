@@ -439,8 +439,8 @@ func (e *Engine) writeMergedPart(
 ) (*part, error) {
 	minT, maxT := colsTimeRange(cols)
 	precision := pickPrecision(opts.Precision, maxT)
-	if e.cfg.MetricFloatGroups && (precision == 0 || precision >= 64) {
-		return e.writeGroupedColumns(ctx, cols, mergeProfile(opts.Recompress, maxT, len(cols.ts)), rollup)
+	if e.cfg.MetricSeriesChunks || e.cfg.MetricFloatGroups && (precision == 0 || precision >= 64) {
+		return e.writeGroupedColumns(ctx, cols, mergeProfile(opts.Recompress, maxT, len(cols.ts)), precision, rollup)
 	}
 	prefix := e.newPartPrefix()
 	// The merged part's identities come from the resident index, which spans every live series —

@@ -566,3 +566,25 @@ fragments from several groups. This format changes value compression, not physic
 Group boundary and candidate buffers contribute to streaming writer residency. Constant columns
 still collapse into their manifest value and leave no column object. All reader paths accept
 this codec independently of writer configuration.
+
+## Independently readable numeric groups
+
+`WithIndependentGroups` makes a `StreamWriter` end numeric chunks at `EndGroup` boundaries and
+at the configured row cap. Each chunk owns one compression frame. Int128 runs remain unframed;
+constant numeric columns still have no object. A buffered `PartWriter` rejects this option.
+
+Version-3 descriptor extensions record `MaxBlockRows` and optional int64 `TimeBounds`. The
+CRC-covered directory appends each chunk's positive row count, then its delta-encoded time bounds
+when recorded. Counts must sum to the manifest's rows and never exceed the recorded cap.
+
+`BlockForRow` and `BlockSpan` map rows through the checked directory. Whole, ranged, block-set and
+cursor reads use the same geometry. Decoded counts, frame ownership and manifest sizing are checked;
+older readers reject the unknown extension bits rather than interpreting a different row layout.
+
+Timestamp chunk directories carry pruning bounds and use adaptive cadence encoding. Variable parts return an empty legacy `Marks`
+index; callers use `Decoder.BlockTimeBounds`. The directory's row and bounds arrays are included
+in input, scan, clone and finishing memory estimates.
+
+The variable descriptor stores the row cap after sizing fields. After the existing directory's
+stream lengths, each chunk stores its row count and, for `TimeBounds`, signed delta minimum and
+signed maximum-minus-minimum. The directory checksum covers these fields together with frame spans.

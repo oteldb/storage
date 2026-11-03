@@ -49,6 +49,8 @@ const (
 	CodecDoDScaled
 	// CodecFloatGroups stores independent, bit-exact float groups.
 	CodecFloatGroups
+	// CodecAdaptiveTimestamps selects exact cadence or scaled delta-of-delta per chunk.
+	CodecAdaptiveTimestamps
 )
 
 // String returns a stable lower-case codec name.
@@ -74,6 +76,8 @@ func (c Codec) String() string {
 		return "dodscaled"
 	case CodecFloatGroups:
 		return "floatgroups"
+	case CodecAdaptiveTimestamps:
+		return "tsadaptive"
 	default:
 		return "unknown"
 	}

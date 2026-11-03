@@ -116,9 +116,11 @@ const (
 	// xTrailerDict marks a shared-dictionary column whose dictionary sits after its frames.
 	xTrailerDict byte = 1 << 0
 	// xSizing marks a column carrying [ColumnDesc.Sizing].
-	xSizing byte = 1 << 1
+	xSizing     byte = 1 << 1
+	xVariable   byte = 1 << 2
+	xTimeBounds byte = 1 << 3
 
-	xKnown = xTrailerDict | xSizing
+	xKnown = xTrailerDict | xSizing | xVariable | xTimeBounds
 )
 
 // maxSharedDictRaw is the format ceiling on a shared dictionary's decompressed size. Writers clamp
@@ -166,6 +168,10 @@ type ColumnDesc struct {
 	// (see blockcolumn.go) instead of a single stream, so a reader can decode one block at a time.
 	// Persisted via [flagBlocked]; clear on the prior single-stream layout.
 	Blocked bool
+	// MaxBlockRows caps variable numeric chunks; zero selects fixed granules.
+	MaxBlockRows int
+	// TimeBounds records per-chunk int64 bounds in the variable directory.
+	TimeBounds bool
 
 	// Framed marks a blocked column written with the frame-packed directory, where a compression
 	// frame spans several decode granules so the compressor sees more than one granule of context.
@@ -306,6 +312,12 @@ func (c *ColumnDesc) flags() byte {
 
 func (c *ColumnDesc) xflags() byte {
 	var x byte
+	if c.MaxBlockRows > 0 {
+		x |= xVariable
+	}
+	if c.TimeBounds {
+		x |= xTimeBounds
+	}
 	if c.TrailerDict {
 		x |= xTrailerDict
 	}
@@ -372,29 +384,7 @@ func (m Manifest) Encode(dst []byte) []byte {
 			_ = w.WriteByte(x)
 		}
 
-		if flags&flagLossy != 0 {
-			_ = w.WriteByte(c.FloatPrecisionBits)
-		}
-
-		if flags&flagLevel != 0 {
-			_ = w.WriteByte(byte(c.Level))
-		}
-
-		if flags&flagBytes != 0 {
-			w.WriteUvarint(uint64(c.Bytes))
-		}
-
-		if x&xTrailerDict != 0 {
-			for _, v := range [...]int64{c.DictOff, c.DictLen, c.DictRaw, c.DictEntries} {
-				w.WriteUvarint(uint64(v))
-			}
-		}
-
-		if x&xSizing != 0 {
-			for _, v := range c.Sizing.fields() {
-				w.WriteUvarint(uint64(*v))
-			}
-		}
+		c.encodeOptions(w, flags, x)
 
 		switch c.Kind {
 		case KindInt64:
@@ -716,6 +706,9 @@ func decodeColumnDesc(r *bitstream.Reader, version uint32, rows uint64) (ColumnD
 	if err := decodeColumnExt(r, &c, x, version, rows); err != nil {
 		return c, err
 	}
+	if err := c.decodeChunkOptions(r, x); err != nil {
+		return c, err
+	}
 
 	switch c.Kind {
 	case KindInt64:
@@ -821,4 +814,33 @@ func getU64(r *bitstream.Reader) (uint64, error) {
 	}
 
 	return binary.BigEndian.Uint64(b), nil
+}
+
+func (c *ColumnDesc) encodeOptions(w *bitstream.Writer, flags, x byte) {
+	if flags&flagLossy != 0 {
+		_ = w.WriteByte(c.FloatPrecisionBits)
+	}
+
+	if flags&flagLevel != 0 {
+		_ = w.WriteByte(byte(c.Level))
+	}
+
+	if flags&flagBytes != 0 {
+		w.WriteUvarint(uint64(c.Bytes))
+	}
+
+	if x&xTrailerDict != 0 {
+		for _, v := range [...]int64{c.DictOff, c.DictLen, c.DictRaw, c.DictEntries} {
+			w.WriteUvarint(uint64(v))
+		}
+	}
+
+	if x&xSizing != 0 {
+		for _, v := range c.Sizing.fields() {
+			w.WriteUvarint(uint64(*v))
+		}
+	}
+	if x&xVariable != 0 {
+		w.WriteUvarint(uint64(c.MaxBlockRows))
+	}
 }
