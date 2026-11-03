@@ -47,6 +47,8 @@ const (
 	// for a blocked column — never per part: a streaming writer seals granules before it could know
 	// a part-wide scale.
 	CodecDoDScaled
+	// CodecFloatGroups stores independent, bit-exact float groups.
+	CodecFloatGroups
 )
 
 // String returns a stable lower-case codec name.
@@ -70,6 +72,8 @@ func (c Codec) String() string {
 		return "bytesraw"
 	case CodecDoDScaled:
 		return "dodscaled"
+	case CodecFloatGroups:
+		return "floatgroups"
 	default:
 		return "unknown"
 	}

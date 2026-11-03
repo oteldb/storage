@@ -42,8 +42,9 @@ type partStreamWriter struct {
 	// wmarks is the part's per-series durability watermark sidecar, accumulated with the runs.
 	wmarks []watermark.Entry
 
-	withSF    bool
-	withStats bool
+	withSF      bool
+	withStats   bool
+	floatGroups bool
 	// sampled decides both whether the weight column survives (OmitConstColumn) and whether the
 	// aggregate sidecar is written — it holds raw values, so a sampled part must fall back to the
 	// weighted decode path.
@@ -89,9 +90,14 @@ func newPartStreamWriter(
 		return nil, err
 	}
 
-	if err := w.AddColumn(block.Column{
-		Name: colValue, Kind: block.KindFloat64, AutoCodec: true, FloatPrecisionBits: precisionBits, Block: true,
-	}); err != nil {
+	value := block.Column{Name: colValue, Kind: block.KindFloat64, AutoCodec: true, FloatPrecisionBits: precisionBits, Block: true}
+	grouped := e.cfg.MetricFloatGroups && (precisionBits == 0 || precisionBits >= 64)
+	if grouped {
+		value.Codec = chunk.CodecFloatGroups
+		value.AutoCodec = false
+		value.FloatPrecisionBits = 0
+	}
+	if err := w.AddColumn(value); err != nil {
 		return nil, err
 	}
 
@@ -107,7 +113,8 @@ func newPartStreamWriter(
 
 	return &partStreamWriter{
 		e: e, w: w, prefix: prefix, withSF: withSF, withStats: withStats,
-		buffered: !backend.StreamsWrites(e.cfg.Backend),
+		buffered:    !backend.StreamsWrites(e.cfg.Backend),
+		floatGroups: grouped,
 	}, nil
 }
 
@@ -128,8 +135,14 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 		return err
 	}
 
-	if err := p.w.AppendFloat64(colValueIdx, values); err != nil {
-		return err
+	var valueErr error
+	if p.floatGroups {
+		valueErr = p.w.AppendFloat64Group(colValueIdx, values, !sameSeries)
+	} else {
+		valueErr = p.w.AppendFloat64(colValueIdx, values)
+	}
+	if valueErr != nil {
+		return valueErr
 	}
 
 	if p.withSF {

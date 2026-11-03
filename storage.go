@@ -1286,8 +1286,9 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		DecodeCacheBytes: s.opts.DecodeCacheBytes,
 		// One budget for every tenant engine, so the decode-admission cap bounds the process-wide
 		// in-flight decoded bytes instead of multiplying per tenant. nil ⇒ unlimited.
-		DecodeBudget:   s.decodeBudget,
-		AggregateStats: s.opts.AggregateStats,
+		DecodeBudget:      s.decodeBudget,
+		AggregateStats:    s.opts.AggregateStats,
+		MetricFloatGroups: s.opts.MetricFloatGroups,
 		// MaxPartBytes caps each flushed part; resolved from the tenant's policy, falling back to
 		// defaultMaxPartBytes when the policy leaves it unset. It is an operational/structural cap
 		// fixed at engine creation (unlike the per-write admission limits).

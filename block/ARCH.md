@@ -552,3 +552,17 @@ slack); `compress.DecodeWorkspace` rounds it to 512 KiB.
 Sidecars written *next to* a part (series index, stats, blooms, keys, symbol tables, EC meta) are
 owned by the engines, not by `block` — see [`../engine/ARCH.md`](../engine/ARCH.md) and
 [`../recordengine/ARCH.md`](../recordengine/ARCH.md).
+
+## Series-aware float encoding
+
+A blocked float column can select `CodecFloatGroups` and supply `FloatGroupEnds`; streaming writers
+use `AppendFloat64Group` to mark logical group starts. A group can span appends and fixed granules.
+Empty appends create no boundary, and each granule independently resumes a spanning group.
+
+Grouped columns require lossless encoding and bypass whole-column `AutoCodec` selection.
+The existing fixed-row granules and compression frames remain in use, so frames can contain
+fragments from several groups. This format changes value compression, not physical read granularity.
+
+Group boundary and candidate buffers contribute to streaming writer residency. Constant columns
+still collapse into their manifest value and leave no column object. All reader paths accept
+this codec independently of writer configuration.

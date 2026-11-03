@@ -116,6 +116,13 @@ func (w *StreamWriter) AddColumn(c Column) error {
 		return errors.Errorf("block: column %q has invalid kind %d", c.Name, c.Kind)
 	}
 
+	if c.Codec == chunk.CodecFloatGroups && w.granuleSize > chunk.MaxFloatGroupRows {
+		return errors.New("block: grouped granule exceeds row limit")
+	}
+	if err := c.checkFloatGroups(false); err != nil {
+		return err
+	}
+
 	codec := c.Codec
 	if codec == chunk.CodecNone {
 		codec = defaultCodec(c.Kind)
@@ -196,6 +203,27 @@ func (w *StreamWriter) AddColumn(c Column) error {
 	w.cols = append(w.cols, sc)
 
 	return nil
+}
+
+// AppendFloat64Group appends rows, starting a logical group when begin is true.
+func (w *StreamWriter) AppendFloat64Group(i int, vals []float64, begin bool) error {
+	c, err := w.column(i, KindFloat64)
+	if err != nil {
+		return err
+	}
+	if c.codec != chunk.CodecFloatGroups {
+		return errors.New("block: column is not grouped")
+	}
+	if len(vals) == 0 {
+		return nil
+	}
+	if len(c.groupStarts) == 0 {
+		c.groupStarts = append(c.groupStarts, 0)
+	}
+	if begin && c.groupStarts[len(c.groupStarts)-1] != len(c.stageF64) {
+		c.groupStarts = append(c.groupStarts, len(c.stageF64))
+	}
+	return c.appendFloat64(vals, w.granuleSize)
 }
 
 // AppendInt64 appends vals to the i-th column, encoding every granule they complete.
@@ -503,8 +531,10 @@ type streamColumn struct {
 	open      func() (backend.ObjectWriter, error)
 	streaming bool
 
-	stageI64 []int64
-	stageF64 []float64
+	stageI64               []int64
+	stageF64               []float64
+	groupStarts, groupEnds []int
+	groupEncoder           chunk.FloatGroupEncoder
 
 	runs     []chunk.U128Run // KindInt128 only
 	bytes    *streamBytes    // KindBytes only
@@ -589,7 +619,7 @@ func (c *streamColumn) appendFloat64(vals []float64, granuleSize int) error {
 
 	off := 0
 	for len(c.stageF64)-off >= granuleSize {
-		if err := c.flushGranuleFloat64(c.stageF64[off : off+granuleSize]); err != nil {
+		if err := c.flushGranuleFloat64(c.stageF64[off:off+granuleSize], off); err != nil {
 			return err
 		}
 
@@ -598,6 +628,20 @@ func (c *streamColumn) appendFloat64(vals []float64, granuleSize int) error {
 
 	if off > 0 {
 		c.stageF64 = append(c.stageF64[:0], c.stageF64[off:]...)
+		if c.codec == chunk.CodecFloatGroups {
+			first, _ := slices.BinarySearch(c.groupStarts, off)
+			c.groupStarts = append(c.groupStarts[:0], c.groupStarts[first:]...)
+			for i := range c.groupStarts {
+				c.groupStarts[i] -= off
+			}
+			if len(c.stageF64) == 0 {
+				c.groupStarts = c.groupStarts[:0]
+			} else if len(c.groupStarts) == 0 || c.groupStarts[0] != 0 {
+				c.groupStarts = append(c.groupStarts, 0)
+				copy(c.groupStarts[1:], c.groupStarts[:len(c.groupStarts)-1])
+				c.groupStarts[0] = 0
+			}
+		}
 	}
 
 	return nil
@@ -634,7 +678,21 @@ func (c *streamColumn) trackFloat(v float64) {
 	}
 }
 
-func (c *streamColumn) flushGranuleFloat64(vals []float64) error {
+func (c *streamColumn) flushGranuleFloat64(vals []float64, offset int) error {
+	if c.codec == chunk.CodecFloatGroups {
+		c.groupEnds = c.groupEnds[:0]
+		for _, start := range c.groupStarts {
+			if start > offset && start < offset+len(vals) {
+				c.groupEnds = append(c.groupEnds, start-offset)
+			}
+		}
+		c.groupEnds = append(c.groupEnds, len(vals))
+		if err := c.blk.addGranule(func(dst []byte) ([]byte, error) { return c.groupEncoder.Encode(dst, vals, c.groupEnds) }); err != nil {
+			return err
+		}
+		return c.maybeAttach()
+	}
+
 	if err := c.blk.addGranule(func(dst []byte) ([]byte, error) {
 		return appendFloat64Granule(dst, c.codec, c.budget, vals)
 	}); err != nil {
@@ -744,6 +802,7 @@ func (c *streamColumn) residentBytes() int64 {
 	total += int64(cap(c.granules)) * granuleBytes
 	total += c.blk.residentBytes() + c.alt.residentBytes() + c.bytes.residentBytes()
 	total += int64(cap(c.first))
+	total += int64(cap(c.groupStarts)+cap(c.groupEnds))*8 + c.groupEncoder.ResidentBytes()
 
 	return total
 }
@@ -752,6 +811,9 @@ func (c *streamColumn) finishBytes() (retained, transient int64) {
 	const runBytes = 24
 
 	transient = max(c.blk.sealBytes(), c.alt.sealBytes())
+	if c.codec == chunk.CodecFloatGroups {
+		transient = max(transient, int64(len(c.stageF64))*64)
+	}
 
 	if len(c.runs) > 0 && c.comp != nil {
 		raw := len(c.runs) * runBytes
@@ -851,7 +913,7 @@ func (c *streamColumn) finish(ctx context.Context, granuleSize int, sizing bool)
 	}
 
 	if len(c.stageF64) > 0 {
-		if err := c.flushGranuleFloat64(c.stageF64); err != nil {
+		if err := c.flushGranuleFloat64(c.stageF64, 0); err != nil {
 			return ColumnDesc{}, nil, 0, err
 		}
 

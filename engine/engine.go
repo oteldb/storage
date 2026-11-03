@@ -164,6 +164,8 @@ type Config struct {
 	// the block boundaries drive the part's marks granules. 0 ⇒ [DefaultMetricBlockRows]. A finer
 	// size skips more on sparse selectors at a small per-block header cost.
 	MetricBlockRows int
+	// MetricFloatGroups enables exact per-series value segments in newly written parts.
+	MetricFloatGroups bool
 	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
 	// still has it, and says whether the part is gone from every owner. The cluster layer supplies
 	// it over its transport; a single-node store supplies one that fetches nothing and answers for

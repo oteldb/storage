@@ -334,3 +334,7 @@ cluster/{,ring,etcd,etcd/etcdtest,replica,rebalance,partsync,ec,router}   L0 dis
 internal/{obs,retry,simd,parallel,partid,diskguard,vfs,memlimit,memsize,engineguard,identitysnapshot,indexcommit,buildbudget,watermark,mergestream,repair,enginetest,reproduce,heaptest,cmd/gensimd}  injected observability · reliability · AVX2 kernels · fan-out · part ids · disk-pressure guard · heap accounting · per-series watermark sidecar codec · the merge seam both engines share (k-way key union, seal units, conformance suite) · the repair pass both engines share · the cross-engine conformance suite · gated defect reproducers · heap and allocation measurement for tests · filesystem seam + crash model (validated against ext4 on dm-flakey by `internal/vfs/crashmodel`, `-tags crashmodel`)
 reliability/          public RetryConfig presets
 ```
+
+`WithMetricFloatGroups` opts new metric parts into bit-exact per-series value compression.
+Deploy readers supporting the new codec to every replica before enabling this writer option.
+Disabling it stops new writes in that codec; existing parts still require compatible readers.

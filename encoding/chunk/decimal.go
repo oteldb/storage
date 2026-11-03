@@ -3,6 +3,7 @@ package chunk
 import (
 	"math"
 	"math/bits"
+	"slices"
 
 	"github.com/oteldb/storage/encoding/bitstream"
 )
@@ -28,6 +29,11 @@ import (
 // near-exact (within float64 rounding) for fractional values. With precisionBits<64
 // the codec is deliberately lossy.
 func EncodeFloatsDecimal(dst []byte, vals []float64, precisionBits uint8) []byte {
+	var scratch decimalScratch
+	return encodeFloatsDecimal(dst, vals, precisionBits, &scratch)
+}
+
+func encodeFloatsDecimal(dst []byte, vals []float64, precisionBits uint8, scratch *decimalScratch) []byte {
 	w := bitstream.NewWriter(dst)
 	w.WriteUvarint(uint64(len(vals)))
 
@@ -44,7 +50,7 @@ func EncodeFloatsDecimal(dst []byte, vals []float64, precisionBits uint8) []byte
 	w.WriteUvarint(uint64(precisionBits))
 
 	// Step 1: batch-convert to scaled int64s with a shared exponent.
-	scaled, exp := floatsToDecimal(vals)
+	scaled, exp := scratch.convert(vals)
 	w.WriteVarint(int64(exp))
 
 	// Step 2-4: delta + nearest-delta + zigzag varint.
@@ -68,7 +74,9 @@ func EncodeFloatsDecimal(dst []byte, vals []float64, precisionBits uint8) []byte
 
 // DecodeFloatsDecimal decodes a scaled-decimal + nearest-delta encoded float64 column.
 func DecodeFloatsDecimal(dst []float64, src []byte) ([]float64, int, error) {
-	r, rows, consumed, err := readHeader(src)
+	var reader bitstream.Reader
+	r := &reader
+	rows, consumed, err := readHeaderInto(src, r)
 	if err != nil {
 		return dst, 0, err
 	}
@@ -130,12 +138,15 @@ func DecodeFloatsDecimal(dst []float64, src []byte) ([]float64, int, error) {
 	return dst, consumed + r.ConsumedBytes(), nil
 }
 
-// floatsToDecimal converts a batch of float64 to scaled int64s with a shared exponent.
-// It minimizes each mantissa (strips trailing decimal zeros) then aligns all values to
-// the minimum exponent across the batch (upscaling where it won't overflow int64).
-func floatsToDecimal(vals []float64) ([]int64, int) {
-	scaled := make([]int64, len(vals))
-	exps := make([]int, len(vals))
+type decimalScratch struct {
+	scaled []int64
+	exps   []int
+}
+
+func (s *decimalScratch) convert(vals []float64) ([]int64, int) {
+	s.scaled = slices.Grow(s.scaled[:0], len(vals))[:len(vals)]
+	s.exps = slices.Grow(s.exps[:0], len(vals))[:len(vals)]
+	scaled, exps := s.scaled, s.exps
 
 	minExp := math.MaxInt
 

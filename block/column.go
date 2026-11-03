@@ -54,6 +54,8 @@ type Column struct {
 	// integer-valued or low-precision column (e.g. a counter) takes the far denser decimal path
 	// while a high-entropy column keeps Gorilla. Lossless either way (see [chooseFloatCodec]).
 	AutoCodec bool
+	// FloatGroupEnds gives increasing group ends for [chunk.CodecFloatGroups], ending at the row count.
+	FloatGroupEnds []int
 	// FloatPrecisionBits, when in 1..63 on an AutoCodec float column, requests *lossy* encoding:
 	// the scaled-decimal codec retains only this many significant mantissa bits (fewer ⇒ denser,
 	// less accurate), competing against lossless Gorilla so the result is never worse than
@@ -202,6 +204,13 @@ func buildColumn(c Column, comp *compress.Compressor, blockRows, compressBytes i
 func buildColumnWith(c Column, comp *compress.Compressor, l columnLayout) (ColumnDesc, []byte, error) {
 	if !c.Kind.valid() {
 		return ColumnDesc{}, nil, errors.Errorf("block: column %q has invalid kind %d", c.Name, c.Kind)
+	}
+
+	if c.Codec == chunk.CodecFloatGroups && l.blockRows > chunk.MaxFloatGroupRows {
+		return ColumnDesc{}, nil, errors.New("block: grouped granule exceeds row limit")
+	}
+	if err := c.checkFloatGroups(true); err != nil {
+		return ColumnDesc{}, nil, err
 	}
 
 	codec := c.Codec
@@ -1055,6 +1064,8 @@ func (r *ColumnReader) float64Decoder() decodeFunc[float64] {
 		return rowsUnchecked(chunk.DecodeFloats)
 	case chunk.CodecDecimal:
 		return rowsUnchecked(chunk.DecodeFloatsDecimal)
+	case chunk.CodecFloatGroups:
+		return chunk.DecodeFloatGroupsRows
 	default:
 		return nil
 	}

@@ -1808,3 +1808,13 @@ also uses a try-lock, since another first read may be waiting while holding that
 Already-owned scopes retain their ordinary charged growth, and an oversized read may still run alone.
 The facade forwards this capability only through its read-budget/observability seed wrapper;
 routing, fan-out, gap and scale wrappers conservatively return `fetch.ErrTryUnsupported`.
+
+## Opt-in grouped metric values
+
+`Config.MetricFloatGroups` groups values by canonical series ID inside the existing fixed-row
+blocks. Flush and ordinary merge outputs use the same streaming encoder; buffered merge columns
+also pass through it without allocating another part-wide group index.
+
+Explicit lossy precision policies retain their existing encoding path. The writer option does not
+force rewrites; readers handle both encodings in one catalog. Identities, SIDX, durability watermarks,
+WAL frames and catalog publication retain their existing formats and ownership rules.

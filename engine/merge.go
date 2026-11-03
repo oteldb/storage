@@ -438,6 +438,10 @@ func (e *Engine) writeMergedPart(
 	ctx context.Context, cols *flushColumns, opts MergeOptions, rollup *block.Rollup,
 ) (*part, error) {
 	minT, maxT := colsTimeRange(cols)
+	precision := pickPrecision(opts.Precision, maxT)
+	if e.cfg.MetricFloatGroups && (precision == 0 || precision >= 64) {
+		return e.writeGroupedColumns(ctx, cols, mergeProfile(opts.Recompress, maxT, len(cols.ts)), rollup)
+	}
 	prefix := e.newPartPrefix()
 	// The merged part's identities come from the resident index, which spans every live series —
 	// snapshotted here (a brief read lock, off the flush path) because the write itself is off-lock.
