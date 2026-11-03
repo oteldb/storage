@@ -264,8 +264,8 @@ func (r *seriesBlockReader) readFloatChunk(ctx context.Context, decoder **block.
 	return (*decoder).DecodeFloat64Into(b, r.chunkF64Buffer(n))
 }
 
-// Map and LRU capacity is amortized alongside the entry and its exact-sized numeric buffer.
-var variableChunkEntryOverhead = memsize.Of[blockEntry]() + 256
+// The compact key map allowance includes bucket slack and amortized per-part maps.
+var variableChunkEntryOverhead = memsize.Of[blockEntry]() + 96
 
 func (r *seriesBlockReader) chunkCacheBytes(capacity int) int64 {
 	n := int64(capacity) * 8

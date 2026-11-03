@@ -164,15 +164,16 @@ func TestSeriesChunkCacheChargesCapacityAndEntries(t *testing.T) {
 	for i := range e.blockCache.shards {
 		shard := &e.blockCache.shards[i]
 		shard.mu.Lock()
-		for key, el := range shard.items {
-			if key.blk < 0 || key.col == colMarksID {
-				continue
+		for _, cached := range shard.items {
+			for key, entry := range cached {
+				if key.blk < 0 || key.col == colMarksID {
+					continue
+				}
+				require.Equal(t, 1, cap(entry.i64)+cap(entry.f64))
+				require.GreaterOrEqual(t, entry.bytes, variableChunkEntryOverhead+8)
+				entries++
+				charged += entry.bytes
 			}
-			entry := el.Value.(*blockEntry)
-			require.Equal(t, 1, cap(entry.i64)+cap(entry.f64))
-			require.GreaterOrEqual(t, entry.bytes, variableChunkEntryOverhead+8)
-			entries++
-			charged += entry.bytes
 		}
 		shard.mu.Unlock()
 	}

@@ -131,8 +131,10 @@ func blockCachePins(c *blockCache) int {
 	for i := range c.shards {
 		shard := &c.shards[i]
 		shard.mu.Lock()
-		for _, element := range shard.items {
-			refs += element.Value.(*blockEntry).refs
+		for _, entries := range shard.items {
+			for _, e := range entries {
+				refs += e.refs
+			}
 		}
 		shard.mu.Unlock()
 	}
