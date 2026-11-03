@@ -87,7 +87,7 @@ func TestSeriesChunkWarmCacheChecksColumnGeometry(t *testing.T) {
 	require.NotNil(t, r)
 	defer r.releasePins()
 	require.NoError(t, r.ensureGeometry(ctx))
-	r.valDec, err = other.ColumnBlocks(ctx, colValue)
+	r.metadata[colValID], err = other.ColumnBlocks(ctx, colValue)
 	require.NoError(t, err)
 	entry := e.blockCache.insert(&blockEntry{key: blockKey{prefix: p.prefix, col: colValID, blk: 0}, f64: []float64{0, 1, 2, 3}, bytes: 32})
 	e.blockCache.release(entry)

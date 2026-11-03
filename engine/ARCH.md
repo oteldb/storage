@@ -1836,3 +1836,7 @@ Constant timestamp columns retain the whole-part fallback and its existing times
 Chunk directories are held by queries or the byte-bounded metadata cache. Short chunk buffers use
 exact capacities; numeric cache charges include capacity and an entry/LRU/map allowance. Queries
 prune through inline timestamp bounds without loading or permanently retaining variable marks.
+
+Chunk readers pin immutable directory prototypes in fixed column slots for geometry checks, even on
+warm numeric hits. Mutable decoder and frame-read state are cloned only when a numeric block misses;
+metadata eviction cannot invalidate a pinned directory, and each clone uses the current read context.

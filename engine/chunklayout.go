@@ -14,25 +14,19 @@ func (r *seriesBlockReader) ensureGeometry(ctx context.Context) error {
 	if !r.part.variable || r.geometry != nil {
 		return nil
 	}
-	for _, c := range []struct {
-		name    string
-		decoder **block.Decoder
-	}{{colTs, &r.tsDec}, {colValue, &r.valDec}, {colSF, &r.sfDec}} {
-		desc, ok := r.part.reader.ColumnDescByName(c.name)
+	for _, name := range []string{colTs, colValue, colSF} {
+		desc, ok := r.part.reader.ColumnDescByName(name)
 		if !ok || desc.Const {
 			continue
 		}
 		if desc.MaxBlockRows == 0 {
 			return errors.Wrap(block.ErrCorrupt, "mixed numeric chunk geometry")
 		}
-		if *c.decoder == nil {
-			d, err := r.partDecoder(ctx, c.name)
-			if err != nil {
-				return err
-			}
-			*c.decoder = d
+		d, err := r.partGeometry(ctx, name)
+		if err != nil {
+			return err
 		}
-		r.geometry = *c.decoder
+		r.geometry = d
 		return nil
 	}
 	return errors.Wrap(block.ErrCorrupt, "missing metric chunk geometry")
@@ -80,7 +74,7 @@ func (r *seriesBlockReader) chunkInWindow(ctx context.Context, b int, start, end
 	return !ok || hi >= start && lo <= end
 }
 
-func (r *seriesBlockReader) checkColumnGeometry(ctx context.Context, decoder **block.Decoder, name string, b int) error {
+func (r *seriesBlockReader) checkColumnGeometry(ctx context.Context, name string, b int) error {
 	if err := r.ensureGeometry(ctx); err != nil {
 		return err
 	}
@@ -94,16 +88,13 @@ func (r *seriesBlockReader) checkColumnGeometry(ctx context.Context, decoder **b
 	if desc.MaxBlockRows == 0 {
 		return errors.Wrap(block.ErrCorrupt, "missing variable numeric geometry")
 	}
-	if *decoder == nil {
-		d, err := r.partDecoder(ctx, name)
-		if err != nil {
-			return err
-		}
-		*decoder = d
+	other, err := r.partGeometry(ctx, name)
+	if err != nil {
+		return err
 	}
 	lo, hi := r.geometry.BlockSpan(b)
-	otherLo, otherHi := (*decoder).BlockSpan(b)
-	if (*decoder).NumBlocks() != r.geometry.NumBlocks() || lo != otherLo || hi != otherHi {
+	otherLo, otherHi := other.BlockSpan(b)
+	if other.NumBlocks() != r.geometry.NumBlocks() || lo != otherLo || hi != otherHi {
 		return errors.Wrap(block.ErrCorrupt, "numeric chunk geometry differs")
 	}
 	return nil

@@ -54,7 +54,8 @@ type seriesBlockReader struct {
 	// the rest at teardown (releasePins). Entries are sorted by (block, column), with one owned
 	// reference per key, so a block warmed privately can be reused without decoding it again.
 	pins        []*blockEntry
-	decoderPins []*blockEntry
+	decoderPins [3]*blockEntry
+	metadata    [3]*block.Decoder
 }
 
 // newSeriesBlockReader returns a reader for part if it is block-sliceable (ts/value, and sf when
@@ -280,7 +281,7 @@ func (r *seriesBlockReader) floatBlock(
 	ctx context.Context, dec **block.Decoder, name string, cid colID, b int,
 ) ([]float64, *blockEntry, error) {
 	if r.part.variable {
-		if err := r.checkColumnGeometry(ctx, dec, name, b); err != nil {
+		if err := r.checkColumnGeometry(ctx, name, b); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -377,9 +378,14 @@ func (r *seriesBlockReader) releaseSeriesPins() {
 // these blocks are dead.
 func (r *seriesBlockReader) releasePins() {
 	for _, entry := range r.decoderPins {
-		r.engine.blockCache.release(entry)
+		if entry != nil {
+			r.engine.blockCache.release(entry)
+		}
 	}
-	r.decoderPins = nil
+	r.decoderPins = [3]*blockEntry{}
+	r.metadata = [3]*block.Decoder{}
+	r.geometry = nil
+	r.tsDec, r.valDec, r.sfDec = nil, nil, nil
 	for _, e := range r.pins {
 		r.engine.blockCache.release(e)
 	}
@@ -395,8 +401,19 @@ func (r *seriesBlockReader) releasePins() {
 // them are fetched as blocks are decoded. Reading the object whole here is what made a selector
 // matching 16 series pay for all of them.
 func (r *seriesBlockReader) partDecoder(ctx context.Context, name string) (*block.Decoder, error) {
+	metadata, err := r.partGeometry(ctx, name)
+	if err != nil {
+		return nil, err
+	}
 	if r.engine == nil || r.engine.blockCache == nil {
-		return r.part.reader.ColumnBlocks(ctx, name)
+		return metadata, nil
+	}
+	return metadata.Clone(ctx), nil
+}
+
+func (r *seriesBlockReader) partGeometry(ctx context.Context, name string) (*block.Decoder, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	var cid colID
 	switch name {
@@ -409,9 +426,20 @@ func (r *seriesBlockReader) partDecoder(ctx context.Context, name string) (*bloc
 	default:
 		return r.part.reader.ColumnBlocks(ctx, name)
 	}
-	decoder, pin, err := r.engine.partBlockDecoder(ctx, r.part, name, cid)
-	if pin != nil {
-		r.decoderPins = append(r.decoderPins, pin)
+	if d := r.metadata[cid]; d != nil {
+		return d, nil
 	}
-	return decoder, err
+	if r.engine == nil || r.engine.blockCache == nil {
+		d, err := r.part.reader.ColumnBlocks(ctx, name)
+		if err == nil {
+			r.metadata[cid] = d
+		}
+		return d, err
+	}
+	entry, err := r.engine.partBlockMetadata(ctx, r.part, name, cid)
+	if err != nil {
+		return nil, err
+	}
+	r.decoderPins[cid], r.metadata[cid] = entry, entry.decoder
+	return entry.decoder, nil
 }

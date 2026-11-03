@@ -171,18 +171,25 @@ func (e *Engine) fillFloatColumn(
 // than its bytes: this path decodes the blocks a query's matched series fall in, so the column
 // object is fetched one compression frame at a time.
 func (e *Engine) partBlockDecoder(ctx context.Context, p *part, name string, cid colID) (*block.Decoder, *blockEntry, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, nil, err
-	}
-	key := blockKey{prefix: p.prefix, col: cid, blk: -1}
-	if entry, ok := e.blockCache.get(key); ok {
-		return entry.decoder.Clone(ctx), entry, nil
-	}
-	decoder, err := p.reader.ColumnBlocks(ctx, name)
+	entry, err := e.partBlockMetadata(ctx, p, name, cid)
 	if err != nil {
 		return nil, nil, err
 	}
-	prototype := decoder.Clone(context.Background()) //nolint:contextcheck // Cached metadata must not retain request contexts or values.
-	entry := e.blockCache.insert(&blockEntry{key: key, decoder: prototype, bytes: prototype.MetadataBytes()})
 	return entry.decoder.Clone(ctx), entry, nil
+}
+
+func (e *Engine) partBlockMetadata(ctx context.Context, p *part, name string, cid colID) (*blockEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	key := blockKey{prefix: p.prefix, col: cid, blk: -1}
+	if entry, ok := e.blockCache.get(key); ok {
+		return entry, nil
+	}
+	decoder, err := p.reader.ColumnBlocks(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	prototype := decoder.Clone(context.Background()) //nolint:contextcheck // Cached metadata must not retain request contexts or values.
+	return e.blockCache.insert(&blockEntry{key: key, decoder: prototype, bytes: prototype.MetadataBytes()}), nil
 }
