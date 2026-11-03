@@ -26,9 +26,10 @@ import (
 // meaningful XOR bits are stored right-shifted by trailing (the trailing zeros are
 // dropped and re-shifted on decode).
 func EncodeFloats(dst []byte, vals []float64) []byte {
-	w, out := writeHeader(dst, len(vals))
+	w := bitstream.NewWriter(dst)
+	w.WriteUvarint(uint64(len(vals)))
 	if len(vals) == 0 {
-		return out
+		return w.Bytes()
 	}
 
 	// Row 0: full 64 bits.
@@ -47,7 +48,9 @@ func EncodeFloats(dst []byte, vals []float64) []byte {
 
 // DecodeFloats decodes a Gorilla XOR encoded float64 column from src into dst.
 func DecodeFloats(dst []float64, src []byte) ([]float64, int, error) {
-	r, rows, consumed, err := readHeader(src)
+	var reader bitstream.Reader
+	r := &reader
+	rows, consumed, err := readHeaderInto(src, r)
 	if err != nil {
 		return dst, 0, err
 	}

@@ -199,6 +199,9 @@ type Options struct {
 	// value column — returning one number per series instead of every sample. It costs a little
 	// storage per series; off by default. AggregateMetrics works without it (by decoding).
 	AggregateStats bool
+	// MetricFloatGroups enables experimental per-series value compression for new metric parts.
+	// Deploy compatible readers on every replica before enabling it.
+	MetricFloatGroups bool
 
 	// FlushInterval is the max age of unflushed head data: the cadence of the background loop that
 	// flushes each head to a part and runs compaction/retention. Zero ⇒ a sane default
@@ -605,3 +608,6 @@ func (o *Options) applyDefaults() {
 
 // ensure errors import is used even if validation grows later.
 var _ = errors.Is
+
+// WithMetricFloatGroups enables experimental, bit-exact per-series value compression.
+func WithMetricFloatGroups() Option { return func(o *Options) { o.MetricFloatGroups = true } }

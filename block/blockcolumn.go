@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"math"
+	"slices"
 	"sync"
 
 	"github.com/go-faster/errors"
@@ -83,6 +84,14 @@ func encodeBlocked(
 func accumulateColumn(
 	c Column, codec chunk.Codec, budget uint8, comp *compress.Compressor, blockRows, compressBytes int,
 ) (*blockAccum, error) {
+	if codec == chunk.CodecFloatGroups {
+		var enc chunk.FloatGroupEncoder
+		var ends []int
+		return accumulateBlocked(c.rows(), comp, blockRows, compressBytes, func(dst []byte, lo, hi int) ([]byte, error) {
+			ends = floatGroupRange(ends[:0], c.FloatGroupEnds, lo, hi)
+			return enc.Encode(dst, c.Float64[lo:hi], ends)
+		})
+	}
 	return accumulateBlocked(c.rows(), comp, blockRows, compressBytes,
 		func(dst []byte, lo, hi int) ([]byte, error) {
 			return appendBlockStream(dst, c, codec, budget, lo, hi)
@@ -1406,6 +1415,9 @@ func (c *blockedCursor[T, C]) Next() (T, error) {
 			return zero, errors.Wrapf(err, "block %d", c.blk)
 		}
 
+		if c.codec == chunk.CodecFloatGroups && c.cur.Len() != min(c.streams.dir.blockRows, c.rows-c.blk*c.streams.dir.blockRows) {
+			return zero, errors.New("block: grouped cursor row mismatch")
+		}
 		c.opened = true
 	}
 
@@ -1417,4 +1429,15 @@ func (c *blockedCursor[T, C]) Next() (T, error) {
 	c.pos++
 
 	return v, nil
+}
+
+func floatGroupRange(dst, ends []int, lo, hi int) []int {
+	start, _ := slices.BinarySearch(ends, lo+1)
+	for _, end := range ends[start:] {
+		if end >= hi {
+			break
+		}
+		dst = append(dst, end-lo)
+	}
+	return append(dst, hi-lo)
 }

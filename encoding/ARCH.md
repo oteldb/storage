@@ -99,3 +99,17 @@ the cgo decoder takes no cap.
 
 `ByteIntMap`: open-addressing `[]byte → int` map (xxh3 + `bytes.Equal`) for the dictionary hot
 path — beats `map[string]int` by avoiding string conversion and hashing. Poolable and resettable.
+
+## Grouped metric values
+
+`chunk.CodecFloatGroups` is an opt-in lossless float stream. Version 1 contains a row count and
+fragment count, followed by `(codec, rows, length, payload)` fragments. Only bit-constant,
+Gorilla and scaled-decimal fragments are accepted; recursive grouping is invalid.
+
+The decoder validates positive counts, exact payload lengths and a total of at most 1M rows.
+Block readers additionally verify the expected granule row count before allocating output.
+Decimal candidates must reconstruct every original float bit, including signed zero and NaN payloads.
+
+`FloatGroupEncoder` retains decimal conversion and verification scratch across fragments.
+Group boundaries affect encoding only: row order, timestamps, duplicates and sample weights retain
+their existing meanings.

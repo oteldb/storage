@@ -366,6 +366,8 @@ func NewFloatDecoder(codec Codec, src []byte) (FloatDecoder, error) {
 		return NewGorillaDecoder(src)
 	case CodecDecimal:
 		return NewDecimalDecoder(src)
+	case CodecFloatGroups:
+		return NewFloatGroupsDecoder(src)
 	default:
 		return nil, errUnsupportedCodec
 	}
