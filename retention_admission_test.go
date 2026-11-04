@@ -22,7 +22,7 @@ func writeRetentionPair(t *testing.T, s *Storage, sig signal.Signal, old, fresh 
 	case signal.Metric:
 		acc, err = s.WriteMetrics(t.Context(), gaugeBatch("api", "m", []int64{old, fresh}, []float64{1, 2}))
 	case signal.Log:
-		acc, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{int(old), 9, "old"}, [3]any{int(fresh), 9, "fresh"}))
+		acc, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{old, 9, "old"}, [3]any{fresh, 9, "fresh"}))
 	case signal.Trace:
 		acc, err = s.WriteTraces(t.Context(), traceBatch("api", spanSpec{traceID: "a", spanID: "a", name: "old", start: old, end: old + 1}, spanSpec{traceID: "b", spanID: "b", name: "fresh", start: fresh, end: fresh + 1}))
 	case signal.Profile:
@@ -204,19 +204,19 @@ func TestRetentionAdmissionUsesCurrentTenantPolicy(t *testing.T) {
 	const now = int64(10 * time.Hour)
 	s.now = func() int64 { return now }
 	old := now - int64(2*time.Hour)
-	acc, err := s.WriteLogs(t.Context(), logBatch("api", [3]any{int(old), 9, "old"}))
+	acc, err := s.WriteLogs(t.Context(), logBatch("api", [3]any{old, 9, "old"}))
 	require.NoError(t, err)
 	require.EqualValues(t, 1, acc.Accepted)
 	current.Store(&tenant.Retention{PerSignal: map[signal.Signal]tenant.SignalRetention{signal.Log: {MaxAge: time.Hour}}})
-	acc, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{int(old), 9, "old"}))
+	acc, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{old, 9, "old"}))
 	require.NoError(t, err)
 	require.EqualValues(t, 1, acc.Rejected)
-	acc, err = s.WriteLogs(t.Context(), logBatch("other", [3]any{int(old), 9, "old"}))
+	acc, err = s.WriteLogs(t.Context(), logBatch("other", [3]any{old, 9, "old"}))
 	require.NoError(t, err)
 	require.EqualValues(t, 1, acc.Accepted)
 	require.Zero(t, s.AdmissionStats("other").RejectedRetention)
 	current.Store(&tenant.Retention{MaxAge: 24 * time.Hour})
-	acc, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{int(old), 9, "old"}))
+	acc, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{old, 9, "old"}))
 	require.NoError(t, err)
 	require.EqualValues(t, 1, acc.Accepted)
 }
