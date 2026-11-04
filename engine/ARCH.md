@@ -1878,3 +1878,8 @@ Optional append timestamp floors are numeric (`MinTimestamp`, `EnforceMinTimesta
 checked before identity admission and WAL staging. Floor presence is explicit, so zero and negative
 cutoffs remain valid. Retention policy and wall-clock resolution belong to the facade; replay and
 replica application trust the already accepted payload instead of reapplying a moving cutoff.
+
+## Aggregate window validation
+
+`WindowSpec.Validate` rejects nonpositive overlapping-window steps before planning or empty-range
+shortcuts. Disjoint step aggregates retain their step<=0 whole-range convention.

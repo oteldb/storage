@@ -793,6 +793,16 @@ func (s *Storage) AggregateMetricsStepNamed(
 func (s *Storage) AggregateMetricsWindowNamed(
 	ctx context.Context, t signal.TenantID, r fetch.Request, spec engine.WindowSpec,
 ) ([]engine.NamedWindowAgg, error) {
+	if s.closed.Load() {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := spec.Validate(); err != nil {
+		return nil, err
+	}
+
 	return metricAggregateRead(ctx, s, t, r,
 		func(ctx context.Context, t signal.TenantID, r fetch.Request) ([]engine.NamedWindowAgg, error) {
 			return s.clusterAggregateWindowNamedFor(ctx, t, r, spec)

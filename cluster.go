@@ -643,6 +643,13 @@ func (s *Storage) localAggregate(
 func (s *Storage) localAggregateWindow(
 	ctx context.Context, tenant string, start, end int64, spec engine.WindowSpec, matchers []fetch.Matcher,
 ) ([]engine.NamedWindowAgg, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := spec.Validate(); err != nil {
+		return nil, err
+	}
+
 	plan, err := s.prepareLocalMetricRead(ctx, tenant, start, end)
 	if err != nil || plan.eng == nil {
 		return nil, err

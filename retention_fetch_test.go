@@ -327,3 +327,40 @@ func TestRetentionFetchCancellation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) { t.Parallel(); require.ErrorIs(t, tc.call(), context.Canceled) })
 	}
 }
+
+func TestRetentionFetchExpiredWindowValidation(t *testing.T) {
+	t.Parallel()
+	s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy { return tenant.Policy{Retention: tenant.Retention{MaxAge: 300}} })))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close(context.Background())) })
+	s.now = func() int64 { return 1000 }
+	_, err = s.WriteMetrics(t.Context(), gaugeBatch("api", "retention", []int64{100, 800}, []float64{1, 8}))
+	require.NoError(t, err)
+	eng, ok := s.lookupEngine("default")
+	require.True(t, ok)
+	expired := fetch.Request{Start: 0, End: 100}
+	for _, tc := range []struct {
+		name string
+		step int64
+	}{{"negative", -1}, {"zero", 0}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			spec := engine.WindowSpec{Step: tc.step, Window: 100}
+			_, wantErr := eng.AggregateWindowNamed(t.Context(), expired, spec)
+			require.Error(t, wantErr)
+			_, err := s.AggregateMetricsWindowNamed(t.Context(), "default", expired, spec)
+			require.ErrorIs(t, err, wantErr)
+			_, err = s.localAggregateWindow(t.Context(), "default", expired.Start, expired.End, spec, nil)
+			require.ErrorIs(t, err, wantErr)
+			disjoint, err := s.AggregateMetricsStepNamed(t.Context(), "default", expired, tc.step)
+			require.NoError(t, err)
+			require.Empty(t, disjoint, "disjoint nonpositive step remains valid")
+			peerDisjoint, err := s.localAggregate(t.Context(), "default", expired.Start, expired.End, tc.step, nil)
+			require.NoError(t, err)
+			require.Empty(t, peerDisjoint)
+		})
+	}
+	windows, err := s.AggregateMetricsWindowNamed(t.Context(), "default", expired, engine.WindowSpec{Step: 100, Window: 100})
+	require.NoError(t, err)
+	require.Empty(t, windows)
+}
