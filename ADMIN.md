@@ -416,6 +416,9 @@ column rather than folding the parts' precomputed stats:
 
 **EXPLAIN ANALYZE** (`query/profile`): `profile.WithCollector(ctx)` opts a single query into a
 per-operator timing tree; distributed reads graft each peer's subtree under a `remote {addr}` node.
+Record fetches expose `parts_pruned_range` separately from `parts_pruned_bloom`; the corresponding
+trace attribute is `storage.parts_pruned_range`. It counts parts rejected by persisted physical
+int64 column extrema before any condition-column decode.
 
 ## Act
 

@@ -126,13 +126,14 @@ type Request struct {
 // rows. A predicate that only accepts a concrete value must therefore reject [signal.KindEmpty] —
 // which also keeps the hints below sound, since a pruning hint asserts a value is present.
 //
-// Three optional, serializable hints let a fetcher prune whole parts before scanning (the engine
+// Optional hints let a fetcher prune whole parts before scanning (the engine
 // always re-checks Match per row, so a hint only ever skips work, never changes results):
 //   - Tokens: the full-text tokens the column value must contain (lowered) — consulted against a
 //     per-part token bloom for a `contains` condition (an empty Tokens ⇒ not full-text).
 //   - Equal: an exact column=value equality — consulted against a per-part value bloom. For a
 //     per-record attribute condition, Column is the attribute key and Equal carries key=value.
 //   - AnyEqual: the same equality widened to a set of values (see below).
+//   - Int64Range: physical signed integer bounds, checked against persisted column extrema.
 type Condition struct {
 	Column string
 	Match  func(value signal.Value) bool
@@ -161,6 +162,12 @@ type Condition struct {
 	// membership predicate still matches nothing, because Match decides — its closure rejects every
 	// row.
 	AnyEqual [][]byte
+
+	// Int64Range applies only to a fixed physical int64 column. Every value Match accepts must
+	// lie inside it and Match must reject absence. Attribute keys, including keys colliding with
+	// physical column names, and logical floats encoded as integer bits must not carry this hint.
+	// Missing columns or unsupported statistics retain candidates. Match remains authoritative.
+	Int64Range *Int64Range
 }
 
 // Batch is one matching identity (a metric series, or a log stream) and its rows within the

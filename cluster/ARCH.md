@@ -748,3 +748,7 @@ nonnegative and no larger than the folded count. Legacy clients still report the
 shed, with legacy OOO attribution; updated clients accept responses without the header. Enable
 the optional feature only after upgrading routers/owners and publishing a consistent retention
 policy. WAL and replication payload formats do not change.
+
+Physical `Int64Range` condition hints stay local: routed fetches omit them and retain the requester
+callback through `fetch.Filter`. Peers return a superset, including older peers; numeric-only routed
+reads currently decode a broader set of rows. Equality/set hints on other conditions still travel.

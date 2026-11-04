@@ -19,6 +19,10 @@ Limit, Reverse, Recycle, Scope}` carries two **operator-free** predicate familie
   part's blooms, never a replacement for `Match`. `AnyEqual` is a disjunction *inside* one condition
   — conditions AND, so an N-value equality cannot be spelled as N conditions; build it with
   `AnyEqualSet`, which sorts and dedups. Nil and empty both mean "no hint".
+  `Int64Range` applies only to fixed physical signed-integer columns. Optional inclusive/exclusive
+  bounds compare directly without floating conversion or endpoint arithmetic. Callers must never
+  attach it to attributes (including colliding names) or logical floats stored as integer bits.
+  Unknown/missing/wrong-kind column statistics retain parts; the callback still judges rows.
 
 Neither is an operator enum, so equality/regex/negation and condition extraction live in the
 language layer and storage stays operator-free. `Fetch` returns an `Iterator` of

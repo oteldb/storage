@@ -1024,3 +1024,10 @@ With timestamp admission enabled, primary side deltas are queued until record ad
 A transaction whose data rows are all rejected discards its associated side deltas; accepted rows
 validate and absorb their deltas before WAL/head application. Pure side-only transactions remain
 valid. Partial rejection retains the existing side-stray cleanup for unreferenced symbols.
+
+## Physical integer range pruning
+
+Under `AllConditions`, `Condition.Int64Range` rejects non-overlapping parts using existing
+whole-column `ColumnDesc` extrema before opening timestamp or condition columns. Missing columns,
+unsupported kinds and invalid statistics retain candidates. Heads still evaluate `Match`; flush and
+merge maintain the same persisted extrema. No granule metadata or part format is added.

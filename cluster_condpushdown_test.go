@@ -136,3 +136,42 @@ func TestPeerFetchKeepsAdvisoryConditions(t *testing.T) {
 
 	assert.ElementsMatch(t, []string{"GET /", "GET /other"}, names)
 }
+
+func TestPeerFetchNumericRangeFallback(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s, err := InMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close(context.Background())) })
+	_, err = s.WriteTraces(ctx, traceBatch("frontend",
+		spanSpec{traceID: "short", spanID: "s", name: "short", start: 100, end: 110},
+		spanSpec{traceID: "long", spanID: "l", name: "long", start: 200, end: 300}))
+	require.NoError(t, err)
+	s.maintain(ctx)
+	cond := fetch.Condition{
+		Column:     trace.ColDuration,
+		Int64Range: &fetch.Int64Range{Lower: &fetch.Int64Bound{Value: 50, Inclusive: true}},
+		Match:      func(v signal.Value) bool { return v.Kind() == signal.KindInt && v.Int() >= 50 },
+	}
+	require.Empty(t, cluster.ConditionHints([]fetch.Condition{cond}, true), "numeric hints deliberately use the legacy superset fallback")
+	r := fetch.Request{Signal: signal.Trace, Tenant: "default", Start: 0, End: 1000, Conditions: []fetch.Condition{cond}, AllConditions: true}
+	remote := servePeerFetch(t, s, signal.Trace)
+	it, err := remote.Fetch(ctx, r)
+	require.NoError(t, err)
+	broad, err := fetch.Drain(ctx, it)
+	require.NoError(t, err)
+	broadNames := make([]string, 0, 2)
+	for _, batch := range broad {
+		broadNames = append(broadNames, spanNames(batch)...)
+	}
+	assert.ElementsMatch(t, []string{"short", "long"}, broadNames)
+	it, err = fetch.Filter(remote).Fetch(ctx, r)
+	require.NoError(t, err)
+	got, err := fetch.Drain(ctx, it)
+	require.NoError(t, err)
+	names := make([]string, 0, 2)
+	for _, batch := range got {
+		names = append(names, spanNames(batch)...)
+	}
+	assert.Equal(t, []string{"long"}, names)
+}
