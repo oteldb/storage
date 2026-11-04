@@ -1,14 +1,18 @@
 // Package engineguard separates engine writer ordering from reader visibility.
 package engineguard
 
-import "sync"
+import (
+	"math"
+	"sync"
+)
 
 // Mutex serializes mutations while allowing readers during a writer's blocking I/O.
 // The zero value is ready to use. Like [sync.RWMutex], it must not be copied or locked recursively.
 type Mutex struct {
-	catalog sync.Mutex
-	writer  sync.Mutex
-	state   sync.RWMutex
+	catalog  sync.Mutex
+	writer   sync.Mutex
+	state    sync.RWMutex
+	revision uint64
 }
 
 // Lock acquires catalog ownership, then the writer gate and mutable state.
@@ -47,8 +51,18 @@ func (m *Mutex) Unlock() {
 
 // UnlockWriter releases an ingestion or WAL operation.
 func (m *Mutex) UnlockWriter() {
+	if m.revision != math.MaxUint64 {
+		m.revision++
+	}
 	m.state.Unlock()
 	m.writer.Unlock()
+}
+
+// Revision returns a coherent publication version; exhaustion permanently disables reuse.
+func (m *Mutex) Revision() (uint64, bool) {
+	m.state.RLock()
+	defer m.state.RUnlock()
+	return m.revision, m.revision != math.MaxUint64
 }
 
 // RLock acquires a state snapshot without joining the writer gate.

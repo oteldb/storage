@@ -20,3 +20,6 @@ does not accidentally wait for WAL I/O merely because the index needs its first 
 Outside this primitive, engine build slots precede the shared maintenance barrier. Reset,
 repair and pruning take the barrier exclusively. Identity pruning also excludes public
 reloads through the identity lifecycle gate. Catalog operations never wait for a build slot.
+
+Every writer unlock advances a monotone read revision under state exclusion, including yielded
+catalog stages. Derived `LockState` updates leave it unchanged. Saturation disables token reuse.

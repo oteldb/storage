@@ -92,6 +92,10 @@ complete cluster inventory; `Owned` separately names held compaction claims.
   call), so a step-grid range query costs one call rather than one per step. `WindowNamed` is the
   overlapping form: a window wider than the step (a 1h range at a 5m step) at a cost proportional
   to the data, not to the overlap.
+  `MetricReadRevision(tenant, minInputNS)` supplies a comparable local read token for completed
+  result caches. Its age deadline is derived from the earliest input timestamp, rather than a TTL;
+  expired/straddling windows and clustered sources cannot reuse completed results. Policy age
+  changes alter the token's deadline, and all engine publications change its revision.
 - **Maintenance** — a periodic/catch-up worker flushes and merges tenant engines, with deferred
   tenants receiving an exclusive admission turn before bounded parallel work. An independent
   pressure worker services head-size wakes even while a merge is building. Engines admit one

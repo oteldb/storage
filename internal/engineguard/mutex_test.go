@@ -1,12 +1,41 @@
 package engineguard
 
 import (
+	"math"
 	"testing"
 
 	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRevision(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name     string
+		start    uint64
+		want     uint64
+		reusable bool
+	}{
+		{"advance", 0, 1, true},
+		{"exhaust", math.MaxUint64 - 1, math.MaxUint64, false},
+		{"saturate", math.MaxUint64, math.MaxUint64, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := Mutex{revision: tt.start}
+			m.LockState()
+			m.UnlockState()
+			version, _ := m.Revision()
+			require.Equal(t, tt.start, version, "derived cache changes preserve the token")
+			m.LockWriter()
+			m.UnlockWriter()
+			version, reusable := m.Revision()
+			require.Equal(t, tt.want, version)
+			require.Equal(t, tt.reusable, reusable)
+		})
+	}
+}
 
 func TestTryLockWriter(t *testing.T) {
 	t.Parallel()
