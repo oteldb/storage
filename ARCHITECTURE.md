@@ -352,3 +352,11 @@ at runtime, with optional `Retention.Validate` for embedder validation.
 it defaults off. Metric points and attached exemplars resolve independently, and expired points
 do not consume lossy-sampling budget or register identities. Partial-success/observability report
 `out_of_retention`; primary responses preserve legacy total rejection counts.
+
+Read entry points clamp samples and records to the tenant's per-signal age retention before engine
+planning. Count and aggregate pushdowns retain the same sample floor without shifting evaluation
+grids; metadata enumeration remains a superset. Policies resolve per read, independently of physical
+cleanup and size retention. Split/cache children share one policy-and-time snapshot per fetch.
+Result-cache requests bypass caching
+when a cutoff clips the requested range, so an older cache entry cannot expose expired rows.
+Embedder result-sharing layers outside the facade must apply the same retention boundary themselves.

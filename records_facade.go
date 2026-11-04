@@ -327,16 +327,18 @@ func (s *Storage) recordFetcher(
 		return fetch.Merge()
 	}
 
+	var bound []signal.TenantID
 	seed := func(f fetch.Fetcher) fetch.Fetcher {
 		return seedFetcher{
-			inner: f, obs: s.obs, maxQueryBytes: s.maxQueryBytes, signal: sig.String(),
+			inner: s.retainedQuery(sig, bound, f), obs: s.obs, maxQueryBytes: s.maxQueryBytes, signal: sig.String(),
 		}
 	}
 
 	if s.cluster != nil && len(tenants) > 0 {
 		fetchers := make([]fetch.Fetcher, 0, len(tenants))
 		for _, t := range tenants {
-			fetchers = append(fetchers, clusterFor(t))
+			fetchers = append(fetchers, s.retainedFetcher(sig, t, clusterFor(t)))
+			bound = append(bound, t)
 		}
 
 		return seed(oneOrConcat(fetchers))
@@ -346,13 +348,15 @@ func (s *Storage) recordFetcher(
 
 	if len(tenants) == 0 {
 		for tid, eng := range snapshot() {
-			fetchers = append(fetchers, s.gapGuarded(sig, tid, eng, nil))
+			fetchers = append(fetchers, s.retainedFetcher(sig, tid, s.gapGuarded(sig, tid, eng, nil)))
+			bound = append(bound, tid)
 		}
 	} else {
 		for _, t := range tenants {
 			tid := s.normalizeTenant(t)
 			if e, ok := lookup(tid); ok {
-				fetchers = append(fetchers, s.gapGuarded(sig, tid, e, nil))
+				fetchers = append(fetchers, s.retainedFetcher(sig, tid, s.gapGuarded(sig, tid, e, nil)))
+				bound = append(bound, tid)
 			}
 		}
 	}

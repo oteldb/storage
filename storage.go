@@ -560,7 +560,12 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 		return fetch.Merge() // empty
 	}
 
-	inner := s.scaleWrap(s.baseFetcher(tenants), tenants)
+	base, bound := s.baseFetcher(tenants)
+	inner := s.scaleWrap(base, tenants)
+	if len(tenants) > 0 {
+		bound = tenants
+	}
+	inner = s.retainedQuery(signal.Metric, bound, inner)
 
 	return seedFetcher{inner: inner, obs: s.obs, maxQueryBytes: s.maxQueryBytes, signal: signal.Metric.String()}
 }
@@ -654,6 +659,18 @@ func (s *Storage) AggregateMetrics(ctx context.Context, t signal.TenantID, r fet
 		return map[signal.SeriesID]engine.SeriesAgg{}, nil
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if s.cluster != nil {
+		ctx = s.snapshotRead(ctx, signal.Metric, []signal.TenantID{s.normalizeTenant(tenantOfShard(t))})
+	}
+	r = s.clampRead(ctx, signal.Metric, t, r)
+	if r.Start > r.End {
+		return map[signal.SeriesID]engine.SeriesAgg{}, nil
+	}
+
 	if s.cluster != nil {
 		bucketed, err := s.clusterAggregateFor(ctx, t, r, 0) // step 0 ⇒ one whole-range bucket per series
 		if err != nil {
@@ -742,26 +759,14 @@ func (s *Storage) AggregateMetricsNamed(ctx context.Context, t signal.TenantID, 
 func (s *Storage) AggregateMetricsStepNamed(
 	ctx context.Context, t signal.TenantID, r fetch.Request, step int64,
 ) ([]engine.NamedAgg, error) {
-	if s.closed.Load() {
-		return nil, nil
-	}
-
-	if s.cluster != nil {
-		return s.clusterAggregateNamedFor(ctx, t, r, step)
-	}
-
-	tid := s.normalizeTenant(t)
-
-	eng, ok := s.lookupEngine(tid)
-	if !ok {
-		return nil, nil
-	}
-
-	if err := s.answerLocally(ctx, rpcOpRead, signal.Metric, tid, eng, r.Start, r.End); err != nil {
-		return nil, err
-	}
-
-	return eng.AggregateStepNamed(ctx, r, step)
+	return metricAggregateRead(ctx, s, t, r,
+		func(ctx context.Context, t signal.TenantID, r fetch.Request) ([]engine.NamedAgg, error) {
+			return s.clusterAggregateNamedFor(ctx, t, r, step)
+		},
+		func(ctx context.Context, eng *engine.Engine, r fetch.Request) ([]engine.NamedAgg, error) {
+			return eng.AggregateStepNamed(ctx, r, step)
+		},
+	)
 }
 
 // AggregateMetricsWindowNamed is the *overlapping* form of [Storage.AggregateMetricsStepNamed]: it
@@ -788,26 +793,14 @@ func (s *Storage) AggregateMetricsStepNamed(
 func (s *Storage) AggregateMetricsWindowNamed(
 	ctx context.Context, t signal.TenantID, r fetch.Request, spec engine.WindowSpec,
 ) ([]engine.NamedWindowAgg, error) {
-	if s.closed.Load() {
-		return nil, nil
-	}
-
-	if s.cluster != nil {
-		return s.clusterAggregateWindowNamedFor(ctx, t, r, spec)
-	}
-
-	tid := s.normalizeTenant(t)
-
-	eng, ok := s.lookupEngine(tid)
-	if !ok {
-		return nil, nil
-	}
-
-	if err := s.answerLocally(ctx, rpcOpRead, signal.Metric, tid, eng, r.Start, r.End); err != nil {
-		return nil, err
-	}
-
-	return eng.AggregateWindowNamed(ctx, r, spec)
+	return metricAggregateRead(ctx, s, t, r,
+		func(ctx context.Context, t signal.TenantID, r fetch.Request) ([]engine.NamedWindowAgg, error) {
+			return s.clusterAggregateWindowNamedFor(ctx, t, r, spec)
+		},
+		func(ctx context.Context, eng *engine.Engine, r fetch.Request) ([]engine.NamedWindowAgg, error) {
+			return eng.AggregateWindowNamed(ctx, r, spec)
+		},
+	)
 }
 
 // seedFetcher is the outermost read wrapper: it installs the injected logger as the zctx base so
@@ -923,34 +916,38 @@ func (s *Storage) allEngines() []engineCloser {
 
 // baseFetcher builds the unwrapped read seam for the tenant set: owner-aware per tenant in
 // cluster mode, otherwise the local engines (or a cross-tenant snapshot when none are named).
-func (s *Storage) baseFetcher(tenants []signal.TenantID) fetch.Fetcher {
+func (s *Storage) baseFetcher(tenants []signal.TenantID) (fetch.Fetcher, []signal.TenantID) {
+	var bound []signal.TenantID
 	// In cluster mode a named tenant is served owner-aware (local if owned, else fanned out to
 	// an owner). Without named tenants we fall back to a local cross-tenant snapshot.
 	if s.cluster != nil && len(tenants) > 0 {
 		fetchers := make([]fetch.Fetcher, 0, len(tenants))
 		for _, t := range tenants {
-			fetchers = append(fetchers, s.clusterFetcherFor(t))
+			fetchers = append(fetchers, s.retainedFetcher(signal.Metric, t, s.clusterFetcherFor(t)))
+			bound = append(bound, t)
 		}
 
-		return fetch.Merge(fetchers...)
+		return fetch.Merge(fetchers...), bound
 	}
 
 	var fetchers []fetch.Fetcher
 
 	if len(tenants) == 0 {
 		for tid, eng := range s.engineSnapshotByTenant() {
-			fetchers = append(fetchers, s.gapGuarded(signal.Metric, tid, eng, nil))
+			fetchers = append(fetchers, s.retainedFetcher(signal.Metric, tid, s.gapGuarded(signal.Metric, tid, eng, nil)))
+			bound = append(bound, tid)
 		}
 	} else {
 		for _, t := range tenants {
 			tid := s.normalizeTenant(t)
 			if e, ok := s.lookupEngine(tid); ok {
-				fetchers = append(fetchers, s.gapGuarded(signal.Metric, tid, e, nil))
+				fetchers = append(fetchers, s.retainedFetcher(signal.Metric, tid, s.gapGuarded(signal.Metric, tid, e, nil)))
+				bound = append(bound, tid)
 			}
 		}
 	}
 
-	return fetch.Merge(fetchers...)
+	return fetch.Merge(fetchers...), bound
 }
 
 // scaleWrap decorates the base fetcher with the configured query/scale layers. The cache (when
@@ -960,7 +957,11 @@ func (s *Storage) baseFetcher(tenants []signal.TenantID) fetch.Fetcher {
 func (s *Storage) scaleWrap(f fetch.Fetcher, tenants []signal.TenantID) fetch.Fetcher {
 	if s.queryCache != nil && len(tenants) > 0 {
 		cached := scale.CacheFetcher{Inner: f, Cache: s.queryCache, Freshness: s.opts.QueryCacheFreshness}
-		f = scopedFetcher{inner: cached, scope: s.tenantScope(tenants)}
+		normalized := make([]signal.TenantID, len(tenants))
+		for i, t := range tenants {
+			normalized[i] = s.normalizeTenant(tenantOfShard(t))
+		}
+		f = scopedFetcher{inner: cached, scope: s.tenantScope(tenants), retention: &retentionCache{store: s, tenants: normalized, uncached: f}}
 	}
 
 	if s.opts.QuerySplitInterval > 0 {
@@ -988,12 +989,20 @@ func (s *Storage) tenantScope(tenants []signal.TenantID) signal.TenantID {
 // downstream [scale.CacheFetcher] keys on the tenant set the fetcher was built for (the merge
 // children ignore Request.Tenant, so overwriting it does not affect the actual fetch).
 type scopedFetcher struct {
-	inner fetch.Fetcher
-	scope signal.TenantID
+	inner     fetch.Fetcher
+	scope     signal.TenantID
+	retention *retentionCache
 }
 
 func (f scopedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
 	r.Tenant = f.scope
+	if f.retention != nil {
+		var clipped bool
+		ctx, clipped = f.retention.snapshot(ctx, r.Start)
+		if clipped {
+			return f.retention.uncached.Fetch(ctx, r)
+		}
+	}
 
 	return f.inner.Fetch(ctx, r)
 }

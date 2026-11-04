@@ -516,16 +516,16 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 // localFetch serves a peer's fetch from the local engine, pushing down the (equality) matchers
 // it forwarded — the read-fan-out server's view of this node's data.
 func (s *Storage) localFetch(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
-	tid := s.normalizeTenant(signal.TenantID(tenant))
-
-	eng, ok := s.lookupEngine(tid)
-	if err := s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, ok, start, end); err != nil {
+	plan, err := s.prepareLocalMetricRead(ctx, tenant, start, end)
+	if err != nil || plan.eng == nil {
 		return nil, err
 	}
+	plan.request.Matchers = matchers
+	plan.request.Recycle = true
 
 	// Recycle: the read handler serializes the batches and discards them, so it releases them right
 	// after — recycling this node's result buffers across fan-out reads.
-	it, err := eng.Fetch(ctx, fetch.Request{Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers, Recycle: true})
+	it, err := plan.eng.Fetch(ctx, plan.request)
 	if err != nil {
 		return nil, err
 	}
@@ -630,16 +630,12 @@ func (s *Storage) shardReadTargets(
 func (s *Storage) localAggregate(
 	ctx context.Context, tenant string, start, end, step int64, matchers []fetch.Matcher,
 ) ([]engine.NamedAgg, error) {
-	tid := s.normalizeTenant(signal.TenantID(tenant))
-
-	eng, ok := s.lookupEngine(tid)
-	if err := s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, ok, start, end); err != nil {
+	plan, err := s.prepareLocalMetricRead(ctx, tenant, start, end)
+	if err != nil || plan.eng == nil {
 		return nil, err
 	}
-
-	return eng.AggregateStepNamed(ctx, fetch.Request{
-		Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers,
-	}, step)
+	plan.request.Matchers = matchers
+	return plan.eng.AggregateStepNamed(ctx, plan.request, step)
 }
 
 // localAggregateWindow serves a peer's overlapping-window aggregate from the local shard engine —
@@ -647,16 +643,12 @@ func (s *Storage) localAggregate(
 func (s *Storage) localAggregateWindow(
 	ctx context.Context, tenant string, start, end int64, spec engine.WindowSpec, matchers []fetch.Matcher,
 ) ([]engine.NamedWindowAgg, error) {
-	tid := s.normalizeTenant(signal.TenantID(tenant))
-
-	eng, ok := s.lookupEngine(tid)
-	if err := s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, ok, start, end); err != nil {
+	plan, err := s.prepareLocalMetricRead(ctx, tenant, start, end)
+	if err != nil || plan.eng == nil {
 		return nil, err
 	}
-
-	return eng.AggregateWindowNamed(ctx, fetch.Request{
-		Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers,
-	}, spec)
+	plan.request.Matchers = matchers
+	return plan.eng.AggregateWindowNamed(ctx, plan.request, spec)
 }
 
 // mergeWindowLists combines two per-series window lists by aligned evaluation timestamp, summing
@@ -981,6 +973,10 @@ func (s *Storage) serveFetch(ctx context.Context, r fetch.Request) ([]*fetch.Bat
 // column conditions that prune parts by bloom (without which a condition-only request — trace-by-id
 // — would scan the whole window).
 func (s *Storage) localRecordFetch(ctx context.Context, r fetch.Request) ([]*fetch.Batch, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	sig, tenant := r.Signal, string(r.Tenant)
 	tid := s.normalizeTenant(signal.TenantID(tenant))
 
@@ -988,6 +984,11 @@ func (s *Storage) localRecordFetch(ctx context.Context, r fetch.Request) ([]*fet
 	// install the read budget itself — otherwise a peer serving a fan-out admits nothing and
 	// materializes the whole result the caller has already said it has no room for.
 	ctx = withReadBudget(ctx, s.maxQueryBytes)
+
+	r = s.clampRead(ctx, sig, tid, r)
+	if r.Start > r.End {
+		return nil, nil
+	}
 
 	eng, ok := s.lookupRecordEngine(sig, tid)
 	if err := s.canAnswer(ctx, rpcOpRead, sig, tid, ok, r.Start, r.End); err != nil {
