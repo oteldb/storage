@@ -79,8 +79,9 @@ type recordPartStreamWriter struct {
 }
 
 type sourceBindings struct {
-	stable, framed       *block.Binding
-	stableGen, framedGen block.DictGen
+	stable, framed         *block.Binding
+	stableGen, framedGen   block.DictGen
+	stableSide, framedSide sidecarCache
 }
 
 // newRecordPartStreamWriter starts an output part of a merge over src. coders, when non-nil, are the
@@ -214,10 +215,13 @@ func (w *recordPartStreamWriter) appendBytes(
 	}
 
 	if s := w.sinks[k]; s != nil {
-		dc := g.Column()
-		for r := lo; r < hi; r++ {
-			s.add(dc.At(r))
+		sb := &w.binds[si*len(w.sinks)+k]
+		cache := &sb.framedSide
+		if stable {
+			cache = &sb.stableSide
 		}
+		dc := g.Column()
+		cache.add(s, &dc, lo, hi)
 	}
 
 	if k == w.refCol {
@@ -288,6 +292,11 @@ func (w *recordPartStreamWriter) binding(
 		return nil, err
 	}
 
+	if stable {
+		sb.stableSide.reset()
+	} else {
+		sb.framedSide.reset()
+	}
 	*bound = gen
 
 	return *b, nil
@@ -298,8 +307,8 @@ func (w *recordPartStreamWriter) binding(
 // ([block.StreamWriter.ResidentBytes]), plus the sidecar state — a watermark per stream, and per bloom
 // or attributes column its token hashes, value dedup and keys — and, over a backend that takes objects
 // whole, the frames already handed over. It is what the router sheds writers on,
-// so it must not undercount: the bindings alone are 12 B per entry of every source dictionary bound,
-// for each open day.
+// so it must not undercount: encoding bindings hold 12 B per table entry, and sidecar columns add
+// a 4 B token-count cache, for each open day.
 func (w *recordPartStreamWriter) residentBytes() int64 {
 	const (
 		wmarkBytes   = 24
@@ -313,6 +322,9 @@ func (w *recordPartStreamWriter) residentBytes() int64 {
 	}
 
 	n += int64(cap(w.binds))*int64(unsafe.Sizeof(sourceBindings{})) + int64(w.bound)*bindingBytes
+	for i := range w.binds {
+		n += w.binds[i].stableSide.residentBytes() + w.binds[i].framedSide.residentBytes()
+	}
 	n += int64(cap(w.idScratch)) + w.finishBytes()
 
 	for _, s := range w.sinks {

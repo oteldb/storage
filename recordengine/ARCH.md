@@ -315,12 +315,12 @@ entries (17.8 MiB there).
 
 **Writers are shed on everything they hold.** A writer's `residentBytes` is what dropping it gives
 back: the block writer's frames, directories, output dictionaries and staged granules; the per-entry
-caches of each source binding, 12 B per entry of every source dictionary it bound; the sidecar state
+caches of each source binding, 12 B for encoding and another 4 B on bloom/key columns; the sidecar state
 below; and, over a backend that takes objects whole, the frames already handed over, at twice their
 size for the buffer's growth. The bindings are what make a straddling merge expensive: every day's
 writer binds every source's dictionaries, so they multiply with sources × columns × open days — 16
-sources, 3 dictionary columns and 32 days at 65,536 entries is 1.1 GiB. A binding's cache maps the
-source's entries into that writer's own dictionary and granule, so it cannot be shared across
+sources, 3 sidecar-bearing dictionary columns and 32 days at 65,536 entries is 1.5 GiB. A binding's
+cache maps the source's entries into that writer's own dictionary and granule, so it cannot be shared across
 writers; it is made only for a (source, column) the writer receives rows from, and the router sheds
 the largest writer once the open ones leave less than one append's room in their budget.
 `TestRecordPartWriterResidentTracksHeap` checks the figure against the heap a writer gives back when
@@ -355,7 +355,7 @@ beside its writers. Opening them, one stream id column read back at a time, is c
 grant, which is topped up without waiting and past that counted in `merge.over_budget_bytes` with a
 warning, since the parts are already written (`TestMergeSparseYearsHoldsItsGrant`: 700 days, 1,400
 parts, heap 5.9 MiB within a 6.3 MiB grant). Of that the router keeps room for one append
-(`timebucket.Router.ReserveRun`): a writer binding every source's dictionaries, 12 B an entry, plus
+(`timebucket.Router.ReserveRun`): a writer binding every source's shared and frame-backed tables, at most 16 B an entry, plus
 one run and the least a writer charges for its finish, or the largest append so far if that is more.
 A writer charges its own finish from the start (`finishBytes`, part of `residentBytes`): the block
 writer's last seals and dictionary regions (`block.StreamWriter.FinishBytes` — the dictionary
@@ -392,6 +392,15 @@ open-addressed) with the byte count, occurrence count and distinct sketch the fl
 (`filterItems`), and the filter is bit-identical to `bloomBuilder.build` over the same rows. Record
 keys are collected once per distinct attribute blob. Both are O(distinct tokens) of the part, the one
 output term that grows with the part.
+
+Sidecar columns memoize token counts by source dictionary id, scoped to their binding generation
+and output writer. The memo activates after emitting more than twice the table's entry count, so
+mostly unique tables avoid its allocation. Only emitted entries are visited; zero-token values are
+cached explicitly.
+Repeated rows update byte and occurrence totals without hashing or decoding the value again, while
+the value-hash cache deduplicates first visits across different source tables. Self-granule rebinding
+clears the memo and flat input retains the row path. Admission reserves both the shared table and one
+possible frame table; residency charges actual cache capacities. No sidecar or column format changes.
 
 **What differs from the flush writer.** A merged part decodes identically to what `writePart` writes
 over the same rows, and is byte-identical to it in every shared-dictionary column, the stream id

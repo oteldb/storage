@@ -16,7 +16,7 @@ import (
 
 // sourceBudget is what a merge source costs, bounded from its part's manifest: steady is what it
 // reports once open ([mergeSource.residentBytes]), open what opening one of its columns holds on top
-// at most, and entries the stable dictionary entries it hands a writer ([mergeSource.dictEntries]).
+// at most, and entries the stable and frame-backed table slots a writer may cache ([mergeSource.dictEntries]).
 type sourceBudget struct {
 	steady, open int64
 	entries      int
@@ -95,6 +95,7 @@ func (e *Engine) sourceBoundWindow(ctx context.Context, p *part, window int64) (
 		switch {
 		case desc.Const:
 			b.steady += mergeGranuleRows
+			b.entries++
 		case !desc.Blocked:
 			if !desc.HasSizing {
 				return sourceBudget{}, false
@@ -111,7 +112,7 @@ func (e *Engine) sourceBoundWindow(ctx context.Context, p *part, window int64) (
 
 			b.steady += steady
 			b.open = max(b.open, open)
-			b.entries += int(desc.DictEntries)
+			b.entries += int(desc.DictEntries) + min(p.reader.RowCount(), p.reader.Manifest().GranuleSize, 1<<16)
 		}
 	}
 
@@ -185,10 +186,10 @@ func gatherBound(p *part) int64 {
 const mergeFloorRun = 1 << 20
 
 // appendReserve is the room the router keeps for one append: a writer binding every source's
-// dictionaries, 12 B an entry, plus one run, plus what a writer charges for its finish before it holds
+// dictionaries, 16 B an entry, plus one run, plus what a writer charges for its finish before it holds
 // anything ([writerFinishBase]).
 func appendReserve(schema *Schema, entries int, runBytes int64) int64 {
-	const bindEntryBytes = 12
+	const bindEntryBytes = 16
 
 	if runBytes <= 0 {
 		runBytes = mergeFloorRun

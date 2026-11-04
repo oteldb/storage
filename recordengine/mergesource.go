@@ -28,8 +28,7 @@ type mergeSource interface {
 	// residentBytes bounds what the source holds in RAM from the moment it opens: read-ahead windows,
 	// frame buffers and dictionaries for a forward read, the decoded columns for a whole decode.
 	residentBytes() int64
-	// dictEntries is how many entries of stable dictionaries the source hands a writer, which a
-	// writer binding every source caches an id for each of.
+	// dictEntries bounds entries of stable and frame-backed tables a writer may bind at once.
 	dictEntries() int
 }
 
@@ -415,11 +414,13 @@ type partCursor struct {
 	last     int64
 
 	resident int64
+	rows     int
 }
 
 func openPartCursor(ctx context.Context, p *part, window int64) (*partCursor, error) {
 	c := &partCursor{
 		ranges: p.ranges,
+		rows:   p.reader.RowCount(),
 		fixed:  fixedRowBytes(p.schema),
 		ints:   make([]intCursor, p.schema.numInts()),
 		bytes:  make([]byteCursor, p.schema.numBytes()),
@@ -464,16 +465,19 @@ func (c *partCursor) residentBytes() int64 { return c.resident }
 
 func (c *partCursor) dictEntries() int {
 	var n int
-
 	for k := range c.bytes {
 		b := &c.bytes[k]
 		if b.stable {
 			n += len(b.entries)
 		}
-
+		if b.constant {
+			n += len(b.constCol.Entries)
+		}
 		n += len(b.shared)
+		if b.dec != nil {
+			n += min(c.rows, b.dec.BlockRows(), 1<<16)
+		}
 	}
-
 	return n
 }
 

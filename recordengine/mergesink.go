@@ -82,43 +82,44 @@ func newColumnSink(schema *Schema, k int) *columnSink {
 }
 
 func (s *columnSink) add(v []byte) {
+	n := s.observe(v)
+	s.account(len(v), n)
+}
+
+func (s *columnSink) account(valueBytes int, tokens uint32) {
+	if b := s.bloom; b != nil {
+		b.bytes += int64(valueBytes)
+		b.occurrences += int(tokens)
+	}
+}
+
+func (s *columnSink) observe(v []byte) uint32 {
 	b := s.bloom
-	if b != nil {
-		b.bytes += int64(len(v))
-
-		// An equality column is mostly distinct values, so a dedup pass would hash every row to skip
-		// almost nothing: its tokens go straight to the exact pair set instead.
-		if b.mode == BloomEquality {
-			b.addEquality(v)
-			b = nil
+	var n int32
+	if b != nil && b.mode == BloomEquality {
+		if len(v) > 0 {
+			b.token(v)
+			n = 1
 		}
+		b = nil
 	}
-
 	if b == nil && s.keys == nil {
-		return
+		return uint32(n)
 	}
-
 	h := xxh3.Hash(v)
 	if n, ok := s.seen[h]; ok {
-		if b != nil {
-			b.occurrences += int(n)
-		}
-
-		return
+		return uint32(n)
 	}
-
-	var n int32
 	if b != nil {
 		n = b.addValue(v)
 	}
-
 	if s.keys != nil {
 		s.keyBytes += s.keys.add(v, &s.attrs)
 	}
-
 	if len(s.seen) < maxDedupRows {
 		s.seen[h] = n
 	}
+	return uint32(n)
 }
 
 // bloomAccum builds a column's bloom from values streamed to it, producing the filter
@@ -135,17 +136,9 @@ type bloomAccum struct {
 	pairs       hashPairs
 }
 
-func (a *bloomAccum) addEquality(v []byte) {
-	if len(v) > 0 {
-		a.occurrences++
-		a.token(v)
-	}
-}
-
 // addValue adds a value not seen before and returns its token count.
 func (a *bloomAccum) addValue(v []byte) int32 {
 	n := a.tok.count(a.mode, v)
-	a.occurrences += n
 	a.tok.tokens(a.mode, v, a.token)
 
 	return int32(n)
