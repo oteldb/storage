@@ -2,6 +2,7 @@ package retention
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -61,4 +62,29 @@ func TestBoundString(t *testing.T) {
 	}{{BoundNone, "none"}, {BoundAge, "age"}, {BoundSignalBytes, "signal_bytes"}, {BoundPooledBytes, "pooled_bytes"}, {Bound(255), "none"}} {
 		t.Run(tc.name, func(t *testing.T) { t.Parallel(); require.Equal(t, tc.name, tc.bound.String()) })
 	}
+}
+
+func TestStateStaleTenureCannotReplaceNewerRequest(t *testing.T) {
+	t.Parallel()
+	var s State
+	var current atomic.Uint64
+	current.Store(7)
+	captured := make(chan struct{})
+	resume := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		term := current.Load()
+		close(captured)
+		<-resume
+		s.Record(100, BoundAge, term)
+	}()
+	<-captured
+	current.Store(8)
+	s.Record(200, BoundSignalBytes, current.Load())
+	close(resume)
+	<-done
+	require.Equal(t, Request{Cutoff: 200, Bound: BoundSignalBytes, Term: 8}, s.Load(8))
+	s.Record(50, BoundAge, 8)
+	require.Equal(t, Request{Cutoff: 50, Bound: BoundAge, Term: 8}, s.Load(8), "the same owner may lengthen retention")
 }

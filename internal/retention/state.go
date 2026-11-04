@@ -46,10 +46,15 @@ func (s *State) Record(cutoff int64, bound Bound, term uint64) {
 		cutoff, bound = 0, BoundNone
 	}
 	next := Request{Cutoff: cutoff, Bound: bound, Term: term}
-	if old := s.request.Load(); old != nil && *old == next {
-		return
+	for {
+		old := s.request.Load()
+		if old != nil && (old.Term > term || *old == next) {
+			return
+		}
+		if s.request.CompareAndSwap(old, &next) {
+			return
+		}
 	}
-	s.request.Store(&next)
 }
 
 // Load returns the request only while its ownership term is current.
