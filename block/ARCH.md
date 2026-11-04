@@ -588,3 +588,15 @@ in input, scan, clone and finishing memory estimates.
 The variable descriptor stores the row cap after sizing fields. After the existing directory's
 stream lengths, each chunk stores its row count and, for `TimeBounds`, signed delta minimum and
 signed maximum-minus-minimum. The directory checksum covers these fields together with frame spans.
+
+Independent chunks omit parsed granule-to-frame maps and in-frame spans: each checked granule
+owns exactly one frame, so frame identity and stream span are implicit. The wire fields remain
+validated when reading older variable directories.
+
+`xCompactDir` marks a compressed independent-chunk directory, emitted only when it saves bytes.
+Its envelope is `[uvarint rawLen][compressed block][CRC32C]`, using LZ4 independently of the sample compression algorithm;
+the raw directory retains its own CRC. Sizing records the envelope length. Readers verify the outer
+CRC before decoding, bound `rawLen` by the manifest frame/granule counts, require an exact decoded
+length, then validate the ordinary directory and its frame checksums. Input and scan admission
+include the transient directory buffer; LZ4 decoding needs no separate workspace. Default fixed-row writers keep
+their existing format; old readers reject the unknown extension bit.

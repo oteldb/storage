@@ -206,7 +206,7 @@ func (w *StreamWriter) AddColumn(c Column) error {
 		return errors.Errorf("block: column %q: kind %s is not streamable; use PartWriter", c.Name, c.Kind)
 	}
 
-	sc.setIndependentGroups()
+	sc.setIndependentGroups(w)
 
 	w.cols = append(w.cols, sc)
 
@@ -857,6 +857,11 @@ func (c *streamColumn) finishBytes() (retained, transient int64) {
 	const runBytes = 24
 
 	transient = max(c.blk.sealBytes(), c.alt.sealBytes())
+	if c.variable && c.blk != nil {
+		sizing := ColumnSizing{NumFrames: int64(len(c.blk.frameGranules) + 1), NumGranules: int64(len(c.blk.gLens) + 1)}
+		n := compactDirBound(sizing, c.timeBounds)
+		transient = max(transient, 2*n+c.blk.dirComp.CompressTransient(int(n), false)+c.blk.dirComp.EncodeWorkspace())
+	}
 	if c.codec == chunk.CodecFloatGroups {
 		transient = max(transient, int64(len(c.stageF64))*64)
 	}
@@ -1020,12 +1025,14 @@ func (c *streamColumn) finish(ctx context.Context, granuleSize int, sizing bool)
 	}
 
 	desc.Footer = acc.streams()
+	acc.compactDir = sizing
 
 	obj, n, err := acc.finish(ctx, granuleSize, nil)
 	if err != nil {
 		return ColumnDesc{}, nil, 0, err
 	}
 
+	desc.CompactDir = acc.packedDir
 	if sizing {
 		desc.HasSizing, desc.Sizing = true, acc.sizing()
 	}
@@ -1097,8 +1104,10 @@ func appendFloat64Granule(dst []byte, codec chunk.Codec, budget uint8, vals []fl
 // they all are — is written after them as a footer. Either way the directory itself stays in memory:
 // it is two integers per frame and one per granule, kilobytes against a column of hundreds of MiB.
 type blockAccum struct {
-	comp          *compress.Compressor
-	compressBytes int
+	compactDir, packedDir bool
+	comp                  *compress.Compressor
+	dirComp               *compress.Compressor
+	compressBytes         int
 
 	frames [][]byte // retained frames; empty once a sink is attached
 	// Per sealed frame: its granule count and its compressed byte length. Kept apart from frames
@@ -1395,7 +1404,17 @@ func (a *blockAccum) encodeDir(blockRows int) []byte {
 			}
 		}
 	}
-	return binary.LittleEndian.AppendUint32(dir, crc32.Checksum(dir, castagnoli))
+	dir = binary.LittleEndian.AppendUint32(dir, crc32.Checksum(dir, castagnoli))
+	a.packedDir = false
+	if a.variable && a.compactDir {
+		packed := binary.AppendUvarint(nil, uint64(len(dir)))
+		packed = a.dirComp.Compress(packed, dir)
+		if len(packed)+dirCRCBytes < len(dir) {
+			a.packedDir = true
+			return binary.LittleEndian.AppendUint32(packed, crc32.Checksum(packed, castagnoli))
+		}
+	}
+	return dir
 }
 
 func (c *streamColumn) groupCost(data []byte) int {

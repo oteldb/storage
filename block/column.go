@@ -1087,7 +1087,7 @@ func (r *ColumnReader) blockDir() (blockDir, error) {
 		object = r.sharedRest
 	}
 
-	return parseBlockDirWith(object, r.desc, r.limits)
+	return parseBlockDirUsing(object, r.desc, r.limits, r.comp)
 }
 
 // sharedEntries returns the column's shared dictionary, parsed once. A leading dictionary's

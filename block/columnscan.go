@@ -77,7 +77,11 @@ func (r *PartReader) ScanBound(ctx context.Context, name string, window int64) (
 
 	n := 4 * (3*sz.NumFrames + 1 + 3*sz.NumGranules)
 	n += desc.DictRaw + (binary.MaxVarintLen32+24)*desc.DictEntries
+	if desc.CompactDir {
+		open += compactDirOpenBytes(desc)
+	}
 	if desc.MaxBlockRows > 0 {
+		n -= 12 * sz.NumGranules
 		n += 8 * (sz.NumGranules + 1)
 	}
 	if desc.TimeBounds {

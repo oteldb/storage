@@ -120,7 +120,9 @@ const (
 	xVariable   byte = 1 << 2
 	xTimeBounds byte = 1 << 3
 
-	xKnown = xTrailerDict | xSizing | xVariable | xTimeBounds
+	xCompactDir byte = 1 << 4
+
+	xKnown = xTrailerDict | xSizing | xVariable | xTimeBounds | xCompactDir
 )
 
 // maxSharedDictRaw is the format ceiling on a shared dictionary's decompressed size. Writers clamp
@@ -210,6 +212,9 @@ type ColumnDesc struct {
 	// decompressed size and DictEntries its entry count; all four are zero otherwise.
 	TrailerDict                            bool
 	DictOff, DictLen, DictRaw, DictEntries int64
+
+	// CompactDir stores a bounded compressed directory for independent numeric chunks.
+	CompactDir bool
 
 	// HasSizing reports that Sizing is set, which a writer given [WithSizingStats] does for every
 	// column with an object.
@@ -317,6 +322,9 @@ func (c *ColumnDesc) xflags() byte {
 	}
 	if c.TimeBounds {
 		x |= xTimeBounds
+	}
+	if c.CompactDir {
+		x |= xCompactDir
 	}
 	if c.TrailerDict {
 		x |= xTrailerDict

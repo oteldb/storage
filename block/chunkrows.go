@@ -8,6 +8,7 @@ import (
 
 	"github.com/oteldb/storage/encoding/bitstream"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/encoding/compress"
 )
 
 func (d blockDir) span(blk, rows int) (int, int) {
@@ -162,14 +163,16 @@ func (w *StreamWriter) checkIndependentColumn(c Column) error {
 	return nil
 }
 
-func (c *streamColumn) setIndependentGroups() {
+func (c *streamColumn) setIndependentGroups(w *StreamWriter) {
 	if !c.variable || c.blk == nil {
 		return
 	}
+	c.blk.dirComp = w.compressorFor(compress.AlgorithmLZ4)
 	c.blk.variable = true
 	c.blk.timeBounds = c.timeBounds
 	if c.alt != nil {
 		c.alt.variable = true
+		c.alt.dirComp = c.blk.dirComp
 	}
 }
 
@@ -204,6 +207,12 @@ func (c *ColumnDesc) decodeChunkOptions(r *bitstream.Reader, x byte) error {
 		if err := c.decodeVariableRows(r); err != nil {
 			return err
 		}
+	}
+	if x&xCompactDir != 0 {
+		if c.MaxBlockRows == 0 {
+			return errors.Wrap(ErrCorrupt, "compact directory requires variable chunks")
+		}
+		c.CompactDir = true
 	}
 	if x&xTimeBounds != 0 {
 		if c.MaxBlockRows == 0 || c.Kind != KindInt64 {
