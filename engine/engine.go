@@ -1236,7 +1236,7 @@ func collectMany(
 		}
 
 		if rival && leadTs == rivalTs {
-			v, w, tag, mixed := foldTie(runs, layouts, cur, leadTs)
+			v, w, tag, mixed := foldTie(runs, layouts, cur, leadTs, tags != nil)
 			if mixed {
 				*ambiguous++
 			}
@@ -1698,6 +1698,7 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 	}
 	e.flushing = nil
 	e.head.detachedBytes = 0
+	e.head.detachedKnown = false
 	if err == nil {
 		err = e.checkpointLocked(checkpointSeq)
 	}

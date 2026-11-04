@@ -345,20 +345,37 @@ func cohortRun(
 func cohortRunLimited(
 	cohorts []mergeCohort, readable []*part, opts MergeOptions, capBytes int64, idle int, start uint64, maxInputs int,
 ) (selected []*part, tiers, dropped []DownsampleTier) {
-	newest := newestSample(readable)
+	selection := cohortRunPlanLimited(cohorts, readable, opts, capBytes, idle, start, maxInputs)
+	return selection.parts, selection.tiers, selection.conflicting
+}
 
+func cohortRunPlanLimited(
+	cohorts []mergeCohort, readable []*part, opts MergeOptions, capBytes int64, idle int, start uint64, maxInputs int,
+) boundedMergeSelection {
+	newest := newestSample(readable)
+	var dropped []DownsampleTier
 	for i := range cohorts {
 		c := &cohorts[(start+uint64(i))%uint64(len(cohorts))]
-
 		o := opts
 		o.Downsample, dropped = resolvePolicy(c.history, readable, opts.Downsample)
-
-		if sel := selectMergePartsBeforeLimited(c.parts, o, capBytes, idle, newest, maxInputs); len(sel) > 0 {
-			return sel, o.Downsample, dropped
+		remaining := c.parts
+		for len(remaining) > 0 {
+			seed := selectMergePartsBeforeLimited(remaining, o, capBytes, idle, newest, maxInputs)
+			if len(seed) == 0 {
+				break
+			}
+			selected, tiers, closure := closeRollupSelection(seed, c.parts, readable, o, maxInputs)
+			if len(selected) > 0 {
+				outputCap := capBytes
+				if closure {
+					outputCap = 0
+				}
+				return boundedMergeSelection{parts: selected, tiers: tiers, conflicting: dropped, capBytes: outputCap}
+			}
+			remaining = slices.DeleteFunc(slices.Clone(remaining), func(p *part) bool { return slices.Contains(seed, p) })
 		}
 	}
-
-	return nil, nil, dropped
+	return boundedMergeSelection{conflicting: dropped, capBytes: capBytes}
 }
 
 // rollupPlan is the downsampling a merge applies and the marker its outputs record.
@@ -430,7 +447,11 @@ func mergeLayout(src []*part, tiers []DownsampleTier) []DownsampleTier {
 	var layout []DownsampleTier
 
 	for _, p := range src {
-		layout = append(layout, p.rollup...)
+		for _, tier := range p.rollup {
+			if p.minTime < tier.Before {
+				layout = append(layout, tier)
+			}
+		}
 	}
 
 	return compactLayout(append(layout, tiers...))

@@ -2,12 +2,12 @@ package engine_test
 
 import (
 	"math"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -29,8 +29,7 @@ const rerollOps = uint8(opSwitchAgg) + 1
 
 // oracleMode widens what [runRerollOracle] may do.
 type oracleMode struct {
-	// dups lets a write repeat one not yet merged, value included, as an exporter retry does, and
-	// runs merges under a cap that rolls parts one at a time, so the two copies can be rolled apart.
+	// dups repeats unmerged writes as exporter retries, with a tiny cap that exercises bucket closure.
 	dups bool
 	// mixedAggs lets the policy switch to another Agg between merges.
 	mixedAggs bool
@@ -58,28 +57,7 @@ func runRerollOracle(t *testing.T, agg signal.Aggregation, ops []byte, mode orac
 			engine.DownsampleTier{Before: rerollBase + dayNanos, Interval: 5 * min1})
 	}
 
-	var (
-		recorded       signal.Aggregation
-		hasRecorded    bool
-		recordedCoarse bool
-		flushedData    bool
-	)
-
-	// applied notes what a merge under agg with the given width records: the first Agg a merge rolls
-	// data with is the only one ever applied.
-	applied := func(agg signal.Aggregation, wide bool) {
-		if !flushedData {
-			return
-		}
-
-		if !hasRecorded {
-			recorded, hasRecorded = agg, true
-		}
-
-		if agg == recorded && wide {
-			recordedCoarse = true
-		}
-	}
+	var recorded []engine.DownsampleTier
 
 	r := newRerollEngine(t)
 	// The ladder leaves the newest day open; a sample two days on closes the one under test.
@@ -96,8 +74,25 @@ func runRerollOracle(t *testing.T, agg signal.Aggregation, ops []byte, mode orac
 	}
 
 	mergeOp := func(opts engine.MergeOptions) {
+		allowed := append([]engine.DownsampleTier(nil), recorded...)
+		for _, tier := range opts.Downsample {
+			compatible := true
+			for _, prior := range recorded {
+				compatible = compatible && prior.Agg == tier.Agg && (prior.Interval%tier.Interval == 0 || tier.Interval%prior.Interval == 0)
+			}
+			if compatible {
+				allowed = append(allowed, tier)
+			}
+		}
 		r.merge(opts)
-
+		next := r.e.RecordedTiers()
+		for _, tier := range next {
+			require.Truef(t, slices.ContainsFunc(allowed, func(a engine.DownsampleTier) bool {
+				return a.Agg == tier.Agg && a.Interval == tier.Interval && tier.Before <= a.Before
+			}),
+				"recorded tier %+v exceeds prior/requested compatible tiers %+v", tier, allowed)
+		}
+		recorded = next
 		for ts := range written {
 			merged[ts] = true
 		}
@@ -124,12 +119,9 @@ func runRerollOracle(t *testing.T, agg signal.Aggregation, ops []byte, mode orac
 			}
 		case opFlush:
 			r.flush()
-			flushedData = flushedData || len(written) > 0
 		case opMergeFine:
-			applied(agg, false)
 			mergeOp(fine(agg))
 		case opMergeCoarse:
-			applied(agg, true)
 			mergeOp(coarse(agg))
 		case opMergePlain:
 			mergeOp(engine.MergeOptions{})
@@ -143,25 +135,21 @@ func runRerollOracle(t *testing.T, agg signal.Aggregation, ops []byte, mode orac
 	r.flush()
 	r.e.SetMergeCeilingBytes(0)
 
-	flushedData = flushedData || len(written) > 0
-	applied(agg, true)
-
 	settle := coarse(agg)
 	settle.Force = true
-
-	if hasRecorded {
-		agg = recorded
+	want := append([]engine.DownsampleTier(nil), recorded...)
+	for _, tier := range settle.Downsample {
+		compatible := true
+		for _, prior := range recorded {
+			compatible = compatible && prior.Agg == tier.Agg && (prior.Interval%tier.Interval == 0 || tier.Interval%prior.Interval == 0)
+		}
+		if compatible {
+			want = append(want, tier)
+		}
 	}
-
-	want := fine(agg)
-	if recordedCoarse {
-		want = coarse(agg)
-	}
-
-	width := want.Downsample[len(want.Downsample)-1].Interval
 
 	for range 16 {
-		r.merge(settle)
+		mergeOp(settle)
 	}
 
 	wantParts := 1 // the anchor
@@ -171,14 +159,14 @@ func runRerollOracle(t *testing.T, agg signal.Aggregation, ops []byte, mode orac
 
 	require.Equal(t, wantParts, r.e.PartCount(), "the day under test compacts to one part")
 
-	wantTs, wantVals := oneRollup(r.raw, want.Downsample, 0)
+	wantTs, wantVals := oneRollup(r.raw, want, 0)
 
 	got := fetchAll(t, r.e, fetch.Request{Start: -1 << 62, End: 1 << 62, Matchers: []fetch.Matcher{eqMatcher("job", "api")}})
 	require.Len(t, got, 1)
 	require.Equal(t, wantTs, got[0].Timestamps, "timestamps")
 
 	tol := 0.0
-	if agg == signal.AggSum || agg == signal.AggAvg {
+	if slices.ContainsFunc(want, func(t engine.DownsampleTier) bool { return t.Agg == signal.AggSum || t.Agg == signal.AggAvg }) {
 		vals := make([]float64, len(r.raw))
 		for i, s := range r.raw {
 			vals[i] = s.v
@@ -189,14 +177,22 @@ func runRerollOracle(t *testing.T, agg signal.Aggregation, ops []byte, mode orac
 
 	population := map[int64]float64{}
 	for ts := range written {
-		population[ts-ts%width]++
+		width := int64(0)
+		for _, tier := range want {
+			if ts < tier.Before && tier.Interval > width {
+				width = tier.Interval
+			}
+		}
+		if width > 0 {
+			population[ts-ts%width]++
+		}
 	}
 
 	for i, v := range got[0].Values {
 		require.InDelta(t, wantVals[i], v, tol, "value at %d", got[0].Timestamps[i])
 
 		wantW := 1.0
-		if agg == signal.AggAvg && got[0].Timestamps[i] < rerollBase+dayNanos {
+		if slices.ContainsFunc(want, func(t engine.DownsampleTier) bool { return t.Agg == signal.AggAvg && got[0].Timestamps[i] < t.Before }) {
 			wantW = population[got[0].Timestamps[i]]
 		}
 
@@ -277,16 +273,12 @@ func FuzzRerollOracle(f *testing.F) {
 	})
 }
 
-// rolledApartIssue gates the reproducers of copies of one sample rolled up by separate merges.
-const rolledApartIssue = 739
-
 // TestRerollOracleDuplicates is [TestRerollOracle] where a sample is written twice before either copy
-// is merged, and the copies land in parts a capped merge rolls one at a time.
+// is merged; capped selection must still combine their bucket before rolling.
 func TestRerollOracleDuplicates(t *testing.T) {
-	reproduce.Unfixed(t, rolledApartIssue, "two representatives of copies of one sample, rolled apart, fold as two samples")
 	t.Parallel()
 
-	// Two copies of each sample in separate parts, then capped merges roll each part on its own.
+	// Both copies must be consumed before any representative erases their raw timestamp identity.
 	ops := []byte{0, 1, 0, 2, 1, 3, 2, 0, 0, 1, 0, 2, 1, 3, 2, 0, 3, 0, 3, 0, 3, 0, 3, 0}
 
 	for _, agg := range []signal.Aggregation{
@@ -304,10 +296,11 @@ func TestRerollOracleDuplicates(t *testing.T) {
 func FuzzRerollOracleDuplicates(f *testing.F) {
 	f.Add(uint8(4), []byte{0, 1, 0, 2, 1, 3, 2, 0, 0, 1, 0, 2, 1, 3, 2, 0, 3, 0, 3, 0, 3, 0, 3, 0})
 	f.Add(uint8(6), []byte{0, 5, 2, 0, 0, 5, 2, 0, 3, 0, 3, 0})
+	f.Add(uint8(signal.AggAvg), []byte{0, 48, 2, 0, 0, 3, 0, 3})
+	f.Add(uint8(signal.AggSum), []byte{0, 1, 2, 0, 0, 1, 3, 0})
+	f.Add(uint8(157), []byte{0, 48, 2, 0, 0, 48, 3, 0, 6, 48})
 
 	f.Fuzz(func(t *testing.T, aggByte uint8, ops []byte) {
-		reproduce.Unfixed(t, rolledApartIssue, "two representatives of copies of one sample, rolled apart, fold as two samples")
-
 		if len(ops) > 64 {
 			ops = ops[:64]
 		}

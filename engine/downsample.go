@@ -43,7 +43,8 @@ type MergeOptions struct {
 	// selecting nothing — the operator escape from a fixed point where every run scores below
 	// [minMergeMultiplier] and the engine would sit on its part count until the idle waiver fires.
 	// It bypasses the selection heuristic only: the seal threshold and the run's cumulative-bytes
-	// cap still bound what one merge reads, writes, and holds.
+	// cap still bound plain compaction. Bucket-closed rollups can relax the disk cap; input-count
+	// and resident-memory admission still bound the work.
 	Force bool
 
 	retentionNow time.Time

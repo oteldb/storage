@@ -54,9 +54,9 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 // commitIndexLocked is [Engine.updateIndexLocked] for an operation that began under ownership term
 // stamp. Every attempt first passes the tenure fence ([Engine.tenureLocked]), so a writer displaced
 // while the operation ran — or one a rebase shows a later tenure has overtaken — commits nothing.
-// guard, when non-nil, runs after each rebase: an error from it abandons the commit, since the
-// rival's parts it adopted may be ones the caller's own must not be committed beside. Caller holds
-// e.mu.
+// A guard runs before each attempt and after rebases, retaining writer ownership through the CAS
+// so acknowledged head admissions cannot invalidate a rollup after validation. Readers proceed.
+// Unguarded publications admit ingestion during I/O. Caller holds e.mu.
 func (e *Engine) commitIndexLocked(ctx context.Context, parts []*part, epoch, stamp uint64, guard func() error) error {
 	if e.cfg.Backend == nil {
 		return nil
@@ -71,7 +71,12 @@ func (e *Engine) commitIndexLocked(ctx context.Context, parts []*part, epoch, st
 			return err
 		}
 
-		landed, err := e.commitOnceLocked(ctx, parts, epoch)
+		if guard != nil {
+			if err := guard(); err != nil {
+				return err
+			}
+		}
+		landed, err := e.commitOnceLocked(ctx, parts, epoch, guard != nil)
 		if err != nil || landed {
 			return err
 		}
@@ -93,14 +98,20 @@ func (e *Engine) commitIndexLocked(ctx context.Context, parts []*part, epoch, st
 
 // commitOnceLocked makes one conditional write of the index this engine would commit now, reporting
 // whether it landed; a lost race is not an error. Caller holds e.mu.
-func (e *Engine) commitOnceLocked(ctx context.Context, parts []*part, epoch uint64) (bool, error) {
+func (e *Engine) commitOnceLocked(ctx context.Context, parts []*part, epoch uint64, guarded bool) (bool, error) {
 	ix := e.nextIndexLocked(ctx, parts, epoch)
 
 	var version backend.Version
-	err := e.mu.WithWriters(func() (err error) {
+	save := func() (err error) {
 		version, err = indexcommit.Save(ctx, ix, e.cfg.Backend, e.indexKey(), e.indexVersion)
 		return err
-	})
+	}
+	var err error
+	if guarded {
+		err = e.mu.WithReaders(save)
+	} else {
+		err = e.mu.WithWriters(save)
+	}
 	if err != nil {
 		if errors.Is(err, bucketindex.ErrConflict) {
 			return false, nil
@@ -1007,7 +1018,7 @@ func (e *Engine) establishTenureLocked(ctx context.Context) error {
 		return err
 	}
 
-	landed, err := e.commitOnceLocked(ctx, e.parts, e.flushedEpoch)
+	landed, err := e.commitOnceLocked(ctx, e.parts, e.flushedEpoch, false)
 	if err != nil {
 		e.cfg.Obs.Corruption.EstablishFailed(ctx, metricSignal, obs.EstablishUnavailable)
 

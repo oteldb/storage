@@ -81,12 +81,9 @@ func TestEntryLayoutFilledFromTheManifest(t *testing.T) {
 	}
 }
 
-// TestUnknownLayoutOfAnUnreadablePartIsRaw: an adopted entry that records no layout and whose part
-// cannot be opened is legacy, and counts as raw — it never aborts a commit. Aborting would stall the
-// merge for good, since only reading the manifest could ever fill the layout in. What it costs is a
-// layout check against that one part, which only an index written before layouts were carried can
-// lack.
-func TestUnknownLayoutOfAnUnreadablePartIsRaw(t *testing.T) {
+// TestUnknownLayoutOfAnUnreadablePartBlocksRollup: an unreadable adopted part may contain raw
+// duplicates, so its time range must participate in bucket closure even without a recorded layout.
+func TestUnknownLayoutOfAnUnreadablePartBlocksRollup(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -125,5 +122,5 @@ func TestUnknownLayoutOfAnUnreadablePartIsRaw(t *testing.T) {
 		sum = sum || ent.Rollup != nil && len(ent.Rollup.Tiers) > 0 && ent.Rollup.Tiers[0].Agg == uint8(signal.AggSum)
 	}
 
-	assert.True(t, sum, "b's rollup committed: the unknown layout did not abort it")
+	assert.False(t, sum, "the unavailable overlapping input prevents rolling the bucket")
 }

@@ -850,19 +850,36 @@ carrying the value; value 1 with weight = count reads as 1 to anything unweighte
 samples keep freshest-wins, so a re-appended duplicate and the recent tier's copy of a flushed sample
 dedup as before. Where a representative takes part, the representatives combine by their recorded
 Agg and the freshest raw sample folds in as one more sample: two parts can each hold a representative
-of one bucket start (a bucket split by a merge cap, `maxParts`, or rolled on either side of a
-straddler), and a late sample can land on one. Freshest-wins would drop the other's data. Runs fold
+of one bucket start (a bucket split into outputs, or separately rolled by an older writer), and
+a late sample can land on one. Freshest-wins would drop the other's data. Runs fold
 newest first, so a First or Last tie goes to the freshest sample. The read path folds through the same
 `collectMany`, so a query over unmerged parts returns what the merge that joins them stores. Only
 equal timestamps fold on read: anchored representatives of one bucket split across parts are real
 samples and read as two until a merge joins them.
 
 Folding has no per-sample provenance, so it cannot tell two copies of one sample from two samples.
-- Two raw parts holding copies of one sample, an exporter retry for example, that are rolled by
-  separate merges (a merge cap or `maxParts` splitting the parts due in a bucket) fold as two
-  samples: Sum, Avg and Count count the copy twice. Merged together they dedup first. This is #739,
-  whose reproducers are gated. The fix is to roll a bucket only in a merge that holds every part
-  overlapping it.
+- Raw copies deduplicate before a bucket rolls. A rollup selection expands through overlapping
+  rollup buckets, including sealed parts and straddlers, rather than stopping at a ladder boundary.
+  It retains the input-count and resident-memory limits but relaxes the disk-byte cap for this
+  bounded streamed work. Each tier's cutoff stops at its first bucket with an unselected input.
+  Markers exclude source tiers inactive over that source, so a raw fragment cannot relabel another
+  source. Partial raw selections compact without rolling; already rolled inputs can compact unchanged at
+  their recorded layout. Both reduce the input count until the bucket can close, instead of
+  repeatedly rewriting a blocked singleton. Numeric sources keep source order for freshest-wins.
+- Closure includes adopted and unreadable entries, unresolved repair obligations, and admitted
+  active/frozen-head bounds. An unflushed copy cannot be excluded merely because its part is not
+  published yet. Buffered minima track successful admission and survive detach/rollback; trimming
+  recomputes them, while the recent mirror is already covered by its parts. A want with
+  unknown bounds blocks every rollup range until repaired or acknowledged lost. A merge commits
+  only while its selected inputs remain live and no new local/rival part or admitted head range
+  overlaps a bucket it planned to roll. Learning an adopted entry's layout also reruns the compatibility check.
+  Rollup CAS retains the writer gate after validation, while admitting readers; ordinary raw
+  compaction and flush still admit ingestion during catalog I/O. This narrow serialization prevents
+  a durable append between closure validation and publication.
+  This is a planning/publication snapshot, not a permanent bucket seal: late raw copies arriving
+  after a bucket rolled still lack provenance and can double-count, as can duplicates already
+  rolled separately by older writers. The lateness policy and planned ingestion dedup govern
+  those cases; compaction cannot reconstruct their erased raw identities.
 - A part holding the same rolled data as another would add Sum and Count twice; repair never commits
   a part beside ancestors it duplicates.
 - The recent tier mirrors raw samples that may since have been rolled up. A merge that publishes

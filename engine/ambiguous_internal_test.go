@@ -23,7 +23,7 @@ func TestReadTieAmbiguousIsReported(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	minute, step := int64(time.Minute), 10*int64(time.Second)
+	step := 10 * int64(time.Second)
 	count := MergeOptions{Downsample: countTiers(1<<62, time.Minute)}
 	b := backend.Memory()
 
@@ -31,12 +31,18 @@ func TestReadTieAmbiguousIsReported(t *testing.T) {
 	flushEvery(t, e, 0, 3*step, step, 1)
 	require.NoError(t, e.MergeWith(ctx, count))
 
-	e.cfg.MergeCeilingBytes = 1
-	flushEvery(t, e, 3*step, minute, step, 1)
-	require.NoError(t, e.MergeWith(ctx, count))
-	require.Equal(t, 2, e.PartCount(), "each half rolled on its own")
-
-	rewriteRollup(t, b, oldPart(t, e).prefix, rollupMarker(sumTiers(1<<62, time.Minute)))
+	first := e.parts[0].prefix
+	// Restore a legacy snapshot with separately rolled representatives at one bucket start.
+	_, err := e.Append(rollupSeries(), 0, 3)
+	require.NoError(t, err)
+	require.NoError(t, e.Flush(ctx))
+	require.Equal(t, 2, e.PartCount())
+	for _, p := range e.parts {
+		if p.prefix != first {
+			rewriteRollup(t, b, p.prefix, rollupMarker(count.Downsample))
+		}
+	}
+	rewriteRollup(t, b, first, rollupMarker(sumTiers(1<<62, time.Minute)))
 
 	reader := sdkmetric.NewManualReader()
 	o, err := obs.New(obs.Config{MeterProvider: sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))})

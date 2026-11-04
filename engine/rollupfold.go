@@ -89,7 +89,7 @@ func appendTags(tags []rollupTag, r *tsRun, layout []DownsampleTier, lo, hi, n, 
 // Aggs, from parts written under different policies; it folds only those of the smallest Agg and
 // reports mixed, so the caller can say a cohort was left out. The pick depends on nothing but the
 // samples, so the read stays the same whichever parts merges combine meanwhile.
-func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64) (v, w float64, tag rollupTag, mixed bool) {
+func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64, normalizeRaw bool) (v, w float64, tag rollupTag, mixed bool) {
 	var (
 		raw    = -1
 		reps   int
@@ -118,8 +118,9 @@ func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64) (v, 
 	}
 
 	if reps == 0 {
-		v, w = runs[raw].vals[cur[raw]], runs[raw].weight(cur[raw])
-		advanceTie(runs, cur, ts)
+		k := rawTieAt(&runs[raw], cur[raw], ts, normalizeRaw)
+		v, w = runs[raw].vals[k], runs[raw].weight(k)
+		advanceTie(runs, cur, ts, normalizeRaw)
 
 		return v, w, rollupTag{}, false
 	}
@@ -144,21 +145,35 @@ func foldTie(runs []tsRun, layouts [][]DownsampleTier, cur []int, ts int64) (v, 
 				tag = t
 			}
 		case t.interval == 0 && i == raw:
+			k = rawTieAt(r, k, ts, normalizeRaw)
 			acc.add(ts, r.vals[k], r.weight(k))
 		}
 	}
 
-	advanceTie(runs, cur, ts)
+	advanceTie(runs, cur, ts, normalizeRaw)
 
 	_, v, w = acc.result(ts)
 
 	return v, w, tag, mixed
 }
 
-func advanceTie(runs []tsRun, cur []int, ts int64) {
+func rawTieAt(r *tsRun, at int, ts int64, normalize bool) int {
+	if !normalize {
+		return at
+	}
+	for at+1 < len(r.ts) && r.ts[at+1] == ts {
+		at++
+	}
+	return at
+}
+
+func advanceTie(runs []tsRun, cur []int, ts int64, normalizeRaw bool) {
 	for i := range runs {
-		if cur[i] < len(runs[i].ts) && runs[i].ts[cur[i]] == ts {
+		for cur[i] < len(runs[i].ts) && runs[i].ts[cur[i]] == ts {
 			cur[i]++
+			if !normalizeRaw {
+				break
+			}
 		}
 	}
 }
@@ -207,6 +222,25 @@ func repBucketShared(ts []int64, tags []rollupTag) bool {
 // representatives the sources recorded rather than re-aggregating them as raw samples.
 func rollSeries(m *sampleMerge, tiers []DownsampleTier) (ts []int64, values, sf []float64, covered []int64) {
 	ts, values, sf, tags := m.collectTagged()
-
-	return downsampleCovering(ts, values, sf, tags, tiers)
+	n := 0
+	for i, t := range ts {
+		if i+1 < len(ts) && t == ts[i+1] && tagAt(tags, i).interval == 0 && tagAt(tags, i+1).interval == 0 {
+			continue
+		}
+		ts[n], values[n] = t, values[i]
+		if sf != nil {
+			sf[n] = sf[i]
+		}
+		if tags != nil {
+			tags[n] = tags[i]
+		}
+		n++
+	}
+	if sf != nil {
+		sf = sf[:n]
+	}
+	if tags != nil {
+		tags = tags[:n]
+	}
+	return downsampleCovering(ts[:n], values[:n], sf, tags, tiers)
 }

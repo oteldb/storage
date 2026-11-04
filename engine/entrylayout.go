@@ -48,25 +48,47 @@ func (e *Engine) foreignLayoutLocked(ent *bucketindex.Entry) []DownsampleTier {
 	return entryTiers(ent.Rollup)
 }
 
-// unopenedLayoutsLocked stands in, by the layout its entry records, for each adopted part this engine
-// could not open, so a merge plans against a rival's layout it cannot read. A stand-in carries a
-// prefix, a time range and a layout and no reader: only the layout checks read it ([mergeCohorts],
-// [resolvePolicy], the commit's [rollupGuard]), never a decode or a selection. Caller holds e.mu.
+// unopenedLayoutsLocked supplies reader-less bounds and layouts for adopted parts and unresolved
+// losses. They constrain layout compatibility and rollup closure, never merge decoding. Caller holds e.mu.
 func (e *Engine) unopenedLayoutsLocked() []*part {
 	var out []*part
 
 	for i := range e.foreign {
 		ent := &e.foreign[i]
-		if _, open := e.foreignParts[ent.Prefix]; open || ent.Rollup == nil {
+		if _, open := e.foreignParts[ent.Prefix]; open {
 			continue
 		}
 
 		out = append(out, &part{
 			prefix: ent.Prefix, minTime: ent.MinTime, maxTime: ent.MaxTime,
-			rollup: entryTiers(ent.Rollup), rollupKnown: true,
+			rollup: entryTiers(ent.Rollup), rollupKnown: ent.Rollup != nil,
 		})
 	}
 
+	for _, wants := range [][]bucketindex.Want{e.wants, e.pendingWants, e.adoptedWants, e.pendingHoles} {
+		for i := range wants {
+			w := &wants[i]
+			lo, hi := w.MinTime, w.MaxTime
+			if lo == 0 && hi == 0 {
+				lo, hi = minInt64, maxInt64
+			}
+			out = append(out, &part{prefix: w.Prefix, minTime: lo, maxTime: hi})
+		}
+	}
+	if e.head != nil && e.head.bytes > 0 {
+		lo := minInt64
+		if e.head.bufferedKnown {
+			lo = e.head.bufferedMin
+		}
+		out = append(out, &part{prefix: "\x00head", minTime: lo, maxTime: e.head.newest})
+	}
+	if e.head != nil && e.head.detachedBytes > 0 {
+		lo := minInt64
+		if e.head.detachedKnown {
+			lo = e.head.detachedMin
+		}
+		out = append(out, &part{prefix: "\x00frozen", minTime: lo, maxTime: e.head.newest})
+	}
 	return out
 }
 

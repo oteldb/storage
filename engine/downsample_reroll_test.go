@@ -503,10 +503,9 @@ func TestRerollLateOverwrite(t *testing.T) {
 	}
 }
 
-// TestRerollReadFoldsRepresentatives: a query over two unmerged parts that each hold a representative
-// of one bucket start, and an unflushed raw sample on it, returns what the merge that joins them
-// stores: one rollup of the raw data.
-func TestRerollReadFoldsRepresentatives(t *testing.T) {
+// TestRerollStraddlerClosesExistingBucket: a straddler joins an existing representative before
+// rolling a shared bucket; a subsequent raw sample folds into the same result on read and merge.
+func TestRerollStraddlerClosesExistingBucket(t *testing.T) {
 	t.Parallel()
 
 	for _, agg := range []signal.Aggregation{signal.AggSum, signal.AggAvg, signal.AggCount} {
@@ -521,12 +520,12 @@ func TestRerollReadFoldsRepresentatives(t *testing.T) {
 			r.flush()
 			r.merge(opts)
 
-			// A straddler is rewritten alone, so this representative lands in a part of its own.
+			// The straddler includes the existing representative to close its shared bucket.
 			r.write(rerollBase-sec, 100)
 			r.write(rerollBase+3*hr, 5)
 			r.flush()
 			r.merge(opts)
-			require.Equal(t, 3, r.e.PartCount(), "two parts hold a representative at the bucket start")
+			require.Equal(t, 2, r.e.PartCount(), "the shared bucket closes while the previous day splits off")
 
 			r.write(rerollBase, 7)
 
@@ -550,11 +549,9 @@ func TestRerollReadFoldsRepresentatives(t *testing.T) {
 	}
 }
 
-// TestRerollAggChangeLateRolledAlone: after an Agg change, a late part in a range already rolled with
-// Sum is rolled on its own before it meets the Sum part. It is rolled with Sum, the recorded Agg, so
-// no part ever records Count beside it; and the Count tier is not applied past the recorded cutoff
-// either, so data there stays raw.
-func TestRerollAggChangeLateRolledAlone(t *testing.T) {
+// TestRerollAggChangeLateClosesBucket: a late part closes its bucket with the recorded Sum part.
+// A conflicting Count policy never relabels the representatives or rolls newer raw data.
+func TestRerollAggChangeLateClosesBucket(t *testing.T) {
 	t.Parallel()
 
 	sum := tiersOf(signal.AggSum, engine.DownsampleTier{Before: rerollBase + dayNanos, Interval: 6 * hr})
@@ -570,13 +567,13 @@ func TestRerollAggChangeLateRolledAlone(t *testing.T) {
 	r.flush()
 	r.merge(sum)
 
-	// A straddler is rewritten alone, so the late samples are rolled without the Sum part.
+	// A straddler joins the Sum part before rolling the late samples.
 	r.write(rerollBase-sec, 100)
 	r.write(rerollBase+3*hr, 4)
 	r.write(rerollBase+7*hr, 6)
 	r.flush()
 	r.merge(count)
-	require.Equal(t, 4, r.e.PartCount(), "the late part was rolled alone")
+	require.Equal(t, 3, r.e.PartCount(), "the late bucket closes with the Sum part")
 
 	count.RetainFrom = rerollBase
 	r.merge(count)
