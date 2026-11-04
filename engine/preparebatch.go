@@ -161,6 +161,9 @@ func (p *preparedBatch) admit(
 	h *head, id signal.SeriesID, ts int64, value, sf float64, oooWindow int64, limits AppendLimits,
 	materialize func() signal.Series,
 ) admitOutcome {
+	if limits.EnforceMinTimestamp && ts < limits.MinTimestamp {
+		return rejectRetention
+	}
 	g := &p.groups[p.current]
 	b := p.batch
 	k := g.staged

@@ -20,12 +20,14 @@ func (w *metricWriter) flush() error {
 	if len(w.buffer.ids) == 0 {
 		return nil
 	}
-	res, err := w.buffer.flush(w.run.eng)
+	res, err := w.buffer.flush(w.run.eng, engine.AppendLimits{MinTimestamp: w.run.floor.timestamp, EnforceMinTimestamp: w.run.floor.enabled})
 	if err != nil {
 		return err
 	}
 	w.rejected.ooo += int64(res.RejectedOOO)
+	w.rejected.retention += int64(res.RejectedRetention)
 	w.run.admit.record(int64(res.Accepted), int64(res.RejectedOOO), 0, 0)
+	w.run.admit.addRetention(int64(res.RejectedRetention))
 	w.store.pokeFlush(w.run.eng)
 	return nil
 }
@@ -46,6 +48,9 @@ func (w *metricWriter) write(b *metric.Batch) {
 	}
 	w.run, w.err = w.store.metricRunFor(w.run, tid)
 	if w.err != nil {
+		return
+	}
+	if w.run.floor.enabled && w.writeFiltered(b) {
 		return
 	}
 	if w.run.canBatch() && b.Len() <= metricAppendPoints {
@@ -124,6 +129,7 @@ func (w *metricWriter) appendSampled(b *metric.Batch, weights []float64, dropped
 	}
 
 	res, err := run.eng.AppendBatch(ids, tss, vals, sf, mat, engine.AppendLimits{
+		MinTimestamp: run.floor.timestamp, EnforceMinTimestamp: run.floor.enabled,
 		MaxSeries:        run.limits.MaxSeries,
 		MaxSeriesSoft:    run.limits.MaxSeriesSoft,
 		Overflow:         metricOverflow,
@@ -136,9 +142,11 @@ func (w *metricWriter) appendSampled(b *metric.Batch, weights []float64, dropped
 	}
 
 	w.rejected.ooo += int64(res.RejectedOOO)
+	w.rejected.retention += int64(res.RejectedRetention)
 	w.rejected.cardinality += int64(res.RejectedCardinality)
 	w.rejected.inflight += int64(res.RejectedBytes)
 	run.admit.record(int64(res.Accepted), int64(res.RejectedOOO), int64(res.RejectedCardinality), int64(res.RejectedBytes))
+	run.admit.addRetention(int64(res.RejectedRetention))
 
 	if res.Overflowed > 0 {
 		w.overflowed += int64(res.Overflowed)
@@ -146,4 +154,27 @@ func (w *metricWriter) appendSampled(b *metric.Batch, weights []float64, dropped
 	}
 
 	w.store.pokeFlush(run.eng)
+}
+
+func (w *metricWriter) writeFiltered(b *metric.Batch) bool {
+	expired := 0
+	for _, ts := range b.Ts {
+		if ts < w.run.floor.timestamp {
+			expired++
+		}
+	}
+	if expired == 0 {
+		return false
+	}
+	if w.err = w.flush(); w.err != nil {
+		return true
+	}
+	if !w.run.admit.allowRate(w.run.limits, int64(b.Len())*engine.SampleBytes, w.store.now()) {
+		w.rejected.rate += int64(b.Len())
+		w.run.admit.addRate(int64(b.Len()))
+		return true
+	}
+	weights, dropped := w.run.admit.sampleRetained(w.run.sampling, w.store.now(), b.IDs, b.Ts, w.run.floor)
+	w.appendSampled(b, weights, dropped)
+	return true
 }

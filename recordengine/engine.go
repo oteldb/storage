@@ -410,11 +410,22 @@ func (e *Engine) AppendBatch(b *Batch, limits AppendLimits) (AppendResult, error
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
 
+	expired := 0
+	if limits.EnforceMinTimestamp {
+		for _, ts := range b.Ts {
+			if ts < limits.MinTimestamp {
+				expired++
+			}
+		}
+		if expired == len(b.Ts) {
+			return AppendResult{RejectedRetention: expired}, nil
+		}
+	}
 	// Cardinality is a per-batch decision (a batch is one stream): if this stream is new and the
 	// head is at the cap, the whole batch is rejected and the stream is not registered.
 	isNew, ok := e.head.admitStream(b.Stream, limits.MaxSeries)
 	if !ok {
-		return AppendResult{RejectedCardinality: len(b.Ts)}, nil
+		return AppendResult{RejectedCardinality: len(b.Ts) - expired, RejectedRetention: expired}, nil
 	}
 
 	// The stream's identity is logged when the stream is registered — not when it first has an

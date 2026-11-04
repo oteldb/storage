@@ -144,6 +144,7 @@ func (s *Storage) writeRecordsLocal(
 		lastEng    *recordengine.Engine
 		lastAdmit  *tenantAdmission
 		lastLimits tenant.Limits
+		lastFloor  writeTimeFloor
 	)
 
 	emitted := project(func(b *recordengine.Batch) {
@@ -169,7 +170,9 @@ func (s *Storage) writeRecordsLocal(
 
 			lastTenant, lastEng = tid, eng
 			lastAdmit = s.admissionFor(tid)
-			lastLimits = s.tenant.Resolve(s.normalizeTenant(tid)).Limits
+			policy := s.tenant.Resolve(s.normalizeTenant(tid))
+			lastLimits = policy.Limits
+			lastFloor = s.writeTimeFloor(policy.Retention, sig)
 		}
 
 		// Admission (same valves as metrics, no sampling — dropping a log/span breaks a
@@ -186,6 +189,7 @@ func (s *Storage) writeRecordsLocal(
 		res, err := lastEng.AppendBatch(b, recordengine.AppendLimits{
 			MaxSeries:        lastLimits.MaxSeries,
 			MaxInFlightBytes: lastLimits.MaxInFlightBytes,
+			MinTimestamp:     lastFloor.timestamp, EnforceMinTimestamp: lastFloor.enabled,
 		})
 		if err != nil {
 			firstErr = err
@@ -194,9 +198,11 @@ func (s *Storage) writeRecordsLocal(
 		}
 
 		rej.ooo += int64(res.RejectedOOO)
+		rej.retention += int64(res.RejectedRetention)
 		rej.cardinality += int64(res.RejectedCardinality)
 		rej.inflight += int64(res.RejectedBytes)
 		lastAdmit.record(int64(res.Accepted), int64(res.RejectedOOO), int64(res.RejectedCardinality), int64(res.RejectedBytes))
+		lastAdmit.addRetention(int64(res.RejectedRetention))
 		s.pokeFlush(lastEng)
 	})
 
@@ -280,6 +286,7 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 	rej := rejectTally{rate: rateRejected - reserved, reserved: reserved}
 	for _, r := range rejects {
 		rej.ooo += int64(r.OOO)
+		rej.retention += int64(r.Retention)
 		rej.cardinality += int64(r.Cardinality)
 		rej.inflight += int64(r.InFlight)
 	}
@@ -289,7 +296,7 @@ func (s *Storage) writeRecordsClustered(ctx context.Context, sig signal.Signal, 
 		keys[i] = r.key
 	}
 
-	primaryRejected := rej.ooo + rej.cardinality + rej.inflight
+	primaryRejected := rej.ooo + rej.cardinality + rej.inflight + rej.retention
 	failed := routeFailures(frames.Counts, keys, errs)
 	s.emitRouted(ctx, sig, int64(emitted-frames.Shed)-primaryRejected-failed, primaryRejected, failed)
 

@@ -13,6 +13,10 @@ const SampleBytes = 16
 // engine) so a consumer's hot-reloaded tenant policy takes effect on the next write. The engine
 // stays policy-agnostic — it sees only these numbers, never a tenant or a [tenant.Policy].
 type AppendLimits struct {
+	// MinTimestamp is the inclusive timestamp floor when EnforceMinTimestamp is true.
+	MinTimestamp int64
+	// EnforceMinTimestamp enables the floor, including zero or negative timestamps.
+	EnforceMinTimestamp bool
 	// MaxSeries caps the number of distinct series buffered in the head. A sample that would
 	// register a new series once the head already holds MaxSeries is rejected (cardinality
 	// backpressure); samples for already-known series are unaffected. 0 ⇒ unlimited.
@@ -37,6 +41,7 @@ type AppendLimits struct {
 // accepted and how many were rejected, by reason, so the caller can attribute an OTLP
 // partial-success precisely.
 type AppendResult struct {
+	RejectedRetention   int // older than MinTimestamp
 	Accepted            int
 	RejectedOOO         int // older than the out-of-order window
 	RejectedCardinality int // would exceed AppendLimits.MaxSeries (a new series)
@@ -48,7 +53,7 @@ type AppendResult struct {
 
 // Rejected returns the total number of rejected samples across all reasons.
 func (r AppendResult) Rejected() int {
-	return r.RejectedOOO + r.RejectedCardinality + r.RejectedBytes
+	return r.RejectedOOO + r.RejectedCardinality + r.RejectedBytes + r.RejectedRetention
 }
 
 // with returns r with one more sample counted under out.
@@ -59,6 +64,8 @@ func (r AppendResult) with(out admitOutcome) AppendResult {
 	case admittedOverflow:
 		r.Accepted++
 		r.Overflowed++
+	case rejectRetention:
+		r.RejectedRetention++
 	case rejectOOO:
 		r.RejectedOOO++
 	case rejectCardinality:
@@ -76,6 +83,7 @@ type admitOutcome uint8
 const (
 	admitted admitOutcome = iota
 	rejectOOO
+	rejectRetention
 	rejectCardinality
 	rejectBytes
 	admittedOverflow // a new series past the soft budget routed to an overflow series

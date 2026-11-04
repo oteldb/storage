@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 
 	"github.com/go-faster/errors"
 
@@ -24,17 +25,20 @@ var ErrNotPrimary = errors.New("cluster: shard no longer held by this node")
 // shard, so every write for it lands here and the admission decision is made once.
 const PrimaryWritePath = "/internal/primary-write"
 
+const retentionRejectHeader = "Oteldb-Rejected-Retention"
+
 // Reject is the per-reason rejection breakdown a primary reports back to the write's origin, so
 // ingest can attribute OTLP partial-success exactly like the single-node path. The rate valve is
 // applied at the origin, so it is not carried here.
 type Reject struct {
+	Retention   int
 	OOO         int
 	Cardinality int
 	InFlight    int
 }
 
 // Total is how many records the primary rejected, for all reasons it reports.
-func (r Reject) Total() int { return r.OOO + r.Cardinality + r.InFlight }
+func (r Reject) Total() int { return r.OOO + r.Cardinality + r.InFlight + r.Retention }
 
 // PrimaryWriteFunc applies a write as the addressed shard's primary and returns what it rejected.
 // walBytes is the WAL-encoded run of records for the shard, framed by [EncodeWrite].
@@ -80,7 +84,10 @@ func PrimaryWriteHandler(fn PrimaryWriteFunc) http.Handler {
 			return
 		}
 
-		_, _ = fmt.Fprintf(w, "%d %d %d", rej.OOO, rej.Cardinality, rej.InFlight)
+		if rej.Retention > 0 {
+			w.Header().Set(retentionRejectHeader, strconv.Itoa(rej.Retention))
+		}
+		_, _ = fmt.Fprintf(w, "%d %d %d", rej.OOO+rej.Retention, rej.Cardinality, rej.InFlight)
 	})
 }
 
@@ -123,10 +130,5 @@ func SendPrimaryWrite(ctx context.Context, client *http.Client, addr string, pay
 		return Reject{}, errors.Errorf("cluster: primary %q returned %d: %s", addr, resp.StatusCode, bytes.TrimSpace(body))
 	}
 
-	var rej Reject
-	if _, err := fmt.Sscanf(string(bytes.TrimSpace(body)), "%d %d %d", &rej.OOO, &rej.Cardinality, &rej.InFlight); err != nil {
-		return Reject{}, errors.Wrap(err, "parse reject breakdown")
-	}
-
-	return rej, nil
+	return decodePrimaryReject(body, resp.Header.Get(retentionRejectHeader))
 }

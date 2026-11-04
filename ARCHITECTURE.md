@@ -347,3 +347,8 @@ replica before enabling the writer. The default layout remains the packed layout
 Per-tenant retention uses `tenant.Retention.PerSignal` for independent age overrides and byte bounds.
 Positive ages override the default; per-signal and pooled byte limits both apply. Policies resolve
 at runtime, with optional `Retention.Validate` for embedder validation.
+
+`WithRejectOutOfRetention` optionally rejects rows before append using the tenant signal's age;
+it defaults off. Metric points and attached exemplars resolve independently, and expired points
+do not consume lossy-sampling budget or register identities. Partial-success/observability report
+`out_of_retention`; primary responses preserve legacy total rejection counts.

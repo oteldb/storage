@@ -17,6 +17,7 @@ import (
 // valve tripped under load. Counts are cumulative since the store opened.
 type AdmissionStats struct {
 	Accepted            int64
+	RejectedRetention   int64 // older than the signal retention age
 	RejectedOOO         int64 // out of the out-of-order window
 	RejectedRate        int64 // over IngestBytesPerSecond
 	RejectedCardinality int64 // over MaxSeries
@@ -33,7 +34,7 @@ type AdmissionStats struct {
 
 // Rejected returns the total shed across all reasons.
 func (s AdmissionStats) Rejected() int64 {
-	return s.RejectedOOO + s.RejectedRate + s.RejectedCardinality + s.RejectedInFlight
+	return s.RejectedOOO + s.RejectedRate + s.RejectedCardinality + s.RejectedInFlight + s.RejectedRetention
 }
 
 // tokenBucket is a byte-rate limiter: tokens (bytes) accrue at ratePerSec up to burst, and a
@@ -95,6 +96,7 @@ type tenantAdmission struct {
 
 	mu                  sync.Mutex
 	accepted            int64
+	rejectedRetention   int64
 	rejectedOOO         int64
 	rejectedRate        int64
 	rejectedCardinality int64
@@ -118,6 +120,20 @@ type tenantAdmission struct {
 // 1-second window from the prior window's observed rate, so the kept rate tracks the budget while
 // the weights keep counts/sums unbiased.
 func (a *tenantAdmission) sample(budgetPerSec, nowNs int64, ids []signal.SeriesID, ts []int64) (weights []float64, active bool) {
+	return a.sampleWithFloor(budgetPerSec, nowNs, ids, ts, writeTimeFloor{})
+}
+
+func (a *tenantAdmission) sampleWithFloor(
+	budgetPerSec, nowNs int64, ids []signal.SeriesID, ts []int64, floor writeTimeFloor,
+) (weights []float64, active bool) {
+	eligible := len(ids)
+	if floor.enabled {
+		for _, t := range ts {
+			if t < floor.timestamp {
+				eligible--
+			}
+		}
+	}
 	a.smu.Lock()
 	defer a.smu.Unlock()
 
@@ -130,7 +146,7 @@ func (a *tenantAdmission) sample(budgetPerSec, nowNs int64, ids []signal.SeriesI
 		a.winStart, a.winCount = nowNs, 0
 	}
 
-	a.winCount += int64(len(ids)) // every observed row feeds the next window's rate estimate
+	a.winCount += int64(eligible) // Expired points never feed the sampling rate estimate.
 
 	sf := a.winSF
 	if sf <= 1 {
@@ -139,6 +155,10 @@ func (a *tenantAdmission) sample(budgetPerSec, nowNs int64, ids []signal.SeriesI
 
 	weights = make([]float64, len(ids))
 	for i := range ids {
+		if floor.enabled && ts[i] < floor.timestamp {
+			weights[i] = 1
+			continue
+		}
 		if sampleHash(ids[i], ts[i])%uint64(sf) == 0 {
 			weights[i] = float64(sf) // kept; its weight represents the sf-1 dropped peers
 		}
@@ -160,7 +180,13 @@ func (a *tenantAdmission) sample(budgetPerSec, nowNs int64, ids []signal.SeriesI
 func (a *tenantAdmission) sampleBatch(
 	budgetPerSec, nowNs int64, ids []signal.SeriesID, ts []int64,
 ) (weights []float64, dropped int64) {
-	w, active := a.sample(budgetPerSec, nowNs, ids, ts)
+	return a.sampleBatchWithFloor(budgetPerSec, nowNs, ids, ts, writeTimeFloor{})
+}
+
+func (a *tenantAdmission) sampleBatchWithFloor(
+	budgetPerSec, nowNs int64, ids []signal.SeriesID, ts []int64, floor writeTimeFloor,
+) (weights []float64, dropped int64) {
+	w, active := a.sampleWithFloor(budgetPerSec, nowNs, ids, ts, floor)
 	if !active {
 		return nil, 0
 	}
@@ -187,6 +213,8 @@ func sampleHash(id signal.SeriesID, ts int64) uint64 {
 
 	return h
 }
+
+func (a *tenantAdmission) addRetention(n int64) { a.add(&a.rejectedRetention, n) }
 
 func (a *tenantAdmission) addRate(n int64) { a.add(&a.rejectedRate, n) }
 
@@ -234,6 +262,7 @@ func (a *tenantAdmission) stats() AdmissionStats {
 
 	return AdmissionStats{
 		Accepted:            a.accepted,
+		RejectedRetention:   a.rejectedRetention,
 		RejectedOOO:         a.rejectedOOO,
 		RejectedRate:        a.rejectedRate,
 		RejectedCardinality: a.rejectedCardinality,
@@ -324,6 +353,7 @@ func (s *Storage) emitAdmission(ctx context.Context, sig signal.Signal, accepted
 	name := sig.String()
 	a := s.obs.Admission
 	a.Accepted(ctx, accepted, name)
+	a.Rejected(ctx, rej.retention, name, reasonOutOfRetention)
 	a.Rejected(ctx, rej.ooo, name, reasonOutOfOrder)
 	a.Rejected(ctx, rej.rate, name, reasonRateLimit)
 	a.Rejected(ctx, rej.cardinality, name, reasonMaxSeries)
@@ -337,7 +367,7 @@ func (s *Storage) emitAdmission(ctx context.Context, sig signal.Signal, accepted
 	if total := rej.total(); total > 0 {
 		zctx.From(ctx).Warn("admission shed writes",
 			zap.String("signal", name), zap.Int64("rejected", total),
-			zap.Int64(reasonOutOfOrder, rej.ooo), zap.Int64(reasonRateLimit, rej.rate),
+			zap.Int64(reasonOutOfRetention, rej.retention), zap.Int64(reasonOutOfOrder, rej.ooo), zap.Int64(reasonRateLimit, rej.rate),
 			zap.Int64(reasonMaxSeries, rej.cardinality), zap.Int64(reasonMaxInFlightBytes, rej.inflight),
 			zap.Int64(reasonReservedTenant, rej.reserved))
 	}

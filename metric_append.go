@@ -48,8 +48,8 @@ func (b *metricAppendBuffer) series(i int) signal.Series {
 	return b.sources[r.source].Series(r.point)
 }
 
-func (b *metricAppendBuffer) flush(eng *engine.Engine) (engine.AppendResult, error) {
-	res, err := eng.AppendBatch(b.ids, b.ts, b.values, nil, b.series, engine.AppendLimits{})
+func (b *metricAppendBuffer) flush(eng *engine.Engine, limits engine.AppendLimits) (engine.AppendResult, error) {
+	res, err := eng.AppendBatch(b.ids, b.ts, b.values, nil, b.series, limits)
 	b.reset()
 	return res, err
 }

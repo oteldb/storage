@@ -1566,6 +1566,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 		lastAdmit    *tenantAdmission
 		lastLimits   tenantpkg.Limits
 		lastSampling int64
+		lastFloor    writeTimeFloor
 		haveTenant   bool
 
 		sampledDropped int64
@@ -1586,6 +1587,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 
 				pol := s.tenant.Resolve(tid)
 				lastLimits, lastSampling = pol.Limits, pol.Sampling.MaxRowsPerSecond
+				lastFloor = s.writeTimeFloor(pol.Retention, signal.Metric)
 			}
 
 			if !lastAdmit.allowRate(lastLimits, int64(b.Len())*engine.SampleBytes, s.now()) {
@@ -1598,7 +1600,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 			// here rather than on the primary: the primary is handed an already-framed payload, so
 			// which samples to keep is no longer its to decide. The weights ride to the primary in
 			// the frame itself (wal.WriteSamplesSF).
-			weights, dropped := lastAdmit.sampleBatch(lastSampling, s.now(), b.IDs, b.Ts)
+			weights, dropped := lastAdmit.sampleRetained(lastSampling, s.now(), b.IDs, b.Ts, lastFloor)
 			sampledDropped += dropped
 
 			return weights, true
@@ -1636,6 +1638,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 	rej := rejectTally{rate: rateRejected - reserved, reserved: reserved}
 	for _, r := range rejects {
 		rej.ooo += int64(r.OOO)
+		rej.retention += int64(r.Retention)
 		rej.cardinality += int64(r.Cardinality)
 		rej.inflight += int64(r.InFlight)
 	}
@@ -1645,7 +1648,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 		keys[i] = r.key
 	}
 
-	primaryRejected := rej.ooo + rej.cardinality + rej.inflight
+	primaryRejected := rej.ooo + rej.cardinality + rej.inflight + rej.retention
 	failed := routeFailures(frames.Counts, keys, errs)
 	s.emitRouted(ctx, signal.Metric,
 		int64(emitted-frames.Shed)-sampledDropped-primaryRejected-failed, primaryRejected, failed)
@@ -1700,7 +1703,9 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 
 	// Policy is per real tenant; in sharded-metric mode tenant is a shard key ({tenant}/_s{idx}).
 	tid := s.normalizeTenant(tenantOfShard(signal.TenantID(tenant)))
-	limits := s.tenant.Resolve(tid).Limits
+	policy := s.tenant.Resolve(tid)
+	limits := policy.Limits
+	floor := s.writeTimeFloor(policy.Retention, sig)
 
 	var (
 		accepted   []byte
@@ -1716,8 +1721,12 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 			var res engine.AppendResult
 			accepted, res, err = eng.ApplyPrimary(walBytes, engine.AppendLimits{
 				MaxSeries: limits.MaxSeries, MaxInFlightBytes: limits.MaxInFlightBytes,
+				MinTimestamp: floor.timestamp, EnforceMinTimestamp: floor.enabled,
 			})
-			rej = cluster.Reject{OOO: res.RejectedOOO, Cardinality: res.RejectedCardinality, InFlight: res.RejectedBytes}
+			rej = cluster.Reject{
+				Retention: res.RejectedRetention, OOO: res.RejectedOOO,
+				Cardinality: res.RejectedCardinality, InFlight: res.RejectedBytes,
+			}
 			admitted, overflowed = int64(res.Accepted), int64(res.Overflowed)
 			s.pokeFlush(eng)
 		}
@@ -1727,8 +1736,12 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 			var res recordengine.AppendResult
 			accepted, res, err = eng.ApplyPrimary(walBytes, recordengine.AppendLimits{
 				MaxSeries: limits.MaxSeries, MaxInFlightBytes: limits.MaxInFlightBytes,
+				MinTimestamp: floor.timestamp, EnforceMinTimestamp: floor.enabled,
 			})
-			rej = cluster.Reject{OOO: res.RejectedOOO, Cardinality: res.RejectedCardinality, InFlight: res.RejectedBytes}
+			rej = cluster.Reject{
+				Retention: res.RejectedRetention, OOO: res.RejectedOOO,
+				Cardinality: res.RejectedCardinality, InFlight: res.RejectedBytes,
+			}
 			admitted = int64(res.Accepted)
 			s.pokeFlush(eng)
 		}
@@ -1747,6 +1760,7 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 	// stays one tally per point.
 	admit := s.admissionFor(tid)
 	admit.record(admitted, int64(rej.OOO), int64(rej.Cardinality), int64(rej.InFlight))
+	admit.addRetention(int64(rej.Retention))
 
 	if overflowed > 0 {
 		admit.recordOverflowed(overflowed)

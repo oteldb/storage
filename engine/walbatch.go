@@ -72,6 +72,9 @@ func (b *walBatch) admit(
 	h *head, id signal.SeriesID, ts int64, value, sf float64, oooWindow int64, limits AppendLimits,
 	materialize func() signal.Series,
 ) admitOutcome {
+	if limits.EnforceMinTimestamp && ts < limits.MinTimestamp {
+		return rejectRetention
+	}
 	k, staged := b.pos[id]
 	var newest int64
 	var seen bool

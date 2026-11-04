@@ -438,6 +438,7 @@ const (
 	reasonMaxSeries        = "max_series"
 	reasonMaxInFlightBytes = "max_in_flight_bytes"
 	reasonReservedTenant   = "reserved_tenant"
+	reasonOutOfRetention   = "out_of_retention"
 )
 
 // defaultMaxPartBytes is the per-part size cap applied when a tenant's policy leaves MaxPartSize
@@ -479,6 +480,7 @@ func metricOverflow(s signal.Series) signal.Series {
 // rejectTally accumulates per-reason rejection counts during a write and renders the dominant
 // OTLP partial-success reason.
 type rejectTally struct {
+	retention   int64
 	ooo         int64
 	rate        int64
 	cardinality int64
@@ -487,7 +489,7 @@ type rejectTally struct {
 }
 
 func (r rejectTally) total() int64 {
-	return r.ooo + r.rate + r.cardinality + r.inflight + r.reserved
+	return r.ooo + r.rate + r.cardinality + r.inflight + r.reserved + r.retention
 }
 
 // reason returns a machine-readable reason for the rejections. When several reasons fired it
@@ -500,6 +502,7 @@ func (r rejectTally) reason() string {
 	}
 
 	all := []kv{
+		{reasonOutOfRetention, r.retention},
 		{reasonOutOfOrder, r.ooo},
 		{reasonRateLimit, r.rate},
 		{reasonMaxSeries, r.cardinality},
@@ -2285,6 +2288,7 @@ type metricRun struct {
 	admit    *tenantAdmission
 	limits   tenant.Limits
 	sampling int64
+	floor    writeTimeFloor
 }
 
 func (s *Storage) metricRunFor(run metricRun, tid signal.TenantID) (metricRun, error) {
@@ -2305,5 +2309,6 @@ func (s *Storage) metricRunFor(run metricRun, tid signal.TenantID) (metricRun, e
 		admit:    s.admissionFor(tid),
 		limits:   pol.Limits,
 		sampling: pol.Sampling.MaxRowsPerSecond,
+		floor:    s.writeTimeFloor(pol.Retention, signal.Metric),
 	}, nil
 }

@@ -979,3 +979,15 @@ its term changed. This is requested policy, not a claim that physical cleanup co
 Confirmed publication counts whole-part expiry drops and merges rewriting retention straddlers.
 Drop bytes use the existing recorded stored-byte estimate, excluding unrecorded sidecars; retirement
 may precede physical deletion while readers hold pins. Failed and unconfirmed commits count nothing.
+
+## Retention admission
+
+Optional append timestamp floors reject expired rows before stream registration and record WAL
+staging. `EnforceMinTimestamp` distinguishes a disabled limit from a zero or negative floor. Primary
+admission filters first and replicates its accepted rows verbatim; replicas and WAL replay do not
+recompute retention against a later clock.
+
+With timestamp admission enabled, primary side deltas are queued until record admission finishes.
+A transaction whose data rows are all rejected discards its associated side deltas; accepted rows
+validate and absorb their deltas before WAL/head application. Pure side-only transactions remain
+valid. Partial rejection retains the existing side-stray cleanup for unreferenced symbols.

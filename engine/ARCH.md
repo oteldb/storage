@@ -1871,3 +1871,10 @@ its term changed. This is requested policy, not a claim that physical cleanup co
 Confirmed publication counts whole-part expiry drops and merges rewriting retention straddlers.
 Drop bytes use the existing recorded stored-byte estimate, excluding unrecorded sidecars; retirement
 may precede physical deletion while readers hold pins. Failed and unconfirmed commits count nothing.
+
+## Retention admission
+
+Optional append timestamp floors are numeric (`MinTimestamp`, `EnforceMinTimestamp`) and are
+checked before identity admission and WAL staging. Floor presence is explicit, so zero and negative
+cutoffs remain valid. Retention policy and wall-clock resolution belong to the facade; replay and
+replica application trust the already accepted payload instead of reapplying a moving cutoff.
