@@ -23,12 +23,15 @@ var (
 // over stream labels) plus per-stream full-column record buffers in arrival order (sorted on
 // read). Not safe for concurrent use; the [Engine] holds the lock.
 type head struct {
-	schema  *Schema
-	sym     *symbols.Table
-	series  *series.Index
-	post    *postings.MemPostings
-	records map[signal.SeriesID]*recordCols
-	newest  int64 // newest record timestamp across every stream (reported as Inspect.MaxTime)
+	schema        *Schema
+	sym           *symbols.Table
+	series        *series.Index
+	post          *postings.MemPostings
+	records       map[signal.SeriesID]*recordCols
+	reusable      *recordCols
+	reusableBytes int64
+	reusableCount int
+	newest        int64 // newest record timestamp across every stream (reported as Inspect.MaxTime)
 
 	// streamNewest is each stream's own newest admitted timestamp: the OOO window is a per-stream
 	// lateness bound, not a cross-stream one, so a high-rate (or clock-skewed-ahead) stream cannot
@@ -264,7 +267,7 @@ func (a *streamAppender) admitSized(ts, size, oooWindow, maxBytes int64, pending
 	// detached buffers back into the live ones ([head.reattach]) — so the bound covers both sides of
 	// the in-flight measure, not just the live half, which would let a reattach restore ~2× the cap.
 	// MaxInFlightBytes is memory backpressure, and covers everything resident for its own reason.
-	inFlight := a.h.inFlightBytes() + *pending
+	inFlight := a.h.admissionBytes(maxBytes, *pending)
 	if inFlight >= headByteCap || (maxBytes > 0 && inFlight >= maxBytes) {
 		return rejectBytes
 	}
@@ -282,8 +285,8 @@ func (a *streamAppender) admitSized(ts, size, oooWindow, maxBytes int64, pending
 func (a *streamAppender) apply(r rec) {
 	h := a.h
 
-	if a.buf == nil {
-		a.buf = newRecordCols(h.schema, 0, fullSel(h.schema))
+	if a.buf == nil || (len(a.buf.ts) == 0 && cap(a.buf.ts) == 0 && h.reusable != nil) {
+		a.buf = h.takeRecordCols()
 		h.records[a.id] = a.buf
 	}
 

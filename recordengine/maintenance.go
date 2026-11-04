@@ -56,6 +56,7 @@ func (e *Engine) reserveFlush(
 		sides = buildbudget.Add(sides, 256+int64(len(data)))
 	}
 	columns := int64(1 + e.cfg.Schema.numInts() + e.cfg.Schema.numBytes())
+	workspace = buildbudget.Add(workspace, max(8192, buildbudget.Mul(int64(len(detached)), 32)))
 	estimate := buildbudget.Flush(rows, values, identities, int64(len(detached)), columns, sides, buildbudget.Add(workspace, materialized))
 	if e.cfg.SideStore != nil {
 		// SideStore has no bound for Encode/Stored on the active accumulator; run this flush alone.
@@ -112,9 +113,11 @@ func (e *Engine) publishFlushLocked(ctx context.Context, newParts []*part, epoch
 	// Keep completed flush outputs locally even when commit confirmation fails. Their WAL
 	// remains intact, and the next commit carries these same outputs rather than rewriting rows.
 	e.parts, e.flushedEpoch = next, epoch
+	detached := e.flushing
 	e.flushing = nil
 	e.flushingSide = nil
 	e.head.releaseDetached()
+	e.head.recycleRecordCols(detached)
 	if err == nil {
 		err = e.checkpointLocked(checkpointSeq)
 	}

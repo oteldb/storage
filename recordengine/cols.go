@@ -98,11 +98,12 @@ func selectColumns(s *Schema, r fetch.Request) colSel {
 // selects it (lazy decode); unselected vectors stay nil and are never touched. All populated
 // vectors share one length, [recordCols.len].
 type recordCols struct {
-	schema *Schema
-	sel    colSel
-	ts     []int64
-	ints   [][]int64
-	bytes  []byteCol // one offsets+blob column per schema byte column (zero-value when unselected)
+	reuseNext *recordCols
+	schema    *Schema
+	sel       colSel
+	ts        []int64
+	ints      [][]int64
+	bytes     []byteCol // one offsets+blob column per schema byte column (zero-value when unselected)
 
 	// keyCache memoizes the buffer's distinct record-attribute keys (see distinctAttrKeys); it is
 	// invalidated on every append. tsMin/tsMax bound the buffer's timestamps so Keys can use the

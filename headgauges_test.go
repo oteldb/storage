@@ -49,6 +49,32 @@ func TestMaintainPublishesHeadGauges(t *testing.T) {
 	assert.Zero(t, partGauge(t, rm, "storage.wal.segments", metricSig))
 }
 
+func TestReusableHeadCapacityInspectAndGauge(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	reader := sdkmetric.NewManualReader()
+	s, err := InMemory(WithMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close(ctx) })
+	_, err = s.WriteLogs(ctx, logBatch("api", [3]any{1, 9, "hello"}))
+	require.NoError(t, err)
+	eng, err := s.logEngineFor("default")
+	require.NoError(t, err)
+	require.NoError(t, eng.Flush(ctx))
+	stats, ok := findSignal(mustTenant(t, s.Inspect(), "default"), signal.Log)
+	require.True(t, ok)
+	require.Positive(t, stats.ReusableBytes)
+	assert.Zero(t, stats.HeadBytes)
+	s.recordHeadShape(ctx)
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+	logSig := map[string]string{"signal": "log"}
+	assert.Equal(t, stats.ReusableBytes, partGauge(t, rm, "storage.head.reusable_bytes", logSig))
+	assert.Zero(t, partGauge(t, rm, "storage.head.bytes", logSig))
+	require.NoError(t, eng.Reset(ctx))
+	assert.Zero(t, eng.Stats().ReusableBytes)
+}
+
 // TestMaintainPublishesPartBytes covers the part-size gauge that makes a rising part count
 // readable: whether the parts themselves grew, or a merge stopped taking them.
 func TestMaintainPublishesPartBytes(t *testing.T) {

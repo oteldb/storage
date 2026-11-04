@@ -54,6 +54,7 @@ func TestHeadGaugesRecord(t *testing.T) {
 
 	o.Head.Record(ctx, "metric", 32<<20, 1_000, 40, 5<<20, 90*time.Second)
 	o.Head.Record(ctx, "log", 1<<20, 12, 3, 4096, 0)
+	o.Head.RecordReusable(ctx, "log", 2048)
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(ctx, &rm))
@@ -67,6 +68,7 @@ func TestHeadGaugesRecord(t *testing.T) {
 
 	logSig := map[string]string{"signal": "log"}
 	assert.Equal(t, int64(1<<20), gaugeValue(t, rm, "storage.head.bytes", logSig))
+	assert.Equal(t, int64(2048), gaugeValue(t, rm, "storage.head.reusable_bytes", logSig))
 	assert.Zero(t, f64GaugeValue(t, rm, "storage.head.age", logSig))
 }
 

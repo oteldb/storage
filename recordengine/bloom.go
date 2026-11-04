@@ -1,6 +1,7 @@
 package recordengine
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/go-faster/errors"
@@ -46,6 +47,7 @@ type tokenizer struct {
 	attrs signal.Attributes // reused attribute-decode buffer
 	text  []byte            // reused rendered attribute value
 	token []byte            // reused key-scoped token
+	keys  recordKeySet
 }
 
 // tokens calls fn once per bloom token of val under mode:
@@ -79,6 +81,11 @@ func (t *tokenizer) tokens(mode BloomMode, val []byte, fn func(token []byte)) {
 
 		t.attrs = a
 		for j := range a {
+			if t.keys != nil {
+				if _, exists := t.keys[string(a[j].Key)]; !exists {
+					t.keys[string(a[j].Key)] = struct{}{}
+				}
+			}
 			t.text = a[j].Value.AppendText(t.text[:0])
 
 			t.token = appendAttrToken(t.token[:0], a[j].Key, t.text)
@@ -139,10 +146,10 @@ func (t *tokenizer) count(mode BloomMode, val []byte) int {
 type bloomBuilder struct {
 	tokenizer
 
-	distinct bloom.Sketch        // reused distinct-token estimator (constant 4 KiB)
-	seen     map[uint64]struct{} // value hashes already walked, for the repeated-value skip
-	rowsBuf  []int               // backing array of rows, kept across columns
-	rows     []int               // rows holding a value's first occurrence; nil ⇒ walk every row
+	distinct bloom.Sketch   // reused distinct-token estimator (constant 4 KiB)
+	seen     map[uint64]int // first row for each hash, for the repeated-value skip
+	rowsBuf  []int          // backing array of rows, kept across columns
+	rows     []int          // rows holding a value's first occurrence; nil ⇒ walk every row
 }
 
 // Per-part filters are consulted once per part, so a query over a store with thousands of parts
@@ -182,8 +189,8 @@ const countingWorthwhileBytes = 1 << 20
 // distinct-token estimate. When the filter the occurrences imply is already small in absolute terms,
 // that is the answer — an oversized-but-tiny filter is simply a lower false-positive rate than asked
 // for.
-func filterItems(mode BloomMode, bytes int64, occurrences, distinct func() int) int {
-	if bytes > countingWorthwhileBytes {
+func filterItems(mode BloomMode, sizeBytes int64, occurrences, distinct func() int) int {
+	if sizeBytes > countingWorthwhileBytes {
 		return distinct()
 	}
 
@@ -200,7 +207,11 @@ func filterItems(mode BloomMode, bytes int64, occurrences, distinct func() int) 
 // materialized, no hashing); only when it does not settle the size does the builder walk the column a
 // second time for the distinct estimate.
 func (bb *bloomBuilder) sizeTokens(mode BloomMode, values *byteCol) int {
-	return filterItems(mode, values.byteSize(),
+	var size int64
+	if len(values.offsets) > 0 {
+		size = int64(values.offsets[len(values.offsets)-1] - values.offsets[0])
+	}
+	return filterItems(mode, size,
 		func() int { return bb.countTokens(mode, values) },
 		func() int { return bb.distinctTokens(mode, values) })
 }
@@ -283,14 +294,11 @@ func (bb *bloomBuilder) selectRows(mode BloomMode, values *byteCol) {
 	bb.markRows(values)
 }
 
-// markRows fills bb.rows with the rows holding a value's first occurrence. Values are compared by
-// 64-bit hash: a collision would drop a row (a marginally smaller token set, never a false
-// negative for the values that were walked), at a probability far below the filter's own.
-// It is the dominant cost of a heavily repeated column's build: one hash and one map probe per row,
-// against a token walk over only the distinct values that survive.
+// markRows keeps distinct values. Hash collisions retain the row, so neither a bloom nor its
+// accompanying record-key footer loses a value.
 func (bb *bloomBuilder) markRows(values *byteCol) {
 	if bb.seen == nil {
-		bb.seen = make(map[uint64]struct{}, 1024)
+		bb.seen = make(map[uint64]int, 1024)
 	}
 
 	clear(bb.seen)
@@ -300,7 +308,7 @@ func (bb *bloomBuilder) markRows(values *byteCol) {
 	n := values.rows()
 	for i := range n {
 		h := xxh3.Hash(values.at(i))
-		if _, dup := bb.seen[h]; dup {
+		if bb.duplicateValue(values, i, h) {
 			continue
 		}
 
@@ -314,11 +322,16 @@ func (bb *bloomBuilder) markRows(values *byteCol) {
 			break
 		}
 
-		bb.seen[h] = struct{}{}
+		bb.seen[h] = i
 		rows = append(rows, i)
 	}
 
 	bb.rowsBuf, bb.rows = rows, rows
+}
+
+func (bb *bloomBuilder) duplicateValue(values *byteCol, row int, hash uint64) bool {
+	first, exists := bb.seen[hash]
+	return exists && bytes.Equal(values.at(first), values.at(row))
 }
 
 // eachValue calls fn with each selected row's value (rows nil ⇒ every row).
@@ -392,13 +405,21 @@ func buildColumnBloom(mode BloomMode, values *byteCol) []byte {
 func writeBlooms(
 	ctx context.Context, b backend.Backend, schema *Schema, prefix string, cols *recordCols, bb *bloomBuilder,
 ) error {
+	attrs, hasAttrs := schema.attrsByteCol()
 	for k := range schema.byteCols {
 		col := schema.byteColumn(k)
 		if col.Bloom == BloomNone {
 			continue
 		}
 
+		if hasAttrs && k == attrs {
+			bb.keys = make(recordKeySet)
+		}
 		data := bb.build(col.Bloom, &cols.bytes[k])
+		if bb.keys != nil {
+			cols.keyCache, cols.keyCacheValid = bb.keys.sorted(), true
+			bb.keys = nil
+		}
 		if err := backend.WriteDeferred(ctx, b, bloomKey(prefix, col.Name), data); err != nil {
 			return errors.Wrapf(err, "write bloom %q", col.Name)
 		}

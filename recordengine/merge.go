@@ -722,6 +722,7 @@ func (e *Engine) Close(ctx context.Context) error {
 	defer e.flushMu.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.head.clearReusable()
 
 	if e.cfg.WAL != nil {
 		if err := e.mu.WithReaders(e.cfg.WAL.Close); err != nil && flushErr == nil {

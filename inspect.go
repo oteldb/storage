@@ -52,6 +52,8 @@ type SignalStats struct {
 	HeadItems int64
 	// HeadBytes is the head's buffered bytes — the in-flight memory measure a flush drains.
 	HeadBytes int64
+	// ReusableBytes is idle record-head buffer capacity, separate from flushable HeadBytes.
+	ReusableBytes int64
 	// HeadAge is how long the head has been accumulating since its last flush (0 when empty) — the
 	// flush lag. It is wall clock, not data time: a backfilled timestamp says nothing about how
 	// long the head has held the data.
@@ -307,6 +309,7 @@ func (s *Storage) Inspect() StoreStats {
 			ts := tenantStats(tid)
 			ts.Signals = append(ts.Signals, SignalStats{
 				Signal: sig, Series: es.Streams, HeadItems: es.HeadRecords, HeadBytes: es.HeadBytes,
+				ReusableBytes: es.ReusableBytes,
 				HeadAge:       es.HeadAge,
 				IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
 				MergeRunning:  eng.MergeRunning(),

@@ -495,6 +495,8 @@ type Stats struct {
 	Streams          int64 // distinct streams ever seen (index span: head ∪ flushed)
 	HeadRecords      int64 // records currently buffered in the head (unflushed)
 	HeadBytes        int64 // buffered record bytes, head + in-flight flush (the in-flight memory measure)
+	// ReusableBytes is idle head-buffer capacity, evicted before it can block record admission.
+	ReusableBytes int64
 	// HeadAge is how long the head has been accumulating since its last flush (0 when empty) —
 	// the flush lag, which no data-time field here reports (backfill makes record timestamps
 	// useless as a measure of it).
@@ -542,6 +544,7 @@ func (e *Engine) Stats() Stats {
 		Streams:       int64(e.head.series.Len()),
 		OutOfSpace:    e.space.Exhausted(),
 		HeadBytes:     e.head.inFlightBytes(),
+		ReusableBytes: e.head.reusableSize(),
 		HeadAge:       e.head.age(),
 		IdentityBytes: e.head.identityBytes(),
 		Parts:         len(e.parts),

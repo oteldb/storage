@@ -32,8 +32,8 @@ func (a *streamAppender) applyBatchRange(b *Batch, lo, hi int) {
 	if lo == hi {
 		return
 	}
-	if a.buf == nil {
-		a.buf = newRecordCols(a.h.schema, 0, fullSel(a.h.schema))
+	if a.buf == nil || (len(a.buf.ts) == 0 && cap(a.buf.ts) == 0 && a.h.reusable != nil) {
+		a.buf = a.h.takeRecordCols()
 		a.h.records[a.id] = a.buf
 	}
 	a.buf.ts = append(a.buf.ts, b.Ts[lo:hi]...)

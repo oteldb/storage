@@ -23,7 +23,9 @@ type flushColumns struct {
 	cols   *recordCols // full column set (every schema column)
 	// sortIdx is the reusable row-order buffer shared by every stream's ts gather — see
 	// [recordCols.tsOrder]. It rides the flush buffer because it has the same lifetime.
-	sortIdx []int
+	sortIdx        []int
+	runEnds        []int
+	timeRangeKnown bool
 }
 
 func (f *flushColumns) len() int { return len(f.stream) }
@@ -45,6 +47,8 @@ const streamIDBytes = 16
 // buffer that fed one part is free to feed the next — and after the first flush its arrays are
 // already the right size, so a steady ingest rate stops allocating and re-zeroing them entirely.
 func (f *flushColumns) reset(schema *Schema, rows int, blob []int) {
+	f.runEnds = f.runEnds[:0]
+	f.timeRangeKnown = true
 	if cap(f.stream) >= rows {
 		f.stream = f.stream[:0]
 	} else {
@@ -128,8 +132,25 @@ func (f *flushColumns) slice(lo, hi int) *flushColumns {
 
 		cols.bytes[k] = byteCol{data: bc.data, offsets: bc.offsets[lo : hi+1]}
 	}
+	cols.tsMin, cols.tsMax = f.timeRange(lo, hi)
 
-	return &flushColumns{stream: f.stream[lo:hi], cols: cols}
+	return &flushColumns{stream: f.stream[lo:hi], cols: cols, timeRangeKnown: true}
+}
+
+func (f *flushColumns) timeRange(lo, hi int) (minTime, maxTime int64) {
+	minTime, maxTime = maxInt64, minInt64
+	if len(f.runEnds) == 0 {
+		for _, ts := range f.cols.ts[lo:hi] {
+			minTime, maxTime = min(minTime, ts), max(maxTime, ts)
+		}
+		return minTime, maxTime
+	}
+	for i, _ := slices.BinarySearch(f.runEnds, lo+1); i < len(f.runEnds) && lo < hi; i++ {
+		end := min(f.runEnds[i], hi)
+		minTime, maxTime = min(minTime, f.cols.ts[lo]), max(maxTime, f.cols.ts[end-1])
+		lo = end
+	}
+	return minTime, maxTime
 }
 
 func (h *head) hasRows() bool {
@@ -214,6 +235,10 @@ func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols, 
 
 	rows, blob := flushShape(schema, records, ids)
 	f.reset(schema, rows, blob)
+	if cap(f.runEnds) > max(1024, 4*len(ids)) {
+		f.runEnds = nil
+	}
+	f.runEnds = slices.Grow(f.runEnds, len(ids))
 
 	for _, id := range ids {
 		buf := records[id]
@@ -235,6 +260,7 @@ func buildFlushColumns(schema *Schema, records map[signal.SeriesID]*recordCols, 
 			f.stream = append(f.stream, u)
 			f.cols.appendRow(buf, row)
 		}
+		f.runEnds = append(f.runEnds, f.len())
 	}
 
 	return f
@@ -331,7 +357,7 @@ func writePart(
 		return errors.Wrapf(err, "write watermark sidecar %q", prefix)
 	}
 
-	return writeRecordKeys(ctx, b, schema, prefix, f.cols)
+	return writeRecordKeys(ctx, b, prefix, f.cols)
 }
 
 // computeWatermarks folds the (stream, ts)-sorted flush columns into one newest timestamp per
@@ -371,16 +397,8 @@ func (e *Engine) newPartPrefix() string {
 
 // colsTimeRange returns the inclusive min/max timestamp across f (≥ 1 record when a part is written).
 func colsTimeRange(f *flushColumns) (minTime, maxTime int64) {
-	minTime, maxTime = maxInt64, minInt64
-	for _, t := range f.cols.ts {
-		if t < minTime {
-			minTime = t
-		}
-
-		if t > maxTime {
-			maxTime = t
-		}
+	if f.timeRangeKnown {
+		return f.cols.tsMin, f.cols.tsMax
 	}
-
-	return minTime, maxTime
+	return f.timeRange(0, f.len())
 }

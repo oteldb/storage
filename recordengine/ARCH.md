@@ -118,6 +118,11 @@ the retained encoded output and its serialization copy as resident state.
 Attribute-key enumeration reuses decode scratch across rows, clearing references after each walk.
 Streamed writers charge that scratch to resident memory, so reuse does not hide retained capacity.
 
+Flush collects exact record keys during the attributes bloom walk, including each split output's
+own rows. Dedup checks the original value after a hash match, so a collision cannot lose a key.
+Timestamp bounds reuse the gathered columns' tracked extrema; split outputs inspect the endpoints
+of their sorted stream runs. The run-boundary scratch is included in flush admission.
+
 ### Inspection and logical sizes
 
 `MergeShape.CapBytes` reports the last measured disk cutoff, zero before the first merge, so polling
@@ -619,6 +624,16 @@ columns built from them — live until the part is published, so their size is p
 cleared at the publish or handed back by `head.reattach` on a failed flush, never both. Otherwise the
 measure would read zero for the whole duration of a slow flush and `MaxInFlightBytes` would admit a
 second full head on top of the one still being written out.
+
+Published generations may contribute idle head buffers to a per-engine free list, bounded by
+1 MiB of full backing-array capacity and 1,024 buffers. Publication first excludes frozen-head
+readers and installs the parts; failed flushes reattach without recycling. Buffers are acquired
+only while applying accepted rows, leaving fresh-buffer WAL identity logging intact. A generation
+replaces the previous idle pool, and buffers over four times their current payload (with a 4 KiB
+floor) are dropped, so a large-to-small workload does not retain its high-water mark.
+`Stats.ReusableBytes`, facade `SignalStats.ReusableBytes` and `storage.head.reusable_bytes` report
+idle capacity separately from flushable `HeadBytes`. Admission includes it and evicts idle buffers
+before rejecting records; idle capacity never triggers flush pressure.
 
 **How long it has been waiting** is `head.since`, stamped when the head takes its first bytes after a
 flush and cleared by `head.detach` (`Stats.HeadAge`). Wall time, not record timestamps: backfill puts
