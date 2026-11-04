@@ -19,6 +19,7 @@ func TestPreparedBatchAdmission(t *testing.T) {
 		fail   bool
 	}{
 		{name: "unlimited"},
+		{name: "timestamp floor", limits: AppendLimits{MinTimestamp: 100, EnforceMinTimestamp: true}},
 		{name: "cardinality", limits: AppendLimits{MaxSeries: 2}},
 		{name: "bytes", limits: AppendLimits{MaxInFlightBytes: 5 * SampleBytes}},
 		{name: "inactive overflow", limits: AppendLimits{Overflow: func(signal.Series) signal.Series { panic("inactive overflow") }}},

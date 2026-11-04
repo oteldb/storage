@@ -6,6 +6,10 @@ package recordengine
 // sees only these numbers. They mirror the metric engine's limits so the facade maps one
 // tenant.Limits to both.
 type AppendLimits struct {
+	// MinTimestamp is the inclusive timestamp floor when EnforceMinTimestamp is true.
+	MinTimestamp int64
+	// EnforceMinTimestamp enables the floor, including zero or negative timestamps.
+	EnforceMinTimestamp bool
 	// MaxSeries caps the number of distinct streams buffered in the head. A record that would
 	// register a new stream once the head already holds MaxSeries is rejected (the whole batch,
 	// since a batch is one stream); known streams are unaffected. 0 ⇒ unlimited.
@@ -18,6 +22,7 @@ type AppendLimits struct {
 // AppendResult reports the disposition of an [Engine.AppendBatch] run by reason, so the caller can
 // attribute an OTLP partial-success precisely.
 type AppendResult struct {
+	RejectedRetention   int // older than MinTimestamp
 	Accepted            int
 	RejectedOOO         int // older than the out-of-order window
 	RejectedCardinality int // would exceed AppendLimits.MaxSeries (a new stream)
@@ -26,7 +31,7 @@ type AppendResult struct {
 
 // Rejected returns the total number of rejected records across all reasons.
 func (r AppendResult) Rejected() int {
-	return r.RejectedOOO + r.RejectedCardinality + r.RejectedBytes
+	return r.RejectedOOO + r.RejectedCardinality + r.RejectedBytes + r.RejectedRetention
 }
 
 // admitOutcome is the per-record decision inside the head (cardinality is decided per batch in
@@ -36,6 +41,7 @@ type admitOutcome uint8
 const (
 	admitted admitOutcome = iota
 	rejectOOO
+	rejectRetention
 	rejectBytes
 )
 

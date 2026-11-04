@@ -102,7 +102,8 @@ engines over the fetch seam (`query/fetch`).
   refused with `ErrReadOnly`. `Open` refuses it alongside a cluster, a WAL dir, or an ephemeral
   backend. See the invariant in §4.
 - **Operator surface** — `Inspect`, `Admin`, `Parts`/`PartsDetailed`/`Cardinality`/`StreamCosts`,
-  `AdmissionStats`. See `ADMIN.md`.
+  `AdmissionStats`. Retention snapshots expose the last authorized requested cutoff and bound, while
+  confirmed publication counts expiry work. See `ADMIN.md`.
 - **Policy** — `tenant.Policy` (limits, retention, downsample, sampling, recompress,
   precision, durability/EC) resolved per tenant id through a consumer-supplied `Resolver`.
 
@@ -342,3 +343,20 @@ Disabling it stops new writes in that codec; existing parts still require compat
 `WithMetricSeriesChunks` opts new metric parts into independently framed series chunks with
 checked row geometry and inline timestamp bounds. Compatible readers must be deployed on every
 replica before enabling the writer. The default layout remains the packed layout.
+
+Per-tenant retention uses `tenant.Retention.PerSignal` for independent age overrides and byte bounds.
+Positive ages override the default; per-signal and pooled byte limits both apply. Policies resolve
+at runtime, with optional `Retention.Validate` for embedder validation.
+
+`WithRejectOutOfRetention` optionally rejects rows before append using the tenant signal's age;
+it defaults off. Metric points and attached exemplars resolve independently, and expired points
+do not consume lossy-sampling budget or register identities. Partial-success/observability report
+`out_of_retention`; primary responses preserve legacy total rejection counts.
+
+Read entry points clamp samples and records to the tenant's per-signal age retention before engine
+planning. Count and aggregate pushdowns retain the same sample floor without shifting evaluation
+grids; metadata enumeration remains a superset. Policies resolve per read, independently of physical
+cleanup and size retention. Split/cache children share one policy-and-time snapshot per fetch.
+Result-cache requests bypass caching
+when a cutoff clips the requested range, so an older cache entry cannot expose expired rows.
+Embedder result-sharing layers outside the facade must apply the same retention boundary themselves.

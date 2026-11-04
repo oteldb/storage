@@ -438,6 +438,7 @@ const (
 	reasonMaxSeries        = "max_series"
 	reasonMaxInFlightBytes = "max_in_flight_bytes"
 	reasonReservedTenant   = "reserved_tenant"
+	reasonOutOfRetention   = "out_of_retention"
 )
 
 // defaultMaxPartBytes is the per-part size cap applied when a tenant's policy leaves MaxPartSize
@@ -479,6 +480,7 @@ func metricOverflow(s signal.Series) signal.Series {
 // rejectTally accumulates per-reason rejection counts during a write and renders the dominant
 // OTLP partial-success reason.
 type rejectTally struct {
+	retention   int64
 	ooo         int64
 	rate        int64
 	cardinality int64
@@ -487,7 +489,7 @@ type rejectTally struct {
 }
 
 func (r rejectTally) total() int64 {
-	return r.ooo + r.rate + r.cardinality + r.inflight + r.reserved
+	return r.ooo + r.rate + r.cardinality + r.inflight + r.reserved + r.retention
 }
 
 // reason returns a machine-readable reason for the rejections. When several reasons fired it
@@ -500,6 +502,7 @@ func (r rejectTally) reason() string {
 	}
 
 	all := []kv{
+		{reasonOutOfRetention, r.retention},
 		{reasonOutOfOrder, r.ooo},
 		{reasonRateLimit, r.rate},
 		{reasonMaxSeries, r.cardinality},
@@ -557,7 +560,12 @@ func (s *Storage) Fetcher(tenants ...signal.TenantID) fetch.Fetcher {
 		return fetch.Merge() // empty
 	}
 
-	inner := s.scaleWrap(s.baseFetcher(tenants), tenants)
+	base, bound := s.baseFetcher(tenants)
+	inner := s.scaleWrap(base, tenants)
+	if len(tenants) > 0 {
+		bound = tenants
+	}
+	inner = s.retainedQuery(signal.Metric, bound, inner)
 
 	return seedFetcher{inner: inner, obs: s.obs, maxQueryBytes: s.maxQueryBytes, signal: signal.Metric.String()}
 }
@@ -651,6 +659,18 @@ func (s *Storage) AggregateMetrics(ctx context.Context, t signal.TenantID, r fet
 		return map[signal.SeriesID]engine.SeriesAgg{}, nil
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if s.cluster != nil {
+		ctx = s.snapshotRead(ctx, signal.Metric, []signal.TenantID{s.normalizeTenant(tenantOfShard(t))})
+	}
+	r = s.clampRead(ctx, signal.Metric, t, r)
+	if r.Start > r.End {
+		return map[signal.SeriesID]engine.SeriesAgg{}, nil
+	}
+
 	if s.cluster != nil {
 		bucketed, err := s.clusterAggregateFor(ctx, t, r, 0) // step 0 ⇒ one whole-range bucket per series
 		if err != nil {
@@ -739,26 +759,14 @@ func (s *Storage) AggregateMetricsNamed(ctx context.Context, t signal.TenantID, 
 func (s *Storage) AggregateMetricsStepNamed(
 	ctx context.Context, t signal.TenantID, r fetch.Request, step int64,
 ) ([]engine.NamedAgg, error) {
-	if s.closed.Load() {
-		return nil, nil
-	}
-
-	if s.cluster != nil {
-		return s.clusterAggregateNamedFor(ctx, t, r, step)
-	}
-
-	tid := s.normalizeTenant(t)
-
-	eng, ok := s.lookupEngine(tid)
-	if !ok {
-		return nil, nil
-	}
-
-	if err := s.answerLocally(ctx, rpcOpRead, signal.Metric, tid, eng, r.Start, r.End); err != nil {
-		return nil, err
-	}
-
-	return eng.AggregateStepNamed(ctx, r, step)
+	return metricAggregateRead(ctx, s, t, r,
+		func(ctx context.Context, t signal.TenantID, r fetch.Request) ([]engine.NamedAgg, error) {
+			return s.clusterAggregateNamedFor(ctx, t, r, step)
+		},
+		func(ctx context.Context, eng *engine.Engine, r fetch.Request) ([]engine.NamedAgg, error) {
+			return eng.AggregateStepNamed(ctx, r, step)
+		},
+	)
 }
 
 // AggregateMetricsWindowNamed is the *overlapping* form of [Storage.AggregateMetricsStepNamed]: it
@@ -788,23 +796,21 @@ func (s *Storage) AggregateMetricsWindowNamed(
 	if s.closed.Load() {
 		return nil, nil
 	}
-
-	if s.cluster != nil {
-		return s.clusterAggregateWindowNamedFor(ctx, t, r, spec)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-
-	tid := s.normalizeTenant(t)
-
-	eng, ok := s.lookupEngine(tid)
-	if !ok {
-		return nil, nil
-	}
-
-	if err := s.answerLocally(ctx, rpcOpRead, signal.Metric, tid, eng, r.Start, r.End); err != nil {
+	if err := spec.Validate(); err != nil {
 		return nil, err
 	}
 
-	return eng.AggregateWindowNamed(ctx, r, spec)
+	return metricAggregateRead(ctx, s, t, r,
+		func(ctx context.Context, t signal.TenantID, r fetch.Request) ([]engine.NamedWindowAgg, error) {
+			return s.clusterAggregateWindowNamedFor(ctx, t, r, spec)
+		},
+		func(ctx context.Context, eng *engine.Engine, r fetch.Request) ([]engine.NamedWindowAgg, error) {
+			return eng.AggregateWindowNamed(ctx, r, spec)
+		},
+	)
 }
 
 // seedFetcher is the outermost read wrapper: it installs the injected logger as the zctx base so
@@ -920,34 +926,38 @@ func (s *Storage) allEngines() []engineCloser {
 
 // baseFetcher builds the unwrapped read seam for the tenant set: owner-aware per tenant in
 // cluster mode, otherwise the local engines (or a cross-tenant snapshot when none are named).
-func (s *Storage) baseFetcher(tenants []signal.TenantID) fetch.Fetcher {
+func (s *Storage) baseFetcher(tenants []signal.TenantID) (fetch.Fetcher, []signal.TenantID) {
+	var bound []signal.TenantID
 	// In cluster mode a named tenant is served owner-aware (local if owned, else fanned out to
 	// an owner). Without named tenants we fall back to a local cross-tenant snapshot.
 	if s.cluster != nil && len(tenants) > 0 {
 		fetchers := make([]fetch.Fetcher, 0, len(tenants))
 		for _, t := range tenants {
-			fetchers = append(fetchers, s.clusterFetcherFor(t))
+			fetchers = append(fetchers, s.retainedFetcher(signal.Metric, t, s.clusterFetcherFor(t)))
+			bound = append(bound, t)
 		}
 
-		return fetch.Merge(fetchers...)
+		return fetch.Merge(fetchers...), bound
 	}
 
 	var fetchers []fetch.Fetcher
 
 	if len(tenants) == 0 {
 		for tid, eng := range s.engineSnapshotByTenant() {
-			fetchers = append(fetchers, s.gapGuarded(signal.Metric, tid, eng, nil))
+			fetchers = append(fetchers, s.retainedFetcher(signal.Metric, tid, s.gapGuarded(signal.Metric, tid, eng, nil)))
+			bound = append(bound, tid)
 		}
 	} else {
 		for _, t := range tenants {
 			tid := s.normalizeTenant(t)
 			if e, ok := s.lookupEngine(tid); ok {
-				fetchers = append(fetchers, s.gapGuarded(signal.Metric, tid, e, nil))
+				fetchers = append(fetchers, s.retainedFetcher(signal.Metric, tid, s.gapGuarded(signal.Metric, tid, e, nil)))
+				bound = append(bound, tid)
 			}
 		}
 	}
 
-	return fetch.Merge(fetchers...)
+	return fetch.Merge(fetchers...), bound
 }
 
 // scaleWrap decorates the base fetcher with the configured query/scale layers. The cache (when
@@ -957,7 +967,11 @@ func (s *Storage) baseFetcher(tenants []signal.TenantID) fetch.Fetcher {
 func (s *Storage) scaleWrap(f fetch.Fetcher, tenants []signal.TenantID) fetch.Fetcher {
 	if s.queryCache != nil && len(tenants) > 0 {
 		cached := scale.CacheFetcher{Inner: f, Cache: s.queryCache, Freshness: s.opts.QueryCacheFreshness}
-		f = scopedFetcher{inner: cached, scope: s.tenantScope(tenants)}
+		normalized := make([]signal.TenantID, len(tenants))
+		for i, t := range tenants {
+			normalized[i] = s.normalizeTenant(tenantOfShard(t))
+		}
+		f = scopedFetcher{inner: cached, scope: s.tenantScope(tenants), retention: &retentionCache{store: s, tenants: normalized, uncached: f}}
 	}
 
 	if s.opts.QuerySplitInterval > 0 {
@@ -985,12 +999,20 @@ func (s *Storage) tenantScope(tenants []signal.TenantID) signal.TenantID {
 // downstream [scale.CacheFetcher] keys on the tenant set the fetcher was built for (the merge
 // children ignore Request.Tenant, so overwriting it does not affect the actual fetch).
 type scopedFetcher struct {
-	inner fetch.Fetcher
-	scope signal.TenantID
+	inner     fetch.Fetcher
+	scope     signal.TenantID
+	retention *retentionCache
 }
 
 func (f scopedFetcher) Fetch(ctx context.Context, r fetch.Request) (fetch.Iterator, error) {
 	r.Tenant = f.scope
+	if f.retention != nil {
+		var clipped bool
+		ctx, clipped = f.retention.snapshot(ctx, r.Start)
+		if clipped {
+			return f.retention.uncached.Fetch(ctx, r)
+		}
+	}
 
 	return f.inner.Fetch(ctx, r)
 }
@@ -1683,7 +1705,7 @@ func (s *Storage) maintainWith(ctx context.Context, background bool) {
 		budgeted = owned
 	}
 
-	sizeCutoffs := s.sizeCutoffs(ctx, budgeted)
+	sizeCutoffs, _ := s.measureSizeDecisions(ctx, budgeted)
 
 	// maintainEngine flushes then merges one engine, unless this node is a non-owning replica (then
 	// it only refreshes from the shared store). merge is signal-specific: metrics carry downsampling
@@ -1735,7 +1757,7 @@ func (s *Storage) maintainWith(ctx context.Context, background bool) {
 	// identity, and because it runs on the owned path only — the live set is derived from this node's
 	// parts, so a replica mid-sync must not decide what is dead.
 	mergeMetrics := func(tid signal.TenantID, eng *engine.Engine) error {
-		opts := s.metricMergeOptions(tid, sizeCutoffs[tid].at(signal.Metric))
+		opts := s.metricMergeOptionsDecision(tid, sizeCutoffs[tid].at(signal.Metric))
 		// This loop is the one caller that may skip a merge rather than wait for the memory budget:
 		// it runs on a single goroutine shared with flush pressure.
 		opts.Background = true
@@ -1782,8 +1804,9 @@ func (s *Storage) maintainWith(ctx context.Context, background bool) {
 	// part set, since that is the only thing that kills a stream identity. A replica reaches it
 	// only through the refresh — it never merges.
 	mergeRecords := func(tid signal.TenantID, eng *recordengine.Engine, sig signal.Signal) error {
+		decision := s.retentionFor(tid, sig, sizeCutoffs[tid].at(sig))
 		opts := recordengine.MergeOptions{
-			RetainFrom: s.retainFrom(tid, sig, sizeCutoffs[tid].at(sig)),
+			RetainFrom: decision.cutoff, RetentionBoundBy: decision.bound,
 			Background: true, // see mergeMetrics: this loop skips rather than waits
 		}
 
@@ -1859,6 +1882,7 @@ func (s *Storage) recordShape(
 // detail is [Storage.Inspect]).
 func (s *Storage) recordPartShape(ctx context.Context) {
 	shapes := make(map[signal.Signal]*obs.PartShape, 4)
+	var retentionLags [signalCount]float64
 
 	// The cycle's merges changed the part set its size cutoffs were resolved for, so they are resolved
 	// again (memoized: the next cycle finds them current unless something flushes first).
@@ -1899,6 +1923,10 @@ func (s *Storage) recordPartShape(ctx context.Context) {
 			stale[signal.Metric] = true
 		}
 
+		if s.claimsShard(tid) {
+			stats := eng.Stats()
+			retentionLags[signal.Metric] = max(retentionLags[signal.Metric], retentionLag(stats.RetainFrom, stats.MinTime, stats.Parts))
+		}
 		m := s.metricShape(tid, eng, size[tid])
 		add(signal.Metric, m.Parts, m.Sealed, m.Backlog, m.Candidates, m.ForceCandidates, m.CapBytes, m.Bytes)
 	}
@@ -1909,11 +1937,18 @@ func (s *Storage) recordPartShape(ctx context.Context) {
 				stale[sig] = true
 			}
 
+			if s.claimsShard(tid) {
+				stats := eng.Stats()
+				retentionLags[sig] = max(retentionLags[sig], retentionLag(stats.RetainFrom, stats.MinTime, stats.Parts))
+			}
 			m := s.recordShape(sig, tid, eng, size[tid])
 			add(sig, m.Parts, m.Sealed, m.Backlog, m.Candidates, m.ForceCandidates, m.CapBytes, m.Bytes)
 		}
 	}
 
+	for _, sig := range []signal.Signal{signal.Metric, signal.Log, signal.Trace, signal.Profile, signal.Exemplar} {
+		s.obs.Retention.Lag(ctx, sig.String(), retentionLags[sig])
+	}
 	s.shapeMu.Lock()
 	defer s.shapeMu.Unlock()
 
@@ -2122,7 +2157,7 @@ func (s *Storage) ownedTenants(ctx context.Context, tids map[signal.TenantID]str
 // nanoseconds) for one signal; 0 means retain forever. sizeCutoff is that signal's size-budget cutoff
 // (0 when no byte budget binds it, see [Storage.sizeCutoffFor]): whichever budget binds first — age
 // or bytes — wins. The age window is per signal too, so exemplars can expire ahead of everything else
-// ([tenant.Retention.ExemplarMaxAge]).
+// ([tenant.Retention.PerSignal]).
 func (s *Storage) retainFrom(tid signal.TenantID, sig signal.Signal, sizeCutoff int64) int64 {
 	// tid may be a shard key ({tenant}/_s{idx}) when a signal is sharded; policy is per real tenant.
 	ret := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Retention
@@ -2137,6 +2172,10 @@ func (s *Storage) retainFrom(tid signal.TenantID, sig signal.Signal, sizeCutoff 
 // sizeCutoff is the tenant's size-budget cutoff, folded into RetainFrom the same way (see
 // [Storage.retainFrom]).
 func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engine.MergeOptions {
+	return s.metricMergeOptionsDecision(tid, retentionDecision{cutoff: sizeCutoff})
+}
+
+func (s *Storage) metricMergeOptionsDecision(tid signal.TenantID, size retentionDecision) engine.MergeOptions {
 	now := s.now()
 	// In cluster mode tid is a shard key ({tenant}/_s{idx}); policy is per real tenant.
 	realTenant := s.normalizeTenant(tenantOfShard(tid))
@@ -2170,8 +2209,9 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engi
 		})
 	}
 
+	decision := retentionDecisionFor(p.Retention, signal.Metric, now, size)
 	return engine.MergeOptions{
-		RetainFrom: max(retentionCutoff(p.Retention, signal.Metric, now), sizeCutoff),
+		RetainFrom: decision.cutoff, RetentionBoundBy: decision.bound,
 		Downsample: s.downsampleTiers(realTenant, p.Downsample, now),
 		Recompress: recompress,
 		Precision:  precision,
@@ -2267,6 +2307,7 @@ type metricRun struct {
 	admit    *tenantAdmission
 	limits   tenant.Limits
 	sampling int64
+	floor    writeTimeFloor
 }
 
 func (s *Storage) metricRunFor(run metricRun, tid signal.TenantID) (metricRun, error) {
@@ -2287,5 +2328,6 @@ func (s *Storage) metricRunFor(run metricRun, tid signal.TenantID) (metricRun, e
 		admit:    s.admissionFor(tid),
 		limits:   pol.Limits,
 		sampling: pol.Sampling.MaxRowsPerSecond,
+		floor:    s.writeTimeFloor(pol.Retention, signal.Metric),
 	}, nil
 }

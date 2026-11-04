@@ -23,6 +23,7 @@ import (
 	"github.com/oteldb/storage/internal/engineguard"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/repair"
+	"github.com/oteldb/storage/internal/retention"
 	"github.com/oteldb/storage/pool"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -189,8 +190,9 @@ const DefaultMetricBlockRows = 1024
 
 // Engine is a single tenant's storage engine. Safe for concurrent use.
 type Engine struct {
-	cfg Config
-	mu  engineguard.Mutex
+	retentionState retention.State
+	cfg            Config
+	mu             engineguard.Mutex
 	// The build barrier excludes reset, prune and repair; admitted flush/merge builds take read slots.
 	// Identity lifecycle precedes catalog -> writer -> reader-visible state (see ARCH.md).
 	flushMu       sync.RWMutex
@@ -558,9 +560,13 @@ func (e *Engine) IdentityBytes() int64 {
 
 // Stats is an in-memory snapshot of an engine's state for introspection (no backend I/O, no decode).
 type Stats struct {
-	Series      int64 // distinct series ever seen (index span: head ∪ flushed)
-	HeadSamples int64 // samples currently buffered in the head (unflushed)
-	HeadBytes   int64 // head's buffered sample bytes (the in-flight memory measure)
+	// RetainFrom is the last authorized requested cutoff; cleanup may still be pending.
+	RetainFrom int64
+	// RetentionBoundBy identifies the bound behind RetainFrom.
+	RetentionBoundBy RetentionBound
+	Series           int64 // distinct series ever seen (index span: head ∪ flushed)
+	HeadSamples      int64 // samples currently buffered in the head (unflushed)
+	HeadBytes        int64 // head's buffered sample bytes (the in-flight memory measure)
 	// HeadAge is how long the head has been accumulating since its last flush (0 when empty) —
 	// the flush lag, which no data-time field here reports (backfill makes sample timestamps
 	// useless as a measure of it).
@@ -603,7 +609,9 @@ func (e *Engine) Stats() Stats {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	request := e.retentionRequest()
 	s := Stats{
+		RetainFrom: request.Cutoff, RetentionBoundBy: request.Bound,
 		Series:        int64(e.head.series.Len()),
 		OutOfSpace:    e.space.Exhausted(),
 		HeadBytes:     e.head.inFlightBytes(),

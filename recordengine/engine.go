@@ -22,6 +22,7 @@ import (
 	"github.com/oteldb/storage/internal/engineguard"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/repair"
+	"github.com/oteldb/storage/internal/retention"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
@@ -146,8 +147,9 @@ type FetchResult = bucketindex.FetchResult
 
 // Engine is one tenant's record store for a signal. Safe for concurrent use.
 type Engine struct {
-	cfg Config
-	mu  engineguard.Mutex
+	retentionState retention.State
+	cfg            Config
+	mu             engineguard.Mutex
 	// The build barrier excludes reset, prune and repair; admitted flush/merge builds take read slots.
 	// Identity lifecycle precedes catalog -> writer -> reader-visible state (see ARCH.md).
 	flushMu      sync.RWMutex
@@ -408,11 +410,22 @@ func (e *Engine) AppendBatch(b *Batch, limits AppendLimits) (AppendResult, error
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
 
+	expired := 0
+	if limits.EnforceMinTimestamp {
+		for _, ts := range b.Ts {
+			if ts < limits.MinTimestamp {
+				expired++
+			}
+		}
+		if expired == len(b.Ts) {
+			return AppendResult{RejectedRetention: expired}, nil
+		}
+	}
 	// Cardinality is a per-batch decision (a batch is one stream): if this stream is new and the
 	// head is at the cap, the whole batch is rejected and the stream is not registered.
 	isNew, ok := e.head.admitStream(b.Stream, limits.MaxSeries)
 	if !ok {
-		return AppendResult{RejectedCardinality: len(b.Ts)}, nil
+		return AppendResult{RejectedCardinality: len(b.Ts) - expired, RejectedRetention: expired}, nil
 	}
 
 	// The stream's identity is logged when the stream is registered — not when it first has an
@@ -475,9 +488,13 @@ func (e *Engine) IdentityBytes() int64 {
 
 // Stats is an in-memory snapshot of a record engine's state for introspection (no backend I/O).
 type Stats struct {
-	Streams     int64 // distinct streams ever seen (index span: head ∪ flushed)
-	HeadRecords int64 // records currently buffered in the head (unflushed)
-	HeadBytes   int64 // buffered record bytes, head + in-flight flush (the in-flight memory measure)
+	// RetainFrom is the last authorized requested cutoff; cleanup may still be pending.
+	RetainFrom int64
+	// RetentionBoundBy identifies the bound behind RetainFrom.
+	RetentionBoundBy RetentionBound
+	Streams          int64 // distinct streams ever seen (index span: head ∪ flushed)
+	HeadRecords      int64 // records currently buffered in the head (unflushed)
+	HeadBytes        int64 // buffered record bytes, head + in-flight flush (the in-flight memory measure)
 	// HeadAge is how long the head has been accumulating since its last flush (0 when empty) —
 	// the flush lag, which no data-time field here reports (backfill makes record timestamps
 	// useless as a measure of it).
@@ -519,7 +536,9 @@ func (e *Engine) Stats() Stats {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	request := e.retentionRequest()
 	s := Stats{
+		RetainFrom: request.Cutoff, RetentionBoundBy: request.Bound,
 		Streams:       int64(e.head.series.Len()),
 		OutOfSpace:    e.space.Exhausted(),
 		HeadBytes:     e.head.inFlightBytes(),

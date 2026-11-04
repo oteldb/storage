@@ -20,6 +20,9 @@ import (
 // defaults; [Open] applies them. The zero value is not valid — call [Open] (or
 // [InMemory]) to construct a [Storage].
 type Options struct {
+	// RejectOutOfRetention rejects writes older than the tenant signal's configured retention age.
+	// Disabled by default so historical backfill remains accepted.
+	RejectOutOfRetention bool
 	// Backend is the storage backend (memory/file/s3). If nil, [Open] defaults to
 	// [backend.Memory] — the in-memory, ephemeral engine (DESIGN.md §5).
 	Backend backend.Backend
@@ -616,3 +619,6 @@ func WithMetricFloatGroups() Option { return func(o *Options) { o.MetricFloatGro
 
 // WithMetricSeriesChunks enables independently readable per-series metric chunks.
 func WithMetricSeriesChunks() Option { return func(o *Options) { o.MetricSeriesChunks = true } }
+
+// WithRejectOutOfRetention enables retention-age admission for all writes.
+func WithRejectOutOfRetention() Option { return func(o *Options) { o.RejectOutOfRetention = true } }

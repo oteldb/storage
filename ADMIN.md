@@ -94,6 +94,7 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 | `IdentityBytes` | resident identity state: the symbol table, the series/stream index, the postings lists, per-series out-of-order watermarks and cached metric registry ordering. A flush does **not** drain it — identities outlive the data they named and are reclaimed only by `Reset` — so it is reported beside `HeadBytes` rather than folded into it (`MaxInFlightBytes` / `FlushThresholdBytes` would otherwise chase a number a flush cannot lower). It falls when the background maintenance prunes the identities retention left without data — on every node holding metric parts, owner or replica, since a part carries its own identities — so an unbounded rise means churn is outpacing retention |
 | `Parts` | flushed immutable part count |
 | `MinTimeUnixNano` / `MaxTimeUnixNano` | data time span (min over parts; max includes the head) |
+| `RetainFromUnixNano` / `RetentionBoundBy` | last authorized requested cutoff and its winning bound (`none`, `age`, `signal_bytes`, `pooled_bytes`); zero on current replicas, ownership-fenced nodes or a different tenure. A deferred or failed cleanup, including an index-fenced engine that still owns its claim, keeps the request visible: it does not assert rows below the cutoff are gone |
 | `MergeRunning` | a compaction is executing on this engine right now |
 | `MergeDeferred` | the last merge had parts to compact and no merge-memory budget to do it with, so it compacted nothing; see "Merge memory admission" |
 | `SealedParts` | parts already at the merge cap, excluded from size compaction. Retention and compression rewrites can still take them |
@@ -239,7 +240,7 @@ Feedback resets on process restart and does not change the storage format.
 ### `Storage.AdmissionStats(tenant) AdmissionStats` (`admission.go`)
 
 Per-tenant cumulative admission tally (shared across signals — the valves are keyed by tenant):
-`Accepted`, `RejectedOOO`, `RejectedRate`, `RejectedCardinality`, `RejectedInFlight`,
+`Accepted`, `RejectedOOO`, `RejectedRate`, `RejectedCardinality`, `RejectedInFlight`, `RejectedRetention`,
 `SampledDropped`, `Overflowed`, plus the `Rejected()` total. Drives "why is this tenant being shed?".
 Records routed to a reserved tenant id (`reserved_tenant`) appear only in `ingest.rejected`.
 
@@ -249,11 +250,27 @@ Observability is **injected, never owned**: pass `Logger`, `TracerProvider`, `Me
 `Options`; each defaults to a no-op, so an unconfigured store emits nothing at zero overhead. The
 library imports only the OTel **API** — the embedder owns the SDK and exporters.
 
+Retention instruments are tagged by `signal` only. `storage.retention.dropped_parts` counts
+whole live parts retired after confirmed catalog publication; `dropped_bytes` uses their recorded
+stored-byte estimate, matching merge byte units and excluding sidecars not included in those
+sizes. They are not an exact freed-space counter: query pins can delay object deletion. Failed or
+unconfirmed publication does not advance them. `storage.retention.rewrites` counts published
+merges that rewrite at least one retention straddler, not ordinary ladder-only compaction.
+`storage.retention.lag_seconds` is the maximum live-part lag behind the last requested cutoff among
+locally owned engines, floored at zero; no parts means zero, while a part at timestamp zero remains
+real data. It is refreshed with the part-shape gauges, including zeroes for empty signals.
+
+Cutoff and winning bound are one snapshot, scoped to the ownership term. Equal cutoffs prefer age,
+then a signal byte budget, then the pooled budget. A policy change is reflected on the next authorized
+merge request, including explicit admin compaction. `Inspect` does not resolve new size budgets or
+perform backend I/O merely to display retention. Compare a live part's minimum with the requested
+cutoff to diagnose cleanup lag; query age filtering is a separate read-path policy.
+
 Metric instruments (all prefixed `storage.`):
 
 | Instrument | Tags | Notes |
 |-----------|------|-------|
-| `ingest.accepted` / `ingest.rejected` | `signal`(, `reason`) | reasons: `out_of_order`, `rate_limit`, `max_series`, `max_in_flight_bytes`, `reserved_tenant` (the `Tenant` callback derived an id in the reserved `wal` namespace; not counted in `AdmissionStats`, since no such tenant exists) |
+| `ingest.accepted` / `ingest.rejected` | `signal`(, `reason`) | reasons: `out_of_retention`, `out_of_order`, `rate_limit`, `max_series`, `max_in_flight_bytes`, `reserved_tenant` (the `Tenant` callback derived an id in the reserved `wal` namespace; not counted in `AdmissionStats`, since no such tenant exists) |
 | `ingest.sampled_dropped` / `ingest.overflowed` | `signal` | budgeted sampling / overflow routing |
 | `flush.total` / `flush.duration` / `flush.rows` / `flush.bytes` | `signal` | head flushes; `flush.bytes` is stored part-column bytes for records (decoded bytes in older versions), the denominator of write amplification |
 | `merge.total` / `merge.duration` / `merge.parts_in` / `merge.bytes_in` / `merge.bytes_out` | `signal` | background merges; record byte counters sum stored column bytes, matching the selection unit (older versions counted decoded bytes). `bytes_out` against `flush.bytes` is how many times the engine rewrites what it ingests, `bytes_out`/`bytes_in` what one cycle gains |
@@ -427,17 +444,27 @@ error wrapping `ErrReadOnly` (as do the `Write*` methods and `Reset`); the read 
 `Parts`/`PartsDetailed`/`Cardinality`/`StreamCosts`, `AdmissionStats` and the fetchers — is
 unaffected, which is what makes a read-only handle the right shape for an offline inspector.
 
-The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The **age cutoff
-is per signal** (`tenant.Retention.AgeFor`): `MaxAge` for everything, except exemplars when
-`tenant.Retention.ExemplarMaxAge` is set — exemplars are a sampled debugging aid whose value ends
-with the trace they point at, so they are the natural first thing to expire, and setting this to the
-trace retention stops them outliving their referents.
+The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The age cutoff
+uses `tenant.Retention.AgeFor`: a positive `PerSignal[signal].MaxAge` overrides the default `MaxAge`,
+whether longer or shorter. Zero per-signal fields inherit; a zero default age retains forever.
+`Retention.Validate` lets embedders reject negative bounds, unknown signals and per-signal byte
+budgets above a configured pooled ceiling before publishing a policy. Runtime lookups ignore
+unknown signal keys and treat nonpositive overrides as unset.
+
+Write admission can also enforce the age cutoff with `WithRejectOutOfRetention()` (or
+`Options.RejectOutOfRetention`). It is disabled by default for backfill. A row strictly below the
+signal's age cutoff is rejected as `out_of_retention`, included in `AdmissionStats.RejectedRetention`
+and `storage.ingest.rejected{reason="out_of_retention"}`. The exact boundary is retained. A zero
+age disables this valve. Coarse rate admission retains precedence; timestamp admission then runs
+before lossy sampling, identity admission and WAL staging, with each rejected row counted once.
+Exemplars use their own timestamps and signal policy, remain best effort,
+and do not change the producer's metric-point rejection count. Byte-budget retention stays eventual.
 
 The size cutoff comes from the tenant's byte budgets, and there are two, both enforced (`retention.go`):
 
 - `tenant.Retention.MaxBytes` is **pooled**: the tenant's parts across all signals/shards on this
   node are summed and dropped oldest-first until the total fits. It is the tenant-wide outer bound.
-- `tenant.Retention.MaxBytesPerSignal` bounds **one signal at a time**, from that signal's parts
+- `tenant.Retention.PerSignal[signal].MaxBytes` bounds **one signal at a time**, from that signal's parts
   alone. It exists because a pooled budget has no isolation: on a tenant whose metrics dwarf its
   logs, metric growth alone moves the shared cutoff and evicts log history that never grew.
 

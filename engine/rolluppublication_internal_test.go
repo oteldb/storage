@@ -34,7 +34,7 @@ func TestRollupPublicationRechecksHeadBeforeFirstCAS(t *testing.T) {
 	accepted, err := e.Append(rollupSeries(), 11, 3)
 	require.NoError(t, err)
 	require.True(t, accepted)
-	committed, err := e.publishMerge(t.Context(), src, out, src, e.term(), plan)
+	committed, err := e.publishMerge(t.Context(), src, out, src, e.term(), plan, 0)
 	require.NoError(t, err)
 	assert.False(t, committed, "accepted raw duplicate arrived before rollup publication")
 	_, values := rollupSamples(t, e)
@@ -74,7 +74,10 @@ func TestRollupPublicationExcludesWritersDuringCAS(t *testing.T) {
 		err       error
 	}
 	done := make(chan result, 1)
-	go func() { ok, err := e.publishMerge(t.Context(), src, out, src, e.term(), plan); done <- result{ok, err} }()
+	go func() {
+		ok, err := e.publishMerge(t.Context(), src, out, src, e.term(), plan, 0)
+		done <- result{ok, err}
+	}()
 	<-be.entered
 	writerEntered := e.mu.TryLockWriter()
 	if writerEntered {

@@ -26,7 +26,11 @@ func logBatch(svc string, recs ...[3]any) log.Logs {
 
 	for _, r := range recs {
 		rec := sl.AddRecord()
-		rec.Timestamp = int64(r[0].(int))
+		ts, ok := r[0].(int64)
+		if !ok {
+			ts = int64(r[0].(int))
+		}
+		rec.Timestamp = ts
 		rec.SeverityNumber = int32(r[1].(int))
 		rec.Body = []byte(r[2].(string))
 	}

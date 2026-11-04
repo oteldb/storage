@@ -91,7 +91,7 @@ func (e *Engine) pinMergeSourcesLocked(ctx context.Context) ([]*part, func(), er
 }
 
 func (e *Engine) publishMerge(
-	ctx context.Context, selected, newParts, readable []*part, stamp uint64, plan rollupPlan,
+	ctx context.Context, selected, newParts, readable []*part, stamp uint64, plan rollupPlan, retainFrom int64,
 ) (bool, error) {
 	removed := make(map[string]struct{}, len(selected))
 	for _, p := range selected {
@@ -137,6 +137,9 @@ func (e *Engine) publishMerge(
 	}
 
 	e.mu.Unlock()
+	if retentionStraddler(selected, retainFrom) {
+		e.cfg.Obs.Retention.Rewritten(ctx, metricSignal)
+	}
 
 	e.reclaimRetired(ctx)
 

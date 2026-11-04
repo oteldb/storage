@@ -30,6 +30,10 @@ func (e *Engine) appendUnlogged(b *Batch, limits AppendLimits) (AppendResult, er
 	app := e.head.appenderFor(b.Stream)
 
 	for i := range b.Ts {
+		if limits.EnforceMinTimestamp && b.Ts[i] < limits.MinTimestamp {
+			res.RejectedRetention++
+			continue
+		}
 		batchRec(&scratch, b, i)
 		res = res.with(app.append(scratch, e.cfg.OOOWindow, limits.MaxInFlightBytes))
 	}
@@ -69,6 +73,10 @@ func (e *Engine) appendLogged(b *Batch, limits AppendLimits) (AppendResult, erro
 	payload := openRecs(e.walBuf)
 
 	for i := range b.Ts {
+		if limits.EnforceMinTimestamp && b.Ts[i] < limits.MinTimestamp {
+			res.RejectedRetention++
+			continue
+		}
 		batchRec(&scratch, b, i)
 
 		out := app.admit(scratch, e.cfg.OOOWindow, limits.MaxInFlightBytes, &pending)
@@ -120,6 +128,8 @@ func (r AppendResult) with(out admitOutcome) AppendResult {
 	switch out {
 	case admitted:
 		r.Accepted++
+	case rejectRetention:
+		r.RejectedRetention++
 	case rejectOOO:
 		r.RejectedOOO++
 	case rejectBytes:

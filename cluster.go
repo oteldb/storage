@@ -516,16 +516,16 @@ func (s *Storage) startCluster(ctx context.Context, cfg *cluster.Config) error {
 // localFetch serves a peer's fetch from the local engine, pushing down the (equality) matchers
 // it forwarded — the read-fan-out server's view of this node's data.
 func (s *Storage) localFetch(ctx context.Context, tenant string, start, end int64, matchers []fetch.Matcher) ([]*fetch.Batch, error) {
-	tid := s.normalizeTenant(signal.TenantID(tenant))
-
-	eng, ok := s.lookupEngine(tid)
-	if err := s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, ok, start, end); err != nil {
+	plan, err := s.prepareLocalMetricRead(ctx, tenant, start, end)
+	if err != nil || plan.eng == nil {
 		return nil, err
 	}
+	plan.request.Matchers = matchers
+	plan.request.Recycle = true
 
 	// Recycle: the read handler serializes the batches and discards them, so it releases them right
 	// after — recycling this node's result buffers across fan-out reads.
-	it, err := eng.Fetch(ctx, fetch.Request{Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers, Recycle: true})
+	it, err := plan.eng.Fetch(ctx, plan.request)
 	if err != nil {
 		return nil, err
 	}
@@ -630,16 +630,12 @@ func (s *Storage) shardReadTargets(
 func (s *Storage) localAggregate(
 	ctx context.Context, tenant string, start, end, step int64, matchers []fetch.Matcher,
 ) ([]engine.NamedAgg, error) {
-	tid := s.normalizeTenant(signal.TenantID(tenant))
-
-	eng, ok := s.lookupEngine(tid)
-	if err := s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, ok, start, end); err != nil {
+	plan, err := s.prepareLocalMetricRead(ctx, tenant, start, end)
+	if err != nil || plan.eng == nil {
 		return nil, err
 	}
-
-	return eng.AggregateStepNamed(ctx, fetch.Request{
-		Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers,
-	}, step)
+	plan.request.Matchers = matchers
+	return plan.eng.AggregateStepNamed(ctx, plan.request, step)
 }
 
 // localAggregateWindow serves a peer's overlapping-window aggregate from the local shard engine —
@@ -647,16 +643,19 @@ func (s *Storage) localAggregate(
 func (s *Storage) localAggregateWindow(
 	ctx context.Context, tenant string, start, end int64, spec engine.WindowSpec, matchers []fetch.Matcher,
 ) ([]engine.NamedWindowAgg, error) {
-	tid := s.normalizeTenant(signal.TenantID(tenant))
-
-	eng, ok := s.lookupEngine(tid)
-	if err := s.canAnswer(ctx, rpcOpRead, signal.Metric, tid, ok, start, end); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := spec.Validate(); err != nil {
 		return nil, err
 	}
 
-	return eng.AggregateWindowNamed(ctx, fetch.Request{
-		Tenant: signal.TenantID(tenant), Start: start, End: end, Matchers: matchers,
-	}, spec)
+	plan, err := s.prepareLocalMetricRead(ctx, tenant, start, end)
+	if err != nil || plan.eng == nil {
+		return nil, err
+	}
+	plan.request.Matchers = matchers
+	return plan.eng.AggregateWindowNamed(ctx, plan.request, spec)
 }
 
 // mergeWindowLists combines two per-series window lists by aligned evaluation timestamp, summing
@@ -981,6 +980,10 @@ func (s *Storage) serveFetch(ctx context.Context, r fetch.Request) ([]*fetch.Bat
 // column conditions that prune parts by bloom (without which a condition-only request — trace-by-id
 // — would scan the whole window).
 func (s *Storage) localRecordFetch(ctx context.Context, r fetch.Request) ([]*fetch.Batch, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	sig, tenant := r.Signal, string(r.Tenant)
 	tid := s.normalizeTenant(signal.TenantID(tenant))
 
@@ -988,6 +991,11 @@ func (s *Storage) localRecordFetch(ctx context.Context, r fetch.Request) ([]*fet
 	// install the read budget itself — otherwise a peer serving a fan-out admits nothing and
 	// materializes the whole result the caller has already said it has no room for.
 	ctx = withReadBudget(ctx, s.maxQueryBytes)
+
+	r = s.clampRead(ctx, sig, tid, r)
+	if r.Start > r.End {
+		return nil, nil
+	}
 
 	eng, ok := s.lookupRecordEngine(sig, tid)
 	if err := s.canAnswer(ctx, rpcOpRead, sig, tid, ok, r.Start, r.End); err != nil {
@@ -1566,6 +1574,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 		lastAdmit    *tenantAdmission
 		lastLimits   tenantpkg.Limits
 		lastSampling int64
+		lastFloor    writeTimeFloor
 		haveTenant   bool
 
 		sampledDropped int64
@@ -1586,6 +1595,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 
 				pol := s.tenant.Resolve(tid)
 				lastLimits, lastSampling = pol.Limits, pol.Sampling.MaxRowsPerSecond
+				lastFloor = s.writeTimeFloor(pol.Retention, signal.Metric)
 			}
 
 			if !lastAdmit.allowRate(lastLimits, int64(b.Len())*engine.SampleBytes, s.now()) {
@@ -1598,7 +1608,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 			// here rather than on the primary: the primary is handed an already-framed payload, so
 			// which samples to keep is no longer its to decide. The weights ride to the primary in
 			// the frame itself (wal.WriteSamplesSF).
-			weights, dropped := lastAdmit.sampleBatch(lastSampling, s.now(), b.IDs, b.Ts)
+			weights, dropped := lastAdmit.sampleRetained(lastSampling, s.now(), b.IDs, b.Ts, lastFloor)
 			sampledDropped += dropped
 
 			return weights, true
@@ -1636,6 +1646,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 	rej := rejectTally{rate: rateRejected - reserved, reserved: reserved}
 	for _, r := range rejects {
 		rej.ooo += int64(r.OOO)
+		rej.retention += int64(r.Retention)
 		rej.cardinality += int64(r.Cardinality)
 		rej.inflight += int64(r.InFlight)
 	}
@@ -1645,7 +1656,7 @@ func (s *Storage) writeMetricsClustered(ctx context.Context, md metric.Metrics) 
 		keys[i] = r.key
 	}
 
-	primaryRejected := rej.ooo + rej.cardinality + rej.inflight
+	primaryRejected := rej.ooo + rej.cardinality + rej.inflight + rej.retention
 	failed := routeFailures(frames.Counts, keys, errs)
 	s.emitRouted(ctx, signal.Metric,
 		int64(emitted-frames.Shed)-sampledDropped-primaryRejected-failed, primaryRejected, failed)
@@ -1700,7 +1711,9 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 
 	// Policy is per real tenant; in sharded-metric mode tenant is a shard key ({tenant}/_s{idx}).
 	tid := s.normalizeTenant(tenantOfShard(signal.TenantID(tenant)))
-	limits := s.tenant.Resolve(tid).Limits
+	policy := s.tenant.Resolve(tid)
+	limits := policy.Limits
+	floor := s.writeTimeFloor(policy.Retention, sig)
 
 	var (
 		accepted   []byte
@@ -1716,8 +1729,12 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 			var res engine.AppendResult
 			accepted, res, err = eng.ApplyPrimary(walBytes, engine.AppendLimits{
 				MaxSeries: limits.MaxSeries, MaxInFlightBytes: limits.MaxInFlightBytes,
+				MinTimestamp: floor.timestamp, EnforceMinTimestamp: floor.enabled,
 			})
-			rej = cluster.Reject{OOO: res.RejectedOOO, Cardinality: res.RejectedCardinality, InFlight: res.RejectedBytes}
+			rej = cluster.Reject{
+				Retention: res.RejectedRetention, OOO: res.RejectedOOO,
+				Cardinality: res.RejectedCardinality, InFlight: res.RejectedBytes,
+			}
 			admitted, overflowed = int64(res.Accepted), int64(res.Overflowed)
 			s.pokeFlush(eng)
 		}
@@ -1727,8 +1744,12 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 			var res recordengine.AppendResult
 			accepted, res, err = eng.ApplyPrimary(walBytes, recordengine.AppendLimits{
 				MaxSeries: limits.MaxSeries, MaxInFlightBytes: limits.MaxInFlightBytes,
+				MinTimestamp: floor.timestamp, EnforceMinTimestamp: floor.enabled,
 			})
-			rej = cluster.Reject{OOO: res.RejectedOOO, Cardinality: res.RejectedCardinality, InFlight: res.RejectedBytes}
+			rej = cluster.Reject{
+				Retention: res.RejectedRetention, OOO: res.RejectedOOO,
+				Cardinality: res.RejectedCardinality, InFlight: res.RejectedBytes,
+			}
 			admitted = int64(res.Accepted)
 			s.pokeFlush(eng)
 		}
@@ -1747,6 +1768,7 @@ func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant st
 	// stays one tally per point.
 	admit := s.admissionFor(tid)
 	admit.record(admitted, int64(rej.OOO), int64(rej.Cardinality), int64(rej.InFlight))
+	admit.addRetention(int64(rej.Retention))
 
 	if overflowed > 0 {
 		admit.recordOverflowed(overflowed)

@@ -13,7 +13,7 @@ import (
 
 // retentionCutoff converts a signal's retention window into an absolute cutoff at the given now
 // (unix nanoseconds); 0 means retain forever. The window is per signal ([tenant.Retention.AgeFor]),
-// so exemplars can expire ahead of the samples they hang off.
+// so each signal can expire independently.
 func retentionCutoff(r tenant.Retention, sig signal.Signal, now int64) int64 {
 	age := r.AgeFor(sig)
 	if age <= 0 {
@@ -64,9 +64,9 @@ type sizeBudgets struct {
 func budgetsOf(r tenant.Retention) sizeBudgets {
 	b := sizeBudgets{pooled: r.MaxBytes}
 
-	for sig, n := range r.MaxBytesPerSignal {
-		if int(sig) < len(b.perSignal) {
-			b.perSignal[sig] = n
+	for sig, bounds := range r.PerSignal {
+		if sig >= signal.Metric && int(sig) < len(b.perSignal) {
+			b.perSignal[sig] = bounds.MaxBytes
 		}
 	}
 
@@ -153,7 +153,7 @@ func (s *Storage) sizeCutoffCached(t signal.TenantID) (cutoffs bySignal, current
 // bounds the bytes this node stores for it.
 //
 // The pooled budget ([tenant.Retention.MaxBytes]) and the per-signal ones
-// ([tenant.Retention.MaxBytesPerSignal]) both apply: a signal's cutoff is the later of the two, so
+// ([tenant.Retention.PerSignal]) both apply: a signal's cutoff is the later of the two, so
 // the pooled budget remains the tenant-wide outer bound while a per-signal budget keeps one signal's
 // growth from evicting the others' history.
 //
@@ -173,15 +173,25 @@ func (s *Storage) sizeCutoffFor(ctx context.Context, t signal.TenantID) bySignal
 // measureSizeCutoff is [Storage.sizeCutoffFor] reporting whether the cutoffs were measured: false
 // when the part sizes could not be read and the zero cutoffs are a fallback, not a result.
 func (s *Storage) measureSizeCutoff(ctx context.Context, t signal.TenantID) (bySignal, bool) {
+	decision, ok := s.measureSizeDecision(ctx, t)
+	return decision.cutoffs, ok
+}
+
+func (s *Storage) sizeDecisionFor(ctx context.Context, t signal.TenantID) sizeRetentionDecision {
+	decision, _ := s.measureSizeDecision(ctx, t)
+	return decision
+}
+
+func (s *Storage) measureSizeDecision(ctx context.Context, t signal.TenantID) (sizeRetentionDecision, bool) {
 	t = s.normalizeTenant(t) // engines are keyed by the normalized id
 
 	b := budgetsOf(s.tenant.Resolve(t).Retention)
 	if b.empty() {
-		return bySignal{}, true
+		return sizeRetentionDecision{}, true
 	}
 
 	fp := s.partSetFingerprint(t, b)
-	if cutoffs, ok := s.sizeRetention.lookup(t, fp); ok {
+	if cutoffs, ok := s.sizeRetention.lookupDecision(t, fp); ok {
 		return cutoffs, true
 	}
 
@@ -192,10 +202,11 @@ func (s *Storage) measureSizeCutoff(ctx context.Context, t signal.TenantID) (byS
 		s.obs.Logger(ctx).Warn("size retention: part sizes unavailable",
 			zap.String("tenant", string(t)), zap.Error(err))
 
-		return bySignal{}, false
+		return sizeRetentionDecision{}, false
 	}
 
-	var cutoffs bySignal
+	var decision sizeRetentionDecision
+	cutoffs := &decision.cutoffs
 
 	if b.pooled > 0 {
 		var all []sizedPart
@@ -206,16 +217,22 @@ func (s *Storage) measureSizeCutoff(ctx context.Context, t signal.TenantID) (byS
 		pooled := sizeRetentionCutoff(all, b.pooled)
 		for sig := range cutoffs {
 			cutoffs[sig] = pooled
+			if pooled > 0 {
+				decision.bounds[sig] = RetentionBoundPooledBytes
+			}
 		}
 	}
 
 	for sig := range cutoffs {
-		cutoffs[sig] = max(cutoffs[sig], sizeRetentionCutoff(parts[sig], b.perSignal[sig]))
+		signalCutoff := sizeRetentionCutoff(parts[sig], b.perSignal[sig])
+		if signalCutoff > 0 && signalCutoff >= cutoffs[sig] {
+			cutoffs[sig], decision.bounds[sig] = signalCutoff, RetentionBoundSignalBytes
+		}
 	}
 
-	s.sizeRetention.store(t, fp, cutoffs)
+	s.sizeRetention.storeDecision(t, fp, decision)
 
-	return cutoffs, true
+	return decision, true
 }
 
 // sizedParts collects the flushed parts this node holds for a tenant, bucketed by signal and pooled
@@ -279,9 +296,23 @@ func (s *Storage) sizeCutoffs(ctx context.Context, tids map[signal.TenantID]stru
 // sizes could not be read.
 func (s *Storage) measureSizeCutoffs(
 	ctx context.Context, tids map[signal.TenantID]struct{},
-) (out map[signal.TenantID]bySignal, failed map[signal.TenantID]struct{}) {
+) (map[signal.TenantID]bySignal, map[signal.TenantID]struct{}) {
+	decisions, failed := s.measureSizeDecisions(ctx, tids)
+	var cutoffs map[signal.TenantID]bySignal
+	if decisions != nil {
+		cutoffs = make(map[signal.TenantID]bySignal, len(decisions))
+	}
+	for tid, decision := range decisions {
+		cutoffs[tid] = decision.cutoffs
+	}
+	return cutoffs, failed
+}
+
+func (s *Storage) measureSizeDecisions(
+	ctx context.Context, tids map[signal.TenantID]struct{},
+) (out map[signal.TenantID]sizeRetentionDecision, failed map[signal.TenantID]struct{}) {
 	type measured struct {
-		cutoffs bySignal
+		cutoffs sizeRetentionDecision
 		ok      bool
 	}
 
@@ -294,7 +325,7 @@ func (s *Storage) measureSizeCutoffs(
 
 		m, seen := byTenant[t]
 		if !seen {
-			m.cutoffs, m.ok = s.measureSizeCutoff(ctx, t)
+			m.cutoffs, m.ok = s.measureSizeDecision(ctx, t)
 			byTenant[t] = m
 		}
 
@@ -307,9 +338,9 @@ func (s *Storage) measureSizeCutoffs(
 		}
 
 		cutoffs := m.cutoffs
-		if cutoffs.any() {
+		if cutoffs.cutoffs.any() {
 			if out == nil {
-				out = make(map[signal.TenantID]bySignal)
+				out = make(map[signal.TenantID]sizeRetentionDecision)
 			}
 
 			out[tid] = cutoffs

@@ -740,3 +740,11 @@ rack/server/disk hierarchy; a scheme is rack-safe with at least `ceil(Shards/Par
     unreachable peer cannot prove a signal is absent, so it retries — and entries for shards this
     node no longer owns are dropped, so a lost-and-regained shard bootstraps again. A signal that
     gains data later needs no re-probe: its write reaches every owner and creates the engine there.
+
+Retention-age rejection remains primary-authoritative. Primary responses retain their legacy
+three-count body, folding retention rejection into its OOO count. An optional
+`Oteldb-Rejected-Retention` response header separates that subset for updated clients; it must be
+nonnegative and no larger than the folded count. Legacy clients still report the correct total
+shed, with legacy OOO attribution; updated clients accept responses without the header. Enable
+the optional feature only after upgrading routers/owners and publishing a consistent retention
+policy. WAL and replication payload formats do not change.

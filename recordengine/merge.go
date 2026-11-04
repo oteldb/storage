@@ -27,6 +27,8 @@ type MergeOptions struct {
 	// RetainFrom drops records older than this absolute unix-nanosecond cutoff (retention);
 	// ≤ 0 disables it.
 	RetainFrom int64
+	// RetentionBoundBy is the policy bound behind RetainFrom, for observability only.
+	RetentionBoundBy RetentionBound
 	// Background marks this merge as the maintenance loop's own, where declining costs nothing: if
 	// the process merge budget ([Config.MergeAdmission]) is fully committed the merge is skipped and
 	// the next cycle retries it, rather than waiting.
@@ -59,6 +61,7 @@ func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool
 	}
 	retainFrom := opts.RetainFrom
 	ctx = e.cfg.Obs.Base(ctx)
+	e.recordRetentionRequest(opts.RetainFrom, opts.RetentionBoundBy)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "recordengine.merge",
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
 	defer span.End()
@@ -286,6 +289,9 @@ func (e *Engine) mergeHeld(ctx context.Context, opts MergeOptions, abandoned *[]
 	}
 
 	e.mu.Unlock()
+	if retentionStraddler(selected, retainFrom) {
+		e.cfg.Obs.Retention.Rewritten(ctx, e.cfg.Signal)
+	}
 
 	e.reclaimRetired(ctx)
 
@@ -358,6 +364,12 @@ func (e *Engine) dropExpired(ctx context.Context, src []*part, retainFrom int64)
 	}
 
 	e.mu.Lock()
+	var actual []*part
+	for _, p := range e.parts {
+		if _, drop := removed[p.prefix]; drop {
+			actual = append(actual, p)
+		}
+	}
 	next := replaceParts(e.parts, removed)
 
 	if err := e.commitIndexLocked(ctx, next, e.flushedEpoch, e.term()); err != nil {
@@ -372,6 +384,7 @@ func (e *Engine) dropExpired(ctx context.Context, src []*part, retainFrom int64)
 	// reasoning as a merge that drops rows, and the identity prune has something to find.
 	e.identityDirty = true
 	e.mu.Unlock()
+	e.cfg.Obs.Retention.Dropped(ctx, e.cfg.Signal, int64(len(actual)), partsBytes(actual))
 
 	remaining := make([]*part, 0, len(src)-len(expired))
 

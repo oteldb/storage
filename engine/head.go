@@ -284,6 +284,9 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 func (h *head) appendByID(
 	id signal.SeriesID, ts int64, value, sf float64, oooWindow int64, limits AppendLimits, materialize func() signal.Series,
 ) (out admitOutcome, effID signal.SeriesID, logSeries bool, s signal.Series) {
+	if limits.EnforceMinTimestamp && ts < limits.MinTimestamp {
+		return rejectRetention, id, false, signal.Series{}
+	}
 	if h.outOfOrder(id, ts, oooWindow) {
 		return rejectOOO, id, false, signal.Series{}
 	}

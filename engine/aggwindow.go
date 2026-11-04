@@ -46,6 +46,14 @@ type WindowSpec struct {
 	Anchor int64
 }
 
+// Validate checks the evaluation grid before a window read is planned.
+func (w WindowSpec) Validate() error {
+	if w.Step <= 0 {
+		return errWindowStep
+	}
+	return nil
+}
+
 // window returns the effective window width (Step when unset).
 func (w WindowSpec) window() int64 {
 	if w.Window <= 0 {
@@ -178,9 +186,9 @@ func (e *Engine) aggregateWindowSeq(
 			attribute.Int64("storage.window", spec.window()),
 		)
 
-		if spec.Step <= 0 {
-			span.RecordError(errWindowStep)
-			yield(NamedWindowAgg{}, errWindowStep)
+		if err := spec.Validate(); err != nil {
+			span.RecordError(err)
+			yield(NamedWindowAgg{}, err)
 
 			return
 		}

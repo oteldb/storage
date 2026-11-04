@@ -40,7 +40,7 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 	applied := false
 
 	defer func() {
-		if a.sideBuf.Len() > 0 && (!applied || a.res.Rejected() > 0) {
+		if a.sideTouched && (!applied || a.res.Rejected() > 0) {
 			e.sideStray = true
 		}
 	}()
@@ -49,6 +49,15 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 		return nil, AppendResult{}, err
 	}
 
+	if limits.EnforceMinTimestamp {
+		if a.res.Accepted == 0 && a.res.Rejected() > 0 {
+			a.sideBuf.Reset()
+		} else {
+			if err := wal.Replay(a.sideBuf.Bytes(), wal.Handlers{OnSide: a.absorbSide}); err != nil {
+				return nil, AppendResult{}, err
+			}
+		}
+	}
 	accepted = a.recBuf.Bytes()
 	if a.sideBuf.Len() > 0 {
 		accepted = append(a.sideBuf.Bytes(), accepted...)
@@ -93,10 +102,11 @@ type primaryApply struct {
 
 	// appenders holds one appender per stream for the whole write: a second run of the same stream
 	// must see the first run's admitted records in its out-of-order watermark.
-	appenders map[signal.SeriesID]*streamAppender
-	runs      []primaryRun
-	pending   int64
-	res       AppendResult
+	appenders   map[signal.SeriesID]*streamAppender
+	runs        []primaryRun
+	pending     int64
+	res         AppendResult
+	sideTouched bool
 }
 
 type primaryRun struct {
@@ -106,6 +116,9 @@ type primaryRun struct {
 
 func (a *primaryApply) series(id signal.SeriesID, s signal.Series) error {
 	a.byID[id] = s
+	if a.limits.EnforceMinTimestamp {
+		return nil
+	}
 	// The primary is the shard's single authority, so it makes the cardinality decision here: a new
 	// stream that would exceed MaxSeries is shed (its records are counted as cardinality rejections in
 	// records below).
@@ -124,6 +137,23 @@ func (a *primaryApply) records(id signal.SeriesID, blob []byte) error {
 		return err
 	}
 
+	if a.limits.EnforceMinTimestamp {
+		eligible := recs[:0]
+		for _, r := range recs {
+			if r.ts < a.limits.MinTimestamp {
+				a.res.RejectedRetention++
+				continue
+			}
+			eligible = append(eligible, r)
+		}
+		recs = eligible
+		if len(recs) == 0 {
+			return nil
+		}
+		if !a.e.head.ensureStream(id, func() signal.Series { return a.byID[id] }, a.limits.MaxSeries) {
+			a.overCard[id] = struct{}{}
+		}
+	}
 	if _, shed := a.overCard[id]; shed {
 		a.res.RejectedCardinality += len(recs)
 
@@ -167,15 +197,20 @@ func (a *primaryApply) records(id signal.SeriesID, blob []byte) error {
 }
 
 func (a *primaryApply) side(payload []byte) error {
-	// Absorb the symbol delta locally and forward it to the secondaries (content-addressed, so
-	// re-absorbing on every replica is an idempotent dedup).
-	if a.e.cfg.SideStore != nil {
-		if err := a.e.absorbSideLocked(payload); err != nil {
+	if !a.limits.EnforceMinTimestamp {
+		if err := a.absorbSide(payload); err != nil {
 			return err
 		}
 	}
-
 	return a.sides.WriteSide(payload)
+}
+
+func (a *primaryApply) absorbSide(payload []byte) error {
+	if a.e.cfg.SideStore == nil {
+		return nil
+	}
+	a.sideTouched = true
+	return a.e.absorbSideLocked(payload)
 }
 
 // ApplyReplicated applies a replicated write from the primary verbatim (no OOO re-check — the
