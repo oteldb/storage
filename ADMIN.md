@@ -30,9 +30,13 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   are counted and compacted on their own. Note their write is best-effort and their accept/reject
   counts stay out of the tenant `Admission` tally, which reports data points.
 - `StoreStats.Cluster` — cluster mode only (nil single-node): this node's address, live membership,
-  owned shards, and the last enacted rebalance plan (`LastRebalance`: each changed shard's full
+  compaction-claim shards (`Owned`), the ring replica/EC owner sets (`Placements`) for locally
+  known shard keys, and the last enacted rebalance plan (`LastRebalance`: each changed shard's full
   owner-set diff at its per-tenant replication factor — the replicas that must backfill, not just
-  the compaction-primary move). `PrivateBackend` echoes the configured
+  the compaction-primary move). `Placements` covers the union of local engine keys, currently held
+  claims and last-plan shard keys; it is not a complete cluster inventory. Owners follow the same
+  per-tenant replication factor and EC placement as read/write routing, in slot order. Computing
+  this view reads neither etcd nor the backend. `PrivateBackend` echoes the configured
   `cluster.Config.PrivateBackend`. `Fenced` is true while the node is past its membership lease's
   fence deadline (`FenceDeadlineUnixNano`: last keep-alive + TTL − margin, zero with no lease): it
   refuses every primary write with `cluster.ErrNotPrimary` and stops flushing, while still serving
@@ -412,6 +416,9 @@ column rather than folding the parts' precomputed stats:
 
 **EXPLAIN ANALYZE** (`query/profile`): `profile.WithCollector(ctx)` opts a single query into a
 per-operator timing tree; distributed reads graft each peer's subtree under a `remote {addr}` node.
+Record fetches expose `parts_pruned_range` separately from `parts_pruned_bloom`; the corresponding
+trace attribute is `storage.parts_pruned_range`. It counts parts rejected by persisted physical
+int64 column extrema before any condition-column decode.
 
 ## Act
 

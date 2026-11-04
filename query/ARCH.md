@@ -19,6 +19,10 @@ Limit, Reverse, Recycle, Scope}` carries two **operator-free** predicate familie
   part's blooms, never a replacement for `Match`. `AnyEqual` is a disjunction *inside* one condition
   — conditions AND, so an N-value equality cannot be spelled as N conditions; build it with
   `AnyEqualSet`, which sorts and dedups. Nil and empty both mean "no hint".
+  `Int64Range` applies only to fixed physical signed-integer columns. Optional inclusive/exclusive
+  bounds compare directly without floating conversion or endpoint arithmetic. Callers must never
+  attach it to attributes (including colliding names) or logical floats stored as integer bits.
+  Unknown/missing/wrong-kind column statistics retain parts; the callback still judges rows.
 
 Neither is an operator enum, so equality/regex/negation and condition extraction live in the
 language layer and storage stays operator-free. `Fetch` returns an `Iterator` of
@@ -169,3 +173,8 @@ contention returns `ErrDecodeBusy` with no reservation; unsupported decorators r
 An independent producer owns its own `fetch.Scope`; borrowing a waiting caller's scope would mix
 lifetimes and defeat admission. Already-owned scope growth and oversized-alone admission retain
 ordinary accounting. This is not a nonblocking I/O or engine-lock guarantee.
+
+`Condition.PhysicalColumn` is an explicit caller claim used only to preserve routed projections.
+Every condition must make that claim and name an explicitly projected column; `SecondPass` disables
+it. Unmarked, attribute, mixed or incompletely projected conditions keep full-column fallback.
+Requester callbacks remain authoritative, and conditions still prevent remote row-limit pushdown.

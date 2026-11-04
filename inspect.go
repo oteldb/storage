@@ -163,6 +163,8 @@ type ClusterStats struct {
 	Members []MemberStats
 	// Owned is the shards this node currently holds a compaction claim on (sorted).
 	Owned []string
+	// Placements is this node's ring owner sets for locally known shard keys, not a global inventory.
+	Placements []ShardPlacement
 	// LastRebalance is the owner-set handoffs enacted at the most recent ring change (empty if
 	// none), at each shard's per-tenant replication factor.
 	LastRebalance []RebalanceMove
@@ -196,6 +198,12 @@ type ClusterStats struct {
 	// process start; nil unless the cluster runs with a private (per-node) backend. All zeros
 	// when no tenant has an EC policy.
 	EC *ECStats
+}
+
+// ShardPlacement is the ring's replica or EC owner set in slot order for one locally known shard.
+type ShardPlacement struct {
+	Shard  string
+	Owners []string
 }
 
 // PartSyncStats is the cumulative shared-nothing part-mirroring activity of this node: how the
@@ -343,7 +351,7 @@ func (s *Storage) Inspect() StoreStats {
 
 	sort.Slice(out.Tenants, func(i, j int) bool { return out.Tenants[i].Tenant < out.Tenants[j].Tenant })
 
-	out.Cluster = s.clusterStats()
+	out.Cluster = s.clusterStats(out.Tenants)
 	out.Maintenance = MaintenanceStats{
 		Cycles:                 s.maintStats.cycles.Load(),
 		LastCycleStartUnixNano: s.maintStats.lastStartNano.Load(),
@@ -368,7 +376,7 @@ func errText(err error) string {
 }
 
 // clusterStats builds the cluster-mode section of [StoreStats], or nil in single-node mode.
-func (s *Storage) clusterStats() *ClusterStats {
+func (s *Storage) clusterStats(tenants []TenantStats) *ClusterStats {
 	if s.cluster == nil {
 		return nil
 	}
@@ -395,6 +403,25 @@ func (s *Storage) clusterStats() *ClusterStats {
 	for _, r := range s.cluster.ownership.LastPlan() {
 		cs.LastRebalance = append(cs.LastRebalance, RebalanceMove{Shard: r.Shard, Added: r.Added, Removed: r.Removed})
 	}
+
+	shards := make(map[string]struct{}, len(tenants)+len(cs.Owned)+len(cs.LastRebalance))
+	for _, tenant := range tenants {
+		shards[string(tenant.Tenant)] = struct{}{}
+	}
+	for _, shard := range cs.Owned {
+		shards[shard] = struct{}{}
+	}
+	for _, move := range cs.LastRebalance {
+		shards[move.Shard] = struct{}{}
+	}
+	for shard := range shards {
+		placement := ShardPlacement{Shard: shard, Owners: []string{}}
+		for _, owner := range s.ownerLookup(signal.TenantID(shard)) {
+			placement.Owners = append(placement.Owners, owner.ID)
+		}
+		cs.Placements = append(cs.Placements, placement)
+	}
+	sort.Slice(cs.Placements, func(i, j int) bool { return cs.Placements[i].Shard < cs.Placements[j].Shard })
 
 	if s.cluster.private {
 		t := s.cluster.psync.Totals()

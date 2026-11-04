@@ -632,6 +632,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, 
 		if plan != nil {
 			pf.Add("parts_pruned_time", int64(plan.partsPrunedTime))
 			pf.Add("parts_pruned_bloom", int64(plan.partsPrunedBloom))
+			pf.Add("parts_pruned_range", int64(plan.partsPrunedRange))
 			pf.Add("parts_live", int64(len(plan.liveParts)))
 			pf.Add("parts_skipped_limit", int64(plan.partsSkippedLimit))
 			pf.Add("rows_total", plan.rowsTotal)
@@ -639,6 +640,7 @@ func (e *Engine) Fetch(ctx context.Context, r fetch.Request) (_ fetch.Iterator, 
 			span.SetAttributes(
 				attribute.Int("storage.parts_pruned_time", plan.partsPrunedTime),
 				attribute.Int("storage.parts_pruned_bloom", plan.partsPrunedBloom),
+				attribute.Int("storage.parts_pruned_range", plan.partsPrunedRange),
 				attribute.Int("storage.parts_live", len(plan.liveParts)),
 				attribute.Int("storage.parts_skipped_limit", plan.partsSkippedLimit),
 				attribute.Int64("storage.rows_total", plan.rowsTotal),
@@ -1144,7 +1146,7 @@ type fetchPlan struct {
 	// liveParts' row counts these answer "how much did pruning actually cut, and how big are the
 	// parts that survived" — e.g. whether a part is too small for a whole-column SIMD scan to
 	// matter relative to per-part fixed costs (decompression, bloom decode, stream setup).
-	partsTotal, partsPrunedTime, partsPrunedBloom int
+	partsTotal, partsPrunedTime, partsPrunedBloom, partsPrunedRange int
 
 	// rowsTotal/rowsLive sum every scanned part's [block.PartReader.RowCount] (cheap: cached from
 	// the manifest at part-open, no extra backend I/O) — rowsTotal over every part considered,
@@ -1261,6 +1263,8 @@ func (e *Engine) planFetch(ctx context.Context, ids []signal.SeriesID, r fetch.R
 		switch {
 		case part.maxTime < r.Start || part.minTime > r.End: // time-prune
 			p.partsPrunedTime++
+		case r.AllConditions && !part.rangesMayMatch(r.Conditions):
+			p.partsPrunedRange++
 		case r.AllConditions && !part.mayContain(r.Conditions): // bloom-prune
 			p.partsPrunedBloom++
 		case p.sizeStreams(part, partRows):

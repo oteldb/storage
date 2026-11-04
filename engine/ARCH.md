@@ -11,6 +11,10 @@ The order is catalog → writer → state. Append, replica apply and WAL operati
 ordering; catalog/reload/repair operations take all three. Queries take the state read lock;
 lazy postings sorting takes only state exclusion. None of these locks is reentrant.
 
+`ReadRevision` pairs engine identity with the guard's monotone publication version. Append, replay,
+reset, reload, repair, flush and merge all advance it through writer unlock; derived postings sorts
+do not. Tokens are process-local, never reset or reused, and become noncacheable on saturation.
+
 Metrics `HasWants` first tries catalog ownership to read all three obligation sets; ingestion
 never mutates them. A busy catalog falls back to the state read lock, preserving reader progress
 during catalog I/O. Windowed repair checks, read gaps, fences, and acknowledged holes are unchanged.

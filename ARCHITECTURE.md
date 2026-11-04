@@ -58,6 +58,10 @@ engines over the fetch seam (`query/fetch`).
 
 ## 3. Public surface (root package)
 
+`Inspect().Cluster.Placements` reports this node's replica/EC owner sets for locally known shard
+keys, using the routing placement and per-tenant policy. It is an in-memory observation, not a
+complete cluster inventory; `Owned` separately names held compaction claims.
+
 `Storage` is the whole API. `Open(ctx, Options, ...Option)` / `InMemory(...Option)` build it;
 `Close` stops maintenance and flushes.
 
@@ -88,6 +92,10 @@ engines over the fetch seam (`query/fetch`).
   call), so a step-grid range query costs one call rather than one per step. `WindowNamed` is the
   overlapping form: a window wider than the step (a 1h range at a 5m step) at a cost proportional
   to the data, not to the overlap.
+  `MetricReadRevision(tenant, minInputNS)` supplies a comparable local read token for completed
+  result caches. Its age deadline is derived from the earliest input timestamp, rather than a TTL;
+  expired/straddling windows and clustered sources cannot reuse completed results. Policy age
+  changes alter the token's deadline, and all engine publications change its revision.
 - **Maintenance** — a periodic/catch-up worker flushes and merges tenant engines, with deferred
   tenants receiving an exclusive admission turn before bounded parallel work. An independent
   pressure worker services head-size wakes even while a merge is building. Engines admit one
