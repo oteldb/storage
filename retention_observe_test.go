@@ -107,7 +107,7 @@ func TestRetentionInspectSignalAgesAndDynamicPolicy(t *testing.T) {
 	for _, ts := range []int64{old, fresh} {
 		_, err = s.WriteMetrics(t.Context(), exemplarBatch("api", "m", ts, map[string][]exemplarSpec{"/": {{ts: ts, value: 1, traceID: "trace"}}}))
 		require.NoError(t, err)
-		_, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{int(ts), 9, "body"}))
+		_, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{ts, 9, "body"}))
 		require.NoError(t, err)
 		_, err = s.WriteTraces(t.Context(), traceBatch("api", spanSpec{traceID: "trace", spanID: "span", name: "op", start: ts, end: ts + 1}))
 		require.NoError(t, err)
@@ -144,7 +144,7 @@ func TestRetentionLagGaugeClearsWithoutParts(t *testing.T) {
 	s, err := Open(t.Context(), Options{Backend: backend.Memory(), MergeMemoryBytes: 1 << 20}, WithFlushInterval(-1), WithMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))))
 	require.NoError(t, err)
 	defer func() { require.NoError(t, s.Close(context.Background())) }()
-	_, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{int(1e9), 9, "old"}, [3]any{int(3e9), 9, "new"}))
+	_, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{int64(1e9), 9, "old"}, [3]any{int64(3e9), 9, "new"}))
 	require.NoError(t, err)
 	require.NoError(t, s.Admin().Flush(t.Context(), "default", signal.Log))
 	e, ok := s.lookupRecordEngine(signal.Log, "default")
@@ -204,7 +204,7 @@ func writeRetentionObserved(t *testing.T, s *Storage, sig signal.Signal, ts int6
 	case signal.Metric:
 		_, err = s.WriteMetrics(t.Context(), gaugeBatch("api", "retention", []int64{ts}, []float64{1}))
 	case signal.Log:
-		_, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{int(ts), 9, "body"}))
+		_, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{ts, 9, "body"}))
 	case signal.Trace:
 		_, err = s.WriteTraces(t.Context(), traceBatch("api", spanSpec{traceID: "trace", spanID: "span", name: "op", start: ts, end: ts + 1}))
 	case signal.Profile:
