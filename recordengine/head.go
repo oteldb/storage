@@ -23,12 +23,15 @@ var (
 // over stream labels) plus per-stream full-column record buffers in arrival order (sorted on
 // read). Not safe for concurrent use; the [Engine] holds the lock.
 type head struct {
-	schema  *Schema
-	sym     *symbols.Table
-	series  *series.Index
-	post    *postings.MemPostings
-	records map[signal.SeriesID]*recordCols
-	newest  int64 // newest record timestamp across every stream (reported as Inspect.MaxTime)
+	schema        *Schema
+	sym           *symbols.Table
+	series        *series.Index
+	post          *postings.MemPostings
+	records       map[signal.SeriesID]*recordCols
+	reusable      *recordCols
+	reusableBytes int64
+	reusableCount int
+	newest        int64 // newest record timestamp across every stream (reported as Inspect.MaxTime)
 
 	// streamNewest is each stream's own newest admitted timestamp: the OOO window is a per-stream
 	// lateness bound, not a cross-stream one, so a high-rate (or clock-skewed-ahead) stream cannot
@@ -252,7 +255,11 @@ func (a *streamAppender) append(r rec, oooWindow, maxBytes int64) admitOutcome {
 // exactly what it would have seen had each admitted record been applied as it was admitted. Every
 // admitted record must then be applied, in admission order, before [streamAppender.commit].
 func (a *streamAppender) admit(r rec, oooWindow, maxBytes int64, pending *int64) admitOutcome {
-	if a.seen && oooWindow > 0 && r.ts < a.ts-oooWindow {
+	return a.admitSized(r.ts, recByteSize(r), oooWindow, maxBytes, pending)
+}
+
+func (a *streamAppender) admitSized(ts, size, oooWindow, maxBytes int64, pending *int64) admitOutcome {
+	if a.seen && oooWindow > 0 && ts < a.ts-oooWindow {
 		return rejectOOO
 	}
 
@@ -260,15 +267,15 @@ func (a *streamAppender) admit(r rec, oooWindow, maxBytes int64, pending *int64)
 	// detached buffers back into the live ones ([head.reattach]) — so the bound covers both sides of
 	// the in-flight measure, not just the live half, which would let a reattach restore ~2× the cap.
 	// MaxInFlightBytes is memory backpressure, and covers everything resident for its own reason.
-	inFlight := a.h.inFlightBytes() + *pending
+	inFlight := a.h.admissionBytes(maxBytes, *pending)
 	if inFlight >= headByteCap || (maxBytes > 0 && inFlight >= maxBytes) {
 		return rejectBytes
 	}
 
-	*pending += recByteSize(r)
+	*pending += size
 
-	if !a.seen || r.ts > a.ts {
-		a.ts, a.seen, a.dirty = r.ts, true, true
+	if !a.seen || ts > a.ts {
+		a.ts, a.seen, a.dirty = ts, true, true
 	}
 
 	return admitted
@@ -278,8 +285,8 @@ func (a *streamAppender) admit(r rec, oooWindow, maxBytes int64, pending *int64)
 func (a *streamAppender) apply(r rec) {
 	h := a.h
 
-	if a.buf == nil {
-		a.buf = newRecordCols(h.schema, 0, fullSel(h.schema))
+	if a.buf == nil || (len(a.buf.ts) == 0 && cap(a.buf.ts) == 0 && h.reusable != nil) {
+		a.buf = h.takeRecordCols()
 		h.records[a.id] = a.buf
 	}
 

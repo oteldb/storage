@@ -4,40 +4,81 @@ import (
 	"github.com/go-faster/errors"
 )
 
-// batchRec loads record i of b into scratch. The byte cells alias b.
-func batchRec(scratch *rec, b *Batch, i int) {
-	scratch.ts = b.Ts[i]
-	for k := range b.Ints {
-		scratch.ints[k] = b.Ints[k][i]
+func batchRowBytes(b *Batch, i int) int64 {
+	n := int64(8 + 8*len(b.Ints))
+	for _, col := range b.Bytes {
+		n += int64(len(col[i]))
 	}
-
-	for k := range b.Bytes {
-		scratch.bytes[k] = b.Bytes[k][i]
-	}
+	return n
 }
 
-func newBatchScratch(b *Batch) rec {
-	return rec{ints: make([]int64, len(b.Ints)), bytes: make([][]byte, len(b.Bytes))}
-}
-
-// appendUnlogged is [Engine.AppendBatch] for an engine with no WAL: nothing can fail between admitting
-// a record and applying it, so it does both in one pass. Caller holds e.mu.
-func (e *Engine) appendUnlogged(b *Batch, limits AppendLimits) (AppendResult, error) {
-	scratch := newBatchScratch(b)
-
-	var res AppendResult
-
-	app := e.head.appenderFor(b.Stream)
-
-	for i := range b.Ts {
-		if limits.EnforceMinTimestamp && b.Ts[i] < limits.MinTimestamp {
-			res.RejectedRetention++
-			continue
+// applyBatch appends admitted rows column by column, copying byte cells into head-owned blobs.
+func (a *streamAppender) applyBatch(b *Batch, rows []int, size int64) {
+	if len(rows) == 0 {
+		return
+	}
+	for len(rows) > 0 {
+		end := 1
+		for end < len(rows) && rows[end] == rows[end-1]+1 {
+			end++
 		}
-		batchRec(&scratch, b, i)
-		res = res.with(app.append(scratch, e.cfg.OOOWindow, limits.MaxInFlightBytes))
+		a.applyBatchRange(b, rows[0], rows[end-1]+1)
+		rows = rows[end:]
 	}
+	a.h.grow(size)
+}
 
+func (a *streamAppender) applyBatchRange(b *Batch, lo, hi int) {
+	if lo == hi {
+		return
+	}
+	if a.buf == nil || (len(a.buf.ts) == 0 && cap(a.buf.ts) == 0 && a.h.reusable != nil) {
+		a.buf = a.h.takeRecordCols()
+		a.h.records[a.id] = a.buf
+	}
+	a.buf.ts = append(a.buf.ts, b.Ts[lo:hi]...)
+	for _, ts := range b.Ts[lo:hi] {
+		a.buf.noteTS(ts)
+		a.h.newest = max(a.h.newest, ts)
+	}
+	for k, col := range b.Ints {
+		a.buf.ints[k] = append(a.buf.ints[k], col[lo:hi]...)
+	}
+	for k, col := range b.Bytes {
+		for _, cell := range col[lo:hi] {
+			a.buf.bytes[k].appendCell(cell)
+		}
+	}
+}
+
+// appendUnlogged admits rows in arrival order and applies contiguous accepted runs without staging
+// a WAL payload. Caller holds e.mu.
+func (e *Engine) appendUnlogged(b *Batch, limits AppendLimits) (AppendResult, error) {
+	var (
+		res     AppendResult
+		pending int64
+		start   int
+	)
+	app := e.head.appenderFor(b.Stream)
+	for i, ts := range b.Ts {
+		out := rejectRetention
+		if !limits.EnforceMinTimestamp || ts >= limits.MinTimestamp {
+			out = app.admitSized(ts, batchRowBytes(b, i), e.cfg.OOOWindow, limits.MaxInFlightBytes, &pending)
+		}
+		res = res.with(out)
+		if out != admitted {
+			app.applyBatchRange(b, start, i)
+			if pending > 0 {
+				e.head.grow(pending)
+				pending = 0
+			}
+			start = i + 1
+		}
+	}
+	app.applyBatchRange(b, start, len(b.Ts))
+	if pending > 0 {
+		e.head.grow(pending)
+	}
 	app.commit()
 
 	if e.cfg.SideStore != nil && res.Accepted > 0 && len(b.Side) > 0 {
@@ -61,8 +102,6 @@ func (e *Engine) appendUnlogged(b *Batch, limits AppendLimits) (AppendResult, er
 // its records costs nothing on retry, whereas records that reached the log without their delta would be
 // replayed and then written again. Caller holds e.mu.
 func (e *Engine) appendLogged(b *Batch, limits AppendLimits) (AppendResult, error) {
-	scratch := newBatchScratch(b)
-
 	var (
 		res     AppendResult
 		pending int64
@@ -77,9 +116,7 @@ func (e *Engine) appendLogged(b *Batch, limits AppendLimits) (AppendResult, erro
 			res.RejectedRetention++
 			continue
 		}
-		batchRec(&scratch, b, i)
-
-		out := app.admit(scratch, e.cfg.OOOWindow, limits.MaxInFlightBytes, &pending)
+		out := app.admitSized(b.Ts[i], batchRowBytes(b, i), e.cfg.OOOWindow, limits.MaxInFlightBytes, &pending)
 		res = res.with(out)
 
 		if out == admitted {
@@ -110,10 +147,7 @@ func (e *Engine) appendLogged(b *Batch, limits AppendLimits) (AppendResult, erro
 		return AppendResult{}, err
 	}
 
-	for _, i := range rows {
-		batchRec(&scratch, b, i)
-		app.apply(scratch)
-	}
+	app.applyBatch(b, rows, pending)
 
 	app.commit()
 

@@ -1977,6 +1977,7 @@ func (s *Storage) recordPartShape(ctx context.Context) {
 func (s *Storage) recordHeadShape(ctx context.Context) {
 	type shape struct {
 		bytes, items, series, identity int64
+		reusable                       int64
 		age                            time.Duration
 		walSegments, walBytes          int64
 	}
@@ -2015,6 +2016,7 @@ func (s *Storage) recordHeadShape(ctx context.Context) {
 		for _, eng := range engines {
 			st := eng.Stats()
 			sh := add(sig, st.HeadBytes, st.HeadRecords, st.Streams, st.IdentityBytes, st.HeadAge)
+			sh.reusable += st.ReusableBytes
 
 			if segments, bytes, _, ok := eng.WALState(); ok {
 				sh.walSegments += int64(segments)
@@ -2026,6 +2028,7 @@ func (s *Storage) recordHeadShape(ctx context.Context) {
 	for sig, sh := range shapes {
 		name := sig.String()
 		s.obs.Head.Record(ctx, name, sh.bytes, sh.items, sh.series, sh.identity, sh.age)
+		s.obs.Head.RecordReusable(ctx, name, sh.reusable)
 		s.obs.WAL.Record(ctx, name, sh.walSegments, sh.walBytes)
 	}
 }

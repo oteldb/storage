@@ -550,6 +550,7 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 // shows here first, and nowhere else until a part finally appears.
 type Head struct {
 	bytes         metric.Int64Gauge
+	reusableBytes metric.Int64Gauge
 	items         metric.Int64Gauge
 	series        metric.Int64Gauge
 	identityBytes metric.Int64Gauge
@@ -569,12 +570,18 @@ func (h *Head) Record(ctx context.Context, sig string, bytes, items, series, ide
 	h.age.Record(ctx, age.Seconds(), a)
 }
 
+// RecordReusable publishes idle record-head buffer capacity, separate from flushable bytes.
+func (h *Head) RecordReusable(ctx context.Context, sig string, bytes int64) {
+	h.reusableBytes.Record(ctx, bytes, sigAttr(sig))
+}
+
 func newHead(m metric.Meter) (*Head, error) {
 	b := &imb{m: m}
 	h := &Head{
-		bytes:  b.gauge("storage.head.bytes", "buffered bytes a flush has yet to make durable", "By"),
-		items:  b.gauge("storage.head.items", "samples or records buffered in the head", "{item}"),
-		series: b.gauge("storage.head.series", "distinct series or streams the identity index holds", "{series}"),
+		bytes:         b.gauge("storage.head.bytes", "buffered bytes a flush has yet to make durable", "By"),
+		reusableBytes: b.gauge("storage.head.reusable_bytes", "idle reusable record-head buffer capacity", "By"),
+		items:         b.gauge("storage.head.items", "samples or records buffered in the head", "{item}"),
+		series:        b.gauge("storage.head.series", "distinct series or streams the identity index holds", "{series}"),
 		identityBytes: b.gauge("storage.head.identity_bytes",
 			"resident identity state (symbols, index, postings) — memory a flush does not drain", "By"),
 		age: b.f64gauge("storage.head.age", "how long the head has been accumulating since its last flush", "s"),

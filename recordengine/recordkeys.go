@@ -117,8 +117,8 @@ func decodeRecordKeys(src []byte) ([][]byte, error) {
 
 // writeRecordKeys persists the part's distinct record-attribute keys as the "{prefix}/keys.bin"
 // footer sidecar. No-op when the schema has no attrs column or the part holds no record attributes.
-func writeRecordKeys(ctx context.Context, b backend.Backend, schema *Schema, prefix string, cols *recordCols) error {
-	keys := distinctRecordKeys(schema, cols)
+func writeRecordKeys(ctx context.Context, b backend.Backend, prefix string, cols *recordCols) error {
+	keys := cols.distinctAttrKeys()
 	if len(keys) == 0 {
 		return nil
 	}

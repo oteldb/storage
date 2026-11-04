@@ -10,6 +10,15 @@ import (
 // BenchmarkAppendBatchWAL measures the logged append: admission, encoding the accepted records into
 // the WAL payload, the log write, and applying the records to the head.
 func BenchmarkAppendBatchWAL(b *testing.B) {
+	benchmarkAppendBatchWAL(b, false)
+}
+
+func BenchmarkAppendBatchWALSync(b *testing.B) {
+	benchmarkAppendBatchWAL(b, true)
+}
+
+func benchmarkAppendBatchWAL(b *testing.B, syncWrite bool) {
+	b.Helper()
 	const rows = 1000
 
 	w, err := wal.Create(b.TempDir(), 0)
@@ -18,6 +27,7 @@ func BenchmarkAppendBatchWAL(b *testing.B) {
 	}
 
 	b.Cleanup(func() { _ = w.Close() })
+	w.SetSync(syncWrite)
 
 	e := recordengine.New(recordengine.Config{Schema: testSchema, WAL: w})
 
