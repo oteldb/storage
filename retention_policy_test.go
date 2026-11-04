@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/tenant"
 )
@@ -18,38 +19,55 @@ func TestRetentionPerSignalAgeIsolation(t *testing.T) {
 	for target := signal.Metric; target <= signal.Exemplar; target++ {
 		t.Run(target.String(), func(t *testing.T) {
 			t.Parallel()
-			s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
-				return tenant.Policy{Retention: tenant.Retention{MaxAge: 24 * time.Hour, PerSignal: map[signal.Signal]tenant.SignalRetention{target: {MaxAge: time.Hour}}}}
-			})))
-			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, s.Close(context.Background())) })
-			now := time.Now()
-			old, fresh := now.Add(-6*time.Hour).UnixNano(), now.Add(-time.Minute).UnixNano()
-			for _, ts := range []int64{old, fresh} {
-				_, err = s.WriteMetrics(t.Context(), exemplarBatch("api", "m", ts, map[string][]exemplarSpec{"/": {{ts: ts, value: 1, traceID: "trace"}}}))
-				require.NoError(t, err)
-				_, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{int(ts), 9, "body"}))
-				require.NoError(t, err)
-				_, err = s.WriteTraces(t.Context(), traceBatch("api", spanSpec{traceID: "trace", spanID: "span", name: "op", start: ts, end: ts + 1}))
-				require.NoError(t, err)
-				_, err = s.WriteProfiles(t.Context(), profileBatch("api", ts, sampleSpec{"cpu", "ns", 1}))
-				require.NoError(t, err)
-			}
-			s.maintain(t.Context())
-			s.maintain(t.Context())
-			stats := s.Inspect()
-			require.Len(t, stats.Tenants, 1)
-			require.Len(t, stats.Tenants[0].Signals, 5)
-			for _, got := range stats.Tenants[0].Signals {
-				require.Positive(t, got.Parts)
-				if got.Signal == target {
-					require.GreaterOrEqual(t, got.MinTimeUnixNano, now.Add(-time.Hour).UnixNano())
-				} else {
-					require.Equal(t, old, got.MinTimeUnixNano, got.Signal.String())
-				}
-			}
+			checkRetentionAgeIsolation(t, target, WithMergeMemory(512<<20), WithMaintenanceConcurrency(1), WithFlushInterval(-1))
 		})
 	}
+}
+
+func checkRetentionAgeIsolation(t *testing.T, target signal.Signal, opts ...Option) {
+	t.Helper()
+	s, err := InMemory(append(opts, WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
+		return tenant.Policy{Retention: tenant.Retention{MaxAge: 24 * time.Hour, PerSignal: map[signal.Signal]tenant.SignalRetention{target: {MaxAge: time.Hour}}}}
+	})))...)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close(context.Background())) })
+	now := time.Now()
+	old, fresh := now.Add(-6*time.Hour).UnixNano(), now.Add(-time.Minute).UnixNano()
+	for _, ts := range []int64{old, fresh} {
+		_, err = s.WriteMetrics(t.Context(), exemplarBatch("api", "m", ts, map[string][]exemplarSpec{"/": {{ts: ts, value: 1, traceID: "trace"}}}))
+		require.NoError(t, err)
+		_, err = s.WriteLogs(t.Context(), logBatch("api", [3]any{ts, 9, "body"}))
+		require.NoError(t, err)
+		_, err = s.WriteTraces(t.Context(), traceBatch("api", spanSpec{traceID: "trace", spanID: "span", name: "op", start: ts, end: ts + 1}))
+		require.NoError(t, err)
+		_, err = s.WriteProfiles(t.Context(), profileBatch("api", ts, sampleSpec{"cpu", "ns", 1}))
+		require.NoError(t, err)
+	}
+	metric, ok := s.lookupEngine("default")
+	require.True(t, ok)
+	require.NoError(t, metric.Flush(t.Context()))
+	require.Equal(t, 1, metric.PartCount(), "the fixture retains a straddling old/fresh metric part")
+
+	s.maintain(t.Context())
+	s.maintain(t.Context())
+	stats := s.Inspect()
+	require.Len(t, stats.Tenants, 1)
+	require.Len(t, stats.Tenants[0].Signals, 5)
+	for i := range stats.Tenants[0].Signals {
+		got := &stats.Tenants[0].Signals[i]
+		require.Positive(t, got.Parts)
+		if got.Signal == target {
+			require.GreaterOrEqual(t, got.MinTimeUnixNano, now.Add(-time.Hour).UnixNano())
+		} else {
+			require.Equal(t, old, got.MinTimeUnixNano, got.Signal.String())
+		}
+	}
+}
+
+func TestMetricRetentionFitsFallbackBudget(t *testing.T) {
+	reproduce.Unfixed(t, 659, "a buffered single-part metric retention rewrite needs more than the fallback per-engine share")
+	t.Parallel()
+	checkRetentionAgeIsolation(t, signal.Metric, WithMergeMemory(512<<20), WithMaintenanceConcurrency(5), WithFlushInterval(-1))
 }
 
 func TestRetentionPolicyIsolationProperty(t *testing.T) {
@@ -99,7 +117,7 @@ func TestRetentionPerTenantRuntimeAge(t *testing.T) {
 	now := time.Now()
 	old, fresh := now.Add(-6*time.Hour).UnixNano(), now.Add(-time.Minute).UnixNano()
 	for _, id := range []string{"left", "right"} {
-		_, err = s.WriteLogs(t.Context(), logBatch(id, [3]any{int(old), 9, "old"}, [3]any{int(fresh), 9, "fresh"}))
+		_, err = s.WriteLogs(t.Context(), logBatch(id, [3]any{old, 9, "old"}, [3]any{fresh, 9, "fresh"}))
 		require.NoError(t, err)
 	}
 	s.maintain(t.Context())
