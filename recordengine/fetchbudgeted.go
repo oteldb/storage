@@ -122,19 +122,19 @@ func (p *fetchPlan) readBudgetedPart(ctx context.Context, part *part) error {
 	if err := reserve(fetchAdd(first, fetchMul(granules, 64))); err != nil {
 		return err
 	}
-	blocks := part.windowGranules(ctx, p.sortedIDs, p.start, p.end)
+	p.matched = part.heldStreams(p.matched[:0], p.sortedIDs)
+	blocks := part.windowGranules(ctx, p.matched, p.start, p.end)
 	// Fresh buffers make the reservation match this decode rather than a larger pooled buffer.
 	lz, err := part.readLazyConds(ctx, p.condSel, p.conds, nil, blocks)
 	if err != nil {
 		return err
 	}
-	p.matched = part.heldStreams(p.matched[:0], p.sortedIDs)
 	var candidates int64
 	for _, sr := range p.matched {
 		w := tsWindow(lz.ts, sr.rowRange, p.start, p.end)
 		candidates = fetchAdd(candidates, int64(w.end-w.start))
 	}
-	matched, err := p.budgetedMatches(part, lz, candidates, reserve)
+	matched, err := p.budgetedMatches(lz, candidates, reserve)
 	if err != nil {
 		return err
 	}
@@ -221,7 +221,7 @@ func (p *fetchPlan) conditionMemoBytes(lz *lazyCols) int64 {
 	return fetchMul(fetchMul(2, int64(len(p.conds))), entries)
 }
 
-func (p *fetchPlan) budgetedMatches(part *part, lz *lazyCols, candidates int64, reserve func(int64) error) (bool, error) {
+func (p *fetchPlan) budgetedMatches(lz *lazyCols, candidates int64, reserve func(int64) error) (bool, error) {
 	if len(p.conds) == 0 {
 		return candidates > 0, nil
 	}
@@ -229,7 +229,7 @@ func (p *fetchPlan) budgetedMatches(part *part, lz *lazyCols, candidates int64, 
 		return false, err
 	}
 	p.hits = make([]int, 0, int(candidates))
-	return p.scanMatches(part, lz), nil
+	return p.scanMatches(lz), nil
 }
 
 func fixedCellBytes(lz *lazyCols, k int) (int, bool) {
