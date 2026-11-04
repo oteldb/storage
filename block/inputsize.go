@@ -21,7 +21,7 @@ type ColumnInputSize struct {
 	MaxGranuleRaw int64
 	// DirBytes is the parsed directory.
 	DirBytes int64
-	// OpenBytes is the encoded bytes held while the column opens.
+	// OpenBytes bounds transient bytes held while the column opens, including directory decompression.
 	OpenBytes int64
 	// WholeResident is the decoded footprint of the column read whole.
 	WholeResident int64
@@ -98,7 +98,17 @@ func sizedInput(desc ColumnDesc, rows int64) ColumnInputSize {
 		perFrame += 4
 	}
 
-	in.DirBytes = satAdd(satAdd(4, satMul(perFrame, s.NumFrames)), satMul(12, s.NumGranules))
+	perGranule := int64(12)
+	if desc.MaxBlockRows > 0 {
+		perGranule = 0
+	}
+	in.DirBytes = satAdd(satAdd(4, satMul(perFrame, s.NumFrames)), satMul(perGranule, s.NumGranules))
+	if desc.MaxBlockRows > 0 {
+		in.DirBytes = satAdd(in.DirBytes, satMul(8, s.NumGranules+1))
+	}
+	if desc.TimeBounds {
+		in.DirBytes = satAdd(in.DirBytes, satMul(16, s.NumGranules))
+	}
 
 	switch {
 	case desc.TrailerDict:
@@ -109,6 +119,9 @@ func sizedInput(desc ColumnDesc, rows int64) ColumnInputSize {
 		in.OpenBytes = s.DirLen
 	}
 
+	if desc.CompactDir {
+		in.OpenBytes = satAdd(in.OpenBytes, compactDirOpenBytes(desc))
+	}
 	return in
 }
 

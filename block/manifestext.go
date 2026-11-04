@@ -17,6 +17,7 @@ const sharedEntriesCeiling = 1 << 16
 // uint64, by comparison and subtraction only, before it is converted: a CRC-valid manifest reaches
 // here with any bytes a writer never produced.
 func decodeColumnExt(r *bitstream.Reader, c *ColumnDesc, x byte, version uint32, rows uint64) error {
+	c.CompactDir = x&xCompactDir != 0
 	if x&xTrailerDict != 0 {
 		var v [4]uint64
 
@@ -143,7 +144,7 @@ func checkSizing(c *ColumnDesc, s ColumnSizing, rows uint64) error {
 			s.DirLen, c.Bytes-c.DictOff-c.DictLen-footerLenBytes)
 	case s.DirLen > dirMax:
 		return errors.Wrapf(ErrCorrupt, "directory of %d bytes in an object of %d", s.DirLen, c.Bytes)
-	case s.NumFrames > s.NumGranules, uint64(s.NumGranules) > rows, s.NumGranules > s.DirLen:
+	case s.NumFrames > s.NumGranules, uint64(s.NumGranules) > rows, (!c.CompactDir && s.NumGranules > s.DirLen):
 		return errors.Wrapf(ErrCorrupt, "%d frames, %d granules for %d rows in a %d-byte directory",
 			s.NumFrames, s.NumGranules, rows, s.DirLen)
 	case s.MaxFrameBytes > c.Bytes:

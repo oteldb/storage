@@ -45,9 +45,11 @@ func (r *ColumnReader) Frames() ([]FrameExtent, error) {
 			h++
 		}
 
+		lo, _ := d.span(g, r.rows)
+		_, hi := d.span(h-1, r.rows)
 		out = append(out, FrameExtent{
-			StartRow: min(g*d.blockRows, r.rows),
-			EndRow:   min(h*d.blockRows, r.rows),
+			StartRow: lo,
+			EndRow:   hi,
 			Bytes:    int64(d.frameOff[f+1] - d.frameOff[f]),
 		})
 

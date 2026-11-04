@@ -132,7 +132,7 @@ func (e *Engine) PartsDetailed(ctx context.Context) ([]PartDetailStat, error) {
 				SizeBytes: p.diskBytes,
 			},
 			Bytes:      sizes.Total,
-			Chunks:     granuleCount(man.RowCount, man.GranuleSize),
+			Chunks:     partGranuleCount(man),
 			Columns:    cols,
 			OtherBytes: sizes.Other,
 		})
@@ -214,4 +214,14 @@ func (e *Engine) Cardinality(topN int) CardinalityStat {
 	}
 
 	return cs
+}
+
+func partGranuleCount(man block.Manifest) int {
+	for i := range man.Columns {
+		c := &man.Columns[i]
+		if c.MaxBlockRows > 0 {
+			return int(c.Sizing.NumGranules)
+		}
+	}
+	return granuleCount(man.RowCount, man.GranuleSize)
 }

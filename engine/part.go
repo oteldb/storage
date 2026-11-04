@@ -355,6 +355,7 @@ type part struct {
 	// the index entry when reconstructed (see engine/index.go).
 	minTime, maxTime int64
 	retentionAt      time.Time
+	variable         bool
 	countRetained    int64
 	countTransient   int64
 	countBounded     bool
@@ -419,6 +420,10 @@ func openPart(
 	if err != nil {
 		return nil, err
 	}
+	variable, err := variableMetricSchema(r)
+	if err != nil {
+		return nil, err
+	}
 
 	var idx partIndex
 
@@ -451,7 +456,9 @@ func openPart(
 		rollup:      rollup,
 		rollupKnown: rollupKnown,
 	}
+	p.variable = variable
 	p.countRetained, p.countTransient, p.countBounded = r.Int64ScanBound(ctx, colTs)
+
 	if desc, ok := r.ColumnDescByName(colTs); ok && desc.Kind == block.KindInt64 && desc.Const {
 		p.countBounded = true
 	}
@@ -739,6 +746,9 @@ func (p *part) decodeInto(ctx context.Context, reuse *decodedPart, need colNeed)
 // A nil ranges, or a part whose ts column is not blocked (a pre-block part, or a tiny constant column),
 // falls back to the whole-column decode.
 func (p *part) decodeRangesInto(ctx context.Context, reuse *decodedPart, need colNeed, ranges []rowRange) (*decodedPart, error) {
+	if p.variable && ranges != nil {
+		return p.decodeChunkRanges(ctx, reuse, need, ranges)
+	}
 	if ranges == nil {
 		return p.decodeInto(ctx, reuse, need)
 	}
@@ -828,6 +838,9 @@ func (p *part) decodeValueBlocks(ctx context.Context, valDst, sfDst []float64, b
 // Rows are sorted by (series, ts), so a granule's bounds are not monotonic across the part — but
 // within one series' row range they are, which is where the pruning is applied.
 func (p *part) granuleTimes(ctx context.Context) []block.Granule {
+	if p.variable {
+		return nil
+	}
 	p.marksOnce.Do(func() {
 		if p.reader == nil {
 			return
@@ -862,6 +875,10 @@ func (p *part) validMarks(m block.Marks) bool {
 		return false
 	}
 	man := p.reader.Manifest()
+	if p.variable {
+		return false
+	}
+
 	return man.GranuleSize > 0 && m.GranuleSize == man.GranuleSize &&
 		len(m.Granules) == (man.RowCount+man.GranuleSize-1)/man.GranuleSize
 }

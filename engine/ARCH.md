@@ -1818,3 +1818,29 @@ also pass through it without allocating another part-wide group index.
 Explicit lossy precision policies retain their existing encoding path. The writer option does not
 force rewrites; readers handle both encodings in one catalog. Identities, SIDX, durability watermarks,
 WAL frames and catalog publication retain their existing formats and ownership rules.
+
+## Opt-in per-series chunks
+
+`MetricSeriesChunks` ends numeric groups when the canonical series ID changes. It enables grouped
+lossless values and preserves explicit precision policies. Parts retain their own identities,
+series index and coverage watermarks, so replication and repair transfer self-contained objects.
+
+Every selected series range must begin and end on chunk boundaries. Nonconstant numeric columns
+must agree on selected chunk spans, including when their decoded data is cached. Constant values
+and weights are synthesized for the actual timestamp chunk span.
+
+A query reserves directory discovery, decoder state, selected samples and chunk pin/list overhead
+in one admission before opening directories. Timestamp-only counts use the timestamp stream bounds.
+Constant timestamp columns retain the whole-part fallback and its existing timestamp-tie behavior.
+
+Chunk directories are held by queries or the byte-bounded metadata cache. Short chunk buffers use
+exact capacities; numeric cache charges include capacity and an entry/LRU/map allowance. Queries
+prune through inline timestamp bounds without loading or permanently retaining variable marks.
+
+Chunk readers pin immutable directory prototypes in fixed column slots for geometry checks, even on
+warm numeric hits. Mutable decoder and frame-read state are cloned only when a numeric block misses;
+metadata eviction cannot invalidate a pinned directory, and each clone uses the current read context.
+
+Each cache shard indexes part prefixes once, with compact (column, block) keys in each part map.
+Entries carry their own LRU links; prefix eviction visits the same index used by lookups. Numeric
+cache charges include entry size and map slack, and pins retain evicted buffers until readers finish.

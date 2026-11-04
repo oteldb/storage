@@ -305,6 +305,8 @@ func NewTsCursor(codec Codec, src []byte) (TsCursor, error) {
 		}
 
 		return &scaledTsDecoder{TsDecoder: *d}, nil
+	case CodecAdaptiveTimestamps:
+		return NewAdaptiveTimestampCursor(src)
 	default:
 		return nil, errNotTsCodec
 	}

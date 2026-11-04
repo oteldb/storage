@@ -25,6 +25,7 @@ const (
 // decodeLimits are the sizes a column's decompression is held to. Frames carry their own exact size
 // in the directory; these cover what the directory does not.
 type decodeLimits struct {
+	rows int
 	// stream bounds an unframed stream and each legacy frame; exact when the manifest records it.
 	stream int64
 	exact  bool
@@ -38,7 +39,7 @@ type decodeLimits struct {
 // columnLimits derives desc's decode limits from its manifest: exact with sizing, bounded by the
 // part's RawBytes without, and unlimited when the part records neither.
 func columnLimits(desc ColumnDesc, rawBytes int64, rows int) decodeLimits {
-	l := decodeLimits{stream: unlimited, frames: unlimited, dict: unlimited}
+	l := decodeLimits{stream: unlimited, frames: unlimited, dict: unlimited, rows: rows}
 
 	if rawBytes > 0 {
 		bound := satAdd(rawBytes, satMul(streamRowSlack, int64(rows)))

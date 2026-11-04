@@ -23,6 +23,7 @@ type seriesBlockReader struct {
 	engine    *Engine
 	part      *part
 	blockRows int
+	geometry  *block.Decoder
 
 	// Per-column block decoders, built lazily on the first cache miss (so a fully-warm part reads
 	// the column object not at all). One reader serves one part for one fetch and is not used
@@ -53,14 +54,15 @@ type seriesBlockReader struct {
 	// the rest at teardown (releasePins). Entries are sorted by (block, column), with one owned
 	// reference per key, so a block warmed privately can be reused without decoding it again.
 	pins        []*blockEntry
-	decoderPins []*blockEntry
+	decoderPins [3]*blockEntry
+	metadata    [3]*block.Decoder
 }
 
 // newSeriesBlockReader returns a reader for part if it is block-sliceable (ts/value, and sf when
 // present, are all block-framed) and the engine has a block cache; otherwise nil (the caller uses the
 // whole-part decode path).
 func (e *Engine) newSeriesBlockReader(p *part) *seriesBlockReader {
-	if e.blockCache == nil || !p.blockSliceable() {
+	if (e.blockCache == nil && !p.variable) || !p.blockSliceable() {
 		return nil
 	}
 
@@ -74,6 +76,22 @@ func (e *Engine) newSeriesBlockReader(p *part) *seriesBlockReader {
 // present — are all block-framed (so the series-block reader can slice them). A constant or
 // legacy-unblocked column is not sliceable and routes through the whole-part decode path.
 func (p *part) blockSliceable() bool {
+	if p.variable {
+		if d, ok := p.reader.ColumnDescByName(colTs); !ok || d.Const {
+			return false
+		}
+		for _, name := range []string{colTs, colValue, colSF} {
+			if name == colSF && !p.hasSF {
+				continue
+			}
+			d, ok := p.reader.ColumnDescByName(name)
+			if !ok || (!d.Const && d.MaxBlockRows == 0) {
+				return false
+			}
+		}
+		return true
+	}
+
 	if d, ok := p.reader.ColumnDescByName(colTs); !ok || !d.Blocked {
 		return false
 	}
@@ -95,15 +113,16 @@ func (p *part) blockSliceable() bool {
 // from the block cache (decoding+caching a miss). The added slices are views into the immutable
 // cached blocks — valid until the caller's collect copies them out.
 func (r *seriesBlockReader) addRange(ctx context.Context, rng rowRange, m *sampleMerge, start, end int64) error {
-	first := rng.start / r.blockRows
-	last := (rng.end - 1) / r.blockRows
-	gran := r.granules(ctx)
+	first, last, err := r.rangeBlocks(ctx, rng)
+	if err != nil {
+		return err
+	}
 
 	for b := first; b <= last; b++ {
 		// Skip a block whose granule bounds put every one of its rows outside the window, before it
 		// is fetched or decoded. A series spanning far more time than the query is otherwise read
 		// whole and discarded row by row in m.add.
-		if !blockInWindow(gran, b, start, end) {
+		if !r.chunkInWindow(ctx, b, start, end) {
 			continue
 		}
 
@@ -117,10 +136,10 @@ func (r *seriesBlockReader) addRange(ctx context.Context, rng rowRange, m *sampl
 			return err
 		}
 
-		blockStart := b * r.blockRows
+		blockStart, blockEnd := r.blockSpan(b)
 
 		lo := max(rng.start, blockStart) - blockStart
-		hi := min(min(rng.end, blockStart+r.blockRows)-blockStart, len(tsBlk))
+		hi := min(min(rng.end, blockEnd)-blockStart, len(tsBlk))
 
 		if lo >= hi {
 			continue
@@ -147,7 +166,10 @@ func (r *seriesBlockReader) addRange(ctx context.Context, rng rowRange, m *sampl
 // (so one per part per fetch at most) keeps the marks read off the per-series path.
 func (r *seriesBlockReader) granules(ctx context.Context) []block.Granule {
 	if !r.granLoaded {
-		r.gran, r.granLoaded = r.engine.partGranuleTimes(ctx, r.part), true
+		if !r.part.variable {
+			r.gran = r.engine.partGranuleTimes(ctx, r.part)
+		}
+		r.granLoaded = true
 	}
 
 	return r.gran
@@ -179,6 +201,11 @@ func (r *seriesBlockReader) warm(ctx context.Context, blocks []int) error {
 // tsBlock returns block b of the timestamp column, from the held memo, the cache, or a fresh decode
 // (cached). Consecutive series in the same block reuse the memo without re-locking the cache.
 func (r *seriesBlockReader) tsBlock(ctx context.Context, b int) ([]int64, error) {
+	if r.part.variable {
+		if err := r.ensureGeometry(ctx); err != nil {
+			return nil, err
+		}
+	}
 	if b == r.tsB {
 		return r.tsHeld, nil
 	}
@@ -202,23 +229,14 @@ func (r *seriesBlockReader) tsBlock(ctx context.Context, b int) ([]int64, error)
 		return ent.i64, nil
 	}
 
-	if r.tsDec == nil {
-		d, err := r.partDecoder(ctx, colTs)
-		if err != nil {
-			return nil, err
-		}
-
-		r.tsDec = d
-	}
-
-	blk, err := r.tsDec.DecodeInt64Into(b, r.engine.blockCache.getI64Buf(r.blockRows))
+	blk, err := r.readTimestampChunk(ctx, b)
 	if err != nil {
 		return nil, err
 	}
 
 	// Read (and memo) the canonical buffer insert returns — a concurrent decode may have won the key,
 	// in which case ours was recycled and the winner's slice is the one that stays valid.
-	ent := r.engine.blockCache.insert(&blockEntry{key: key, i64: blk, bytes: int64(len(blk)) * 8})
+	ent := r.engine.blockCache.insert(&blockEntry{key: key, i64: blk, bytes: r.chunkCacheBytes(cap(blk))})
 	r.pins = slices.Insert(r.pins, at, ent)
 	r.tsB, r.tsHeld, r.tsEnt = b, ent.i64, ent
 
@@ -262,6 +280,32 @@ func (r *seriesBlockReader) sfBlock(ctx context.Context, b int) ([]float64, erro
 func (r *seriesBlockReader) floatBlock(
 	ctx context.Context, dec **block.Decoder, name string, cid colID, b int,
 ) ([]float64, *blockEntry, error) {
+	if r.part.variable {
+		if err := r.checkColumnGeometry(ctx, name, b); err != nil {
+			return nil, nil, err
+		}
+	}
+	if r.engine.blockCache == nil {
+		desc, _ := r.part.reader.ColumnDescByName(name)
+		if desc.Const {
+			lo, hi := r.blockSpan(b)
+			out := make([]float64, hi-lo)
+			for i := range out {
+				out[i] = desc.ConstFloat64
+			}
+			return out, nil, nil
+		}
+		if *dec == nil {
+			d, err := r.partDecoder(ctx, name)
+			if err != nil {
+				return nil, nil, err
+			}
+			*dec = d
+		}
+		out, err := (*dec).DecodeFloat64Into(b, nil)
+		return out, nil, err
+	}
+
 	at, found := r.pinIndex(b, cid)
 	if found {
 		ent := r.pins[at]
@@ -275,21 +319,12 @@ func (r *seriesBlockReader) floatBlock(
 		return ent.f64, ent, nil
 	}
 
-	if *dec == nil {
-		d, err := r.partDecoder(ctx, name)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		*dec = d
-	}
-
-	blk, err := (*dec).DecodeFloat64Into(b, r.engine.blockCache.getF64Buf(r.blockRows))
+	blk, err := r.readFloatChunk(ctx, dec, name, b)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	ent := r.engine.blockCache.insert(&blockEntry{key: key, f64: blk, bytes: int64(len(blk)) * 8})
+	ent := r.engine.blockCache.insert(&blockEntry{key: key, f64: blk, bytes: r.chunkCacheBytes(cap(blk))})
 	r.pins = slices.Insert(r.pins, at, ent)
 
 	return ent.f64, ent, nil
@@ -343,9 +378,14 @@ func (r *seriesBlockReader) releaseSeriesPins() {
 // these blocks are dead.
 func (r *seriesBlockReader) releasePins() {
 	for _, entry := range r.decoderPins {
-		r.engine.blockCache.release(entry)
+		if entry != nil {
+			r.engine.blockCache.release(entry)
+		}
 	}
-	r.decoderPins = nil
+	r.decoderPins = [3]*blockEntry{}
+	r.metadata = [3]*block.Decoder{}
+	r.geometry = nil
+	r.tsDec, r.valDec, r.sfDec = nil, nil, nil
 	for _, e := range r.pins {
 		r.engine.blockCache.release(e)
 	}
@@ -361,8 +401,19 @@ func (r *seriesBlockReader) releasePins() {
 // them are fetched as blocks are decoded. Reading the object whole here is what made a selector
 // matching 16 series pay for all of them.
 func (r *seriesBlockReader) partDecoder(ctx context.Context, name string) (*block.Decoder, error) {
+	metadata, err := r.partGeometry(ctx, name)
+	if err != nil {
+		return nil, err
+	}
 	if r.engine == nil || r.engine.blockCache == nil {
-		return r.part.reader.ColumnBlocks(ctx, name)
+		return metadata, nil
+	}
+	return metadata.Clone(ctx), nil
+}
+
+func (r *seriesBlockReader) partGeometry(ctx context.Context, name string) (*block.Decoder, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	var cid colID
 	switch name {
@@ -375,9 +426,20 @@ func (r *seriesBlockReader) partDecoder(ctx context.Context, name string) (*bloc
 	default:
 		return r.part.reader.ColumnBlocks(ctx, name)
 	}
-	decoder, pin, err := r.engine.partBlockDecoder(ctx, r.part, name, cid)
-	if pin != nil {
-		r.decoderPins = append(r.decoderPins, pin)
+	if d := r.metadata[cid]; d != nil {
+		return d, nil
 	}
-	return decoder, err
+	if r.engine == nil || r.engine.blockCache == nil {
+		d, err := r.part.reader.ColumnBlocks(ctx, name)
+		if err == nil {
+			r.metadata[cid] = d
+		}
+		return d, err
+	}
+	entry, err := r.engine.partBlockMetadata(ctx, r.part, name, cid)
+	if err != nil {
+		return nil, err
+	}
+	r.decoderPins[cid], r.metadata[cid] = entry, entry.decoder
+	return entry.decoder, nil
 }

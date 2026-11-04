@@ -210,23 +210,26 @@ func (r *seriesBlockReader) gridTimestamps(ctx context.Context, rng rowRange, st
 	if r.countStreaming {
 		return r.streamGridTimestamps(ctx, rng, start, end, presence)
 	}
-	granules := r.granules(ctx)
-	for b, last := rng.start/r.blockRows, (rng.end-1)/r.blockRows; b <= last; b++ {
+	first, last, err := r.rangeBlocks(ctx, rng)
+	if err != nil {
+		return err
+	}
+	for b := first; b <= last; b++ {
 		if presence.complete() {
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if !blockInWindow(granules, b, start, end) {
+		if !r.chunkInWindow(ctx, b, start, end) {
 			continue
 		}
 		ts, err := r.tsBlock(ctx, b)
 		if err != nil {
 			return err
 		}
-		base := b * r.blockRows
-		lo, hi := max(rng.start, base)-base, min(rng.end-base, len(ts))
+		base, blockEnd := r.blockSpan(b)
+		lo, hi := max(rng.start, base)-base, min(rng.end-base, blockEnd-base, len(ts))
 		if lo < 0 || lo > hi {
 			return errors.New("count grid block range outside column")
 		}

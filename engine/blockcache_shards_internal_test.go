@@ -145,8 +145,10 @@ func TestBlockCacheSharedBudgetUnderChurn(t *testing.T) {
 	wg.Wait()
 	var actual int64
 	for i := range c.shards {
-		for _, element := range c.shards[i].items {
-			actual += element.Value.(*blockEntry).bytes
+		for _, entries := range c.shards[i].items {
+			for _, e := range entries {
+				actual += e.bytes
+			}
 		}
 	}
 	require.Equal(t, actual, c.stats().Bytes)

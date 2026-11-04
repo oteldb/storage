@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"container/list"
 	"hash/maphash"
 	"slices"
 	"sync"
@@ -47,18 +46,26 @@ type blockCache struct {
 }
 
 type blockCacheShard struct {
-	mu       sync.Mutex
-	ll       list.List
-	marks    list.List
-	items    map[blockKey]*list.Element
-	byPrefix map[string]map[blockKey]struct{}
+	mu        sync.Mutex
+	ll, marks blockLRU
+	items     map[string]map[blockIndex]*blockEntry
 }
 
-func (s *blockCacheShard) lru(key blockKey) *list.List {
+func (s *blockCacheShard) lru(key blockKey) *blockLRU {
 	if key.col == colMarksID {
 		return &s.marks
 	}
 	return &s.ll
+}
+
+func (s *blockCacheShard) lookup(key blockKey) (*blockEntry, bool) {
+	e, ok := s.items[key.prefix][blockIndex{col: key.col, blk: key.blk}]
+	return e, ok
+}
+
+type blockIndex struct {
+	blk int
+	col colID
 }
 
 // colID identifies which metric column a cached block belongs to (part of the cache key).
@@ -84,15 +91,16 @@ type blockKey struct {
 // LRU. The buffer returns to the freelist only when refs hits 0 after evicted is set, so a reader
 // holding a view of an evicted block never sees its buffer recycled underneath it.
 type blockEntry struct {
-	owner    *blockCacheShard
-	key      blockKey
-	i64      []int64
-	f64      []float64
-	decoder  *block.Decoder
-	granules []block.Granule
-	bytes    int64
-	refs     int
-	evicted  bool
+	owner      *blockCacheShard
+	prev, next *blockEntry
+	key        blockKey
+	i64        []int64
+	f64        []float64
+	decoder    *block.Decoder
+	granules   []block.Granule
+	bytes      int64
+	refs       int
+	evicted    bool
 }
 
 func newBlockCache(maxBytes int64) *blockCache {
@@ -104,8 +112,7 @@ func newBlockCacheWithShards(maxBytes int64, count int) *blockCache {
 	c := &blockCache{maxBytes: maxBytes, seed: maphash.MakeSeed(), shards: make([]blockCacheShard, max(count, 1))}
 	for i := range c.shards {
 		shard := &c.shards[i]
-		shard.items = make(map[blockKey]*list.Element)
-		shard.byPrefix = make(map[string]map[blockKey]struct{})
+		shard.items = make(map[string]map[blockIndex]*blockEntry)
 	}
 	capNow := func() int { return blockBufCap * (1 + int(c.inflight.Load())) }
 	c.i64Free.capNow, c.f64Free.capNow = capNow, capNow
@@ -124,7 +131,7 @@ func (c *blockCache) get(key blockKey) (*blockEntry, bool) {
 	shard := c.shard(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	el, ok := shard.items[key]
+	el, ok := shard.lookup(key)
 	if !ok {
 		if key.col != colMarksID {
 			c.misses.Add(1)
@@ -135,7 +142,7 @@ func (c *blockCache) get(key blockKey) (*blockEntry, bool) {
 	if key.col != colMarksID {
 		c.hits.Add(1)
 	}
-	e := el.Value.(*blockEntry)
+	e := el
 	e.refs++
 	return e, true
 }
@@ -144,7 +151,7 @@ func (c *blockCache) insert(e *blockEntry) *blockEntry {
 	shard := c.shard(e.key)
 	e.owner = shard
 	shard.mu.Lock()
-	if el, ok := shard.items[e.key]; ok {
+	if el, ok := shard.lookup(e.key); ok {
 		result := c.redundantInsert(shard, el, e)
 		shard.mu.Unlock()
 		return result
@@ -157,28 +164,26 @@ func (c *blockCache) insert(e *blockEntry) *blockEntry {
 	}
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	if el, ok := shard.items[e.key]; ok {
+	if el, ok := shard.lookup(e.key); ok {
 		c.bytes.Add(-e.bytes)
 		return c.redundantInsert(shard, el, e)
 	}
-	el := shard.lru(e.key).PushFront(e)
-	shard.items[e.key] = el
+	shard.lru(e.key).PushFront(e)
 	if e.key.col == colMarksID {
 		c.marksBytes.Add(e.bytes)
 	}
-	set := shard.byPrefix[e.key.prefix]
-	if set == nil {
-		set = make(map[blockKey]struct{})
-		shard.byPrefix[e.key.prefix] = set
+	entries := shard.items[e.key.prefix]
+	if entries == nil {
+		entries = make(map[blockIndex]*blockEntry)
+		shard.items[e.key.prefix] = entries
 	}
-	set[e.key] = struct{}{}
+	entries[blockIndex{col: e.key.col, blk: e.key.blk}] = e
 	return e
 }
 
 // The caller holds the owning shard; the redundant entry remains private.
-func (c *blockCache) redundantInsert(shard *blockCacheShard, el *list.Element, e *blockEntry) *blockEntry {
-	shard.lru(e.key).MoveToFront(el)
-	current := el.Value.(*blockEntry)
+func (c *blockCache) redundantInsert(shard *blockCacheShard, current, e *blockEntry) *blockEntry {
+	shard.lru(e.key).MoveToFront(current)
 	current.refs++
 	c.recycle(e)
 	return current
@@ -281,35 +286,25 @@ func (c *blockCache) evictPrefix(prefix string) {
 	for i := range c.shards {
 		shard := &c.shards[i]
 		shard.mu.Lock()
-		for key := range shard.byPrefix[prefix] {
-			if el, ok := shard.items[key]; ok {
-				c.removeElemKeepPrefix(shard, el)
-			}
+		for _, e := range shard.items[prefix] {
+			c.removeElem(shard, e)
 		}
-		delete(shard.byPrefix, prefix)
+
 		shard.mu.Unlock()
 	}
 }
 
-func (c *blockCache) removeElem(shard *blockCacheShard, el *list.Element) {
-	e := el.Value.(*blockEntry)
-	if set := shard.byPrefix[e.key.prefix]; set != nil {
-		delete(set, e.key)
-		if len(set) == 0 {
-			delete(shard.byPrefix, e.key.prefix)
-		}
+func (c *blockCache) removeElem(shard *blockCacheShard, e *blockEntry) {
+	entries := shard.items[e.key.prefix]
+	delete(entries, blockIndex{col: e.key.col, blk: e.key.blk})
+	if len(entries) == 0 {
+		delete(shard.items, e.key.prefix)
 	}
-	c.removeElemKeepPrefix(shard, el)
-}
-
-func (c *blockCache) removeElemKeepPrefix(shard *blockCacheShard, el *list.Element) {
-	e := el.Value.(*blockEntry)
 	c.bytes.Add(-e.bytes)
 	if e.key.col == colMarksID {
 		c.marksBytes.Add(-e.bytes)
 	}
-	delete(shard.items, e.key)
-	shard.lru(e.key).Remove(el)
+	shard.lru(e.key).Remove(e)
 	e.evicted = true
 	if e.refs == 0 {
 		c.recycle(e)
@@ -339,11 +334,13 @@ const blockBufCap = prefetchConcurrency * 4
 // get returns a recycled buffer with room for n rows, or a fresh one when none fits. It scans for
 // a fitting buffer instead of popping blindly: a too-small buffer (a smaller-granule part's) stays
 // pooled for a later smaller request rather than being discarded.
-func (p *bufFreeList[T]) get(n int) []T {
+func (p *bufFreeList[T]) get(n int) []T { return p.getCapacity(n, false) }
+
+func (p *bufFreeList[T]) getCapacity(n int, exact bool) []T {
 	p.mu.Lock()
 
 	for i, s := range slices.Backward(p.free) {
-		if cap(s) < n {
+		if cap(s) < n || exact && cap(s) != n {
 			continue
 		}
 
@@ -390,7 +387,9 @@ func (c *blockCache) stats() DecodeCacheStats {
 	for i := range c.shards {
 		shard := &c.shards[i]
 		shard.mu.Lock()
-		items += len(shard.items)
+		for _, entries := range shard.items {
+			items += len(entries)
+		}
 		shard.mu.Unlock()
 	}
 	return DecodeCacheStats{Hits: c.hits.Load(), Misses: c.misses.Load(), Bytes: c.bytes.Load(), Items: items}

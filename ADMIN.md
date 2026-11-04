@@ -571,3 +571,7 @@ for one part at the cap and its finish, so a merge seals parts at the cap, not b
 `Admin.Compact`, `Admin.CompactNow` and `Admin.Retention` **wait** for the budget instead of
 deferring, so an operator command never silently does nothing. `Admin.MaintainNow` runs the
 background cycle and therefore defers like it.
+
+For independent metric chunks, `PartsDetailed.Chunks` reports the recorded chunk count;
+`GranuleSize` is their maximum row count. Decode-cache bytes include retained numeric capacity
+and entry overhead for these chunks, rather than only the number of decoded sample bytes.

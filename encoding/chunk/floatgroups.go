@@ -14,6 +14,7 @@ const MaxFloatGroupRows = 1 << 20
 // FloatGroupEncoder reuses scratch while selecting bit-exact codecs for independent float groups.
 type FloatGroupEncoder struct {
 	gorilla, decimal []byte
+	candidate        []byte
 	decoded          []float64
 	decimalWork      decimalScratch
 }
@@ -45,9 +46,57 @@ func (e *FloatGroupEncoder) Encode(dst []byte, vals []float64, ends []int) ([]by
 	return dst, nil
 }
 
+// EncodeGroupWithCost chooses a bit-exact stream using framed-size cost, which must not retain or mutate its input.
+func (e *FloatGroupEncoder) EncodeGroupWithCost(dst []byte, values []float64, cost func([]byte) int) ([]byte, error) {
+	start := len(dst)
+	var ends []int
+	if len(values) > 0 {
+		ends = []int{len(values)}
+	}
+	out, err := e.Encode(dst, values, ends)
+	if err != nil {
+		return dst, err
+	}
+	if len(values) == 0 || cost == nil {
+		return out, nil
+	}
+	_, rest, err := floatGroupHeader(out[start:])
+	if err != nil {
+		return dst, err
+	}
+	group, err := readFloatGroup(rest)
+	if err != nil {
+		return dst, err
+	}
+	if group.codec == CodecNone {
+		return out, nil
+	}
+	best := cost(out[start:])
+	if group.codec != CodecGorilla {
+		e.gorilla = EncodeFloats(e.gorilla[:0], values)
+		e.candidate = singleFloatGroup(e.candidate[:0], len(values), CodecGorilla, e.gorilla)
+		if n := cost(e.candidate); n < best {
+			out = append(out[:start], e.candidate...)
+			best = n
+		}
+	}
+	if group.codec != CodecDecimal {
+		e.decimal = encodeFloatsDecimal(e.decimal[:0], values, 64, &e.decimalWork)
+		var used int
+		e.decoded, used, err = DecodeFloatsDecimal(e.decoded[:0], e.decimal)
+		if err == nil && used == len(e.decimal) && equalFloatBits(values, e.decoded) {
+			e.candidate = singleFloatGroup(e.candidate[:0], len(values), CodecDecimal, e.decimal)
+			if n := cost(e.candidate); n < best {
+				out = append(out[:start], e.candidate...)
+			}
+		}
+	}
+	return out, nil
+}
+
 // ResidentBytes reports reusable candidate storage held by the encoder.
 func (e *FloatGroupEncoder) ResidentBytes() int64 {
-	return int64(cap(e.gorilla)+cap(e.decimal)) + int64(cap(e.decoded)+cap(e.decimalWork.scaled)+cap(e.decimalWork.exps))*8
+	return int64(cap(e.gorilla)+cap(e.decimal)+cap(e.candidate)) + int64(cap(e.decoded)+cap(e.decimalWork.scaled)+cap(e.decimalWork.exps))*8
 }
 
 func (e *FloatGroupEncoder) appendGroup(dst []byte, group []float64) []byte {
@@ -306,4 +355,13 @@ func (d *FloatGroupsDecoder) advanceGroup() error {
 	}
 	d.values, err = decodeFloatGroup(d.values[:0], g)
 	return err
+}
+
+func singleFloatGroup(dst []byte, rows int, codec Codec, data []byte) []byte {
+	dst = append(dst, 1)
+	dst = binary.AppendUvarint(dst, uint64(rows))
+	dst = append(dst, 1, byte(codec))
+	dst = binary.AppendUvarint(dst, uint64(rows))
+	dst = binary.AppendUvarint(dst, uint64(len(data)))
+	return append(dst, data...)
 }

@@ -117,6 +117,7 @@ func readBlockDir(
 	)
 
 	chk := newDirCheck(desc, lim)
+	chk.dirComp = comp
 
 	switch {
 	case desc.TrailerDict:
@@ -346,6 +347,14 @@ func readLeadingDir(
 		}
 	}
 
+	if chk.compactDir {
+		d, err := parseDetachedDir(raw, size-int64(len(raw)), chk)
+		if err != nil {
+			return blockDir{}, err
+		}
+		d.dataOff = off + int64(len(raw))
+		return d, nil
+	}
 	d, pos, total, err := parseFramedDirFields(raw, int(size), chk)
 	if err != nil {
 		return blockDir{}, err

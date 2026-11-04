@@ -34,19 +34,22 @@ func (p *enginePlan) countStreamingEstimate() (int64, bool) {
 }
 
 func (r *seriesBlockReader) streamGridTimestamps(ctx context.Context, rng rowRange, start, end int64, presence *gridPresence) error {
-	granules := r.granules(ctx)
-	for b, last := rng.start/r.blockRows, (rng.end-1)/r.blockRows; b <= last; b++ {
+	first, last, err := r.rangeBlocks(ctx, rng)
+	if err != nil {
+		return err
+	}
+	for b := first; b <= last; b++ {
 		if presence.complete() {
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if !blockInWindow(granules, b, start, end) {
+		if !r.chunkInWindow(ctx, b, start, end) {
 			continue
 		}
-		base := b * r.blockRows
-		lo, hi := max(rng.start, base)-base, min(rng.end-base, r.blockRows, r.part.rows()-base)
+		base, blockEnd := r.blockSpan(b)
+		lo, hi := max(rng.start, base)-base, min(rng.end, blockEnd)-base
 		cur, err := r.countBlockCursor(ctx, b, lo)
 		if err != nil {
 			return err
