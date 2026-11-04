@@ -752,3 +752,8 @@ policy. WAL and replication payload formats do not change.
 Physical `Int64Range` condition hints stay local: routed fetches omit them and retain the requester
 callback through `fetch.Filter`. Peers return a superset, including older peers; numeric-only routed
 reads currently decode a broader set of rows. Equality/set hints on other conditions still travel.
+
+Projection survives callback conditions only when each carries `PhysicalColumn` and every named
+column is requested. This requester-local claim needs no wire extension: peers already read the
+projection tail. Unmarked/attribute/mixed callbacks or `SecondPass` retain full payloads so requester
+rechecks have their inputs. Limits stay disabled while any callback condition remains.

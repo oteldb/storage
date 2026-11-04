@@ -173,3 +173,8 @@ contention returns `ErrDecodeBusy` with no reservation; unsupported decorators r
 An independent producer owns its own `fetch.Scope`; borrowing a waiting caller's scope would mix
 lifetimes and defeat admission. Already-owned scope growth and oversized-alone admission retain
 ordinary accounting. This is not a nonblocking I/O or engine-lock guarantee.
+
+`Condition.PhysicalColumn` is an explicit caller claim used only to preserve routed projections.
+Every condition must make that claim and name an explicitly projected column; `SecondPass` disables
+it. Unmarked, attribute, mixed or incompletely projected conditions keep full-column fallback.
+Requester callbacks remain authoritative, and conditions still prevent remote row-limit pushdown.

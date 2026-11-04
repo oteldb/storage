@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"encoding/binary"
+	"slices"
 
 	"github.com/go-faster/errors"
 
@@ -15,9 +16,7 @@ func remoteFetchRequest(r fetch.Request) FetchRequest {
 		StringMatchers: fetch.StringSpecs(r.Matchers),
 		Conditions:     ConditionHints(r.Conditions, r.AllConditions),
 	}
-	// A residual condition may read a schema-defined attributes column; SecondPass can read
-	// arbitrary columns. Without dependency metadata their input must remain fully materialized.
-	if len(r.Conditions) == 0 && r.SecondPass == nil {
+	if projectionPreservesConditions(r) {
 		out.Projection = r.Projection
 	}
 	// Equality hints on conditions are necessary predicates, not equivalent predicates. Limiting
@@ -27,6 +26,18 @@ func remoteFetchRequest(r fetch.Request) FetchRequest {
 	}
 
 	return out
+}
+
+func projectionPreservesConditions(r fetch.Request) bool {
+	if r.SecondPass != nil {
+		return false
+	}
+	for _, condition := range r.Conditions {
+		if condition.Column == "" || !condition.PhysicalColumn || !slices.Contains(r.Projection, condition.Column) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r FetchRequest) appendOptions(dst []byte) []byte {

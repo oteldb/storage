@@ -12,6 +12,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/cluster"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -174,4 +177,70 @@ func TestPeerFetchNumericRangeFallback(t *testing.T) {
 		names = append(names, spanNames(batch)...)
 	}
 	assert.Equal(t, []string{"long"}, names)
+}
+
+func TestPeerFetchPhysicalConditionProjection(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	be := backendtest.NewCounting(backend.Memory())
+	s, err := Open(ctx, Options{}, WithBackend(be))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close(context.Background())) })
+	td := traceBatch("frontend",
+		spanSpec{traceID: "trace-A", spanID: "s1", name: "first", start: 100, end: 110},
+		spanSpec{traceID: "trace-A", spanID: "s2", name: "second", start: 200, end: 300})
+	for i := range td.Resources[0].Scopes[0].Spans {
+		td.Resources[0].Scopes[0].Spans[i].Events = []trace.Event{{Name: []byte(strconv.Itoa(i) + strings.Repeat("x", 1024))}}
+	}
+	_, err = s.WriteTraces(ctx, td)
+	require.NoError(t, err)
+	require.NoError(t, s.Admin().Flush(ctx, "default", signal.Trace))
+	keys, err := be.List(ctx, "")
+	require.NoError(t, err)
+	eventKeys := map[string]bool{}
+	for _, key := range keys {
+		if !strings.HasSuffix(key, "/manifest") {
+			continue
+		}
+		data, err := be.Backend.Read(ctx, key)
+		require.NoError(t, err)
+		manifest, err := block.DecodeManifest(data)
+		require.NoError(t, err)
+		for i, column := range manifest.Columns {
+			if column.Name == trace.ColEvents {
+				require.False(t, column.Const)
+				eventKeys[strings.TrimSuffix(key, "/manifest")+"/c/"+strconv.Itoa(i)] = true
+			}
+		}
+	}
+	require.NotEmpty(t, eventKeys)
+	condition := traceIDCondition("trace-A")
+	condition.PhysicalColumn = true
+	r := fetch.Request{Signal: signal.Trace, Tenant: "default", Start: 0, End: 1000,
+		Projection: []string{trace.ColTraceID, trace.ColDuration},
+		Conditions: []fetch.Condition{condition}, AllConditions: true, Limit: 1}
+	remote := fetch.Filter(servePeerFetch(t, s, signal.Trace))
+	before := be.Reads()
+	it, err := remote.Fetch(ctx, r)
+	require.NoError(t, err)
+	got, err := fetch.Drain(ctx, it)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Len(t, got[0].Timestamps, 2, "residual callbacks keep remote limits disabled")
+	_, hasEvents := got[0].Column(trace.ColEvents)
+	require.False(t, hasEvents)
+	for key := range eventKeys {
+		require.Equal(t, before[key], be.Reads()[key], "the peer must not read event blobs for a narrow extent projection")
+	}
+	r.Conditions[0].PhysicalColumn = false
+	it, err = remote.Fetch(ctx, r)
+	require.NoError(t, err)
+	got, err = fetch.Drain(ctx, it)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	_, hasEvents = got[0].Column(trace.ColEvents)
+	require.True(t, hasEvents, "unmarked callbacks retain full-column fallback")
+	for key := range eventKeys {
+		require.Greater(t, be.Reads()[key], before[key])
+	}
 }

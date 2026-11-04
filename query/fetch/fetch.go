@@ -168,6 +168,11 @@ type Condition struct {
 	// physical column names, and logical floats encoded as integer bits must not carry this hint.
 	// Missing columns or unsupported statistics retain candidates. Match remains authoritative.
 	Int64Range *Int64Range
+
+	// PhysicalColumn asserts that Column names a fixed column, never a per-record attribute.
+	// Routed fetches may preserve projection when every condition makes this claim and its
+	// column is explicitly projected. Match remains authoritative; no row limit is pushed.
+	PhysicalColumn bool
 }
 
 // Batch is one matching identity (a metric series, or a log stream) and its rows within the

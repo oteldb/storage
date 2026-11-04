@@ -101,6 +101,26 @@ func TestRemoteFetchOptionsSafety(t *testing.T) {
 			r.AllConditions = true
 			r.Conditions = []fetch.Condition{{Column: "id", Equal: &fetch.EqualMatcher{Name: "id", Value: "x"}}}
 		}, nil, 0},
+		{"physical condition", func(r *fetch.Request) {
+			r.Conditions = []fetch.Condition{{Column: "body", PhysicalColumn: true}}
+		}, []string{"body"}, 0},
+		{"physical column omitted", func(r *fetch.Request) {
+			r.Conditions = []fetch.Condition{{Column: "id", PhysicalColumn: true}}
+		}, nil, 0},
+		{"mixed condition claims", func(r *fetch.Request) {
+			r.Conditions = []fetch.Condition{{Column: "body", PhysicalColumn: true}, {Column: "user"}}
+		}, nil, 0},
+		{"all physical columns", func(r *fetch.Request) {
+			r.Projection = []string{"body", "id"}
+			r.Conditions = []fetch.Condition{{Column: "body", PhysicalColumn: true}, {Column: "id", PhysicalColumn: true}}
+		}, []string{"body", "id"}, 0},
+		{"one physical column omitted", func(r *fetch.Request) {
+			r.Conditions = []fetch.Condition{{Column: "body", PhysicalColumn: true}, {Column: "id", PhysicalColumn: true}}
+		}, nil, 0},
+		{"physical condition and second pass", func(r *fetch.Request) {
+			r.Conditions = []fetch.Condition{{Column: "body", PhysicalColumn: true}}
+			r.SecondPass = func(*fetch.Batch) bool { return true }
+		}, nil, 0},
 		{"second pass", func(r *fetch.Request) { r.SecondPass = func(*fetch.Batch) bool { return true } }, nil, 0},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
