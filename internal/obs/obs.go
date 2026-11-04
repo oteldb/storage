@@ -39,6 +39,7 @@ type Obs struct {
 	Head       *Head
 	Flush      *Flush
 	Merge      *Merge
+	Retention  *Retention
 	Parts      *Parts
 	Fetch      *Fetch
 	Backend    *Backend
@@ -76,6 +77,11 @@ func New(cfg Config) (*Obs, error) {
 	}
 
 	flush, merge, fetch, err := newEngineInstruments(meter)
+	if err != nil {
+		return nil, err
+	}
+
+	retention, err := newRetention(meter)
 	if err != nil {
 		return nil, err
 	}
@@ -132,6 +138,7 @@ func New(cfg Config) (*Obs, error) {
 		Head:       head,
 		Flush:      flush,
 		Merge:      merge,
+		Retention:  retention,
 		Parts:      parts,
 		Fetch:      fetch,
 		Backend:    backend,

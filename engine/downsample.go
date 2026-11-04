@@ -15,6 +15,8 @@ type MergeOptions struct {
 	// RetainFrom drops samples with a timestamp < RetainFrom before the merged part is
 	// written (retention). ≤ 0 disables it. The caller derives the absolute cutoff from tenant policy.
 	RetainFrom int64
+	// RetentionBoundBy is the policy bound behind RetainFrom, for observability only.
+	RetentionBoundBy RetentionBound
 	// Downsample, when non-empty, rolls up old samples at merge time (coarsening resolution
 	// with age). It reuses the one merge engine — no separate subsystem. The cutoffs are
 	// absolute (the caller floors now − After into Before), keeping the merge deterministic.

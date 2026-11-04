@@ -44,6 +44,7 @@ func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool
 		return false, err
 	}
 	ctx = e.cfg.Obs.Base(ctx)
+	e.recordRetentionRequest(opts.RetainFrom, opts.RetentionBoundBy)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.merge",
 		trace.WithAttributes(
 			attribute.String("storage.prefix", e.cfg.Prefix),
@@ -276,7 +277,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	e.stampRetention(selected, newParts, opts.RetainFrom)
 	planMergeBlocks(selected, newParts)
 
-	committed, err := e.publishMerge(ctx, selected, newParts, readable, stamp, plan)
+	committed, err := e.publishMerge(ctx, selected, newParts, readable, stamp, plan, opts.RetainFrom)
 	if err != nil {
 		return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, err
 	}
@@ -382,6 +383,12 @@ func (e *Engine) dropExpired(ctx context.Context, src []*part, opts MergeOptions
 	}
 
 	e.mu.Lock()
+	var actual []*part
+	for _, p := range e.parts {
+		if _, drop := removed[p.prefix]; drop {
+			actual = append(actual, p)
+		}
+	}
 	next := replaceParts(e.parts, removed)
 
 	if err := e.commitIndexLocked(ctx, next, e.flushedEpoch, e.term(), nil); err != nil {
@@ -396,6 +403,7 @@ func (e *Engine) dropExpired(ctx context.Context, src []*part, opts MergeOptions
 	// reasoning as a merge that drops rows, and the identity prune has something to find.
 	e.identityDirty = true
 	e.mu.Unlock()
+	e.cfg.Obs.Retention.Dropped(ctx, metricSignal, int64(len(actual)), partsBytes(actual))
 
 	remaining := make([]*part, 0, len(src)-len(expired))
 

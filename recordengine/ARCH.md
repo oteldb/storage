@@ -969,3 +969,13 @@ A single compression default across signals therefore hides materially different
 Reproduce with `go test -run '^$' -bench '^BenchmarkFlushCompression' -benchmem -cpu=1 -count=6
 -benchtime=500ms ./recordengine`; add `-tags gozstd` for the native backend. `LevelFast` maps to
 klauspost's fastest preset in the default build and level 1 in the native build.
+
+## Retention observability
+
+Each authorized merge request records its cutoff and attribution as one tenure-scoped snapshot,
+including when cleanup later defers or fails. Stats zero that snapshot when its claim is absent or
+its term changed. This is requested policy, not a claim that physical cleanup completed.
+
+Confirmed publication counts whole-part expiry drops and merges rewriting retention straddlers.
+Drop bytes use the existing recorded stored-byte estimate, excluding unrecorded sidecars; retirement
+may precede physical deletion while readers hold pins. Failed and unconfirmed commits count nothing.

@@ -102,7 +102,8 @@ engines over the fetch seam (`query/fetch`).
   refused with `ErrReadOnly`. `Open` refuses it alongside a cluster, a WAL dir, or an ephemeral
   backend. See the invariant in §4.
 - **Operator surface** — `Inspect`, `Admin`, `Parts`/`PartsDetailed`/`Cardinality`/`StreamCosts`,
-  `AdmissionStats`. See `ADMIN.md`.
+  `AdmissionStats`. Retention snapshots expose the last authorized requested cutoff and bound, while
+  confirmed publication counts expiry work. See `ADMIN.md`.
 - **Policy** — `tenant.Policy` (limits, retention, downsample, sampling, recompress,
   precision, durability/EC) resolved per tenant id through a consumer-supplied `Resolver`.
 

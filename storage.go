@@ -1683,7 +1683,7 @@ func (s *Storage) maintainWith(ctx context.Context, background bool) {
 		budgeted = owned
 	}
 
-	sizeCutoffs := s.sizeCutoffs(ctx, budgeted)
+	sizeCutoffs, _ := s.measureSizeDecisions(ctx, budgeted)
 
 	// maintainEngine flushes then merges one engine, unless this node is a non-owning replica (then
 	// it only refreshes from the shared store). merge is signal-specific: metrics carry downsampling
@@ -1735,7 +1735,7 @@ func (s *Storage) maintainWith(ctx context.Context, background bool) {
 	// identity, and because it runs on the owned path only — the live set is derived from this node's
 	// parts, so a replica mid-sync must not decide what is dead.
 	mergeMetrics := func(tid signal.TenantID, eng *engine.Engine) error {
-		opts := s.metricMergeOptions(tid, sizeCutoffs[tid].at(signal.Metric))
+		opts := s.metricMergeOptionsDecision(tid, sizeCutoffs[tid].at(signal.Metric))
 		// This loop is the one caller that may skip a merge rather than wait for the memory budget:
 		// it runs on a single goroutine shared with flush pressure.
 		opts.Background = true
@@ -1782,8 +1782,9 @@ func (s *Storage) maintainWith(ctx context.Context, background bool) {
 	// part set, since that is the only thing that kills a stream identity. A replica reaches it
 	// only through the refresh — it never merges.
 	mergeRecords := func(tid signal.TenantID, eng *recordengine.Engine, sig signal.Signal) error {
+		decision := s.retentionFor(tid, sig, sizeCutoffs[tid].at(sig))
 		opts := recordengine.MergeOptions{
-			RetainFrom: s.retainFrom(tid, sig, sizeCutoffs[tid].at(sig)),
+			RetainFrom: decision.cutoff, RetentionBoundBy: decision.bound,
 			Background: true, // see mergeMetrics: this loop skips rather than waits
 		}
 
@@ -1859,6 +1860,7 @@ func (s *Storage) recordShape(
 // detail is [Storage.Inspect]).
 func (s *Storage) recordPartShape(ctx context.Context) {
 	shapes := make(map[signal.Signal]*obs.PartShape, 4)
+	var retentionLags [signalCount]float64
 
 	// The cycle's merges changed the part set its size cutoffs were resolved for, so they are resolved
 	// again (memoized: the next cycle finds them current unless something flushes first).
@@ -1899,6 +1901,10 @@ func (s *Storage) recordPartShape(ctx context.Context) {
 			stale[signal.Metric] = true
 		}
 
+		if s.claimsShard(tid) {
+			stats := eng.Stats()
+			retentionLags[signal.Metric] = max(retentionLags[signal.Metric], retentionLag(stats.RetainFrom, stats.MinTime, stats.Parts))
+		}
 		m := s.metricShape(tid, eng, size[tid])
 		add(signal.Metric, m.Parts, m.Sealed, m.Backlog, m.Candidates, m.ForceCandidates, m.CapBytes, m.Bytes)
 	}
@@ -1909,11 +1915,18 @@ func (s *Storage) recordPartShape(ctx context.Context) {
 				stale[sig] = true
 			}
 
+			if s.claimsShard(tid) {
+				stats := eng.Stats()
+				retentionLags[sig] = max(retentionLags[sig], retentionLag(stats.RetainFrom, stats.MinTime, stats.Parts))
+			}
 			m := s.recordShape(sig, tid, eng, size[tid])
 			add(sig, m.Parts, m.Sealed, m.Backlog, m.Candidates, m.ForceCandidates, m.CapBytes, m.Bytes)
 		}
 	}
 
+	for _, sig := range []signal.Signal{signal.Metric, signal.Log, signal.Trace, signal.Profile, signal.Exemplar} {
+		s.obs.Retention.Lag(ctx, sig.String(), retentionLags[sig])
+	}
 	s.shapeMu.Lock()
 	defer s.shapeMu.Unlock()
 
@@ -2137,6 +2150,10 @@ func (s *Storage) retainFrom(tid signal.TenantID, sig signal.Signal, sizeCutoff 
 // sizeCutoff is the tenant's size-budget cutoff, folded into RetainFrom the same way (see
 // [Storage.retainFrom]).
 func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engine.MergeOptions {
+	return s.metricMergeOptionsDecision(tid, retentionDecision{cutoff: sizeCutoff})
+}
+
+func (s *Storage) metricMergeOptionsDecision(tid signal.TenantID, size retentionDecision) engine.MergeOptions {
 	now := s.now()
 	// In cluster mode tid is a shard key ({tenant}/_s{idx}); policy is per real tenant.
 	realTenant := s.normalizeTenant(tenantOfShard(tid))
@@ -2170,8 +2187,9 @@ func (s *Storage) metricMergeOptions(tid signal.TenantID, sizeCutoff int64) engi
 		})
 	}
 
+	decision := retentionDecisionFor(p.Retention, signal.Metric, now, size)
 	return engine.MergeOptions{
-		RetainFrom: max(retentionCutoff(p.Retention, signal.Metric, now), sizeCutoff),
+		RetainFrom: decision.cutoff, RetentionBoundBy: decision.bound,
 		Downsample: s.downsampleTiers(realTenant, p.Downsample, now),
 		Recompress: recompress,
 		Precision:  precision,

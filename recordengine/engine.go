@@ -22,6 +22,7 @@ import (
 	"github.com/oteldb/storage/internal/engineguard"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/repair"
+	"github.com/oteldb/storage/internal/retention"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/query/profile"
 	"github.com/oteldb/storage/signal"
@@ -146,8 +147,9 @@ type FetchResult = bucketindex.FetchResult
 
 // Engine is one tenant's record store for a signal. Safe for concurrent use.
 type Engine struct {
-	cfg Config
-	mu  engineguard.Mutex
+	retentionState retention.State
+	cfg            Config
+	mu             engineguard.Mutex
 	// The build barrier excludes reset, prune and repair; admitted flush/merge builds take read slots.
 	// Identity lifecycle precedes catalog -> writer -> reader-visible state (see ARCH.md).
 	flushMu      sync.RWMutex
@@ -475,9 +477,13 @@ func (e *Engine) IdentityBytes() int64 {
 
 // Stats is an in-memory snapshot of a record engine's state for introspection (no backend I/O).
 type Stats struct {
-	Streams     int64 // distinct streams ever seen (index span: head ∪ flushed)
-	HeadRecords int64 // records currently buffered in the head (unflushed)
-	HeadBytes   int64 // buffered record bytes, head + in-flight flush (the in-flight memory measure)
+	// RetainFrom is the last authorized requested cutoff; cleanup may still be pending.
+	RetainFrom int64
+	// RetentionBoundBy identifies the bound behind RetainFrom.
+	RetentionBoundBy RetentionBound
+	Streams          int64 // distinct streams ever seen (index span: head ∪ flushed)
+	HeadRecords      int64 // records currently buffered in the head (unflushed)
+	HeadBytes        int64 // buffered record bytes, head + in-flight flush (the in-flight memory measure)
 	// HeadAge is how long the head has been accumulating since its last flush (0 when empty) —
 	// the flush lag, which no data-time field here reports (backfill makes record timestamps
 	// useless as a measure of it).
@@ -519,7 +525,9 @@ func (e *Engine) Stats() Stats {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	request := e.retentionRequest()
 	s := Stats{
+		RetainFrom: request.Cutoff, RetentionBoundBy: request.Bound,
 		Streams:       int64(e.head.series.Len()),
 		OutOfSpace:    e.space.Exhausted(),
 		HeadBytes:     e.head.inFlightBytes(),

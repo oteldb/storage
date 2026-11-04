@@ -1861,3 +1861,13 @@ metadata eviction cannot invalidate a pinned directory, and each clone uses the 
 Each cache shard indexes part prefixes once, with compact (column, block) keys in each part map.
 Entries carry their own LRU links; prefix eviction visits the same index used by lookups. Numeric
 cache charges include entry size and map slack, and pins retain evicted buffers until readers finish.
+
+## Retention observability
+
+Each authorized merge request records its cutoff and attribution as one tenure-scoped snapshot,
+including when cleanup later defers or fails. Stats zero that snapshot when its claim is absent or
+its term changed. This is requested policy, not a claim that physical cleanup completed.
+
+Confirmed publication counts whole-part expiry drops and merges rewriting retention straddlers.
+Drop bytes use the existing recorded stored-byte estimate, excluding unrecorded sidecars; retirement
+may precede physical deletion while readers hold pins. Failed and unconfirmed commits count nothing.

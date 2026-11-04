@@ -27,8 +27,8 @@ type sizeRetentionCache struct {
 // sizeRetentionEntry is one tenant's memoized per-signal cutoffs and the part-set fingerprint they
 // belong to.
 type sizeRetentionEntry struct {
-	parts   uint64
-	cutoffs bySignal
+	parts    uint64
+	decision sizeRetentionDecision
 }
 
 // lookup returns the cutoffs memoized for the given part-set fingerprint, if they are still current.
@@ -41,7 +41,7 @@ func (c *sizeRetentionCache) lookup(t signal.TenantID, parts uint64) (bySignal, 
 		return bySignal{}, false
 	}
 
-	return e.cutoffs, true
+	return e.decision.cutoffs, true
 }
 
 // latest returns the tenant's last memoized cutoffs whatever part set they were computed for, and
@@ -52,18 +52,27 @@ func (c *sizeRetentionCache) latest(t signal.TenantID, parts uint64) (bySignal, 
 
 	e := c.byTenant[t]
 
-	return e.cutoffs, e.parts == parts
+	return e.decision.cutoffs, e.parts == parts
 }
 
 func (c *sizeRetentionCache) store(t signal.TenantID, parts uint64, cutoffs bySignal) {
+	c.storeDecision(t, parts, sizeRetentionDecision{cutoffs: cutoffs})
+}
+
+func (c *sizeRetentionCache) lookupDecision(t signal.TenantID, parts uint64) (sizeRetentionDecision, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	e, ok := c.byTenant[t]
+	return e.decision, ok && e.parts == parts
+}
 
+func (c *sizeRetentionCache) storeDecision(t signal.TenantID, parts uint64, decision sizeRetentionDecision) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.byTenant == nil {
 		c.byTenant = make(map[signal.TenantID]sizeRetentionEntry)
 	}
-
-	c.byTenant[t] = sizeRetentionEntry{parts: parts, cutoffs: cutoffs}
+	c.byTenant[t] = sizeRetentionEntry{parts: parts, decision: decision}
 }
 
 // forget drops a tenant's entry — every signal's cutoff — forcing the next cycle to re-measure. Used

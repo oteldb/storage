@@ -97,7 +97,7 @@ func (e *Engine) MergeStreamOutputForTest(ctx context.Context, opts MergeOptions
 		return err
 	}
 	planMergeBlocks(src, out)
-	_, err = e.publishMerge(ctx, src, out, src, e.term(), plan)
+	_, err = e.publishMerge(ctx, src, out, src, e.term(), plan, 0)
 	return err
 }
 

@@ -94,6 +94,7 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 | `IdentityBytes` | resident identity state: the symbol table, the series/stream index, the postings lists, per-series out-of-order watermarks and cached metric registry ordering. A flush does **not** drain it — identities outlive the data they named and are reclaimed only by `Reset` — so it is reported beside `HeadBytes` rather than folded into it (`MaxInFlightBytes` / `FlushThresholdBytes` would otherwise chase a number a flush cannot lower). It falls when the background maintenance prunes the identities retention left without data — on every node holding metric parts, owner or replica, since a part carries its own identities — so an unbounded rise means churn is outpacing retention |
 | `Parts` | flushed immutable part count |
 | `MinTimeUnixNano` / `MaxTimeUnixNano` | data time span (min over parts; max includes the head) |
+| `RetainFromUnixNano` / `RetentionBoundBy` | last authorized requested cutoff and its winning bound (`none`, `age`, `signal_bytes`, `pooled_bytes`); zero on current replicas, ownership-fenced nodes or a different tenure. A deferred or failed cleanup, including an index-fenced engine that still owns its claim, keeps the request visible: it does not assert rows below the cutoff are gone |
 | `MergeRunning` | a compaction is executing on this engine right now |
 | `MergeDeferred` | the last merge had parts to compact and no merge-memory budget to do it with, so it compacted nothing; see "Merge memory admission" |
 | `SealedParts` | parts already at the merge cap, excluded from size compaction. Retention and compression rewrites can still take them |
@@ -248,6 +249,22 @@ Records routed to a reserved tenant id (`reserved_tenant`) appear only in `inges
 Observability is **injected, never owned**: pass `Logger`, `TracerProvider`, `MeterProvider` via
 `Options`; each defaults to a no-op, so an unconfigured store emits nothing at zero overhead. The
 library imports only the OTel **API** — the embedder owns the SDK and exporters.
+
+Retention instruments are tagged by `signal` only. `storage.retention.dropped_parts` counts
+whole live parts retired after confirmed catalog publication; `dropped_bytes` uses their recorded
+stored-byte estimate, matching merge byte units and excluding sidecars not included in those
+sizes. They are not an exact freed-space counter: query pins can delay object deletion. Failed or
+unconfirmed publication does not advance them. `storage.retention.rewrites` counts published
+merges that rewrite at least one retention straddler, not ordinary ladder-only compaction.
+`storage.retention.lag_seconds` is the maximum live-part lag behind the last requested cutoff among
+locally owned engines, floored at zero; no parts means zero, while a part at timestamp zero remains
+real data. It is refreshed with the part-shape gauges, including zeroes for empty signals.
+
+Cutoff and winning bound are one snapshot, scoped to the ownership term. Equal cutoffs prefer age,
+then a signal byte budget, then the pooled budget. A policy change is reflected on the next authorized
+merge request, including explicit admin compaction. `Inspect` does not resolve new size budgets or
+perform backend I/O merely to display retention. Compare a live part's minimum with the requested
+cutoff to diagnose cleanup lag; query age filtering is a separate read-path policy.
 
 Metric instruments (all prefixed `storage.`):
 

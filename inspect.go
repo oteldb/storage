@@ -41,7 +41,11 @@ type TenantStats struct {
 
 // SignalStats is one (tenant, signal) engine's in-memory shape.
 type SignalStats struct {
-	Signal signal.Signal
+	// RetainFromUnixNano is the last authorized requested cutoff, not proof of completed cleanup.
+	RetainFromUnixNano int64
+	// RetentionBoundBy identifies that cutoff's winning bound; replicas report none.
+	RetentionBoundBy RetentionBound
+	Signal           signal.Signal
 	// Series is the distinct series/streams ever seen (index span: head ∪ flushed parts).
 	Series int64
 	// HeadItems is the samples (metrics) or records (logs/traces/profiles) buffered unflushed.
@@ -283,6 +287,7 @@ func (s *Storage) Inspect() StoreStats {
 			TenureUnestablished: es.TenureUnestablished,
 		})
 		s.attachReadGap(&ts.Signals[len(ts.Signals)-1], signal.Metric, tid)
+		s.attachRetention(&ts.Signals[len(ts.Signals)-1], tid, es.RetainFrom, es.RetentionBoundBy)
 
 		if dc, ok := eng.DecodeCacheStats(); ok {
 			decode.Hits += dc.Hits
@@ -315,6 +320,7 @@ func (s *Storage) Inspect() StoreStats {
 				TenureUnestablished: es.TenureUnestablished,
 			})
 			s.attachReadGap(&ts.Signals[len(ts.Signals)-1], sig, tid)
+			s.attachRetention(&ts.Signals[len(ts.Signals)-1], tid, es.RetainFrom, es.RetentionBoundBy)
 		}
 	}
 
