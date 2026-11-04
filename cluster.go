@@ -1692,7 +1692,7 @@ func (s *Storage) routeToPrimary(ctx context.Context, sig signal.Signal, tenant 
 // The applying engine is selected by sig (metrics vs the record signals).
 func (s *Storage) primaryWrite(ctx context.Context, sig signal.Signal, tenant string, walBytes []byte) (cluster.Reject, error) {
 	// A write is only acknowledged by a node that can still prove the shard is its own; see
-	// cluster_fence.go. Checked before the engine is touched, so a fenced node neither applies
+	// cluster_fence.go. Checked before the engine is touched, so an unclaimed node neither applies
 	// nor materializes anything for a shard that has moved on.
 	if err := s.checkPrimaryClaim(ctx, sig, tenant); err != nil {
 		return cluster.Reject{}, err

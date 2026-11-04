@@ -61,6 +61,16 @@ plan (`LastPlan`) for operator preview. In cluster mode the maintenance loop flu
 owned shards**, so a shard's parts are written by exactly one node even during ring-disagreement
 windows — the claim arbitrates.
 
+`Ownership.Ensure` performs targeted acquisition and records its term without releasing other
+shards. Acquisition bookkeeping is serialized with lease replacement and `Forget`.
+
+Reconcile input discovers shards; omission from a stale engine snapshot does not revoke a claim
+while the ring still names this node primary. Explicit release and ring movement do.
+
+`Release` forgets locally before its guarded delete, even if the response fails. Failed releases
+remain pending for reconciliation to retry; successful acquisition cancels that pending release.
+Lease replacement and `Forget` clear both sets. Acquisition and release compare node id and lease.
+
 A claim's identity is the pair **(node id, lease)**, not the id alone. A crashed node's lease
 outlives its process by up to the TTL, so a node restarting under the same ring id — or rejoining
 under a fresh lease before the old one lapses — finds a claim carrying its own id bound to a lease
@@ -113,8 +123,11 @@ short-TTL cluster is not fenced permanently). Past it `Membership.Fenced()` is t
 no-op. The `held` set itself is kept, so a lease confirmed again — the same lease, no rejoin —
 resumes the claims in place.
 
+Rejoin keeps the node fenced until its ownership callback has discarded the old lease's claims.
+`Term` and `Owned` recheck the fence after waiting for the ownership mutex.
+
 The gate is deliberately **not "can I reach etcd"**. A node that cannot reach etcd but is still
-inside a live lease is not wrong to serve as primary; a node whose lease has lapsed is wrong
+inside a live lease can serve as primary when its ring placement and tracked claim still agree; a node whose lease has lapsed is wrong
 whether or not etcd is reachable. The cost is stated plainly: an etcd outage longer than the TTL
 does stop ingest cluster-wide, because no node can distinguish "etcd is down for everyone" from
 "I am the one partitioned" — and in the second case someone has already taken over. A blip shorter
@@ -172,9 +185,18 @@ that window, so a client retry re-appends rows the store does not deduplicate (#
 ## Write path — primary-authoritative
 
 A write is framed with its tenant + signal byte and routed to the shard's **ring-primary**, the
-single authority. The primary first checks it can still prove the shard is its own (see *Lease
-fencing*) and otherwise refuses with `ErrNotPrimary`; a write it cannot place must fail, not
-succeed and vanish. It then applies it via `ApplyPrimary` (the *only* OOO and admission decision
+single authority. Before applying data, the receiver requires its local ring to name it primary,
+a live lease and a tracked compaction claim. A cold shard attempts a targeted claim CAS before any
+engine is created, bounded by `RetryConfig.PerTryTimeout` (or the default retry timeout when unset).
+Warm writes consult in-memory ownership; that lookup shares the reconciliation mutex, so it can wait
+behind reconciliation I/O. A peer's claim or misrouted request returns `ErrNotPrimary` without applying data.
+
+`ErrNotPrimary` is propagated to the caller. The conservative write policy retries only proven
+connection failures; it does not automatically reroute refusals or retry ambiguous applied writes.
+The gate authorizes entry to `ApplyPrimary`, not an atomic lease pin through apply and quorum
+replication: ownership changes after entry retain the existing in-flight durability semantics.
+
+The primary then applies it via `ApplyPrimary` (the *only* OOO and admission decision
 for the shard), re-frames the **accepted** set, and replicates that verbatim to secondaries
 (`ApplyReplicated`, no re-check — the way WAL replay trusts the log). Every replica therefore
 receives the same accepted set from one authority: replicas converge even under concurrent writers

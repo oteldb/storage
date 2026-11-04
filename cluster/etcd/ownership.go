@@ -43,10 +43,11 @@ type Ownership struct {
 	mu sync.Mutex
 	// held maps each shard this node holds a claim on to that claim's term — the etcd revision
 	// the claim was created at. See [Ownership.Term].
-	held     map[string]uint64
-	prevRing *ring.Ring               // ring at the last Reconcile (pointer-compared for "unchanged")
-	lastPlan []rebalance.Reassignment // the owner-set handoffs enacted at the last ring change
-	planRF   func(shard string) int   // per-shard rf for LastPlan recording; nil ⇒ 1 (primary only)
+	held           map[string]uint64
+	pendingRelease map[string]struct{}
+	prevRing       *ring.Ring               // ring at the last Reconcile (pointer-compared for "unchanged")
+	lastPlan       []rebalance.Reassignment // the owner-set handoffs enacted at the last ring change
+	planRF         func(shard string) int   // per-shard rf for LastPlan recording; nil ⇒ 1 (primary only)
 }
 
 // NewOwnership returns an ownership coordinator for node id, claiming under root with the
@@ -74,6 +75,7 @@ func (o *Ownership) SetLease(id clientv3.LeaseID) {
 
 	o.leaseID.Store(int64(id))
 	o.held = make(map[string]uint64)
+	o.pendingRelease = nil
 }
 
 // Forget drops every claim this node believes it holds, without touching etcd: for after the lease
@@ -84,6 +86,7 @@ func (o *Ownership) Forget() {
 	defer o.mu.Unlock()
 
 	o.held = make(map[string]uint64)
+	o.pendingRelease = nil
 }
 
 // SetFence installs the predicate that reports this node's claims unprovable — wire it to
@@ -145,6 +148,7 @@ func (o *Ownership) Claims(ctx context.Context) ([]string, error) {
 // deletes at the old lease's expiry — leaving the shard unclaimed and undiscoverable while this
 // node went on flushing it. Such a claim is dropped and recreated under the live lease instead,
 // which is also what makes the restart a new tenure with a term above the dead one's.
+// Unlike [Ensure], Acquire does not update the tracked claims.
 func (o *Ownership) Acquire(ctx context.Context, shard string) (term uint64, ok bool, err error) {
 	term, ok, stale, err := o.tryAcquire(ctx, shard)
 	if err != nil || ok || !stale {
@@ -160,6 +164,31 @@ func (o *Ownership) Acquire(ctx context.Context, shard string) (term uint64, ok 
 	return term, ok, err
 }
 
+// Ensure acquires and records shard without releasing other claims. The caller must check placement.
+func (o *Ownership) Ensure(ctx context.Context, shard string) (uint64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.isFenced() {
+		return 0, false, nil
+	}
+	if term, ok := o.held[shard]; ok {
+		return term, true, nil
+	}
+	term, ok, err := o.Acquire(ctx, shard)
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	if o.isFenced() {
+		return 0, false, nil
+	}
+	o.held[shard] = term
+	delete(o.pendingRelease, shard)
+	return term, true, nil
+}
+
 // Term returns the term of this node's claim on shard — the etcd revision it was created at —
 // and whether the shard is held at all. It is what a writer stamps into the indexes it writes
 // for that shard, so a shrunk index can be told from a damaged one.
@@ -171,31 +200,24 @@ func (o *Ownership) Term(shard string) (uint64, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	if o.isFenced() {
+		return 0, false
+	}
 	term, ok := o.held[shard]
 
 	return term, ok
 }
 
-// Release relinquishes shard, but only if this node still holds the claim (a guarded delete,
-// so it never deletes another node's claim).
+// Release forgets shard locally and deletes only the claim bound to this node and lease.
 func (o *Ownership) Release(ctx context.Context, shard string) error {
-	key := o.prefix + shard
-
-	_, err := o.client.Txn(ctx).
-		If(clientv3.Compare(clientv3.Value(key), "=", o.id)).
-		Then(clientv3.OpDelete(key)).
-		Commit()
-	if err != nil {
-		return errors.Wrapf(err, "release %q", shard)
-	}
-
-	return nil
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.release(ctx, shard)
 }
 
-// Reconcile makes this node's claims match the ring: it acquires every shard this node is the
-// ring-primary of and releases the rest. It returns the shards this node now owns — the set it
-// should flush and compact. Idempotent, so it is safe to call on every membership change and on
-// a timer.
+// Reconcile discovers shards, acquires local primaries and releases claims that moved elsewhere.
+// Input omission does not relinquish a tracked shard; use [Release] for that.
+// It returns the shards this node should flush and compact.
 //
 // The work is minimal: ring-primary lookups are pure in-memory HRW hashing (no etcd), and an
 // etcd write is issued only when a claim must change — a wanted shard not yet held is acquired
@@ -236,20 +258,27 @@ func (o *Ownership) Reconcile(ctx context.Context, r *ring.Ring, shards []string
 
 		if acquired {
 			o.held[shard] = term
+			delete(o.pendingRelease, shard)
 		}
 	}
 
-	// Release each held shard we no longer want (its primary moved away, or its tenant is gone).
+	// The input discovers shards; a stale engine snapshot cannot revoke a current primary's claim.
 	for shard := range o.held {
-		if _, ok := want[shard]; ok {
+		if primary, ok := r.Primary([]byte(shard)); ok && primary.ID == o.id {
 			continue
 		}
 
-		if err := o.Release(ctx, shard); err != nil {
+		if err := o.release(ctx, shard); err != nil {
 			return o.ownedLocked(), err
 		}
 
 		delete(o.held, shard)
+	}
+
+	for shard := range o.pendingRelease {
+		if err := o.release(ctx, shard); err != nil {
+			return o.ownedLocked(), err
+		}
 	}
 
 	// Record the owner-set handoffs this ring change implied, so an operator can see/preview
@@ -281,6 +310,9 @@ func (o *Ownership) Owned() []string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	if o.isFenced() {
+		return nil
+	}
 	return o.ownedLocked()
 }
 
@@ -306,6 +338,30 @@ func (o *Ownership) LastPlan() []rebalance.Reassignment {
 	copy(out, o.lastPlan)
 
 	return out
+}
+
+func (o *Ownership) release(ctx context.Context, shard string) error {
+	// A failed response cannot prove the claim still exists.
+	delete(o.held, shard)
+	key := o.prefix + shard
+
+	_, err := o.client.Txn(ctx).
+		If(
+			clientv3.Compare(clientv3.Value(key), "=", o.id),
+			clientv3.Compare(clientv3.LeaseValue(key), "=", o.leaseID.Load()),
+		).
+		Then(clientv3.OpDelete(key)).
+		Commit()
+	if err != nil {
+		if o.pendingRelease == nil {
+			o.pendingRelease = make(map[string]struct{})
+		}
+		o.pendingRelease[shard] = struct{}{}
+		return errors.Wrapf(err, "release %q", shard)
+	}
+	delete(o.pendingRelease, shard)
+
+	return nil
 }
 
 // tryAcquire is one create-if-absent CAS pass. stale reports that the existing claim carries this

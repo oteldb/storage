@@ -398,6 +398,9 @@ func (m *Membership) rejoin(ctx context.Context) bool {
 		}
 
 		m.leaseID.Store(int64(lease))
+		if fn := m.onRejoin.Load(); fn != nil {
+			(*fn)(lease)
+		}
 		m.selfAbsent.Store(false)
 		m.rejoins.Add(1)
 		m.revoke(ctx, old)
@@ -405,10 +408,6 @@ func (m *Membership) rejoin(ctx context.Context) bool {
 		m.logger().Warn("re-registered in cluster member set",
 			zap.String("id", m.self.ID), zap.Int64("lease", int64(lease)),
 			zap.Int64("rejoins", m.rejoins.Load()))
-
-		if fn := m.onRejoin.Load(); fn != nil {
-			(*fn)(lease)
-		}
 
 		return true
 	}
