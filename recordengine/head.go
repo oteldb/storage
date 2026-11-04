@@ -252,7 +252,11 @@ func (a *streamAppender) append(r rec, oooWindow, maxBytes int64) admitOutcome {
 // exactly what it would have seen had each admitted record been applied as it was admitted. Every
 // admitted record must then be applied, in admission order, before [streamAppender.commit].
 func (a *streamAppender) admit(r rec, oooWindow, maxBytes int64, pending *int64) admitOutcome {
-	if a.seen && oooWindow > 0 && r.ts < a.ts-oooWindow {
+	return a.admitSized(r.ts, recByteSize(r), oooWindow, maxBytes, pending)
+}
+
+func (a *streamAppender) admitSized(ts, size, oooWindow, maxBytes int64, pending *int64) admitOutcome {
+	if a.seen && oooWindow > 0 && ts < a.ts-oooWindow {
 		return rejectOOO
 	}
 
@@ -265,10 +269,10 @@ func (a *streamAppender) admit(r rec, oooWindow, maxBytes int64, pending *int64)
 		return rejectBytes
 	}
 
-	*pending += recByteSize(r)
+	*pending += size
 
-	if !a.seen || r.ts > a.ts {
-		a.ts, a.seen, a.dirty = r.ts, true, true
+	if !a.seen || ts > a.ts {
+		a.ts, a.seen, a.dirty = ts, true, true
 	}
 
 	return admitted

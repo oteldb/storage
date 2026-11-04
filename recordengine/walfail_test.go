@@ -178,7 +178,7 @@ func TestApplyPrimaryWALFailureAppliesNothing(t *testing.T) {
 }
 
 // FuzzAppendAdmissionMatchesUnlogged pins the logged append — which decides the accepted set before
-// applying any of it — to the unlogged one, which admits and applies each record as it goes. Both run
+// applying any of it — to the unlogged one, which applies contiguous admitted runs. Both run
 // the same batches through the same limits; a small in-flight cap makes a byte rejection followed by
 // admitted records a common case.
 func FuzzAppendAdmissionMatchesUnlogged(f *testing.F) {

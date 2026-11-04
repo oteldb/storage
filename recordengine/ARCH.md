@@ -989,6 +989,13 @@ Confirmed publication counts whole-part expiry drops and merges rewriting retent
 Drop bytes use the existing recorded stored-byte estimate, excluding unrecorded sidecars; retirement
 may precede physical deletion while readers hold pins. Failed and unconfirmed commits count nothing.
 
+## Batch ingestion
+
+Admission visits rows in arrival order, preserving per-stream lateness and soft byte-cap semantics.
+Unlogged writes apply contiguous accepted runs directly from the batch columns. Logged writes retain
+accepted row indices until the records frame succeeds, then apply those runs; a failed write never
+raises the head's watermark or stores unlogged rows. Both copy byte cells into head-owned blobs.
+
 ## Retention admission
 
 Optional append timestamp floors reject expired rows before stream registration and record WAL
