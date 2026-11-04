@@ -58,6 +58,10 @@ engines over the fetch seam (`query/fetch`).
 
 ## 3. Public surface (root package)
 
+`Inspect().Cluster.Placements` reports this node's replica/EC owner sets for locally known shard
+keys, using the routing placement and per-tenant policy. It is an in-memory observation, not a
+complete cluster inventory; `Owned` separately names held compaction claims.
+
 `Storage` is the whole API. `Open(ctx, Options, ...Option)` / `InMemory(...Option)` build it;
 `Close` stops maintenance and flushes.
 
