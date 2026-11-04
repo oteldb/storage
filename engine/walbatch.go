@@ -298,6 +298,7 @@ func (b *walBatch) apply(h *head) {
 		}
 		for i := range a.ts {
 			buf.appendSample(a.ts[i], a.values[i], a.sf[i])
+			h.noteBufferedTS(a.ts[i])
 		}
 
 		h.grow(int64(len(a.ts)) * SampleBytes)

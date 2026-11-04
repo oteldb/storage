@@ -114,7 +114,7 @@ func TestFoldTie(t *testing.T) {
 			}
 
 			cur := make([]int, len(runs))
-			v, w, tag, _ := foldTie(runs, layouts, cur, runs[0].ts[0])
+			v, w, tag, _ := foldTie(runs, layouts, cur, runs[0].ts[0], false)
 			assert.InDelta(t, tc.v, v, 0)
 			assert.InDelta(t, tc.w, w, 0)
 			assert.Equal(t, tc.isRep, tag.interval > 0)
@@ -422,5 +422,30 @@ func TestReadTieMixedAggsIndependentOfOrder(t *testing.T) {
 		ts, vals := read(order...)
 		assert.Equal(t, wantTs, ts, "after merging A and C")
 		assert.Equal(t, wantVals, vals, "after merging A and C")
+	}
+}
+
+func TestRollSeriesNormalizesRawTies(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		runs []sourceRun
+		want float64
+	}{
+		{"bulk copied duplicates", []sourceRun{rawRun([]int64{1, 1}, []float64{2, 3}, nil), rawRun([]int64{2}, []float64{5}, nil)}, 8},
+		{"last raw copy keeps its weight", []sourceRun{rawRun([]int64{1, 1}, []float64{2, 3}, []float64{2, 4}), rawRun([]int64{2}, []float64{5}, nil)}, 17},
+		{"newer run wins over every old copy", []sourceRun{rawRun([]int64{1, 1}, []float64{2, 3}, nil), rawRun([]int64{1}, []float64{5}, nil)}, 5},
+		{"last raw copy folds once into a representative", []sourceRun{rolledRun([]int64{1}, []float64{7}, nil, tierOf(signal.AggSum)), rawRun([]int64{1, 1}, []float64{2, 3}, nil)}, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var m sampleMerge
+			for _, source := range tc.runs {
+				m.add(source.run.ts, source.run.vals, source.run.sf, source.layout, minInt64, maxInt64)
+			}
+			ts, values, _, _ := rollSeries(&m, tierOf(signal.AggSum))
+			require.Equal(t, []int64{0}, ts)
+			require.Equal(t, []float64{tc.want}, values)
+		})
 	}
 }

@@ -29,6 +29,7 @@ type boundedMergeSelection struct {
 	tiers, conflicting []DownsampleTier
 	inputBytes         int64
 	allowance          int64
+	capBytes           int64
 }
 
 func (e *Engine) selectBoundedMerge(ctx context.Context, cohorts []mergeCohort, readable []*part,
@@ -52,8 +53,9 @@ func (e *Engine) selectMergeInputsWithWatermarks(ctx context.Context, cohorts []
 		start = opts.RetainFrom
 	}
 	for {
-		parts, tiers, conflicting := cohortRunLimited(cohorts, readable, opts, capBytes, idle, turn, maxInputs)
-		selection := boundedMergeSelection{parts: parts, tiers: tiers, conflicting: conflicting, allowance: limit}
+		selection := cohortRunPlanLimited(cohorts, readable, opts, capBytes, idle, turn, maxInputs)
+		selection.allowance = limit
+		parts, tiers := selection.parts, selection.tiers
 		if len(parts) == 0 {
 			if maxInputs < maxMergeParts {
 				return boundedMergeSelection{}, errMergeInputMemory
@@ -69,9 +71,9 @@ func (e *Engine) selectMergeInputsWithWatermarks(ctx context.Context, cohorts []
 			return boundedMergeSelection{}, err
 		}
 		bound.resident = buildbudget.Add(bound.resident, mergeSeriesScratchBound(parts, tiers))
-		floor := e.minimumMergeOutput(parts, capBytes, opts, tiers)
+		floor := e.minimumMergeOutput(parts, selection.capBytes, opts, tiers)
 		if whole && buildbudget.Add(bound.bytes(), floor) <= limit {
-			floor = buildbudget.Add(floor, e.wholeMergeOutputBound(parts[0], capBytes, opts, tiers))
+			floor = buildbudget.Add(floor, e.wholeMergeOutputBound(parts[0], selection.capBytes, opts, tiers))
 		}
 		if buildbudget.Add(bound.bytes(), floor) <= limit && (len(parts) <= minMergeParts || bound.bytes() <= limit/2) {
 			selection.inputBytes = bound.bytes()

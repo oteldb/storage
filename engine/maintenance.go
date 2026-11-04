@@ -107,7 +107,7 @@ func (e *Engine) publishMerge(
 	}
 	next := replaceParts(e.parts, removed, newParts...)
 
-	if err := e.commitIndexLocked(ctx, next, e.flushedEpoch, stamp, rollupGuard(readable, plan.marker, e)); err != nil {
+	if err := e.commitIndexLocked(ctx, next, e.flushedEpoch, stamp, rollupClosureGuard(selected, readable, plan.marker, e)); err != nil {
 		if !errors.Is(err, errRollupConflict) {
 			e.mu.Unlock()
 

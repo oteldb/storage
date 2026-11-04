@@ -7,16 +7,12 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/engine"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/signal"
 )
 
-// TestRerollDuplicateSplitByMaxParts: seventeen raw parts are due in one bucket, one more than a merge
-// takes, and the last repeats the sample of the one before it, as an exporter retry does. The first
-// merge rolls sixteen, the next rolls the last alone, and the two representatives then fold as if
-// the repeated sample were two.
+// TestRerollDuplicateSplitByMaxParts: seventeen raw parts share one bucket, with an exporter retry
+// across the last two. Partial compaction must deduplicate before a closed merge rolls the bucket.
 func TestRerollDuplicateSplitByMaxParts(t *testing.T) {
-	reproduce.Unfixed(t, rolledApartIssue, "copies of one sample rolled by separate merges fold as two samples")
 	t.Parallel()
 
 	for _, agg := range []signal.Aggregation{signal.AggSum, signal.AggCount, signal.AggAvg} {

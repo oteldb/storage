@@ -25,12 +25,14 @@ var (
 // plus per-series sample buffers in arrival order (sorted on read). It is not safe for
 // concurrent use; the [Engine] holds the lock.
 type head struct {
-	sym             *symbols.Table
-	series          *series.Index
-	post            *postings.Dense
-	nonStringLabels map[uint32]struct{}
-	samples         map[signal.SeriesID]*sampleBuf
-	newest          int64 // newest timestamp across every series (reported as Inspect.MaxTime)
+	sym                          *symbols.Table
+	series                       *series.Index
+	post                         *postings.Dense
+	nonStringLabels              map[uint32]struct{}
+	samples                      map[signal.SeriesID]*sampleBuf
+	newest                       int64 // newest timestamp across every series (reported as Inspect.MaxTime)
+	bufferedMin, detachedMin     int64
+	bufferedKnown, detachedKnown bool
 
 	// seriesNewest is each series' own newest admitted timestamp: the OOO window is a per-series
 	// lateness bound, not a cross-series one, so a high-rate (or clock-skewed-ahead) series cannot
@@ -216,12 +218,19 @@ func (h *head) outOfOrder(id signal.SeriesID, ts, oooWindow int64) bool {
 
 // noteTS advances series id's own watermark and the head-global one after a sample is admitted.
 func (h *head) noteTS(id signal.SeriesID, ts int64) {
+	h.noteBufferedTS(ts)
 	if newest, seen := h.seriesNewest[id]; !seen || ts > newest {
 		h.seriesNewest[id] = ts
 	}
 
 	if ts > h.newest {
 		h.newest = ts
+	}
+}
+
+func (h *head) noteBufferedTS(ts int64) {
+	if !h.bufferedKnown || ts < h.bufferedMin {
+		h.bufferedMin, h.bufferedKnown = ts, true
 	}
 }
 
@@ -413,9 +422,15 @@ func (h *head) trimBelowCovered(covered map[signal.SeriesID]int64) {
 // recountBytes resets the in-flight byte measure from the current buffers (used after a bulk
 // mutation like trimBelow that does not track per-sample deltas).
 func (h *head) recountBytes() {
+	h.bufferedKnown = false
 	var n int64
 	for _, buf := range h.samples {
 		n += int64(len(buf.ts))
+		for _, ts := range buf.ts {
+			if !h.bufferedKnown || ts < h.bufferedMin {
+				h.bufferedMin, h.bufferedKnown = ts, true
+			}
+		}
 	}
 
 	h.bytes = n * SampleBytes
@@ -678,6 +693,8 @@ func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 	h.samples = make(map[signal.SeriesID]*sampleBuf)
 	h.bytes = 0
 	h.detachedBytes = bytes
+	h.detachedMin, h.detachedKnown = h.bufferedMin, h.bufferedKnown
+	h.bufferedKnown = false
 	h.since = time.Time{}
 
 	return detached, bytes, since
@@ -702,8 +719,15 @@ func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, si
 		}
 	}
 
+	if !h.detachedKnown || h.bytes > 0 && !h.bufferedKnown {
+		h.bufferedMin = minInt64
+	} else if !h.bufferedKnown || h.detachedMin < h.bufferedMin {
+		h.bufferedMin = h.detachedMin
+	}
+	h.bufferedKnown = true
 	h.grow(bytes)
 	h.detachedBytes = 0
+	h.detachedKnown = false
 
 	// grow stamps since at now for a head that was empty; the samples coming back are older than
 	// that, so the earlier start wins and the flush interval keeps measuring from it.

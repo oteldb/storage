@@ -196,3 +196,14 @@ func (e *Engine) RecordedIntervals() []int64 {
 
 	return out
 }
+
+// RecordedTiers returns the union of the live parts' recorded tier metadata for oracle tests.
+func (e *Engine) RecordedTiers() []DownsampleTier {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	var tiers []DownsampleTier
+	for _, p := range e.readablePartsLocked() {
+		tiers = append(tiers, p.rollup...)
+	}
+	return compactLayout(tiers)
+}

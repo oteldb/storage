@@ -219,6 +219,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	}
 	selected = selection.parts
 	opts.Downsample = selection.tiers
+	capBytes = selection.capBytes
 	if len(selection.conflicting) > 0 && e.conflictWarned.CompareAndSwap(false, true) {
 		zctx.From(ctx).Warn("downsample tier not applied: its interval does not nest with, or its aggregation "+
 			"differs from, a tier a part already records",
@@ -302,19 +303,27 @@ func rollupGuard(readable []*part, marker *block.Rollup, e *Engine) func() error
 		return nil
 	}
 
-	planned := make(map[string]struct{}, len(readable))
+	planned := make(map[string][]DownsampleTier, len(readable))
 	for _, p := range readable {
-		planned[p.prefix] = struct{}{}
+		planned[p.prefix] = p.rollup
 	}
 
+	incompatible := func(prefix string, current []DownsampleTier) bool {
+		previous, known := planned[prefix]
+		return (!known || !slices.Equal(previous, current)) && !layoutsNest(out, current)
+	}
 	return func() error {
-		for i := range e.foreign {
-			ent := &e.foreign[i]
-			if _, ok := planned[ent.Prefix]; !ok && !layoutsNest(out, e.foreignLayoutLocked(ent)) {
+		for _, p := range e.parts {
+			if incompatible(p.prefix, p.rollup) {
 				return errRollupConflict
 			}
 		}
-
+		for i := range e.foreign {
+			ent := &e.foreign[i]
+			if incompatible(ent.Prefix, e.foreignLayoutLocked(ent)) {
+				return errRollupConflict
+			}
+		}
 		return nil
 	}
 }

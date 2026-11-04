@@ -137,7 +137,10 @@ func TestRebaseNeverCommitsTwoAggs(t *testing.T) {
 
 	r := engine.New(engine.Config{Backend: be, Prefix: sharedPrefix})
 	require.NoError(t, r.LoadParts(ctx))
-	require.Len(t, r.RecordedAggs(), 1, "the committed index holds one Agg")
+	require.LessOrEqual(t, len(r.RecordedAggs()), 1, "neither writer rolls a bucket missing the other input")
+	require.NoError(t, r.MergeWith(ctx, tier(signal.AggCount)))
+	require.Len(t, r.RecordedAggs(), 1, "a fresh owner closes the bucket and records one Agg")
+	require.NoError(t, b.LoadParts(ctx))
 
 	require.NoError(t, b.MergeWith(ctx, tier(signal.AggSum)))
 	require.NoError(t, r.LoadParts(ctx))
@@ -239,7 +242,7 @@ func TestNonNestingGridsStayApart(t *testing.T) {
 
 	r := engine.New(engine.Config{Backend: be, Prefix: sharedPrefix})
 	require.NoError(t, r.LoadParts(ctx))
-	require.Equal(t, 5, r.PartCount(), "two parts per grid and the raw anchor")
+	require.Equal(t, 4, r.PartCount(), "the 7m bucket closes across hours; the 1h parts and anchor remain")
 
 	before := fetchAll(t, r, api)
 	require.Len(t, before, 1)
@@ -375,9 +378,12 @@ func TestRebaseBlindToAdoptedPart(t *testing.T) {
 
 	r := engine.New(engine.Config{Backend: shared, Prefix: sharedPrefix})
 	require.NoError(t, r.LoadParts(ctx))
-	require.Len(t, r.RecordedAggs(), 1, "the committed index holds one Agg while the adopted part is unreadable")
+	require.LessOrEqual(t, len(r.RecordedAggs()), 1, "an unreadable bucket input prevents an unsafe rollup")
+	require.NoError(t, r.MergeWith(ctx, tier(signal.AggCount)))
+	require.Len(t, r.RecordedAggs(), 1, "the reader holding every part closes the bucket")
 
 	blind.setHidden()
+	require.NoError(t, b.LoadParts(ctx))
 	require.NoError(t, b.MergeWith(ctx, tier(signal.AggSum)))
 	require.NoError(t, r.LoadParts(ctx))
 	require.Len(t, r.RecordedAggs(), 1, "and after it reads again")
