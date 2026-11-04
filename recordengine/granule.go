@@ -5,7 +5,6 @@ import (
 	"slices"
 
 	"github.com/oteldb/storage/block"
-	"github.com/oteldb/storage/signal"
 )
 
 // Granule time pruning. A part's columns are block-framed, so a reader can decode one granule at a
@@ -64,8 +63,8 @@ func granuleInWindow(gran []block.Granule, g int, start, end int64) bool {
 // span whose bounds can hold a record in [start, end].
 //
 // nil means "decode everything" — either pruning is unavailable, or every granule survived, in which
-// case naming them all would only cost the caller a list to walk. ids must be sorted ascending.
-func (p *part) windowGranules(ctx context.Context, ids []signal.SeriesID, start, end int64) []int {
+// case naming them all would only cost the caller a list to walk.
+func (p *part) windowGranules(ctx context.Context, matched []streamRange, start, end int64) []int {
 	gran := p.granuleTimes(ctx)
 	if gran == nil || p.reader == nil {
 		return nil
@@ -93,23 +92,8 @@ func (p *part) windowGranules(ctx context.Context, ids []signal.SeriesID, start,
 		}
 	}
 
-	// Selecting granules must not cost more than the decode it saves, and this runs once per part. The
-	// merge-join walks each list once, so a query with no matchers — which requests every stream in
-	// the tenant, hundreds of thousands of them, to skip a handful of granules — costs a scan of the
-	// two sorted lists rather than a lookup per requested stream.
-	rs := p.ranges
-
-	for j := 0; j < len(rs) && len(ids) > 0; {
-		if rs[j].id.Compare(ids[0]) < 0 {
-			j++
-			continue
-		}
-
-		if rs[j].id == ids[0] {
-			addRange(rs[j].rowRange)
-		}
-
-		ids = ids[1:]
+	for _, sr := range matched {
+		addRange(sr.rowRange)
 	}
 
 	if len(out) == 0 {

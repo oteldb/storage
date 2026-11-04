@@ -661,10 +661,13 @@ Heavily tuned around decoding as little as possible.
 
 A part's stream index is a **slice of `{rowRange, id}` sorted by id**, not a map: rows are
 `(stream, ts)`-ordered so each part's stream set is already ascending and each stream one contiguous
-run, and `openPart` only sorts when a column arrives out of order. Every resolution — part selection,
-accumulator pre-sizing, granule selection, the per-part row append — then merge-joins the query's
-once-sorted ids against it, `O(ids + streams)` sequential comparisons per part with no hashing and no
-allocation, plus an `O(1)` min/max reject for a part whose id space misses the request entirely.
+run, and `openPart` only sorts when a column arrives out of order. Planning merge-joins the query's
+once-sorted ids against it to select live parts and size unbudgeted accumulators. Budgeted plans
+need only liveness and stop at the first match. At read time, one reusable per-part match buffer
+feeds both granule selection and row gathering, including filtered and budgeted reads. It holds at
+most the requested stream count rather than a parts × streams cache, covered by the plan's
+per-stream memory reservation. The joins cost `O(ids + streams)` sequential comparisons with no
+hashing, plus an `O(1)` min/max reject for disjoint id spaces.
 Point lookups (`part.lookup`, used by the merge and by `streamInRangeLocked`) binary-search it.
 
 Planning is what a fragmented store's fetch spends its time on: a query over 664 parts × 16.7k streams
@@ -683,9 +686,8 @@ a day-wide part decodes the day: **286× the rows needed** on a real log corpus.
 Selection comes from the **requested streams'** row ranges, not the whole part. Rows are
 `(stream, ts)`-ordered, so granule bounds are not monotonic across a part, but each stream owns one
 contiguous ts-ascending run — which is what makes a service-filtered query touch a handful of granules.
-Selection merge-joins the plan's sorted ids with the part's stream index, so a query with no matchers —
-requesting every stream in the tenant to skip a handful of granules — costs one walk of the two sorted
-lists per part rather than a lookup per requested stream. `nil` means
+Selection walks the resolved per-part stream ranges shared with row gathering, so granule pruning
+does not repeat stream resolution. `nil` means
 "decode everything", returned both when marks are unusable and when nothing pruned, keeping the
 whole-column path on its simpler route. Decoded rows land at their **part row offsets**, pruned or not,
 so the row-range index and `tsWindow` work unchanged; rows outside selected granules are *unspecified*.

@@ -393,7 +393,8 @@ func (p *fetchPlan) readPartsLazy(ctx context.Context) error {
 	for _, part := range p.liveParts {
 		// Granules the requested streams' rows occupy that the window can intersect; nil when
 		// nothing prunes, which keeps the whole-column decode on its simpler path.
-		blocks := part.windowGranules(ctx, p.sortedIDs, p.start, p.end)
+		p.matched = part.heldStreams(p.matched[:0], p.sortedIDs)
+		blocks := part.windowGranules(ctx, p.matched, p.start, p.end)
 
 		lz, err := part.readLazyConds(ctx, p.condSel, p.conds, p.e.getI64, blocks)
 		if err != nil {
@@ -401,7 +402,7 @@ func (p *fetchPlan) readPartsLazy(ctx context.Context) error {
 		}
 
 		// Phase 1: a non-matching part (a bloom false positive) never decodes its projected columns.
-		if p.scanMatches(part, lz) {
+		if p.scanMatches(lz) {
 			// Phase 2: decode the projected columns and gather the rows phase 1 recorded.
 			if err := part.decodeProjected(ctx, lz, p.sel, p.condSel, p.e.getI64, blocks); err != nil {
 				return err
@@ -446,15 +447,11 @@ type hitRun struct {
 	lo, hi int
 }
 
-// scanMatches is phase 1: it records every requested stream's matching, in-window rows in p.hits (as
-// one contiguous run per stream, p.hitRuns) and reports whether the part holds any. Recording the
-// matches instead of a boolean is what lets phase 2 gather them without re-running the conditions —
-// a match used to be evaluated twice, once here and once in the gather.
-func (p *fetchPlan) scanMatches(part *part, lz *lazyCols) bool {
+// scanMatches records the current part's matching, in-window rows from p.matched in p.hits and
+// p.hitRuns. The hit list lets phase 2 gather without re-evaluating conditions.
+func (p *fetchPlan) scanMatches(lz *lazyCols) bool {
 	evals := p.compileConds(lz)
 	p.hits, p.hitRuns = p.hits[:0], p.hitRuns[:0]
-
-	p.matched = part.heldStreams(p.matched[:0], p.sortedIDs)
 
 	for _, sr := range p.matched {
 		id := sr.id

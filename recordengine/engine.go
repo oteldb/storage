@@ -1173,7 +1173,7 @@ type fetchPlan struct {
 	// is a merge-join against the part's own sorted stream list (see [part.heldStreams]).
 	sortedIDs []signal.SeriesID
 
-	// matched is the per-part merge-join result, reused across parts.
+	// matched is shared by granule pruning and row gathering, reused across parts.
 	matched []streamRange
 
 	// Top-N scan (see limitscan.go): limit/reverse mirror the request, and partsSkippedLimit counts
@@ -1241,14 +1241,15 @@ func (e *Engine) planFetch(ctx context.Context, ids []signal.SeriesID, r fetch.R
 	readable := e.readablePartsLocked()
 	p.partsTotal = len(readable)
 
-	// Resolving the query's streams against a part is the whole cost of planning a fetch on a
-	// fragmented store (parts × streams). Sorting the ids once turns each part's resolution into a
-	// merge-join that both selects the part and sizes its contribution in one pass, so no (part,
-	// stream) pair is resolved twice.
+	// Sorting once lets each part's planning join both establish liveness and size unbudgeted
+	// accumulators. Budgeted reads size only surviving rows during gathering.
 	p.sortedIDs = slices.Clone(ids)
 	slices.SortFunc(p.sortedIDs, signal.SeriesID.Compare)
 
-	partRows := make([]int, len(p.sortedIDs))
+	var partRows []int
+	if p.memory == nil {
+		partRows = make([]int, len(p.sortedIDs))
+	}
 
 	for _, part := range readable {
 		rows := int64(part.reader.RowCount()) // cached from the manifest at part-open; no extra I/O
@@ -1311,8 +1312,8 @@ func (e *Engine) planFetch(ctx context.Context, ids []signal.SeriesID, r fetch.R
 
 // sizeStreams merge-joins the plan's sorted ids against part's stream list, adding each held
 // stream's row count to rows (indexed by position in [fetchPlan.sortedIDs]), and reports whether the
-// part holds any requested stream — i.e. whether it is live for this fetch. A part that holds none
-// leaves rows untouched.
+// part holds any requested stream. A nil rows slice requests only liveness, stopping at the first
+// match. A part that holds none leaves rows untouched.
 func (p *fetchPlan) sizeStreams(part *part, rows []int) bool {
 	rs := part.ranges
 	if len(rs) == 0 || len(p.sortedIDs) == 0 {
@@ -1335,6 +1336,9 @@ func (p *fetchPlan) sizeStreams(part *part, rows []int) bool {
 		}
 
 		if rs[j].id == id {
+			if rows == nil {
+				return true
+			}
 			rows[k] += rs[j].end - rs[j].start
 			held = true
 		}
@@ -1361,12 +1365,11 @@ func (p *fetchPlan) readParts(ctx context.Context) error {
 	}
 
 	for i, part := range p.liveParts {
-		cols, err := part.readCols(ctx, p.sel, p.e.getI64, part.windowGranules(ctx, p.sortedIDs, p.start, p.end))
+		p.matched = part.heldStreams(p.matched[:0], p.sortedIDs)
+		cols, err := part.readCols(ctx, p.sel, p.e.getI64, part.windowGranules(ctx, p.matched, p.start, p.end))
 		if err != nil {
 			return err
 		}
-
-		p.matched = part.heldStreams(p.matched[:0], p.sortedIDs)
 
 		for _, sr := range p.matched {
 			acc := p.accs[sr.id]
