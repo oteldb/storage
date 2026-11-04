@@ -70,6 +70,7 @@ func (r *Router) writeRecords(
 		out.Rejected.OOO += rej.OOO
 		out.Rejected.Cardinality += rej.Cardinality
 		out.Rejected.InFlight += rej.InFlight
+		out.Rejected.Retention += rej.Retention
 	}
 
 	out.Accepted = frames.Emitted - out.Rejected.Total()
