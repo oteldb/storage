@@ -7,6 +7,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/cluster"
+	"github.com/oteldb/storage/reliability"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -39,13 +40,49 @@ func (s *Storage) fenced() bool {
 // holds the shard's claim, so the write fails at its origin instead of being acknowledged and
 // withheld.
 func (s *Storage) checkPrimaryClaim(ctx context.Context, sig signal.Signal, shardKey string) error {
-	if !s.fenced() {
+	if s.cluster == nil {
 		return nil
 	}
+	if err := s.requirePrimaryClaim(ctx, shardKey); err != nil {
+		s.obs.Logger(ctx).Warn("refusing primary write: this node can no longer prove it holds the shard",
+			zap.Stringer("signal", sig), zap.String("shard", shardKey), zap.Error(err))
+		s.obs.Cluster.PrimaryRefused(ctx, sig.String())
+		return errors.Wrapf(err, "shard %q", shardKey)
+	}
+	return nil
+}
 
-	s.obs.Logger(ctx).Warn("refusing primary write: this node can no longer prove it holds the shard",
-		zap.Stringer("signal", sig), zap.String("shard", shardKey))
-	s.obs.Cluster.PrimaryRefused(ctx, sig.String())
+func (s *Storage) requirePrimaryClaim(ctx context.Context, shard string) error {
+	if s.fenced() || !s.ringPrimary(shard) {
+		return cluster.ErrNotPrimary
+	}
+	if _, held := s.cluster.ownership.Term(shard); held {
+		if s.fenced() || !s.ringPrimary(shard) {
+			return cluster.ErrNotPrimary
+		}
+		return nil
+	}
+	timeout := s.cluster.retry.PerTryTimeout
+	if timeout <= 0 {
+		timeout = reliability.Default().PerTryTimeout
+	}
+	claimCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	term, acquired, err := s.cluster.ownership.Ensure(claimCtx, shard)
+	if err != nil {
+		return errors.Errorf("%w: %w", cluster.ErrNotPrimary, err)
+	}
+	if !acquired || s.fenced() || !s.ringPrimary(shard) {
+		return cluster.ErrNotPrimary
+	}
+	current, held := s.cluster.ownership.Term(shard)
+	if !held || current != term || s.fenced() || !s.ringPrimary(shard) {
+		return cluster.ErrNotPrimary
+	}
+	return nil
+}
 
-	return errors.Wrapf(cluster.ErrNotPrimary, "shard %q", shardKey)
+func (s *Storage) ringPrimary(shard string) bool {
+	primary, ok := s.cluster.membership.Ring().Primary([]byte(shard))
+	return ok && s.cluster.membership.AddrOf(primary.ID) == s.cluster.self
 }
