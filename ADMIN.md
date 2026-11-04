@@ -427,17 +427,18 @@ error wrapping `ErrReadOnly` (as do the `Write*` methods and `Reset`); the read 
 `Parts`/`PartsDetailed`/`Cardinality`/`StreamCosts`, `AdmissionStats` and the fetchers — is
 unaffected, which is what makes a read-only handle the right shape for an offline inspector.
 
-The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The **age cutoff
-is per signal** (`tenant.Retention.AgeFor`): `MaxAge` for everything, except exemplars when
-`tenant.Retention.ExemplarMaxAge` is set — exemplars are a sampled debugging aid whose value ends
-with the trace they point at, so they are the natural first thing to expire, and setting this to the
-trace retention stops them outliving their referents.
+The retention cutoff both paths pass to the merge is `max(age cutoff, size cutoff)`. The age cutoff
+uses `tenant.Retention.AgeFor`: a positive `PerSignal[signal].MaxAge` overrides the default `MaxAge`,
+whether longer or shorter. Zero per-signal fields inherit; a zero default age retains forever.
+`Retention.Validate` lets embedders reject negative bounds, unknown signals and per-signal byte
+budgets above a configured pooled ceiling before publishing a policy. Runtime lookups ignore
+unknown signal keys and treat nonpositive overrides as unset.
 
 The size cutoff comes from the tenant's byte budgets, and there are two, both enforced (`retention.go`):
 
 - `tenant.Retention.MaxBytes` is **pooled**: the tenant's parts across all signals/shards on this
   node are summed and dropped oldest-first until the total fits. It is the tenant-wide outer bound.
-- `tenant.Retention.MaxBytesPerSignal` bounds **one signal at a time**, from that signal's parts
+- `tenant.Retention.PerSignal[signal].MaxBytes` bounds **one signal at a time**, from that signal's parts
   alone. It exists because a pooled budget has no isolation: on a tenant whose metrics dwarf its
   logs, metric growth alone moves the shared cutoff and evicts log history that never grew.
 

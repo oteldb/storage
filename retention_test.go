@@ -489,9 +489,9 @@ func TestSizeRetentionIsolatesSignals(t *testing.T) {
 
 		// One batch of metrics is the metric budget, so the second batch below forces a drop; the
 		// logs get ten times what they occupy and must be untouched by it.
-		budgets.Store(&tenant.Retention{MaxBytesPerSignal: map[signal.Signal]int64{
-			signal.Metric: storedBytes(t, s, signal.Metric),
-			signal.Log:    10 * storedBytes(t, s, signal.Log),
+		budgets.Store(&tenant.Retention{PerSignal: map[signal.Signal]tenant.SignalRetention{
+			signal.Metric: {MaxBytes: storedBytes(t, s, signal.Metric)},
+			signal.Log:    {MaxBytes: 10 * storedBytes(t, s, signal.Log)},
 		}})
 
 		writeMixedMetrics(t, s, mixedMetricBase+10_000)
@@ -551,9 +551,9 @@ func TestSizeRetentionPooledBoundsPerSignalBudgets(t *testing.T) {
 	metricBytes := storedBytes(t, s, signal.Metric)
 	budgets.Store(&tenant.Retention{
 		MaxBytes: 2 * metricBytes, // fits the metrics alone, as above
-		MaxBytesPerSignal: map[signal.Signal]int64{
-			signal.Metric: 1 << 30, // neither per-signal budget binds
-			signal.Log:    1 << 30,
+		PerSignal: map[signal.Signal]tenant.SignalRetention{
+			signal.Metric: {MaxBytes: 1 << 30}, // neither per-signal budget binds
+			signal.Log:    {MaxBytes: 1 << 30},
 		},
 	})
 
@@ -575,7 +575,7 @@ func TestSizeCutoffsSkipsUnbudgetedSignals(t *testing.T) {
 		WithFlushInterval(-1), // no background loop: this test drives maintain itself
 		WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
 			return tenant.Policy{Retention: tenant.Retention{
-				MaxBytesPerSignal: map[signal.Signal]int64{signal.Log: 1 << 30},
+				PerSignal: map[signal.Signal]tenant.SignalRetention{signal.Log: {MaxBytes: 1 << 30}},
 			}}
 		})))
 	require.NoError(t, err)
@@ -624,22 +624,22 @@ func TestBudgetsOf(t *testing.T) {
 		},
 		{
 			name:      "per-signal covers only its own",
-			retention: tenant.Retention{MaxBytesPerSignal: map[signal.Signal]int64{signal.Log: 100}},
+			retention: tenant.Retention{PerSignal: map[signal.Signal]tenant.SignalRetention{signal.Log: {MaxBytes: 100}}},
 			want:      sizeBudgets{perSignal: bySignal{signal.Log: 100}},
 			covers:    map[signal.Signal]bool{signal.Log: true, signal.Metric: false},
 		},
 		{
 			name: "both",
 			retention: tenant.Retention{
-				MaxBytes:          100,
-				MaxBytesPerSignal: map[signal.Signal]int64{signal.Trace: 50},
+				MaxBytes:  100,
+				PerSignal: map[signal.Signal]tenant.SignalRetention{signal.Trace: {MaxBytes: 50}},
 			},
 			want:   sizeBudgets{pooled: 100, perSignal: bySignal{signal.Trace: 50}},
 			covers: map[signal.Signal]bool{signal.Trace: true, signal.Metric: true},
 		},
 		{
 			name:      "unknown signal is ignored",
-			retention: tenant.Retention{MaxBytesPerSignal: map[signal.Signal]int64{signal.Signal(200): 100}},
+			retention: tenant.Retention{PerSignal: map[signal.Signal]tenant.SignalRetention{signal.Signal(200): {MaxBytes: 100}}},
 			empty:     true,
 			covers:    map[signal.Signal]bool{signal.Signal(200): false},
 		},
@@ -706,15 +706,15 @@ func TestPartSetFingerprintFoldsBudgets(t *testing.T) {
 	assert.Equal(t, fp, s.partSetFingerprint("default", base), "an unchanged input is an unchanged fingerprint")
 }
 
-// TestExemplarMaxAgeExpiresAheadOfSamples pins the knob's whole point: with ExemplarMaxAge shorter
+// TestExemplarAgeOverrideExpiresAheadOfSamples pins the knob's whole point: with ExemplarAgeOverride shorter
 // than MaxAge, a maintenance pass drops old exemplars while the samples they hang off survive.
-func TestExemplarMaxAgeExpiresAheadOfSamples(t *testing.T) {
+func TestExemplarAgeOverrideExpiresAheadOfSamples(t *testing.T) {
 	t.Parallel()
 
 	s, err := InMemory(WithTenancy(tenant.ResolverFunc(func(signal.TenantID) tenant.Policy {
 		return tenant.Policy{Retention: tenant.Retention{
-			MaxAge:         24 * time.Hour,
-			ExemplarMaxAge: time.Hour,
+			MaxAge:    24 * time.Hour,
+			PerSignal: map[signal.Signal]tenant.SignalRetention{signal.Exemplar: {MaxAge: time.Hour}},
 		}}
 	})))
 	require.NoError(t, err)
@@ -724,7 +724,7 @@ func TestExemplarMaxAgeExpiresAheadOfSamples(t *testing.T) {
 	t.Cleanup(func() { _ = s.Close(ctx) })
 
 	now := time.Now()
-	old := now.Add(-6 * time.Hour).UnixNano() // past ExemplarMaxAge, within MaxAge
+	old := now.Add(-6 * time.Hour).UnixNano() // past ExemplarAgeOverride, within MaxAge
 	fresh := now.Add(-time.Minute).UnixNano() // within both
 
 	for _, ts := range []int64{old, fresh} {
@@ -749,8 +749,8 @@ func TestExemplarMaxAgeExpiresAheadOfSamples(t *testing.T) {
 		ids = append(ids, exemplarTraceIDs(b)...)
 	}
 
-	assert.NotContains(t, ids, "trace-"+strconv.FormatInt(old, 10), "exemplar past ExemplarMaxAge is dropped")
-	assert.Contains(t, ids, "trace-"+strconv.FormatInt(fresh, 10), "exemplar within ExemplarMaxAge is retained")
+	assert.NotContains(t, ids, "trace-"+strconv.FormatInt(old, 10), "exemplar past ExemplarAgeOverride is dropped")
+	assert.Contains(t, ids, "trace-"+strconv.FormatInt(fresh, 10), "exemplar within ExemplarAgeOverride is retained")
 
 	// The metric samples themselves are governed by MaxAge and both survive.
 	samples, err := fetch.Drain(ctx, must(s.Fetcher("default").Fetch(ctx, fetch.Request{
@@ -767,7 +767,7 @@ func TestExemplarMaxAgeExpiresAheadOfSamples(t *testing.T) {
 	assert.Equal(t, 2, total, "samples outlive their exemplars under the longer MaxAge")
 }
 
-// Without ExemplarMaxAge, exemplars follow MaxAge like every other signal.
+// Without ExemplarAgeOverride, exemplars follow MaxAge like every other signal.
 func TestExemplarRetentionFallsBackToMaxAge(t *testing.T) {
 	t.Parallel()
 
@@ -775,7 +775,7 @@ func TestExemplarRetentionFallsBackToMaxAge(t *testing.T) {
 	assert.Equal(t, 24*time.Hour, r.AgeFor(signal.Exemplar))
 	assert.Equal(t, 24*time.Hour, r.AgeFor(signal.Metric))
 
-	r.ExemplarMaxAge = time.Hour
+	r.PerSignal = map[signal.Signal]tenant.SignalRetention{signal.Exemplar: {MaxAge: time.Hour}}
 	assert.Equal(t, time.Hour, r.AgeFor(signal.Exemplar), "the override applies to exemplars only")
 	assert.Equal(t, 24*time.Hour, r.AgeFor(signal.Metric))
 	assert.Equal(t, 24*time.Hour, r.AgeFor(signal.Log))

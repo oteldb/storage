@@ -2122,7 +2122,7 @@ func (s *Storage) ownedTenants(ctx context.Context, tids map[signal.TenantID]str
 // nanoseconds) for one signal; 0 means retain forever. sizeCutoff is that signal's size-budget cutoff
 // (0 when no byte budget binds it, see [Storage.sizeCutoffFor]): whichever budget binds first — age
 // or bytes — wins. The age window is per signal too, so exemplars can expire ahead of everything else
-// ([tenant.Retention.ExemplarMaxAge]).
+// ([tenant.Retention.PerSignal]).
 func (s *Storage) retainFrom(tid signal.TenantID, sig signal.Signal, sizeCutoff int64) int64 {
 	// tid may be a shard key ({tenant}/_s{idx}) when a signal is sharded; policy is per real tenant.
 	ret := s.tenant.Resolve(s.normalizeTenant(tenantOfShard(tid))).Retention

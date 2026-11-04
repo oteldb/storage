@@ -52,61 +52,6 @@ type Limits struct {
 	MaxMergePartSize int64
 }
 
-// Retention is the per-tenant retention policy (DESIGN.md §10): whole-partition drops,
-// never per-row deletes. Zero values mean "retain forever".
-type Retention struct {
-	// MaxAge is the maximum age of retained data. Zero ⇒ retain forever.
-	MaxAge time.Duration
-	// MaxBytes is the maximum total retained bytes, pooled across every signal. Zero ⇒ unlimited.
-	//
-	// It bounds the stored (compressed, on-backend) bytes of the tenant's flushed parts across every
-	// signal and every shard the node holds — not its unflushed heads, which [Limits.MaxInFlightBytes]
-	// bounds. Over budget, maintenance drops whole parts oldest-first, exactly as MaxAge does; whichever
-	// budget binds first wins. Two consequences of dropping whole parts:
-	//
-	//   - Enforcement is per node and eventual: it is evaluated once per maintenance cycle, from the
-	//     part sizes at the start of the cycle, so the total can overshoot between cycles.
-	//   - The newest part is never dropped, so the effective floor is one part. Pair a byte budget with
-	//     [Limits.MaxPartSize] to make the granularity — and the overshoot — small enough to matter.
-	//
-	// Because the budget is pooled, one signal growing moves the cutoff for all of them: on a tenant
-	// whose metrics dwarf its logs, metric growth alone decides how much log history survives. Use
-	// MaxBytesPerSignal to give each signal its own budget.
-	MaxBytes int64
-	// MaxBytesPerSignal bounds each signal independently, in the same stored bytes MaxBytes counts.
-	// A signal with no entry is bounded only by MaxBytes; nil ⇒ no per-signal budgets.
-	//
-	// It exists because signals have different retention economics — a week of logs and a week of
-	// metrics are neither the same size nor the same value — which a pooled budget cannot express.
-	// Both budgets apply when both are set: a signal is trimmed to whichever of the two binds first,
-	// so MaxBytes remains the tenant-wide outer bound (useful when the sum of the per-signal budgets
-	// is more than the node should hold for one tenant).
-	//
-	// MaxBytes' per-node, eventual enforcement carries over per signal, and so does the floor: the
-	// newest part of *each* budgeted signal is never dropped, so the floor is one part per signal
-	// rather than one per tenant. Pair it with [Limits.MaxPartSize] for the same reason.
-	MaxBytesPerSignal map[signal.Signal]int64
-	// ExemplarMaxAge caps the age of retained **exemplars**, overriding MaxAge for that signal
-	// alone. Zero ⇒ exemplars are retained for MaxAge like everything else.
-	//
-	// Exemplars are the natural first thing to expire: they are a sampled debugging aid whose value
-	// is highest while the trace they point at still exists, and a trace store is usually kept far
-	// shorter than metrics. Setting this to the trace retention keeps exemplars useful and stops
-	// them outliving the traces they reference. A value larger than MaxAge is allowed (exemplars
-	// then outlive the samples), on the same reasoning that the two budgets are independent.
-	ExemplarMaxAge time.Duration
-}
-
-// AgeFor returns the retention window that applies to a signal: [Retention.ExemplarMaxAge] for
-// [signal.Exemplar] when set, otherwise [Retention.MaxAge]. Zero ⇒ retain forever.
-func (r Retention) AgeFor(sig signal.Signal) time.Duration {
-	if sig == signal.Exemplar && r.ExemplarMaxAge > 0 {
-		return r.ExemplarMaxAge
-	}
-
-	return r.MaxAge
-}
-
 // DownsampleTier rolls up samples once they reach a given age: every sample older than
 // After is replaced, at merge time, by one representative per Interval-wide time bucket,
 // the bucket's samples combined by Agg. A tier with Interval ≤ 0 is ignored.

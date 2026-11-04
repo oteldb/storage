@@ -13,7 +13,7 @@ import (
 
 // retentionCutoff converts a signal's retention window into an absolute cutoff at the given now
 // (unix nanoseconds); 0 means retain forever. The window is per signal ([tenant.Retention.AgeFor]),
-// so exemplars can expire ahead of the samples they hang off.
+// so each signal can expire independently.
 func retentionCutoff(r tenant.Retention, sig signal.Signal, now int64) int64 {
 	age := r.AgeFor(sig)
 	if age <= 0 {
@@ -64,9 +64,9 @@ type sizeBudgets struct {
 func budgetsOf(r tenant.Retention) sizeBudgets {
 	b := sizeBudgets{pooled: r.MaxBytes}
 
-	for sig, n := range r.MaxBytesPerSignal {
-		if int(sig) < len(b.perSignal) {
-			b.perSignal[sig] = n
+	for sig, bounds := range r.PerSignal {
+		if sig >= signal.Metric && int(sig) < len(b.perSignal) {
+			b.perSignal[sig] = bounds.MaxBytes
 		}
 	}
 
@@ -153,7 +153,7 @@ func (s *Storage) sizeCutoffCached(t signal.TenantID) (cutoffs bySignal, current
 // bounds the bytes this node stores for it.
 //
 // The pooled budget ([tenant.Retention.MaxBytes]) and the per-signal ones
-// ([tenant.Retention.MaxBytesPerSignal]) both apply: a signal's cutoff is the later of the two, so
+// ([tenant.Retention.PerSignal]) both apply: a signal's cutoff is the later of the two, so
 // the pooled budget remains the tenant-wide outer bound while a per-signal budget keeps one signal's
 // growth from evicting the others' history.
 //

@@ -342,3 +342,7 @@ Disabling it stops new writes in that codec; existing parts still require compat
 `WithMetricSeriesChunks` opts new metric parts into independently framed series chunks with
 checked row geometry and inline timestamp bounds. Compatible readers must be deployed on every
 replica before enabling the writer. The default layout remains the packed layout.
+
+Per-tenant retention uses `tenant.Retention.PerSignal` for independent age overrides and byte bounds.
+Positive ages override the default; per-signal and pooled byte limits both apply. Policies resolve
+at runtime, with optional `Retention.Validate` for embedder validation.
