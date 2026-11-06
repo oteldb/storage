@@ -3,7 +3,9 @@ package file
 import (
 	"bufio"
 	"context"
+	"io"
 	"path"
+	"sync"
 
 	"github.com/go-faster/errors"
 
@@ -17,6 +19,16 @@ var _ backend.ObjectCreator = (*File)(nil)
 // syscalls. A streamed column arrives one compression frame at a time (tens of KiB), so this only
 // coalesces the small directory/trailer appends that follow them.
 const objectWriteBufferBytes = 64 << 10
+
+var objectWriteBuffers sync.Pool
+
+func takeObjectWriteBuffer(dst io.Writer) *bufio.Writer {
+	if w, ok := objectWriteBuffers.Get().(*bufio.Writer); ok {
+		w.Reset(dst)
+		return w
+	}
+	return bufio.NewWriterSize(dst, objectWriteBufferBytes)
+}
 
 // CreateObject builds key's object incrementally in the temp file that [File.Write] uses for its
 // whole-object write, renaming it over the final path on commit. Nothing is visible under key until
@@ -62,7 +74,7 @@ func (f *File) createObject(key string, durable bool) (backend.ObjectWriter, err
 		path:    p,
 		tmp:     tmp,
 		name:    name,
-		buf:     bufio.NewWriterSize(tmp, objectWriteBufferBytes),
+		buf:     takeObjectWriteBuffer(tmp),
 	}, nil
 }
 
@@ -102,6 +114,7 @@ func (w *objectWriter) Commit(_ context.Context) error {
 	// Past this point the temp file is either renamed or removed; either way the handle is done.
 	tmp, name := w.tmp, w.name
 	w.tmp = nil
+	defer w.releaseBuffer()
 
 	if err := w.buf.Flush(); err != nil {
 		_ = tmp.Close()
@@ -159,5 +172,15 @@ func (w *objectWriter) Abort() {
 	_ = w.root.Remove(name)
 	_ = w.root.Close()
 
-	w.tmp, w.buf = nil, nil
+	w.tmp = nil
+	w.releaseBuffer()
+}
+
+func (w *objectWriter) releaseBuffer() {
+	buf := w.buf
+	w.buf = nil
+	if buf != nil {
+		buf.Reset(io.Discard)
+		objectWriteBuffers.Put(buf)
+	}
 }
