@@ -638,6 +638,11 @@ func (e *Engine) compactStreamWithInputs(
 
 	// One forward cursor per source part; one reusable per-part destination per series range.
 	streams := make([]*partStream, len(src))
+	defer func() {
+		for _, stream := range streams {
+			stream.close()
+		}
+	}()
 	for i, p := range src {
 		s, err := newPartStream(ctx, p, e.mergeReadWindow)
 		if err != nil {

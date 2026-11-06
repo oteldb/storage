@@ -32,8 +32,8 @@ type ReaderAt interface {
 // Negative off or n is a programming error and returns one. An absent key errors like [Backend.Read].
 // The returned slice is caller-owned; unlike [ReadView] it never aliases backend state.
 func ReadAt(ctx context.Context, b Backend, key string, off, n int64) ([]byte, error) {
-	if off < 0 || n < 0 {
-		return nil, errors.Errorf("backend: read %q at [%d,+%d): negative range", key, off, n)
+	if err := validateRange(key, off, n); err != nil {
+		return nil, err
 	}
 
 	if r, ok := b.(ReaderAt); ok {
@@ -46,6 +46,13 @@ func ReadAt(ctx context.Context, b Backend, key string, off, n int64) ([]byte, e
 	}
 
 	return clampRange(data, off, n), nil
+}
+
+func validateRange(key string, off, n int64) error {
+	if off < 0 || n < 0 {
+		return errors.Errorf("backend: read %q at [%d,+%d): negative range", key, off, n)
+	}
+	return nil
 }
 
 // RangeHinter is the optional capability of a backend that ranges natively for some objects only.
@@ -125,5 +132,5 @@ func clampRange(data []byte, off, n int64) []byte {
 		return []byte{}
 	}
 
-	return data[off:min(off+n, int64(len(data)))]
+	return data[off : off+min(n, int64(len(data))-off)]
 }

@@ -255,12 +255,12 @@ common case, computes no permutation at all.
 ```
 source part ─ partCursor: ts, ints, bytes ┐   one granule per column,      per stream: k-way heap
 source part ─ partCursor: ts, ints, bytes ┼→  one window per column     →  on (ts, source)          → day writers
-source part ─ wholeSource (fallback)      ┘   (block.PartReader.ColumnScan)
+source part ─ wholeSource (fallback)      ┘   (block.PartReader.OpenColumnScan)
 ```
 
 Each source is a `mergeSource` the stream sweep asks for one stream's rows at a time, as a *run*:
 the stream's rows at or after the retention cutoff, in (timestamp, row) order. A `partCursor` opens
-every column through `block.PartReader.ColumnScan` with `defaultMergeReadWindow` (1 MiB) read-ahead
+every column through `block.PartReader.OpenColumnScan` with `defaultMergeReadWindow` (1 MiB) read-ahead
 and decodes one granule at a time (`Decoder.DecodeInt64Into`, `Decoder.DecodeBytesBlock`), so a source
 costs a window and a granule per column rather than its decoded columns. A constant column costs no
 read. A column with no granules is read whole: the pre-framing layout, and — a *current* layout — a
@@ -1031,3 +1031,8 @@ Under `AllConditions`, `Condition.Int64Range` rejects non-overlapping parts usin
 whole-column `ColumnDesc` extrema before opening timestamp or condition columns. Missing columns,
 unsupported kinds and invalid statistics retain candidates. Heads still evaluate `Match`; flush and
 merge maintain the same persisted extrema. No granule metadata or part format is added.
+
+Merge scan handles close on success, partial open, retry and budget regrant, after output writers
+release their borrowed granules. File sources reuse pooled raw read windows; their sizes and native
+handle memory stay within the source admission bound. Backends without priced handles retain the
+existing ranged/whole-object reads.

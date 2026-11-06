@@ -30,6 +30,10 @@ during catalog I/O. Windowed repair checks, read gaps, fences, and acknowledged 
 | checkpoint | only the captured sealed prefix, after confirmed catalog commit; readers proceed |
 | reclamation | retired parts wait for query and builder references, then are deleted |
 
+Merge sources and rollup probes own `OpenColumnScan` handles for their scoped walks. Completion
+and failure close every opened source before its part can retire; file windows return to their
+bounded pool after writer finalization. Source admission includes the handle's retained-state hint.
+
 Reset, repair and pruning take the build barrier exclusively. Pruning also excludes public
 reloads through an identity lifecycle gate; a newly adopted part cannot revive an identity
 between prune planning and installation. Full recovery/reload retains writer ordering while

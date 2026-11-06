@@ -98,6 +98,9 @@ func (r *PartReader) ScanBound(ctx context.Context, name string, window int64) (
 	default:
 		n += sz.MaxFrameBytes
 	}
+	if bytes, ok := backend.ReaderMemory(r.b, columnKey(r.prefix, i)); ok && window > 0 {
+		n += bytes
+	}
 
 	n += 2 * (sz.MaxFrameRaw + slack)
 
@@ -146,6 +149,9 @@ func (d *Decoder) ResidentBytes() int64 {
 	if d.streams.comp != nil {
 		maxRaw += int64(d.streams.comp.OutputSlack())
 	}
+	if dir.src != nil && dir.src.reader != nil {
+		n += dir.src.readerBytes
+	}
 
 	return n + 2*maxRaw + int64(min(dir.blockRows, d.rows))*d.kind.decodedRowBytes()
 }
@@ -191,6 +197,9 @@ func (d *Decoder) FloatCursor() (chunk.FloatDecoder, error) {
 // forward walk therefore pays one request per window; a caller that seeks backwards or skips past
 // the window refills, which is why this is not the query path's reader.
 func (s *frameSource) readAhead(f int, off, n int64) ([]byte, error) {
+	if s.closed {
+		return nil, errors.New("block: column scan is closed")
+	}
 	if off < s.lo || off+n > s.hi {
 		if err := s.fill(f, off, n); err != nil {
 			return nil, err
@@ -215,7 +224,15 @@ func (s *frameSource) fill(f int, off, n int64) error {
 	}
 
 	// Dropped before the read, so the walk holds one window rather than two while it refills.
-	s.ahead, s.lo, s.hi = nil, 0, 0
+	s.lo, s.hi = 0, 0
+	if s.reader != nil {
+		if err := s.fillReader(off, hi-off); err != nil {
+			return err
+		}
+		s.lo, s.hi = off, hi
+		return nil
+	}
+	s.ahead = nil
 
 	buf, err := s.read(off, hi-off)
 	if err != nil {

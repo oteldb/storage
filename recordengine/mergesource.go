@@ -61,11 +61,17 @@ var mergeReadWhole = false
 // openMergeSources opens a reader over every source part. A part whose streams occupy ascending row
 // ranges is read forward, a granule at a time per column; any other is decoded whole, as is one an
 // earlier merge found out of timestamp order ([errRunDisorder]).
-func (e *Engine) openMergeSources(ctx context.Context, src []*part) ([]mergeSource, error) {
+func (e *Engine) openMergeSources(ctx context.Context, src []*part) (_ []mergeSource, err error) {
 	var (
 		out      = make([]mergeSource, len(src))
 		streamed = make([]bool, len(src))
 	)
+
+	defer func() {
+		if err != nil {
+			closeMergeSources(out)
+		}
+	}()
 
 	for i, p := range src {
 		disorder := e.disorderReporter(ctx, p)
@@ -417,7 +423,7 @@ type partCursor struct {
 	rows     int
 }
 
-func openPartCursor(ctx context.Context, p *part, window int64) (*partCursor, error) {
+func openPartCursor(ctx context.Context, p *part, window int64) (_ *partCursor, err error) {
 	c := &partCursor{
 		ranges: p.ranges,
 		rows:   p.reader.RowCount(),
@@ -425,6 +431,12 @@ func openPartCursor(ctx context.Context, p *part, window int64) (*partCursor, er
 		ints:   make([]intCursor, p.schema.numInts()),
 		bytes:  make([]byteCursor, p.schema.numBytes()),
 	}
+
+	defer func() {
+		if err != nil {
+			c.close()
+		}
+	}()
 
 	if err := c.ts.open(ctx, p.reader, colTs, window); err != nil {
 		return nil, err
@@ -648,7 +660,7 @@ func (c *intCursor) open(ctx context.Context, r *block.PartReader, name string, 
 
 		c.hi = len(c.vals)
 	default:
-		d, err := r.ColumnScan(ctx, name, window)
+		d, err := r.OpenColumnScan(ctx, name, window)
 		if err != nil {
 			return errors.Wrapf(err, "scan column %q", name)
 		}
@@ -807,7 +819,7 @@ func (c *byteCursor) open(ctx context.Context, r *block.PartReader, name string,
 			c.entries = dc.Entries
 		}
 	default:
-		d, err := r.ColumnScan(ctx, name, window)
+		d, err := r.OpenColumnScan(ctx, name, window)
 		if err != nil {
 			return errors.Wrapf(err, "scan column %q", name)
 		}
@@ -890,4 +902,22 @@ func (c *byteCursor) emit(w *recordPartStreamWriter, si, k, lo, hi int) error {
 	c.constCol.IDs = c.constIDs[:n]
 
 	return w.appendBytes(si, k, block.OwnedGranule(&c.constCol, c.constGen), c.constCol.Entries, true, 0, n)
+}
+
+func (c *partCursor) close() {
+	_ = c.ts.dec.Close()
+	for i := range c.ints {
+		_ = c.ints[i].dec.Close()
+	}
+	for i := range c.bytes {
+		_ = c.bytes[i].dec.Close()
+	}
+}
+
+func closeMergeSources(sources []mergeSource) {
+	for _, source := range sources {
+		if cursor, ok := source.(*partCursor); ok {
+			cursor.close()
+		}
+	}
 }

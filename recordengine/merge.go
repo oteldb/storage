@@ -507,6 +507,8 @@ func (e *Engine) compactStreamed(
 		return nil, err
 	}
 
+	defer closeMergeSources(sources)
+
 	e.reportOverBudget(ctx, grant.bytes)
 
 	var (
@@ -689,16 +691,19 @@ func (e *Engine) openGranted(
 		topped, err := grant.top(ctx, need-grant.bytes)
 		switch {
 		case err != nil:
+			closeMergeSources(sources)
 			return nil, 0, 0, err
 		case topped:
 			limit, reserve, _ = mergeWriterBudget(e.cfg.Schema, grant.bytes, sources, coders, runBytes, finish)
 
 			return sources, limit, reserve, nil
 		case !grant.wait:
+			closeMergeSources(sources)
 			return nil, 0, 0, errMergeDeclined
 		}
 
 		// Dropped before queueing, so the wait holds none of what it was not granted.
+		closeMergeSources(sources)
 		clear(sources)
 
 		if err := grant.regrant(ctx, need); err != nil {

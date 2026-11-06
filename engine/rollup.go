@@ -518,6 +518,7 @@ func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers 
 	if err != nil {
 		return false, err
 	}
+	defer s.close()
 
 	var (
 		streams = []*partStream{s}

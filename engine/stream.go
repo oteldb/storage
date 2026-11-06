@@ -24,22 +24,29 @@ const defaultMergeReadWindow = 1 << 20
 // ranges are contiguous and the cursors move monotonically — each column is read and decoded exactly
 // once across the merge, one read-ahead window at a time.
 type partStream struct {
-	ts  chunk.TsCursor
-	val chunk.FloatDecoder
-	sf  chunk.FloatDecoder // nil when the part has no scale-factor column
-	pos int                // next undecoded row; a requested range's start must equal pos
+	ts       chunk.TsCursor
+	val      chunk.FloatDecoder
+	sf       chunk.FloatDecoder // nil when the part has no scale-factor column
+	pos      int                // next undecoded row; a requested range's start must equal pos
+	decoders [3]*block.Decoder
 }
 
 // newPartStream opens forward cursors over p's ts/value(/sf) columns, each reading window bytes of
 // its encoded column ahead.
-func newPartStream(ctx context.Context, p *part, window int64) (*partStream, error) {
-	ts, err := scanColumn(ctx, p.reader, colTs, window,
+func newPartStream(ctx context.Context, p *part, window int64) (_ *partStream, err error) {
+	stream := &partStream{}
+	defer func() {
+		if err != nil {
+			stream.close()
+		}
+	}()
+	ts, err := scanColumn(ctx, p.reader, colTs, window, &stream.decoders[0],
 		(*block.ColumnReader).TsCursor, (*block.Decoder).TsCursor)
 	if err != nil {
 		return nil, err
 	}
 
-	val, err := scanColumn(ctx, p.reader, colValue, window,
+	val, err := scanColumn(ctx, p.reader, colValue, window, &stream.decoders[1],
 		(*block.ColumnReader).FloatCursor, (*block.Decoder).FloatCursor)
 	if err != nil {
 		return nil, err
@@ -48,20 +55,21 @@ func newPartStream(ctx context.Context, p *part, window int64) (*partStream, err
 	var sf chunk.FloatDecoder
 
 	if p.hasSF {
-		if sf, err = scanColumn(ctx, p.reader, colSF, window,
+		if sf, err = scanColumn(ctx, p.reader, colSF, window, &stream.decoders[2],
 			(*block.ColumnReader).FloatCursor, (*block.Decoder).FloatCursor); err != nil {
 			return nil, err
 		}
 	}
 
-	return &partStream{ts: ts, val: val, sf: sf}, nil
+	stream.ts, stream.val, stream.sf = ts, val, sf
+	return stream, nil
 }
 
 // scanColumn opens a forward cursor over the named column. A constant or unblocked column has no
 // frames to window over — the first costs no I/O, the second is one small stream — so it takes the
 // whole-object reader.
 func scanColumn[C any](
-	ctx context.Context, r *block.PartReader, name string, window int64,
+	ctx context.Context, r *block.PartReader, name string, window int64, decoder **block.Decoder,
 	whole func(*block.ColumnReader) (C, error), scan func(*block.Decoder) (C, error),
 ) (C, error) {
 	var zero C
@@ -75,11 +83,12 @@ func scanColumn[C any](
 		return whole(col)
 	}
 
-	d, err := r.ColumnScan(ctx, name, window)
+	d, err := r.OpenColumnScan(ctx, name, window)
 	if err != nil {
 		return zero, errors.Wrapf(err, "scan column %q", name)
 	}
 
+	*decoder = d
 	return scan(d)
 }
 
@@ -155,4 +164,13 @@ func growLen[T any](dst []T, n int) []T {
 	}
 
 	return make([]T, n)
+}
+
+func (s *partStream) close() {
+	if s == nil {
+		return
+	}
+	for _, d := range s.decoders {
+		_ = d.Close()
+	}
 }
