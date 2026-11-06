@@ -41,8 +41,12 @@ misses occur in one append. Known identities that need WAL relogging come from t
 
 **The series id is computed without allocating or sorting**: the resource‖scope hash pre-image is
 built once per scope group and kept resident at the front of a reused buffer; the reserved labels
-once per metric in sorted-key order; per point only the point's already-sorted attributes are
-merged in one pass, emitting the hash pre-image directly — never materializing a combined sorted
+once per metric in sorted-key order. Series-shaped metrics reuse an ID across points sharing an
+immutable attribute vector; an initially uniform run also recognizes equal independent copies.
+A single initial probe keeps clearly mixed metrics on the independent hashing loop; after the
+first identity change, the run path only reuses shared vectors, avoiding repeated deep comparisons.
+Reuse is scoped to one metric and one projection; no ID survives a resource/scope/metric boundary.
+Other points merge their sorted attributes in one pass — never materializing a combined sorted
 `[]KeyValue`. The result is byte-identical to the reference materialization (fuzz-pinned), which
 is used only when the engine reports a new series. This is what makes ingest ~zero-alloc.
 
