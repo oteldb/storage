@@ -67,6 +67,13 @@ identity set derived from its own parts — the shape Prometheus/Mimir blocks an
 per-partition indexDB have. Fuzzed (decode never panics; encode∘decode is the identity and the
 decoded identity still hashes to its id) and golden-tested.
 
+`identity.WriteSorted` streams the same v1 object through a caller-supplied writer, emitting
+series before symbols and recording their locations in the existing TOC. Existing readers
+resolve sections by kind, so both orders are readable; `Encode`/`EncodeSorted` retain their
+symbols-first bytes. Streaming retains one record's scratch and the part-local symbol table,
+without materializing the full series section or final object. `symbols.Table.WriteTo` streams
+the exact bytes of `Table.Encode`; the destination owns buffering.
+
 ## Metering
 
 `series.EncodingBudget` estimates one selected identity run's encoder workspace from its immutable

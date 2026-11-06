@@ -1,10 +1,13 @@
 package identity_test
 
 import (
+	"bytes"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/go-faster/sdk/gold"
+	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/index/identity"
 	"github.com/oteldb/storage/index/series"
@@ -15,6 +18,25 @@ func TestMain(m *testing.M) {
 	gold.Init() // registers -update/-clean for the golden wire-format files (see _golden/)
 
 	os.Exit(m.Run())
+}
+
+func TestStreamedGolden(t *testing.T) {
+	t.Parallel()
+	for _, count := range []int{0, 2} {
+		entries := make([]series.Entry, count)
+		for i := range entries {
+			entries[i] = mkEntry(i)
+		}
+		slices.SortFunc(entries, func(a, b series.Entry) int { return a.ID.Compare(b.ID) })
+		var out bytes.Buffer
+		_, err := identity.WriteSorted(&out, count, func(i int, _ signal.Attributes) series.Entry { return entries[i] })
+		require.NoError(t, err)
+		name := "identity_streamed"
+		if count == 0 {
+			name += "_empty"
+		}
+		gold.Bytes(t, out.Bytes(), name)
+	}
 }
 
 // TestGolden pins the object's bytes. A part's identity object is durable state a reader of an

@@ -293,6 +293,14 @@ func (b *headPartBuilder) finish() error {
 	if b.writer == nil {
 		return nil
 	}
+	if b.writer.streamIdentities {
+		needed := buildbudget.Add(b.estimate(0, 0, 0, 0), b.writer.identityWriterBytes)
+		if needed > b.reserved {
+			if err := b.reserve(needed); err != nil {
+				return err
+			}
+		}
+	}
 	p, err := b.writer.finishWithIdentities(b.ctx, identitySnapshot{view: b.view, refs: b.partRefs})
 	if err != nil {
 		return err

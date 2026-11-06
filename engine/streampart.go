@@ -57,6 +57,9 @@ type partStreamWriter struct {
 	haveTime    bool
 	buffered    bool
 	mergeFinish *mergeFinishBudget
+
+	streamIdentities    bool
+	identityWriterBytes int64
 }
 
 // newPartStreamWriter starts an output part. comp and precisionBits are fixed for the whole part —
@@ -119,11 +122,17 @@ func newPartStreamWriter(
 		}
 	}
 
+	identityBytes, priced := backend.WriterMemory(e.cfg.Backend, identityKey(prefix))
+	streamIdentities := priced && backend.StreamsWrites(e.cfg.Backend)
+	if !streamIdentities {
+		identityBytes = 0
+	}
 	return &partStreamWriter{
 		e: e, w: w, prefix: prefix, withSF: withSF, withStats: withStats,
-		buffered:     !backend.StreamsWrites(e.cfg.Backend),
-		floatGroups:  grouped,
-		seriesChunks: e.cfg.MetricSeriesChunks,
+		buffered:         !backend.StreamsWrites(e.cfg.Backend),
+		floatGroups:      grouped,
+		seriesChunks:     e.cfg.MetricSeriesChunks,
+		streamIdentities: streamIdentities, identityWriterBytes: identityBytes,
 	}, nil
 }
 
@@ -289,7 +298,7 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 		return nil, errors.Wrapf(err, "write series-index sidecar %q", prefix)
 	}
 
-	if err := writeIdentity(ctx, p.e.cfg.Backend, prefix, identities); err != nil {
+	if err := p.writeIdentity(ctx, identities); err != nil {
 		return nil, err
 	}
 

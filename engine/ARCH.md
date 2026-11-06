@@ -106,6 +106,12 @@ The existing build barrier prevents registry replacement while the references ar
 Output writers retain references and scalar estimates, not registry views: finishing captures one
 fresh view, so several day writers cannot each pin a different generation of growing arenas.
 
+Part writers with a known `backend.WriterMemory` bound stream identity records and symbols into
+an incremental writer. Its captured workspace is charged at merge finishing; head flushes grow
+their reservation before opening it. Unpriced or buffered writers retain the whole-object encoder.
+The identity body/output allowance remains conservative for both paths. The existing v1 TOC
+supports the streamed series-first and legacy symbols-first section order.
+
 Frozen metric sample bytes remain in `HeadBytes` and `MaxInFlightBytes` until publication. They are
 existing input, not additional build workspace; the build pool does not reserve those same bytes
 again. Completed output handles grow with the number of output parts until atomic publication.

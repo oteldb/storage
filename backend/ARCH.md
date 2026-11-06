@@ -443,6 +443,11 @@ a demonstration.
   **An incomplete upload is not an object**: it appears in no listing, so no orphan sweep can
   reclaim it, and the bucket's `AbortIncompleteMultipartUpload` lifecycle rule is the only thing
   that ever does (`ADMIN.md`).
+- **`backend.WriterMemorySizer`** — a metadata-only bound on one incremental writer's owned
+  workspace. File writers price their fixed buffer and retained paths; cached backends add their
+  invalidation metadata. EC wrappers forward the unchanged raw writer's hint. Unknown bounds retain
+  existing whole-object encoding paths; streaming support alone
+  is not a memory bound.
 - **`backend.DeferredSyncer`** — optional `WriteDeferred`/`CreateObjectDeferred`/`DeleteDeferred`
   plus `SyncPrefix(prefix)`: a part's objects are made durable once, not one by one. **A part is
   unreachable until the bucket-index CAS names it**, so its objects need to be on the disk before
