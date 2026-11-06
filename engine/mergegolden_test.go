@@ -126,7 +126,12 @@ func TestMergeOutputGolden(t *testing.T) {
 				b := tc.Open(t)
 				e := goldenMergeCorpus(t, b, window)
 
-				gold.Str(t, backendtest.Digest(t, b, e.PartPrefixes()), "merge_output.txt")
+				// Each encoder layout stays byte-identical across its read windows.
+				fixture := "merge_output.txt"
+				if _, known := backend.WriterMemory(b, e.PartPrefixes()[0]+"/identity"); known && backend.StreamsWrites(b) {
+					fixture = "merge_output_streamed_identity.txt"
+				}
+				gold.Str(t, backendtest.Digest(t, b, e.PartPrefixes()), fixture)
 			})
 		}
 	}

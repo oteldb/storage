@@ -1,6 +1,7 @@
 package identity_test
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/oteldb/storage/index/identity"
@@ -21,6 +22,11 @@ func FuzzDecode(f *testing.F) {
 	}
 
 	f.Add(identity.Encode(nil, entries))
+	var streamed bytes.Buffer
+	if _, err := identity.WriteSorted(&streamed, len(entries), func(i int, _ signal.Attributes) series.Entry { return entries[i] }); err != nil {
+		f.Fatal(err)
+	}
+	f.Add(streamed.Bytes())
 
 	f.Fuzz(func(_ *testing.T, data []byte) {
 		_ = identity.Decode(data, func(signal.SeriesID, signal.Series) error { return nil })

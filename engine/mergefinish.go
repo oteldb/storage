@@ -73,6 +73,7 @@ func (b *mergeFinishBudget) bytes() int64 {
 
 func (p *partStreamWriter) mergeResidentBytes() int64 {
 	n := buildbudget.Add(p.residentBytes(), p.w.FinishBytes())
+	n = buildbudget.Add(n, p.identityWriterBytes)
 	if p.mergeFinish == nil {
 		return n
 	}

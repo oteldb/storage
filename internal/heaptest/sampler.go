@@ -26,8 +26,7 @@ type FileSampler struct {
 
 	// KeyContains selects the sampled keys; empty samples every key.
 	KeyContains string
-	// Writes samples WriteDeferred too, before the write, while the caller still holds the encoded
-	// bytes.
+	// Writes samples whole-object and streamed writes.
 	Writes bool
 
 	mu    sync.Mutex
@@ -68,6 +67,45 @@ func (s *FileSampler) WriteDeferred(ctx context.Context, key string, data []byte
 	}
 
 	return s.File.WriteDeferred(ctx, key, data)
+}
+
+// CreateObjectDeferred samples streamed writes as well as whole-object writes.
+func (s *FileSampler) CreateObjectDeferred(ctx context.Context, key string) (backend.ObjectWriter, error) {
+	w, err := s.File.CreateObjectDeferred(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if s.Writes {
+		s.sample(key)
+	}
+	return &sampledObjectWriter{ObjectWriter: w, sampler: s, key: key, nextSample: 1024}, nil
+}
+
+type sampledObjectWriter struct {
+	backend.ObjectWriter
+
+	sampler             *FileSampler
+	key                 string
+	written, nextSample int64
+}
+
+func (w *sampledObjectWriter) Write(data []byte) (int, error) {
+	if w.sampler.Writes && w.written+int64(len(data)) >= w.nextSample {
+		w.sampler.sample(w.key)
+		for w.nextSample <= w.written+int64(len(data)) {
+			w.nextSample *= 2
+		}
+	}
+	n, err := w.ObjectWriter.Write(data)
+	w.written += int64(n)
+	return n, err
+}
+
+func (w *sampledObjectWriter) Commit(ctx context.Context) error {
+	if w.sampler.Writes {
+		w.sampler.sample(w.key)
+	}
+	return w.ObjectWriter.Commit(ctx)
 }
 
 func (s *FileSampler) sample(key string) {

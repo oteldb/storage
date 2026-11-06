@@ -78,6 +78,27 @@ func writeIdentity(ctx context.Context, b backend.Backend, prefix string, entrie
 	return nil
 }
 
+func (p *partStreamWriter) writeIdentity(ctx context.Context, entries identitySnapshot) error {
+	if !p.streamIdentities {
+		return writeIdentity(ctx, p.e.cfg.Backend, p.prefix, entries)
+	}
+	w, err := backend.CreateObjectDeferred(ctx, p.e.cfg.Backend, identityKey(p.prefix))
+	if err != nil {
+		return errors.Wrapf(err, "create identity object %q", p.prefix)
+	}
+	defer w.Abort()
+	if _, err := identity.WriteSorted(w, len(entries.refs), func(i int, dst signal.Attributes) series.Entry {
+		ref := int(entries.refs[i])
+		return series.Entry{ID: entries.view.ID(ref), Series: entries.view.At(ref, dst)}
+	}); err != nil {
+		return errors.Wrapf(err, "stream identity object %q", p.prefix)
+	}
+	if err := w.Commit(ctx); err != nil {
+		return errors.Wrapf(err, "commit identity object %q", p.prefix)
+	}
+	return nil
+}
+
 // identitiesForColumn resolves distinct column identities in bounded lock sections. Caller holds flushMu.
 func (e *Engine) identitiesForColumn(col []chunk.U128) identitySet {
 	out := identitySet{refs: make(map[signal.SeriesID]uint32)}

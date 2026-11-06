@@ -107,6 +107,8 @@ a demonstration.
   per-operation, as it was with `os.Root`, for the Windows reason recorded in `file.go`.
   Ranged reads open the object before sizing it through that same handle: atomic replacement cannot
   mix one version's size with another version's bytes. No path lookup follows that open.
+  Streamed object writers reuse fixed 64-KiB buffers. Terminal commits, including failures, and
+  aborts clear the destination before returning a buffer to the pool; abort never flushes it.
 - **`backend/s3`** — store-specific calls sit behind a small `ObjectStore` interface so the
   contract logic (root prefixing, sorted listing, 404→`ErrNotExist`, conditional put, idempotent
   delete) is testable over a fake. `CompareAndSwap` is `If-Match` on the object's ETag (and
@@ -449,6 +451,11 @@ a demonstration.
   **An incomplete upload is not an object**: it appears in no listing, so no orphan sweep can
   reclaim it, and the bucket's `AbortIncompleteMultipartUpload` lifecycle rule is the only thing
   that ever does (`ADMIN.md`).
+- **`backend.WriterMemorySizer`** — a metadata-only bound on one incremental writer's owned
+  workspace. File writers price their fixed buffer and retained paths; cached backends add their
+  invalidation metadata. EC wrappers forward the unchanged raw writer's hint. Unknown bounds retain
+  existing whole-object encoding paths; streaming support alone
+  is not a memory bound.
 - **`backend.DeferredSyncer`** — optional `WriteDeferred`/`CreateObjectDeferred`/`DeleteDeferred`
   plus `SyncPrefix(prefix)`: a part's objects are made durable once, not one by one. **A part is
   unreachable until the bucket-index CAS names it**, so its objects need to be on the disk before
