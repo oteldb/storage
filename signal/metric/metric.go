@@ -166,9 +166,8 @@ func (b *Batch) Sample(i int) Sample {
 // unsupported OTLP points are filtered by the producer — e.g. the otlp/pdataconv bridge), so
 // projection rejects nothing; out-of-order rejection is the engine's concern downstream.
 //
-// Each point's SeriesID is computed without allocating: the resource‖scope hash pre-image is
-// hoisted once per scope group, the five folded reserved labels once per metric, and only
-// the point attributes are merged in per point, into a reused buffer. The id equals
+// Series-shaped input reuses hashes across points with shared immutable attributes. Resource/scope
+// and metric prefixes are hoisted; mixed input retains independent hashing. The id equals
 // [Identity.SeriesID] (id == [Batch.Series](i).Hash()).
 func Project(md Metrics, emit func(*Batch)) (accepted int) {
 	var p projector
@@ -206,12 +205,7 @@ func Project(md Metrics, emit func(*Batch)) (accepted int) {
 				p.setMetric(m)
 
 				b.IDs, b.Ts, b.Values = b.IDs[:0], b.Ts[:0], b.Values[:0]
-				for pi := range m.Points {
-					pt := &m.Points[pi]
-					b.IDs = append(b.IDs, p.id(pt.Attributes))
-					b.Ts = append(b.Ts, pt.Ts)
-					b.Values = append(b.Values, pt.Value)
-				}
+				p.projectPoints(b, m.Points)
 
 				b.points = m.Points
 				emit(b)
