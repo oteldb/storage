@@ -357,6 +357,13 @@ is what lets it fetch only those bytes.
 
 ### Scanning a column forward
 
+`OpenColumnScan` adds an explicitly closed object handle to the existing `ColumnScan` path when
+its backend can price one before opening it. File scans reuse a pooled, caller-owned raw window
+across refills; shared cache pages and decoded frames never alias it. Pool size classes stay inside
+the manifest/window bound and retain at most 4 MiB per buffer. `Close` returns the raw window and
+closes the handle. Unknown capabilities keep the original reads. `ScanBound` and `ResidentBytes`
+include the handle-memory allowance. Plain `ColumnScan` retains its existing lifetime.
+
 `PartReader.ColumnScan(ctx, name, window)` is the same decoder with **read-ahead**: a miss fetches
 whole frames up to `window` bytes instead of one frame. It exists because the two access shapes want
 opposite things, not because one is a tuned version of the other.

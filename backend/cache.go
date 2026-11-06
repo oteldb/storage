@@ -215,6 +215,27 @@ func (c *cachedBackend) ReadAt(ctx context.Context, key string, off, n int64) ([
 	return ReadAt(ctx, c.inner, key, off, n)
 }
 
+// ReadAtAppend copies resident ranges into dst, otherwise forwarding reusable reads.
+func (c *cachedBackend) ReadAtAppend(ctx context.Context, dst []byte, key string, off, n int64) ([]byte, error) {
+	if err := validateRange(key, off, n); err != nil {
+		return dst, err
+	}
+	if v, ok := c.values.GetIfPresent(readCacheKey{name: key}); ok {
+		return append(dst, clampRange(v, off, n)...), nil
+	}
+	return ReadAtAppend(ctx, c.inner, dst, key, off, n)
+}
+
+// OpenReader forwards uncached streaming reads to the inner backend.
+func (c *cachedBackend) OpenReader(ctx context.Context, key string) (ObjectReader, bool, error) {
+	return OpenReader(ctx, c.inner, key)
+}
+
+// ReaderMemory forwards the inner handle's retained-memory bound.
+func (c *cachedBackend) ReaderMemory(key string) (int64, bool) {
+	return ReaderMemory(c.inner, key)
+}
+
 // RangesNatively answers for the inner backend, which serves every ranged miss. Implements
 // [RangeHinter].
 func (c *cachedBackend) RangesNatively(ctx context.Context, key string) bool {

@@ -447,10 +447,13 @@ type frameSource struct {
 
 	// Read-ahead, off when window is 0. frameOff is the directory's frame table, so a window is
 	// snapped to a frame boundary and a frame is never held in halves.
-	window   int64
-	frameOff []int32
-	ahead    []byte
-	lo, hi   int64 // data-region extent ahead covers
+	window      int64
+	frameOff    []int32
+	ahead       []byte
+	lo, hi      int64 // data-region extent ahead covers
+	reader      backend.ObjectReader
+	readerBytes int64
+	closed      bool
 }
 
 // frame returns frame f, spanning [off, off+n) of the data region. The bytes are taken as a
