@@ -218,9 +218,6 @@ func (b *headPartBuilder) flushRun() error {
 		return nil
 	}
 	for _, entry := range b.entries {
-		if err := b.ctx.Err(); err != nil {
-			return err
-		}
 		buf := entry.buf
 		ts, values, sf := buf.ts, buf.values, buf.sf
 		if !entry.ordered {
@@ -249,9 +246,6 @@ func (b *headPartBuilder) append(id chunk.U128, ref uint32, ts []int64, values, 
 		chunkRows = DefaultMetricBlockRows
 	}
 	for lo := 0; lo < len(ts); {
-		if err := b.ctx.Err(); err != nil {
-			return err
-		}
 		if b.writer == nil {
 			var err error
 			b.writer, err = newPartStreamWriter(b.ctx, b.e, compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
@@ -292,6 +286,9 @@ func (b *headPartBuilder) append(id chunk.U128, ref uint32, ts []int64, values, 
 func (b *headPartBuilder) finish() error {
 	if b.writer == nil {
 		return nil
+	}
+	if err := b.ctx.Err(); err != nil {
+		return err
 	}
 	if b.writer.streamIdentities {
 		needed := buildbudget.Add(b.estimate(0, 0, 0, 0), b.writer.identityWriterBytes)
