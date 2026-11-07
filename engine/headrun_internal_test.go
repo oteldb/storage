@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"slices"
 	"strconv"
 	"testing"
@@ -11,6 +12,44 @@ import (
 	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/signal"
 )
+
+func TestHeadRunCancellationBeforeFinish(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"ordered", "unordered"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			e := New(Config{Backend: backend.Memory(), Prefix: "canceled-run", MetricBlockRows: 2})
+			s := apiSeries()
+			e.head.registerSeries(s)
+			ref, ok := e.head.series.Ref(s.Hash())
+			require.True(t, ok)
+			b := headPartBuilder{ctx: ctx, e: e, view: e.head.series.View(), target: e.flushMemoryBytes(),
+				entries: make([]headRunEntry, 0, 1), partRefs: make([]uint32, 0, 1)}
+			require.NoError(t, b.reserve(b.target))
+			defer func() {
+				if b.writer != nil {
+					b.writer.abort()
+				}
+				b.release()
+			}()
+			ts := []int64{1, 2, 3, 4}
+			if name == "unordered" {
+				slices.Reverse(ts)
+			}
+			original := slices.Clone(ts)
+			require.NoError(t, b.add(s.Hash(), ref, &sampleBuf{ts: ts, values: []float64{1, 2, 3, 4}}))
+			cancel()
+			require.ErrorIs(t, b.flushRun(), context.Canceled)
+			require.Empty(t, b.parts)
+			require.Equal(t, original, ts)
+			keys, err := e.cfg.Backend.List(t.Context(), e.cfg.Prefix)
+			require.NoError(t, err)
+			require.Empty(t, keys, "canceled encoding cannot publish a part")
+		})
+	}
+}
 
 func TestHeadRunBufferWorkspace(t *testing.T) {
 	t.Parallel()

@@ -45,7 +45,8 @@ Owner orphan sweeps are skipped while a local build is active.
 
 Canceled maintenance stops before starting another stage. Flush checks cancellation before and
 after queued ownership, retaining an empty-head no-op; a canceled queued flush leaves new head
-data untouched. Existing encoding/rollback phases can still outlive cancellation, so Close is
+data untouched. Metric head encoding checks cancellation at part finalization rather than per
+series or chunk. Existing encoding/rollback phases can still outlive cancellation, so Close is
 not a hard deadline on CPU work already in flight.
 
 A read plan sees each stored record in head, frozen buffers, or parts exactly once. Published
