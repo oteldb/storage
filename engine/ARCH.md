@@ -120,6 +120,9 @@ supports the streamed series-first and legacy symbols-first section order.
 Frozen metric sample bytes remain in `HeadBytes` and `MaxInFlightBytes` until publication. They are
 existing input, not additional build workspace; the build pool does not reserve those same bytes
 again. Completed output handles grow with the number of output parts until atomic publication.
+Bounded head runs store sample slice headers inline to avoid revisiting scattered buffer objects
+during encoding. Their backing sample arrays remain borrowed and immutable; admission includes
+the descriptor array, which is cleared after each successful run.
 
 The periodic/catch-up worker and a separate pressure-flush worker have bounded fan-out. A paused
 merge does not stop pressure wakes. Completed pressure passes wake merge catch-up. Close cancels

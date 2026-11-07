@@ -61,7 +61,7 @@ func TestHeadRunBufferWorkspace(t *testing.T) {
 			b.entries = make([]headRunEntry, 0, capacity)
 			b.partRefs = make([]uint32, 0, capacity)
 			want := int64(capacity) * (memsize.Of[headRunEntry]() + memsize.Of[uint32]())
-			require.Equal(t, base+want, b.baseBytes(), "the admission includes pointer entries and part references")
+			require.Equal(t, base+want, b.baseBytes(), "the admission includes sample descriptors and part references")
 		})
 	}
 }
@@ -95,7 +95,7 @@ func TestHeadRunSealsAtCapacityAndClearsPointers(t *testing.T) {
 	require.Len(t, b.parts, 2)
 	require.Equal(t, 4, b.rows)
 	require.Empty(t, b.entries)
-	require.Nil(t, b.entries[:cap(b.entries)][0].buf, "the empty run cannot retain the old sample buffers")
+	require.Zero(t, b.entries[:cap(b.entries)][0].buf, "the empty run cannot retain the old sample buffers")
 	require.Equal(t, []int64{2, 1}, first.ts, "frozen input remains immutable")
 	for i, part := range b.parts {
 		d, err := decodePart(t.Context(), part)

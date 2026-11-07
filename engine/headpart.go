@@ -18,7 +18,7 @@ const defaultFlushMemoryBytes = 64 << 20
 
 type headRunEntry struct {
 	id      signal.SeriesID
-	buf     *sampleBuf
+	buf     sampleBuf
 	ref     uint32
 	ordered bool
 }
@@ -191,7 +191,7 @@ func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) er
 	b.materialized = max(b.materialized, materialized)
 	b.sorting = max(b.sorting, sorting)
 	b.runRows = buildbudget.Add(b.runRows, int64(len(buf.ts)))
-	b.entries = append(b.entries, headRunEntry{id: id, buf: buf, ref: ref, ordered: ordered})
+	b.entries = append(b.entries, headRunEntry{id: id, buf: *buf, ref: ref, ordered: ordered})
 	return nil
 }
 
@@ -217,8 +217,9 @@ func (b *headPartBuilder) flushRun() error {
 	if len(b.entries) == 0 {
 		return nil
 	}
-	for _, entry := range b.entries {
-		buf := entry.buf
+	for i := range b.entries {
+		entry := &b.entries[i]
+		buf := &entry.buf
 		ts, values, sf := buf.ts, buf.values, buf.sf
 		if !entry.ordered {
 			ts, values, sf = sortedWindow(buf, minInt64, maxInt64, nil)
