@@ -213,6 +213,9 @@ to fail over to: a read overlapping a want fails.
   not a stream of failed flushes behind an unbounded head.
 - **Engine locks are never held across object-store I/O.** Plan under lock → read/write off lock →
   publish under lock; parts are copy-on-write and refcounted with deferred reclamation.
+- **Known-series numeric prefixes stay immutable during parallel preparation.** Standalone WAL
+  writers reserve series, prepare tails beyond published lengths, then atomically publish the
+  batch after ordered WAL success. Lifecycle changes drain shared writer leases; see `engine/ARCH.md`.
 - **Reads stream; the consumer must `Close`.** A `fetch.Iterator` produces a batch per `Next` —
   never a pre-built result set — so a consumer that folds and releases each batch stays O(1) in
   matched series (the metric engine and the fan-out `Merge` both hold one series at a time). The

@@ -120,3 +120,21 @@ func TestWithWritersRetainsCatalogOwnership(t *testing.T) {
 	assert.False(t, m.state.TryRLock())
 	m.Unlock()
 }
+
+func TestSharedWriterLifecycleAndRevision(t *testing.T) {
+	t.Parallel()
+	var m Mutex
+	m.EnableSharedWriters()
+	m.RLockWriter()
+	require.False(t, m.TryLockWriter())
+	m.Publish(func() {})
+	version, ok := m.Revision()
+	require.True(t, ok)
+	require.EqualValues(t, 1, version)
+	require.Panics(t, func() { m.Publish(func() { panic("publication") }) })
+	version, _ = m.Revision()
+	require.EqualValues(t, 2, version)
+	m.RUnlockWriter()
+	require.True(t, m.TryLockWriter())
+	m.UnlockWriter()
+}

@@ -53,6 +53,10 @@ func (p *batchPreparations) release(b *preparedBatch) {
 	}
 	b.batch.frames.Reset()
 	clear(b.batch.accs[:cap(b.batch.accs)])
+	clear(b.snapshots[:cap(b.snapshots)])
+	clear(b.next[:cap(b.next)])
+	clear(b.created[:cap(b.created)])
+	b.warm = false
 	p.free <- b
 	<-p.active
 }
@@ -71,6 +75,13 @@ type preparedBatch struct {
 	values    []float64
 	sf        []float64
 	current   int
+	warm      bool
+	snapshots []headSeriesState
+	next      []sampleBuf
+	created   []*sampleBuf
+	refs      []uint32
+	masks     []reservationMask
+	maskOrder []uint32
 }
 
 func (p *preparedBatch) prepare(ids []signal.SeriesID) {
@@ -110,6 +121,16 @@ func (e *Engine) appendPrepared(
 	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series, limits AppendLimits,
 	p *preparedBatch,
 ) (AppendResult, error) {
+	if e.parallel != nil {
+		if res, handled, err := e.appendKnownPrepared(ids, ts, values, sf, materialize, limits, p); handled {
+			return res, err
+		}
+		p.batch.reset()
+		p.warm = false
+		clear(p.next)
+		clear(p.created)
+		p.prepare(ids)
+	}
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
 	return e.appendPreparedLocked(ids, ts, values, sf, materialize, limits, p)
@@ -136,6 +157,20 @@ func (e *Engine) stagePreparedBatch(
 	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series, limits AppendLimits,
 	p *preparedBatch,
 ) (AppendResult, error) {
+	res := e.stagePreparedRows(ids, ts, values, sf, materialize, limits, p)
+	if p.batch.empty() {
+		return res, nil
+	}
+	if err := e.encodeWriteBatch(p.batch, false); err != nil {
+		return AppendResult{}, err
+	}
+	return res, nil
+}
+
+func (e *Engine) stagePreparedRows(
+	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series,
+	limits AppendLimits, p *preparedBatch,
+) AppendResult {
 	var bi int
 	mat := func() signal.Series { return materialize(bi) }
 	var res AppendResult
@@ -148,13 +183,7 @@ func (e *Engine) stagePreparedBatch(
 		p.current = p.positions[i]
 		res = res.with(p.admit(e.head, id, ts[i], values[i], w, e.cfg.OOOWindow, limits, mat))
 	}
-	if p.batch.empty() {
-		return res, nil
-	}
-	if err := e.encodeWriteBatch(p.batch, false); err != nil {
-		return AppendResult{}, err
-	}
-	return res, nil
+	return res
 }
 
 func (p *preparedBatch) admit(
@@ -169,7 +198,7 @@ func (p *preparedBatch) admit(
 	k := g.staged
 	var state headSeriesState
 	if k < 0 && oooWindow > 0 {
-		state = h.seriesState(id)
+		state = p.seriesState(h, id)
 	}
 	var newest int64
 	var seen bool
@@ -191,7 +220,7 @@ func (p *preparedBatch) admit(
 		return admitted
 	}
 	if oooWindow <= 0 {
-		state = h.seriesState(id)
+		state = p.seriesState(h, id)
 		newest, seen = state.newest, state.seen
 	}
 	acc := walSeriesAcc{buffer: state.buffer, priorNewest: newest, hadNewest: seen,
@@ -219,4 +248,11 @@ func (p *preparedBatch) admit(
 	b.relog = b.relog || (acc.isNew && !acc.register)
 	b.add(k, ts, value, sf)
 	return admitted
+}
+
+func (p *preparedBatch) seriesState(h *head, id signal.SeriesID) headSeriesState {
+	if p.warm {
+		return p.snapshots[p.current]
+	}
+	return h.seriesState(id)
 }
