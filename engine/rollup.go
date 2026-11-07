@@ -8,7 +8,6 @@ import (
 
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/compress"
-	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -509,8 +508,8 @@ func coversSpan(tiers []DownsampleTier, hi int64) bool {
 func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers []DownsampleTier) (bool, error) {
 	src := []*part{p}
 
-	var keys mergestream.Keys
-	if err := mergeKeys(ctx, src, &keys); err != nil {
+	var keys seriesMerge
+	if err := keys.init(ctx, src); err != nil {
 		return false, err
 	}
 
@@ -526,7 +525,7 @@ func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers 
 	)
 
 	for keys.Next() {
-		m, err := mergeStreamedSeries(ctx, src, streams, scratch, keys.Key(), start)
+		m, err := mergeStreamedSeries(src, streams, scratch, keys.ranges, start)
 		if err != nil {
 			return false, err
 		}

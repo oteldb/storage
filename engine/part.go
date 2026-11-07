@@ -156,10 +156,10 @@ func (idx partIndex) forEachID(ctx context.Context, fn func(signal.SeriesID)) er
 
 // idSource exposes the part's ascending series ids to a k-way merge. A paged index resolves its
 // entries once here, so indexing them afterwards needs neither a context nor an error path.
-func (idx partIndex) idSource(ctx context.Context) (mergestream.Source, error) {
+func (idx partIndex) idSource(ctx context.Context) (partSeriesSource, error) {
 	p := idx.paged
 	if p == nil {
-		return mergestream.SeriesIDs(idx.ids), nil
+		return residentSeriesSource{ids: idx.ids, starts: idx.starts}, nil
 	}
 
 	ents, err := p.entries(ctx)
@@ -167,18 +167,43 @@ func (idx partIndex) idSource(ctx context.Context) (mergestream.Source, error) {
 		return nil, err
 	}
 
-	return sidxIDs{ents: ents, n: p.n}, nil
+	return sidxIDs{ents: ents, n: p.n, total: p.total}, nil
 }
 
 // sidxIDs reads ids straight out of the on-disk sidecar's fixed-width entries, so a merge over a
 // paged part materializes no id slice.
 type sidxIDs struct {
-	ents []byte
-	n    int
+	ents  []byte
+	n     int
+	total int
 }
 
 func (s sidxIDs) Len() int                 { return s.n }
 func (s sidxIDs) At(i int) signal.SeriesID { return sidxEntryID(s.ents, i) }
+
+type partSeriesSource interface {
+	mergestream.Source
+	RangeAt(i int) rowRange
+}
+
+type residentSeriesSource struct {
+	ids    []signal.SeriesID
+	starts []int32
+}
+
+func (s residentSeriesSource) Len() int                 { return len(s.ids) }
+func (s residentSeriesSource) At(i int) signal.SeriesID { return s.ids[i] }
+func (s residentSeriesSource) RangeAt(i int) rowRange {
+	return rowRange{start: int(s.starts[i]), end: int(s.starts[i+1])}
+}
+
+func (s sidxIDs) RangeAt(i int) rowRange {
+	end := s.total
+	if i+1 < s.n {
+		end = sidxEntryStart(s.ents, i+1)
+	}
+	return rowRange{start: sidxEntryStart(s.ents, i), end: end}
+}
 
 // forEachRange calls fn for every series in the part with its row range, ascending by id.
 func (idx partIndex) forEachRange(ctx context.Context, fn func(signal.SeriesID, rowRange)) error {

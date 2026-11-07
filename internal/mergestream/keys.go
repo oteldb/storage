@@ -32,9 +32,10 @@ type Keys struct {
 }
 
 type cursor struct {
-	src  Source
-	key  signal.SeriesID
-	i, n int
+	src     Source
+	key     signal.SeriesID
+	i, n    int
+	ordinal int
 }
 
 // Reset arms k over src, discarding any traversal in progress. Each source must be ascending.
@@ -42,13 +43,13 @@ func (k *Keys) Reset(src []Source) {
 	k.heap = k.heap[:0]
 	k.key = signal.SeriesID{}
 
-	for _, s := range src {
+	for ordinal, s := range src {
 		n := s.Len()
 		if n == 0 {
 			continue
 		}
 
-		k.heap = append(k.heap, cursor{src: s, key: s.At(0), n: n})
+		k.heap = append(k.heap, cursor{src: s, key: s.At(0), n: n, ordinal: ordinal})
 	}
 
 	for i := len(k.heap)/2 - 1; i >= 0; i-- {
@@ -68,6 +69,26 @@ func (k *Keys) Next() bool {
 	}
 
 	return true
+}
+
+// Position identifies a source entry contributing to the current key.
+type Position struct {
+	Source, Index int
+}
+
+// NextPositions advances and appends each contributing source's first position to dst[:0].
+func (k *Keys) NextPositions(dst []Position) ([]Position, bool) {
+	dst = dst[:0]
+	if len(k.heap) == 0 {
+		return dst, false
+	}
+	k.key = k.heap[0].key
+	for len(k.heap) > 0 && k.heap[0].key == k.key {
+		c := &k.heap[0]
+		dst = append(dst, Position{Source: c.ordinal, Index: c.i})
+		k.skip()
+	}
+	return dst, true
 }
 
 // Key returns the key [Keys.Next] last advanced to.
