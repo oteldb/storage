@@ -12,8 +12,32 @@ ordering; catalog/reload/repair operations take all three. Queries take the stat
 lazy postings sorting takes only state exclusion. None of these locks is reentrant.
 
 `ReadRevision` pairs engine identity with the guard's monotone publication version. Append, replay,
-reset, reload, repair, flush and merge all advance it through writer unlock; derived postings sorts
+reset, reload, repair, flush and merge advance it through exclusive writer unlock or batch
+publication; derived postings sorts
 do not. Tokens are process-local, never reset or reused, and become noncacheable on saturation.
+
+### Independent known-series preparation
+
+Anonymous standalone WAL engines allow contended 1,024–4,096-point batches to prepare independently
+when every identity already exists and soft-overflow routing is inactive. Transient uint32-reference
+bitmaps use 64 reservation stripes; conflicting batches roll back reservations and enter existing
+ordered admission. The shared writer lease pins references and head generation until completion.
+Cluster-owned, new-identity and other batch shapes retain exclusive writer ownership.
+
+Readers see only published slice lengths. A reserved series may prepare appends beyond that prefix
+in spare numeric capacity; growth uses private arrays. Existing prefix values and visible headers
+remain unchanged. Rejected or failed-WAL updates discard their private headers. Materialization,
+frame encoding and column growth are conservatively priced against 32 MiB of extra work per batch;
+larger work falls back. The existing eight-slot preparation pool bounds active private batches.
+
+Accepted sample bytes reserve head admission capacity through an atomic pending counter read
+alongside head bytes under the state read lock. A batch that cannot reserve its complete accepted
+set falls back to existing pointwise admission, preserving partial-success classifications.
+Numeric copies and frame encoding run off state. One WAL owner retains order through an atomic
+header/metadata publication; its revision changes with that complete batch. Pending bytes become
+visible head bytes under the same publication lock. Sync, seal, reset, repair and pruning drain
+shared writer leases, retaining WAL and checkpoint ordering. No extra background worker or file
+format is introduced.
 
 Metrics `HasWants` first tries catalog ownership to read all three obligation sets; ingestion
 never mutates them. A busy catalog falls back to the state read lock, preserving reader progress

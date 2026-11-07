@@ -6,9 +6,10 @@ import (
 	"sync"
 )
 
-// Mutex serializes mutations while allowing readers during a writer's blocking I/O.
+// Mutex orders engine mutations and atomic reader-visible publication.
 // The zero value is ready to use. Like [sync.RWMutex], it must not be copied or locked recursively.
 type Mutex struct {
+	mode     *sync.RWMutex
 	catalog  sync.Mutex
 	writer   sync.Mutex
 	state    sync.RWMutex
@@ -30,13 +31,22 @@ func (m *Mutex) UnlockCatalog() { m.catalog.Unlock() }
 
 // LockWriter orders ingestion and WAL operations without joining catalog publication.
 func (m *Mutex) LockWriter() {
+	if m.mode != nil {
+		m.mode.Lock()
+	}
 	m.writer.Lock()
 	m.state.Lock()
 }
 
 // TryLockWriter acquires writer and state ownership if no other writer owns it; it may wait for readers.
 func (m *Mutex) TryLockWriter() bool {
+	if m.mode != nil && !m.mode.TryLock() {
+		return false
+	}
 	if !m.writer.TryLock() {
+		if m.mode != nil {
+			m.mode.Unlock()
+		}
 		return false
 	}
 	m.state.Lock()
@@ -56,6 +66,9 @@ func (m *Mutex) UnlockWriter() {
 	}
 	m.state.Unlock()
 	m.writer.Unlock()
+	if m.mode != nil {
+		m.mode.Unlock()
+	}
 }
 
 // Revision returns a coherent publication version; exhaustion permanently disables reuse.
@@ -95,4 +108,30 @@ func (m *Mutex) WithWriters(fn func() error) error {
 	m.UnlockWriter()
 	defer m.LockWriter()
 	return fn()
+}
+
+// EnableSharedWriters installs a lifecycle barrier before concurrent use.
+func (m *Mutex) EnableSharedWriters() {
+	if m.mode != nil {
+		panic("shared writers already enabled")
+	}
+	m.mode = &sync.RWMutex{}
+}
+
+// RLockWriter pins engine lifetime while independent series prepare updates.
+func (m *Mutex) RLockWriter() { m.mode.RLock() }
+
+// RUnlockWriter releases shared writer ownership.
+func (m *Mutex) RUnlockWriter() { m.mode.RUnlock() }
+
+// Publish atomically installs a prepared update under shared writer ownership.
+func (m *Mutex) Publish(fn func()) {
+	m.state.Lock()
+	defer func() {
+		if m.revision != math.MaxUint64 {
+			m.revision++
+		}
+		m.state.Unlock()
+	}()
+	fn()
 }

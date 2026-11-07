@@ -255,7 +255,8 @@ type Engine struct {
 	recent    map[signal.SeriesID]*sampleBuf
 	recentMin int64 // oldest ts retained in the recent tier (maxInt64 ⇒ empty ⇒ short-circuit off)
 	// walB stages a logged write before it is applied (reused under e.mu). See [walBatch].
-	walB *walBatch
+	walB     *walBatch
+	parallel *parallelHead
 	// flushedEpoch is the WAL flush watermark: the generation of the most recently flushed head
 	// (persisted in the bucket index, under this writer's [Config.WriterID] slot). Current head
 	// records are written to the WAL at flushedEpoch+1,
@@ -424,6 +425,10 @@ func New(cfg Config) *Engine {
 		e.recentMin = maxInt64
 	}
 
+	if cfg.WAL != nil && cfg.Term == nil && cfg.WriterID == "" {
+		e.parallel = &parallelHead{}
+		e.mu.EnableSharedWriters()
+	}
 	return e
 }
 
