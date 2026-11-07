@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -157,20 +158,19 @@ func TestMultiTenantIsolationThroughMerge(t *testing.T) {
 
 func TestBackgroundMaintenanceFlushes(t *testing.T) {
 	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		const interval = 5 * time.Millisecond
+		s, err := InMemory(WithFlushInterval(int64(interval)))
+		require.NoError(t, err)
+		ctx := context.Background()
+		t.Cleanup(func() { require.NoError(t, s.Close(ctx)) })
+		_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{100}, []float64{1}))
+		require.NoError(t, err)
 
-	s, err := InMemory(WithFlushInterval(int64(5 * time.Millisecond)))
-	require.NoError(t, err)
-
-	ctx := context.Background()
-	_, err = s.WriteMetrics(ctx, gaugeBatch("api", "m", []int64{100}, []float64{1}))
-	require.NoError(t, err)
-
-	// The background loop should flush the head without any explicit call.
-	assert.Eventually(t, func() bool {
-		return mustEngine(s.engineFor("default")).PartCount() >= 1
-	}, time.Second, 2*time.Millisecond)
-
-	require.NoError(t, s.Close(ctx))
+		time.Sleep(interval)
+		synctest.Wait()
+		assert.GreaterOrEqual(t, mustEngine(s.engineFor("default")).PartCount(), 1)
+	})
 }
 
 func TestCloseFlushesAllTenants(t *testing.T) {
