@@ -98,3 +98,45 @@ func TestCacheLostPutKeepsResidentValue(t *testing.T) {
 	require.NoError(t, err)
 	assert.Same(t, &old[0], &got[0])
 }
+
+func TestCacheWriteInvalidatesInflightMiss(t *testing.T) {
+	t.Parallel()
+	for _, deferred := range []bool{false, true} {
+		name := "write"
+		if deferred {
+			name = "deferred"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			inner := faultbackend.Wrap(backend.Memory())
+			require.NoError(t, inner.Write(ctx, "k", []byte("old")))
+			loaded := make(chan struct{})
+			release := make(chan struct{})
+			inner.Add(faultbackend.Rule{Kind: faultbackend.Read, Times: 1, Replace: func(_ faultbackend.Op, data []byte) []byte {
+				close(loaded)
+				<-release
+				return data
+			}})
+			c := backend.Cached(inner, 1<<20)
+			done := make(chan error, 1)
+			go func() {
+				_, err := c.Read(ctx, "k")
+				done <- err
+			}()
+			<-loaded
+			var err error
+			if deferred {
+				err = backend.WriteDeferred(ctx, c, "k", []byte("new"))
+			} else {
+				err = c.Write(ctx, "k", []byte("new"))
+			}
+			close(release)
+			require.NoError(t, err)
+			require.NoError(t, <-done)
+			got, err := c.Read(ctx, "k")
+			require.NoError(t, err)
+			assert.Equal(t, []byte("new"), got, "an older load cannot repopulate the entry after the write")
+		})
+	}
+}
