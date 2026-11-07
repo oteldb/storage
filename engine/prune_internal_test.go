@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"maps"
 	"strconv"
 	"testing"
 
@@ -36,7 +35,8 @@ func headWith(n, live int) (*head, map[signal.SeriesID]struct{}) {
 		s := benchSeries(i)
 		id := s.Hash()
 		h.registerSeries(s)
-		h.seriesNewest[id] = int64(i)
+		ref, _ := h.series.Ref(id)
+		h.slots.set(h.stateRefs[ref], int64(i))
 
 		if i < live {
 			ids[id] = struct{}{}
@@ -53,7 +53,7 @@ func TestRebuildIdentity(t *testing.T) {
 	h.newest = 1234
 	h.bytes = 4096
 
-	out := rebuildIdentity(h.series.View(), live)
+	out := rebuildIdentity(h.series.View(), live, h.stateRefs)
 
 	assert.Equal(t, 10, out.series.Len(), "only the live identities are carried over")
 	assert.True(t, out.indexSorted(), "the new index is sorted before it is published")
@@ -67,7 +67,7 @@ func TestRebuildIdentitySkipsUnknownIdentity(t *testing.T) {
 	h, live := headWith(10, 10)
 	live[signal.SeriesID{Hi: 1, Lo: 2}] = struct{}{} // an id no identity backs (a lost identity object)
 
-	out := rebuildIdentity(h.series.View(), live)
+	out := rebuildIdentity(h.series.View(), live, h.stateRefs)
 
 	assert.Equal(t, 10, out.series.Len(), "an unresolvable id is skipped, not invented")
 }
@@ -83,7 +83,7 @@ func TestHeadSwapIdentity(t *testing.T) {
 	dead := deadPositions(snap, live)
 	require.Len(t, dead, 90)
 
-	rebuilt := rebuildIdentity(snap, live)
+	rebuilt := rebuildIdentity(snap, live, h.stateRefs)
 
 	// Meanwhile: one brand-new series registers, and one the prune considers dead starts buffering
 	// samples again (no re-registration — the old index still has its identity).
@@ -91,7 +91,7 @@ func TestHeadSwapIdentity(t *testing.T) {
 	h.registerSeries(fresh)
 
 	revived := benchSeries(50).Hash()
-	h.samples[revived] = &sampleBuf{ts: []int64{1}, values: []float64{1}}
+	h.bufFor(revived).appendSample(1, 1, 1)
 
 	tail := h.series.View()
 	require.Equal(t, 1, tail.Len()-snap.Len())
@@ -104,11 +104,11 @@ func TestHeadSwapIdentity(t *testing.T) {
 	assert.False(t, h.series.Has(benchSeries(99).Hash()), "a series that stayed dead is gone")
 	assert.Len(t, h.resolve(nil), 12)
 
-	_, kept := h.seriesNewest[revived]
+	_, kept := h.watermark(revived)
 	assert.True(t, kept, "the revived series keeps its lateness bound")
-	_, dropped := h.seriesNewest[benchSeries(99).Hash()]
+	_, dropped := h.watermark(benchSeries(99).Hash())
 	assert.False(t, dropped, "a pruned series' watermark goes with it")
-	assert.Len(t, h.seriesNewest, 11, "10 survivors + the revived one")
+	assert.Equal(t, 11, h.slots.seen, "10 survivors + the revived one")
 }
 
 // BenchmarkRebuildIdentity measures the identity prune's dominant cost: re-interning every
@@ -124,8 +124,9 @@ func BenchmarkSwapIdentity(b *testing.B) {
 			h, ids := headWith(live*5/4, live)
 			snap := h.series.View()
 			dead := deadPositions(snap, ids)
-			rebuilt := rebuildIdentity(snap, ids)
-			watermarks := maps.Clone(h.seriesNewest)
+			rebuilt := rebuildIdentity(snap, ids, h.stateRefs)
+			originalIndex, originalRefs := h.series, h.stateRefs
+			watermarks := cloneHeadSlots(h.slots)
 
 			b.ReportAllocs()
 
@@ -134,7 +135,8 @@ func BenchmarkSwapIdentity(b *testing.B) {
 				// otherwise every run after the first would measure an already-pruned one.
 				b.StopTimer()
 
-				h.seriesNewest = maps.Clone(watermarks)
+				h.series, h.stateRefs = originalIndex, originalRefs
+				h.slots = cloneHeadSlots(watermarks)
 
 				b.StartTimer()
 				h.swapIdentity(rebuilt, snap, snap, dead)
@@ -156,9 +158,22 @@ func BenchmarkRebuildIdentity(b *testing.B) {
 			snap := h.series.View()
 
 			for b.Loop() {
-				out := rebuildIdentity(snap, ids)
+				out := rebuildIdentity(snap, ids, h.stateRefs)
 				b.SetBytes(out.identityBytes())
 			}
 		})
 	}
+}
+
+func cloneHeadSlots(s headSlots) headSlots {
+	s.free = append([]uint32(nil), s.free...)
+	pages := make([]*headWatermarkPage, len(s.pages))
+	for i, p := range s.pages {
+		if p != nil {
+			cloned := *p
+			pages[i] = &cloned
+		}
+	}
+	s.pages = pages
+	return s
 }

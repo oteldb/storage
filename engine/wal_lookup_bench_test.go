@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"testing"
 
@@ -38,6 +39,11 @@ func BenchmarkAppendWALRegistry(b *testing.B) {
 						func(i int) signal.Series { return identity(offset + i) }, AppendLimits{}); err != nil {
 						b.Fatal(err)
 					}
+				}
+				additional := (b.N*points + cardinality - 1) / cardinality
+				for _, buf := range e.head.samples {
+					buf.ts = slices.Grow(buf.ts, additional)
+					buf.values = slices.Grow(buf.values, additional)
 				}
 				var cursor atomic.Uint64
 				materialize := func(int) signal.Series { panic("warm identity was materialized") }

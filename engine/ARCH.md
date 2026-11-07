@@ -137,6 +137,17 @@ Identity pruning made necessary by removed rows still joins the existing build b
 
 The index (`symbols`+`series`+`postings`) plus per-series `(ts, value)` buffers.
 
+Admission resolves a canonical SeriesID once to a registry reference, then reads buffer and
+out-of-order watermark state through a stable uint32 head slot. Buffer pointer pages belong to
+one flush generation and drop at detach; watermark pages persist and track presence separately
+from timestamp zero. The canonical-ID buffer map remains the source for enumeration and frozen
+flush/query snapshots. Failed-flush reattachment rebuilds the active pointer pages.
+
+Pruning builds the surviving registry-to-slot mapping off-lock. Tail registrations and revived
+series retain their slots at installation; only dead slots are cleared and recycled. Updates
+made while rebuilding therefore keep their watermarks, and a reused slot inherits no old bound.
+`IdentityBytes` includes persistent slot references, watermark pages and reusable slot IDs.
+
 Exact matcher specs and finite string hints seek symbol IDs and postings directly when a label
 has only string values. A metered set of names with non-string values keeps those labels on the
 full predicate scan, preserving canonical text equality across types. Necessary hints still run
