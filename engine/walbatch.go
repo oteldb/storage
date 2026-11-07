@@ -76,13 +76,17 @@ func (b *walBatch) admit(
 		return rejectRetention
 	}
 	k, staged := b.pos[id]
+	var state headSeriesState
+	if !staged && oooWindow > 0 {
+		state = h.seriesState(id)
+	}
 	var newest int64
 	var seen bool
 	if oooWindow > 0 {
 		if staged {
 			newest, seen = b.accs[k].admissionNewest(), true
 		} else {
-			newest, seen = h.seriesNewest[id]
+			newest, seen = state.newest, state.seen
 		}
 
 		if seen && ts < newest-oooWindow {
@@ -100,16 +104,17 @@ func (b *walBatch) admit(
 	}
 
 	if oooWindow <= 0 {
-		newest, seen = h.seriesNewest[id]
+		state = h.seriesState(id)
+		newest, seen = state.newest, state.seen
 	}
-	acc := walSeriesAcc{buffer: h.samples[id], priorNewest: newest, hadNewest: seen}
+	acc := walSeriesAcc{buffer: state.buffer, priorNewest: newest, hadNewest: seen,
+		identityRef: state.ref, knownRef: state.known}
 	if acc.buffer != nil {
 		b.add(b.start(id, acc), ts, value, sf)
 		return admitted
 	}
 	acc.isNew = true
-	if ref, known := h.series.Ref(id); known {
-		acc.identityRef, acc.knownRef = ref, true
+	if acc.knownRef {
 		b.add(b.start(id, acc), ts, value, sf)
 		return admitted
 	}
@@ -125,11 +130,11 @@ func (b *walBatch) admit(
 		if k, ok := b.pos[oid]; ok {
 			b.add(k, ts, value, sf)
 		} else {
-			previous, exists := h.seriesNewest[oid]
-			a := walSeriesAcc{buffer: h.samples[oid], priorNewest: previous, hadNewest: exists}
+			state := h.seriesState(oid)
+			a := walSeriesAcc{buffer: state.buffer, priorNewest: state.newest, hadNewest: state.seen,
+				identityRef: state.ref, knownRef: state.known}
 			a.isNew = a.buffer == nil
 			if a.isNew {
-				a.identityRef, a.knownRef = h.series.Ref(oid)
 				a.register, a.series = !a.knownRef, ov
 			}
 			b.add(b.start(oid, a), ts, value, sf)
@@ -221,7 +226,7 @@ func (b *walBatch) encodingView(h *head, everySeries bool) series.View {
 	if everySeries {
 		for k, id := range b.order {
 			a := &b.accs[k]
-			if !a.isNew {
+			if !a.isNew && !a.knownRef {
 				a.identityRef, a.knownRef = h.series.Ref(id)
 			}
 		}
@@ -295,9 +300,13 @@ func (b *walBatch) apply(h *head) {
 			h.register(id, a.series)
 		}
 
+		ref := a.identityRef
+		if !a.knownRef {
+			ref, _ = h.series.Ref(id)
+		}
 		buf := a.buffer
 		if buf == nil {
-			buf = h.bufFor(id)
+			buf = h.bufForRef(id, ref)
 		}
 		for i := range a.ts {
 			buf.appendSample(a.ts[i], a.values[i], a.sf[i])
@@ -306,7 +315,7 @@ func (b *walBatch) apply(h *head) {
 
 		h.grow(int64(len(a.ts)) * SampleBytes)
 		if !a.hadNewest || a.newest > a.priorNewest {
-			h.seriesNewest[id] = a.newest
+			h.slots.set(h.stateRefs[ref], a.newest)
 		}
 		h.newest = max(h.newest, a.newest)
 	}

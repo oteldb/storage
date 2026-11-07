@@ -34,8 +34,8 @@ import (
 // length when the result is installed. What the lock actually covers is the snapshot, the tail
 // replay and the swap — work proportional to concurrent registrations, not to cardinality.
 //
-// The per-series out-of-order watermarks are the exception: an ordinary map, so they are pruned by
-// deleting the dead keys in place rather than rebuilt.
+// Per-series watermarks stay in stable head slots. The off-lock rebuild remaps registry references
+// to those slots; installation releases only slots whose series remained dead.
 
 const (
 	// pruneMinIdentities is the identity count below which a prune is never worth its rebuild: a
@@ -108,6 +108,7 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 
 	e.mu.RLock()
 	snap := e.head.series.View()
+	stateRefs := e.head.stateRefs
 	e.mu.RUnlock()
 
 	dead := deadPositions(snap, live)
@@ -128,7 +129,7 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 	// The expensive part — re-interning every survivor into fresh structures — runs here, off the
 	// lock, over the immutable snapshot. Ingest and queries proceed against the current index
 	// throughout.
-	rebuilt := rebuildIdentity(snap, live)
+	rebuilt := rebuildIdentity(snap, live, stateRefs)
 
 	e.mu.Lock()
 	// Identities registered while the rebuild ran sit past the snapshot's end in the same

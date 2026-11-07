@@ -167,13 +167,17 @@ func (p *preparedBatch) admit(
 	g := &p.groups[p.current]
 	b := p.batch
 	k := g.staged
+	var state headSeriesState
+	if k < 0 && oooWindow > 0 {
+		state = h.seriesState(id)
+	}
 	var newest int64
 	var seen bool
 	if oooWindow > 0 {
 		if k >= 0 {
 			newest, seen = b.accs[k].admissionNewest(), true
 		} else {
-			newest, seen = h.seriesNewest[id]
+			newest, seen = state.newest, state.seen
 		}
 		if seen && ts < newest-oooWindow {
 			return rejectOOO
@@ -187,12 +191,13 @@ func (p *preparedBatch) admit(
 		return admitted
 	}
 	if oooWindow <= 0 {
-		newest, seen = h.seriesNewest[id]
+		state = h.seriesState(id)
+		newest, seen = state.newest, state.seen
 	}
-	acc := walSeriesAcc{buffer: h.samples[id], priorNewest: newest, hadNewest: seen}
+	acc := walSeriesAcc{buffer: state.buffer, priorNewest: newest, hadNewest: seen,
+		identityRef: state.ref, knownRef: state.known}
 	if acc.buffer == nil {
 		acc.isNew = true
-		acc.identityRef, acc.knownRef = h.series.Ref(id)
 		if !acc.knownRef {
 			if limits.MaxSeries > 0 && int64(h.series.Len()+b.registered) >= limits.MaxSeries {
 				return rejectCardinality

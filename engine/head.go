@@ -34,13 +34,9 @@ type head struct {
 	bufferedMin, detachedMin     int64
 	bufferedKnown, detachedKnown bool
 
-	// seriesNewest is each series' own newest admitted timestamp: the OOO window is a per-series
-	// lateness bound, not a cross-series one, so a high-rate (or clock-skewed-ahead) series cannot
-	// drag the watermark forward for the slower series sharing the head. It outlives a flush —
-	// [head.detach] replaces the sample buffers, but a series' lateness bound is not reset by its
-	// samples becoming durable — and is cleared only with the head itself, so it grows with the same
-	// all-time series set the identity index already retains.
-	seriesNewest map[signal.SeriesID]int64
+	stateRefs []uint32
+	slots     headSlots
+	buffers   headBuffers
 
 	bytes         int64 // active buffered sample bytes (SampleBytes each)
 	detachedBytes int64 // resident samples held by the single in-flight flush
@@ -103,8 +99,6 @@ func newHead() *head {
 		series:  series.New(),
 		post:    postings.NewDense(),
 		samples: make(map[signal.SeriesID]*sampleBuf),
-
-		seriesNewest: make(map[signal.SeriesID]int64),
 	}
 }
 
@@ -115,15 +109,12 @@ func newHead() *head {
 // ([Stats.IdentityBytes]) because nothing else counts it, and it only grows.
 func (h *head) identityBytes() int64 {
 	n := h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
-		int64(len(h.seriesNewest))*watermarkEntryBytes
+		memsize.Slice(h.stateRefs) + h.slots.sizeBytes()
 	if h.nonStringLabels != nil {
 		n += memsize.Map(h.nonStringLabels)
 	}
 	return n
 }
-
-// watermarkEntryBytes is one seriesNewest map entry (series id → timestamp).
-var watermarkEntryBytes = memsize.MapEntry[signal.SeriesID, int64]()
 
 // rebuildIdentity returns fresh symbol, series and postings structures holding only the identities
 // of snap that are in live — the identity prune (see prune.go). It is a rebuild rather than a
@@ -137,7 +128,7 @@ var watermarkEntryBytes = memsize.MapEntry[signal.SeriesID, int64]()
 // An id in live whose identity snap does not hold is simply absent: it is already unresolvable
 // (only a lost or truncated identity object can produce one), and inventing an entry for it would
 // be worse than leaving the postings without it.
-func rebuildIdentity(snap series.View, live map[signal.SeriesID]struct{}) *head {
+func rebuildIdentity(snap series.View, live map[signal.SeriesID]struct{}, slots []uint32) *head {
 	out := &head{sym: symbols.New(), series: series.New(), post: postings.NewDense()}
 
 	var attrs signal.Attributes
@@ -148,7 +139,8 @@ func rebuildIdentity(snap series.View, live map[signal.SeriesID]struct{}) *head 
 
 		ident := snap.At(i, attrs)
 		attrs = ident.Attributes
-		out.register(snap.ID(i), ident)
+		out.registerIndex(snap.ID(i), ident)
+		out.stateRefs = append(out.stateRefs, slots[i])
 	}
 
 	// Sort now, while the index is still private: a reader would otherwise trigger the lazy in-place
@@ -178,7 +170,8 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 	for i := snap.Len(); i < tail.Len(); i++ {
 		ident := tail.At(i, attrs)
 		attrs = ident.Attributes
-		rebuilt.register(tail.ID(i), ident)
+		rebuilt.registerIndex(tail.ID(i), ident)
+		rebuilt.stateRefs = append(rebuilt.stateRefs, h.stateRefs[i])
 	}
 
 	for _, pos := range dead {
@@ -186,46 +179,40 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 		if _, revived := h.samples[id]; revived {
 			ident := snap.At(int(pos), attrs)
 			attrs = ident.Attributes
-			rebuilt.register(id, ident)
+			rebuilt.registerIndex(id, ident)
+			rebuilt.stateRefs = append(rebuilt.stateRefs, h.stateRefs[int(pos)])
 
 			continue
 		}
 
-		delete(h.seriesNewest, id)
+		h.slots.release(h.stateRefs[int(pos)])
 	}
 
 	h.sym, h.series, h.post = rebuilt.sym, rebuilt.series, rebuilt.post
 	h.nonStringLabels = rebuilt.nonStringLabels
+	h.stateRefs = rebuilt.stateRefs
 }
 
 // register records and indexes an identity known not to be present.
 func (h *head) register(id signal.SeriesID, s signal.Series) {
+	h.registerIndex(id, s)
+	for len(h.stateRefs) < h.series.Len() {
+		h.stateRefs = append(h.stateRefs, h.slots.alloc())
+	}
+}
+
+func (h *head) registerIndex(id signal.SeriesID, s signal.Series) {
 	h.series.Add(s)
 	h.indexLabels(id, s)
 }
 
-// outOfOrder reports whether ts is more than oooWindow behind series id's own newest admitted
-// sample. A series' first sample is never out of order, however far behind its neighbors it is.
-func (h *head) outOfOrder(id signal.SeriesID, ts, oooWindow int64) bool {
-	if oooWindow <= 0 {
-		return false
-	}
-
-	newest, seen := h.seriesNewest[id]
-
-	return seen && ts < newest-oooWindow
-}
-
 // noteTS advances series id's own watermark and the head-global one after a sample is admitted.
 func (h *head) noteTS(id signal.SeriesID, ts int64) {
-	h.noteBufferedTS(ts)
-	if newest, seen := h.seriesNewest[id]; !seen || ts > newest {
-		h.seriesNewest[id] = ts
+	ref, ok := h.series.Ref(id)
+	if !ok {
+		panic("engine: timestamp for unregistered series")
 	}
-
-	if ts > h.newest {
-		h.newest = ts
-	}
+	h.noteTSRef(ref, ts)
 }
 
 func (h *head) noteBufferedTS(ts int64) {
@@ -240,21 +227,20 @@ func (h *head) noteBufferedTS(ts int64) {
 // to the WAL (see [head.needsSeriesRecord]).
 func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64) (id signal.SeriesID, accepted, logSeries bool) {
 	id = s.Hash()
-	if h.outOfOrder(id, ts, oooWindow) {
+	state := h.seriesState(id)
+	if oooWindow > 0 && state.seen && ts < state.newest-oooWindow {
 		return id, false, false
 	}
-
-	logSeries = h.samples[id] == nil
-
-	if !h.series.Has(id) {
-		h.series.Add(s)
-		h.indexLabels(id, s)
+	logSeries = state.buffer == nil
+	ref := state.ref
+	if !state.known {
+		h.register(id, s)
+		ref, _ = h.series.Ref(id)
 	}
-
-	buf := h.bufFor(id)
+	buf := h.bufForRef(id, ref)
 	buf.appendSample(ts, value, 1)
 	h.grow(SampleBytes)
-	h.noteTS(id, ts)
+	h.noteTSRef(ref, ts)
 
 	return id, true, logSeries
 }
@@ -287,7 +273,8 @@ func (h *head) appendByID(
 	if limits.EnforceMinTimestamp && ts < limits.MinTimestamp {
 		return rejectRetention, id, false, signal.Series{}
 	}
-	if h.outOfOrder(id, ts, oooWindow) {
+	state := h.seriesState(id)
+	if oooWindow > 0 && state.seen && ts < state.newest-oooWindow {
 		return rejectOOO, id, false, signal.Series{}
 	}
 
@@ -297,34 +284,24 @@ func (h *head) appendByID(
 		return rejectBytes, id, false, signal.Series{}
 	}
 
-	// One map probe on the hot path: a present sample buffer means the series is already
-	// known, so a repeat append never touches the series index. Only when the buffer is
-	// absent do we consult the series index (authoritative — WAL replay can register a
-	// series before its first live sample) to decide whether to materialize and index it.
-	buf := h.samples[id]
+	buf, ref := state.buffer, state.ref
 	if buf == nil {
-		// A new identity (not yet indexed) goes through the cardinality decision; an already-indexed
-		// one (WAL replay registered it before its first live sample) just needs a buffer.
-		if !h.series.Has(id) {
+		if !state.known {
 			var done bool
 			if out, effID, logSeries, s, done = h.admitNew(id, ts, value, sf, limits, materialize); done {
 				return out, effID, logSeries, s
 			}
+			ref, _ = h.series.Ref(id)
 		} else {
-			// Known identity starting a fresh buffer: the log needs its record again, and the
-			// resident index already has the identity, so nothing is materialized.
-			s, _ = h.series.Get(id)
+			s = h.series.View().At(int(ref), nil)
 		}
-
 		logSeries = true
-
-		buf = &sampleBuf{}
-		h.samples[id] = buf
+		buf = h.bufForRef(id, ref)
 	}
 
 	buf.appendSample(ts, value, sf)
 	h.grow(SampleBytes)
-	h.noteTS(id, ts)
+	h.noteTSRef(ref, ts)
 
 	return admitted, id, logSeries, s
 }
@@ -354,8 +331,7 @@ func (h *head) admitNew(
 	}
 
 	s = materialize()
-	h.series.Add(s)
-	h.indexLabels(id, s)
+	h.register(id, s)
 
 	return admitted, id, true, s, false
 }
@@ -367,25 +343,22 @@ func (h *head) admitNew(
 func (h *head) appendOverflow(ov signal.Series, ts int64, value, sf float64) (admitOutcome, signal.SeriesID, bool, signal.Series) {
 	oid := ov.Hash()
 
-	logSeries := false
-
-	buf := h.samples[oid]
+	state := h.seriesState(oid)
+	buf, ref := state.buffer, state.ref
+	logSeries := buf == nil
 	if buf == nil {
-		if !h.series.Has(oid) {
-			h.series.Add(ov)
-			h.indexLabels(oid, ov)
+		if !state.known {
+			h.register(oid, ov)
+			ref, _ = h.series.Ref(oid)
 		}
-
-		logSeries = true
-		buf = &sampleBuf{}
-		h.samples[oid] = buf
+		buf = h.bufForRef(oid, ref)
 	}
 
 	buf.appendSample(ts, value, sf)
 	h.grow(SampleBytes)
 	// The sample lands under the overflow identity, so that is the series whose lateness bound it
 	// advances — the shed series never gets one.
-	h.noteTS(oid, ts)
+	h.noteTSRef(ref, ts)
 
 	return admittedOverflow, oid, logSeries, ov
 }
@@ -444,13 +417,11 @@ func (h *head) recountBytes() {
 
 // bufFor returns the (created-on-demand) sample buffer for an already-registered series.
 func (h *head) bufFor(id signal.SeriesID) *sampleBuf {
-	buf := h.samples[id]
-	if buf == nil {
-		buf = &sampleBuf{}
-		h.samples[id] = buf
+	ref, ok := h.series.Ref(id)
+	if !ok {
+		panic("engine: buffer for unregistered series")
 	}
-
-	return buf
+	return h.bufForRef(id, ref)
 }
 
 // registerSeries records and indexes a series identity without samples (used by WAL
@@ -458,19 +429,19 @@ func (h *head) bufFor(id signal.SeriesID) *sampleBuf {
 func (h *head) registerSeries(s signal.Series) {
 	id := s.Hash()
 	if !h.series.Has(id) {
-		h.series.Add(s)
-		h.indexLabels(id, s)
+		h.register(id, s)
 	}
 }
 
 // replaySamples appends a run of samples to an already-registered series (WAL replay; no
 // OOO rejection — logged samples are authoritative).
 func (h *head) replaySamples(id signal.SeriesID, ts []int64, values []float64) {
-	if !h.series.Has(id) {
+	ref, known := h.series.Ref(id)
+	if !known {
 		return // series record missing; ignore (defensive)
 	}
 
-	buf := h.bufFor(id)
+	buf := h.bufForRef(id, ref)
 	buf.ts = append(buf.ts, ts...)
 	buf.values = append(buf.values, values...)
 	// The WAL does not yet carry scale factors, so replayed samples take weight 1; keep the sf
@@ -484,7 +455,7 @@ func (h *head) replaySamples(id signal.SeriesID, ts []int64, values []float64) {
 	h.grow(int64(len(ts)) * SampleBytes)
 
 	for _, t := range ts {
-		h.noteTS(id, t)
+		h.noteTSRef(ref, t)
 	}
 }
 
@@ -493,14 +464,15 @@ func (h *head) replaySamples(id signal.SeriesID, ts []int64, values []float64) {
 // appends per sample through appendSample, which materializes the buffer's sf slice on the first
 // non-unit weight.
 func (h *head) replaySamplesSF(id signal.SeriesID, ts []int64, values, sf []float64) {
-	if !h.series.Has(id) {
+	ref, known := h.series.Ref(id)
+	if !known {
 		return // series record missing; ignore (defensive)
 	}
 
-	buf := h.bufFor(id)
+	buf := h.bufForRef(id, ref)
 	for i := range ts {
 		buf.appendSample(ts[i], values[i], sf[i])
-		h.noteTS(id, ts[i])
+		h.noteTSRef(ref, ts[i])
 	}
 
 	h.grow(int64(len(ts)) * SampleBytes)
@@ -694,6 +666,7 @@ func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 
 	detached, bytes, since := h.samples, h.bytes, h.since
 	h.samples = make(map[signal.SeriesID]*sampleBuf)
+	h.buffers = headBuffers{}
 	h.bytes = 0
 	h.detachedBytes = bytes
 	h.detachedMin, h.detachedKnown = h.bufferedMin, h.bufferedKnown
@@ -722,6 +695,7 @@ func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, si
 		}
 	}
 
+	h.resetBuffers()
 	if !h.detachedKnown || h.bytes > 0 && !h.bufferedKnown {
 		h.bufferedMin = minInt64
 	} else if !h.bufferedKnown || h.detachedMin < h.bufferedMin {

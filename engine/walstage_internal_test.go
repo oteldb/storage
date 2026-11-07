@@ -189,7 +189,7 @@ type headState struct {
 func snapshotHead(h *head) headState {
 	st := headState{
 		Samples:      make(map[signal.SeriesID]sampleBuf, len(h.samples)),
-		SeriesNewest: h.seriesNewest,
+		SeriesNewest: snapshotWatermarks(h),
 		Bytes:        h.bytes,
 		Newest:       h.newest,
 	}
@@ -272,4 +272,15 @@ func FuzzStagedAdmissionMatchesDirect(f *testing.F) {
 			require.Equal(t, snapshotHead(direct.head), snapshotHead(staged.head))
 		}
 	})
+}
+
+func snapshotWatermarks(h *head) map[signal.SeriesID]int64 {
+	out := make(map[signal.SeriesID]int64)
+	for i := range h.series.Len() {
+		id := h.series.ID(uint32(i))
+		if ts, seen := h.watermark(id); seen {
+			out[id] = ts
+		}
+	}
+	return out
 }
