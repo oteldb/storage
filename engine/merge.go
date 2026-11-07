@@ -485,8 +485,8 @@ func (e *Engine) writeMergedPart(
 // columns sorted by (series, ts). The returned columns are empty when no sample survives. It reads
 // the parts off the engine lock; src is the immutable snapshot the caller planned over.
 func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tiers []DownsampleTier) (*flushColumns, error) {
-	var keys mergestream.Keys
-	if err := mergeKeys(ctx, src, &keys); err != nil {
+	var keys seriesMerge
+	if err := keys.init(ctx, src); err != nil {
 		return nil, err
 	}
 
@@ -502,13 +502,9 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 		var m sampleMerge
 
 		// Oldest → newest part, so a later part's value wins on a duplicate timestamp.
-		for _, p := range src {
-			rng, ok, err := p.index.lookup(ctx, id)
-			if err != nil {
-				return nil, err
-			}
-
-			if !ok {
+		for i, p := range src {
+			rng := keys.ranges[i]
+			if rng.start == rng.end {
 				continue
 			}
 
@@ -631,8 +627,8 @@ func (e *Engine) compactStream(
 func (e *Engine) compactStreamWithInputs(
 	ctx context.Context, src []*part, start, capBytes int64, plan rollupPlan, opts MergeOptions, inputBytes, allowance int64,
 ) ([]*part, error) {
-	var keys mergestream.Keys
-	if err := mergeKeys(ctx, src, &keys); err != nil {
+	var keys seriesMerge
+	if err := keys.init(ctx, src); err != nil {
 		return nil, err
 	}
 
@@ -656,7 +652,7 @@ func (e *Engine) compactStreamWithInputs(
 	comp, precision, withSF := mergeEncoding(src, capBytes, opts, plan.tiers)
 	coders := newMetricMergeCoders(src, comp)
 	budget := mergestream.Budget{DiskBytes: capBytes, ResidentBytes: allowance}
-	held := buildbudget.Add(inputBytes, coders.workspace())
+	held := buildbudget.Add(buildbudget.Add(inputBytes, coders.workspace()), mergeRangeBatchBytes(len(src)))
 
 	var newParts []*part
 
@@ -694,7 +690,7 @@ func (e *Engine) compactStreamWithInputs(
 		i := identities.at - 1
 		id, view, ref, found := identities.ids[i], identities.view, identities.refs[i], identities.found[i]
 
-		m, err := mergeStreamedSeries(ctx, src, streams, scratch, id, start)
+		m, err := mergeStreamedSeries(src, streams, scratch, identities.ranges[i*len(src):(i+1)*len(src)], start)
 		if err != nil {
 			return nil, err
 		}
@@ -806,18 +802,13 @@ func rowCapFor(p *part, capBytes int64) int {
 // mergeStreamedSeries gathers one series' samples across the source parts (oldest → newest, so a
 // later part's value wins on a duplicate timestamp), each read through its forward stream cursor.
 func mergeStreamedSeries(
-	ctx context.Context, src []*part, streams []*partStream, scratch []rangeBuf,
-	id signal.SeriesID, start int64,
+	src []*part, streams []*partStream, scratch []rangeBuf,
+	ranges []rowRange, start int64,
 ) (sampleMerge, error) {
 	var m sampleMerge
 
-	for i, p := range src {
-		rng, ok, err := p.index.lookup(ctx, id)
-		if err != nil {
-			return m, err
-		}
-
-		if !ok {
+	for i, rng := range ranges {
+		if rng.start == rng.end {
 			continue
 		}
 
@@ -826,7 +817,7 @@ func mergeStreamedSeries(
 			return m, err
 		}
 
-		m.add(ts, vals, sf, p.rollup, start, maxInt64)
+		m.add(ts, vals, sf, src[i].rollup, start, maxInt64)
 	}
 
 	return m, nil

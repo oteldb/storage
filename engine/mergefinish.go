@@ -6,7 +6,6 @@ import (
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/internal/memsize"
-	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -25,19 +24,26 @@ func (b *mergeFinishBudget) add(view series.View, ref uint32) {
 }
 
 type mergeIdentityBatch struct {
-	ids   [256]signal.SeriesID
-	refs  [256]uint32
-	found [256]bool
-	view  series.View
-	at, n int
+	ids    [256]signal.SeriesID
+	refs   [256]uint32
+	found  [256]bool
+	view   series.View
+	at, n  int
+	ranges []rowRange
 }
 
-func (b *mergeIdentityBatch) next(e *Engine, keys *mergestream.Keys) bool {
+func (b *mergeIdentityBatch) next(e *Engine, keys *seriesMerge) bool {
 	if b.at == b.n {
 		b.at, b.n = 0, 0
 		b.view = series.View{}
+		needed := len(b.ids) * len(keys.ranges)
+		if cap(b.ranges) < needed {
+			b.ranges = make([]rowRange, 0, needed)
+		}
+		b.ranges = b.ranges[:0]
 		for b.n < len(b.ids) && keys.Next() {
 			b.ids[b.n] = keys.Key()
+			b.ranges = append(b.ranges, keys.ranges...)
 			b.n++
 		}
 		if b.n == 0 {

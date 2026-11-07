@@ -319,7 +319,7 @@ func TestMergeCodecFloorUsesActualSharedWorkspaceAtBoundary(t *testing.T) {
 	actual := newMetricMergeCoders(e.parts, profile)
 	oldObjects := compress.NewFrameCompressor(profile.Algorithm, profile.Level, 24*65536)
 	require.Greater(t, actual.objects.EncodeWorkspace(), oldObjects.EncodeWorkspace())
-	staging := int64(4<<20) + int64(DefaultMetricBlockRows)*64
+	staging := int64(4<<20) + int64(DefaultMetricBlockRows)*64 + mergeRangeBatchBytes(len(e.parts))
 	require.Equal(t, staging+actual.workspace(), e.minimumMergeOutput(e.parts, 0, MergeOptions{}, nil))
 }
 

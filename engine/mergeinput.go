@@ -113,8 +113,8 @@ func (e *Engine) minimumMergeOutput(src []*part, capBytes int64, opts MergeOptio
 		rows = DefaultMetricBlockRows
 	}
 	// Four typed columns have at most one bounded frame and pending granule each; codec pools are separate.
-	return buildbudget.Add(buildbudget.Add(4<<20, buildbudget.Mul(int64(rows), 64)),
-		coders.workspace())
+	return buildbudget.Add(buildbudget.Add(buildbudget.Add(4<<20, buildbudget.Mul(int64(rows), 64)),
+		coders.workspace()), mergeRangeBatchBytes(len(src)))
 }
 
 func (e *Engine) mergeInputBound(ctx context.Context, src []*part, whole bool) (mergeInputBound, error) {

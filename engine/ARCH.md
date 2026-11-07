@@ -30,6 +30,11 @@ during catalog I/O. Windowed repair checks, read gaps, fences, and acknowledged 
 | checkpoint | only the captured sealed prefix, after confirmed catalog commit; readers proceed |
 | reclamation | retired parts wait for query and builder references, then are deleted |
 
+Metric merge cursors retain each contributing source's ordinal and series position. Row ranges
+come directly from the captured index entries; encoding does not binary-search each part again.
+The 256-series identity batch retains the corresponding range matrix, charged to output scratch,
+so identity lookahead cannot move the range used for decoding. Sources are consumed oldest first.
+
 Merge sources and rollup probes own `OpenColumnScan` handles for their scoped walks. Completion
 and failure close every opened source before its part can retire; file windows return to their
 bounded pool after writer finalization. Source admission includes the handle's retained-state hint.
