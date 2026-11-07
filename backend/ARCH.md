@@ -125,7 +125,9 @@ a demonstration.
   (embeddable `go-faster/fs` on `httptest`, no Docker).
 - **`backend.Cached(inner, maxBytes)`** — byte-bounded read cache for the cold tier. Correct by
   construction: part objects are write-once immutable, so a hit is never stale; a write/delete of
-  the same key updates/drops the entry. Wrapped **outermost** (a hit skips metering and the
+  the same key invalidates the entry. Only reads populate it: eagerly cloning written objects
+  retains unread metadata and competes with the queried working set. The first subsequent read
+  pays an inner read, including on S3. Wrapped **outermost** (a hit skips metering and the
   backend), skipped for ephemeral backends. It is otter's weight-bounded **loading** cache, not a
   strict LRU: concurrent misses on one key collapse into a single inner read (one object-store GET
   per cold object, not one per in-flight query), and W-TinyLFU admission keeps a cold historical
@@ -468,7 +470,7 @@ a demonstration.
   an orphan with a manifest, which only the open-time sweep sees before anything is served.
   **Every helper falls back to the synchronous operation** (and `SyncPrefix` to nothing), so a
   wrapper that drops the capability loses the saving, never durability, and `Memory`/`s3` need
-  nothing. Wrappers forward all four together (`Cached` with the same store/invalidate rules as
+  nothing. Wrappers forward all four together (`Cached` with the same invalidation rules as
   `Write`/`Delete`, the metered backend under the `write`/`delete` labels). `faultbackend` and
   `backendtest.Capacity` forward none. **Deletes** (`block.DeletePart`) remove the manifest first and
   durably, one directory sync that retires the part, then everything else deferred: a resurrected

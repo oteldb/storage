@@ -14,8 +14,8 @@ import (
 // cache. It targets the cold tier (file/S3), where a part column is otherwise re-read over the
 // network on every query: because part objects are write-once immutable, a cached value is never
 // stale, so the only invalidation is eviction (by byte budget) and an explicit Write/Delete of the
-// same key (manifest/index objects, which the wrapper keeps coherent). List and PutIfAbsent are
-// passed through.
+// same key (manifest/index objects, which the wrapper keeps coherent). Writes invalidate existing
+// entries; only reads populate the cache, avoiding copies and eviction pressure from unread objects.
 //
 // maxBytes is the cache's total value-byte budget; objects larger than it are not cached (they
 // would evict everything else). maxBytes ≤ 0 disables caching (the inner backend is returned
@@ -257,7 +257,7 @@ func (c *cachedBackend) Write(ctx context.Context, key string, data []byte) erro
 		return err
 	}
 
-	c.store(key, data) // keep the cache coherent with the newly written value
+	c.invalidate(key)
 
 	return nil
 }
@@ -269,7 +269,7 @@ func (c *cachedBackend) PutIfAbsent(ctx context.Context, key string, data []byte
 	}
 
 	if ok {
-		c.store(key, data)
+		c.invalidate(key)
 	}
 
 	return ok, nil
@@ -357,10 +357,7 @@ func (c *cachedBackend) Stats() CacheStats {
 }
 
 // WriteUncached writes through b, keeping data out of the read cache while still dropping any
-// stale entry under key (a reader must never be served the superseded value). Use it for the few
-// objects that are rewritten far more often than they are read — the engines' identity sets, which
-// are written on every flush and read only on recovery: caching one is pure eviction pressure, and
-// a single large one can occupy most of the budget. Every other object goes through [Backend.Write].
+// stale entry under key. Like [Backend.Write], it never populates the read cache.
 func WriteUncached(ctx context.Context, b Backend, key string, data []byte) error {
 	c, ok := b.(*cachedBackend)
 	if !ok {
@@ -385,23 +382,4 @@ func ReadUncached(ctx context.Context, b Backend, key string) ([]byte, error) {
 	}
 
 	return b.Read(ctx, key)
-}
-
-// store caches a private copy of data under key, taking a copy because the caller may reuse its
-// buffer after Write returns. An object larger than the whole budget is not cached — and any stale
-// smaller entry under that key is dropped, so a reader cannot be served the superseded value.
-func (c *cachedBackend) store(key string, data []byte) {
-	c.pages.Delete(key)
-	if int64(len(data)) > c.maxBytes {
-		c.invalidate(key)
-
-		return
-	}
-
-	cp := slices.Clone(data)
-	if cp == nil {
-		cp = []byte{}
-	}
-
-	c.values.Set(readCacheKey{name: key}, cp)
 }
