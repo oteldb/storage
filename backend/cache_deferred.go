@@ -11,7 +11,7 @@ func (c *cachedBackend) WriteDeferred(ctx context.Context, key string, data []by
 		return err
 	}
 
-	c.store(key, data)
+	c.invalidate(key)
 
 	return nil
 }
