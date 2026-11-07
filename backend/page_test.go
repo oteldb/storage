@@ -32,6 +32,7 @@ func TestPageCacheCoherence(t *testing.T) {
 	}{
 		{name: "uncached", write: func(v []byte) error { return backend.WriteUncached(ctx, cached, "part", v) }},
 		{name: "deferred", write: func(v []byte) error { return backend.WriteUncachedDeferred(ctx, cached, "part", v) }},
+		{name: "write-deferred", write: func(v []byte) error { return backend.WriteDeferred(ctx, cached, "part", v) }},
 		{name: "cached", write: func(v []byte) error { return cached.Write(ctx, "part", v) }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

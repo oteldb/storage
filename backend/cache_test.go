@@ -45,13 +45,13 @@ func TestCacheHitAvoidsInnerRead(t *testing.T) {
 	c := backend.Cached(inner, 1<<20)
 	require.NoError(t, c.Write(ctx, "k", []byte("value")))
 
-	// Write is cached, so neither read touches the backend.
+	// Only the first read touches the backend.
 	for range 3 {
 		v, err := c.Read(ctx, "k")
 		require.NoError(t, err)
 		assert.Equal(t, []byte("value"), v)
 	}
-	assert.Equal(t, int64(0), inner.reads.Load(), "cached-on-write key needs no inner read")
+	assert.Equal(t, int64(1), inner.reads.Load(), "the first read populates the cache")
 
 	// A key only ever read (not written through the cache) hits the backend exactly once.
 	require.NoError(t, inner.Write(ctx, "z", []byte("zz")))
@@ -59,7 +59,7 @@ func TestCacheHitAvoidsInnerRead(t *testing.T) {
 		_, err := c.Read(ctx, "z")
 		require.NoError(t, err)
 	}
-	assert.Equal(t, int64(1), inner.reads.Load(), "first read misses, the rest hit the cache")
+	assert.Equal(t, int64(2), inner.reads.Load(), "first read misses, the rest hit the cache")
 }
 
 func TestCacheReturnsPrivateCopies(t *testing.T) {
@@ -116,7 +116,10 @@ func TestCacheEvictsByByteBudget(t *testing.T) {
 	require.True(t, ok)
 
 	for i := range 50 {
-		require.NoError(t, c.Write(ctx, "k"+strconv.Itoa(i), make([]byte, 10)))
+		key := "k" + strconv.Itoa(i)
+		require.NoError(t, c.Write(ctx, key, make([]byte, 10)))
+		_, err := c.Read(ctx, key)
+		require.NoError(t, err)
 	}
 	assert.LessOrEqual(t, cs.Stats().Bytes, int64(100), "resident bytes stay within budget")
 
@@ -179,7 +182,7 @@ func TestCacheListPassesThrough(t *testing.T) {
 	assert.Equal(t, []string{"a/1", "a/2"}, keys)
 }
 
-func TestCachePutIfAbsentCaches(t *testing.T) {
+func TestCachePutIfAbsentLoadsOnRead(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -192,7 +195,7 @@ func TestCachePutIfAbsentCaches(t *testing.T) {
 
 	_, err = c.Read(ctx, "k")
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), inner.reads.Load(), "a successful PutIfAbsent populates the cache")
+	assert.Equal(t, int64(1), inner.reads.Load(), "a successful PutIfAbsent leaves population to the first read")
 }
 
 func TestCacheConcurrent(t *testing.T) {
@@ -342,7 +345,10 @@ func TestCacheOversizeDoesNotDropWorkingSet(t *testing.T) {
 	c := backend.Cached(inner, 1<<10)
 
 	for i := range 4 {
-		require.NoError(t, c.Write(ctx, "k"+strconv.Itoa(i), make([]byte, 64)))
+		key := "k" + strconv.Itoa(i)
+		require.NoError(t, c.Write(ctx, key, make([]byte, 64)))
+		_, err := c.Read(ctx, key)
+		require.NoError(t, err)
 	}
 
 	// A single object above the whole budget must not take the resident set with it.
@@ -394,7 +400,7 @@ func TestCacheReadViewNoCopyOnHit(t *testing.T) {
 
 	assert.Equal(t, []byte("value"), v1)
 	assert.Same(t, &v1[0], &v2[0], "hits share the resident entry's backing array")
-	assert.Equal(t, int64(0), inner.reads.Load())
+	assert.Equal(t, int64(1), inner.reads.Load())
 }
 
 func TestCacheReadViewMissStoresAndStaysValidAfterOverwrite(t *testing.T) {
@@ -483,7 +489,9 @@ func TestWriteUncachedDropsStaleEntry(t *testing.T) {
 	ctx := context.Background()
 
 	c := backend.Cached(newCounting(), 1<<20)
-	require.NoError(t, c.Write(ctx, "k", []byte("old"))) // cached by the ordinary write path
+	require.NoError(t, c.Write(ctx, "k", []byte("old")))
+	_, err := c.Read(ctx, "k")
+	require.NoError(t, err)
 
 	require.NoError(t, backend.WriteUncached(ctx, c, "k", []byte("new")))
 
