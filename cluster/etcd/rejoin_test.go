@@ -143,7 +143,19 @@ func TestMembershipRejoinsAfterLeaseExpiry(t *testing.T) {
 	// registration rather than adding a second one, and node-a picked it back up.
 	requireConverged(t, client, nodes, "node-a", "node-b")
 	assert.NotEqual(t, lost, b.LeaseID(), "node-b registered under a fresh lease")
-	assert.Zero(t, a.Rejoins(), "the undisturbed node did not re-register")
+
+	// There is deliberately no `assert.Zero(t, a.Rejoins())` here. It asserted a negative about
+	// a background watcher that the design permits to fire: `follow` ends on either of two
+	// things, and only one of them is node-b's deletion. The other is the keep-alive channel
+	// closing, which a loaded runner can produce on any node at any time, and `maintain`
+	// documents the response as ordinary — a new lease and a new key rather than an exit. So a
+	// rejoin by node-a is correct behaviour, not evidence of a defect, and the assertion read it
+	// as one; it failed on the windows runner for exactly that reason (#509).
+	//
+	// What matters is asserted by requireConverged above: node-b's loss must not evict node-a
+	// from the member set, nor leave it holding a registration the cluster cannot see. Whether
+	// node-a got there on its original lease or a replacement one is not this test's business.
+	assert.False(t, a.SelfAbsent(), "node-a still holds a registration the cluster can see")
 }
 
 // TestMembershipRejoinsAfterWholeRingLeaseLoss reproduces the reported end state directly:
@@ -196,7 +208,8 @@ func TestMembershipRejoinsAfterExternalKeyDelete(t *testing.T) {
 
 	requireConverged(t, client, nodes, "node-a", "node-b")
 	assert.NotEqual(t, held, b.LeaseID(), "the stale lease is not reused")
-	assert.Zero(t, a.Rejoins(), "the undisturbed node did not re-register")
+	// No `assert.Zero(t, a.Rejoins())`: see TestMembershipRejoinsAfterLeaseExpiry.
+	assert.False(t, a.SelfAbsent(), "node-a still holds a registration the cluster can see")
 }
 
 // TestMembershipRejoinIsIdempotent hits the same node repeatedly. Each loss must produce
