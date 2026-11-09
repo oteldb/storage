@@ -230,7 +230,7 @@ ones sharing the head, and a first sample is never late. Watermarks outlive a fl
 and re-appends do not re-index.
 
 With `Config.DiskSeries`, immutable parts own historical identities and postings. Flush publication
-rebuilds resident metadata around active samples, with a fixed bloom filter and bounded watermark
+rebuilds resident metadata around active samples, with a bounded scalable bloom filter and bounded watermark
 cache. Historical cache misses probe parts before admission; distinct-series counts come from a
 streaming union after load, repair and retention, rather than sums of overlapping parts.
 

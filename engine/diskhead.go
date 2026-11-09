@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"math/bits"
 	"slices"
 
 	"github.com/go-faster/errors"
@@ -15,6 +16,7 @@ import (
 const defaultResidentHeadBytes = 128 << 20
 const diskHeadCacheEntries = 8192
 const diskHeadBloomWords = 1 << 17
+const diskHeadBloomMaxWords = 32 * diskHeadBloomWords
 
 type diskHeadEntry struct {
 	newest int64
@@ -24,7 +26,7 @@ type diskHeadEntry struct {
 type diskHeadState struct {
 	complete bool
 	count    int64
-	bloom    []uint64
+	bloom    diskHeadBloom
 	cache    map[signal.SeriesID]diskHeadEntry
 	order    []signal.SeriesID
 	next     int
@@ -32,25 +34,86 @@ type diskHeadState struct {
 }
 
 func newDiskHeadState() *diskHeadState {
-	return &diskHeadState{complete: true, bloom: make([]uint64, diskHeadBloomWords), cache: make(map[signal.SeriesID]diskHeadEntry)}
-}
-
-func (s *diskHeadState) note(id signal.SeriesID) {
-	for _, x := range []uint64{id.Lo, id.Hi, id.Lo ^ (id.Hi >> 17)} {
-		bit := x % uint64(len(s.bloom)*64)
-		s.bloom[bit/64] |= uint64(1) << (bit % 64)
+	return &diskHeadState{
+		complete: true,
+		bloom:    newDiskHeadBloom(diskHeadBloomWords, diskHeadBloomMaxWords),
+		cache:    make(map[signal.SeriesID]diskHeadEntry),
 	}
 }
 
-func (s *diskHeadState) mayContain(id signal.SeriesID) bool {
-	for _, x := range []uint64{id.Lo, id.Hi, id.Lo ^ (id.Hi >> 17)} {
-		bit := x % uint64(len(s.bloom)*64)
-		if s.bloom[bit/64]&(uint64(1)<<(bit%64)) == 0 {
-			return false
+type diskBloomSegment struct {
+	words    []uint64
+	inserted uint64
+}
+
+type diskHeadBloom struct {
+	segments               []diskBloomSegment
+	initialWords, maxWords int
+}
+
+func newDiskHeadBloom(initialWords, maxWords int) diskHeadBloom {
+	return diskHeadBloom{initialWords: initialWords, maxWords: maxWords}
+}
+
+func (b *diskHeadBloom) add(id signal.SeriesID) {
+	if len(b.segments) == 0 {
+		b.segments = append(b.segments, diskBloomSegment{words: make([]uint64, b.initialWords)})
+	}
+	last := &b.segments[len(b.segments)-1]
+	if last.inserted >= uint64(len(last.words)*64/10) && len(last.words) < b.maxWords {
+		b.segments = append(b.segments, diskBloomSegment{words: make([]uint64, min(2*len(last.words), b.maxWords))})
+		last = &b.segments[len(b.segments)-1]
+	}
+	h1, h2 := diskBloomHashes(id)
+	mask := uint64(len(last.words)*64 - 1)
+	for i := range uint64(4) {
+		bit := (h1 + i*h2) & mask
+		last.words[bit/64] |= uint64(1) << (bit % 64)
+	}
+	last.inserted++
+}
+
+func (b *diskHeadBloom) contains(id signal.SeriesID) bool {
+	h1, h2 := diskBloomHashes(id)
+	for _, segment := range b.segments {
+		mask := uint64(len(segment.words)*64 - 1)
+		found := true
+		for i := range uint64(4) {
+			bit := (h1 + i*h2) & mask
+			if segment.words[bit/64]&(uint64(1)<<(bit%64)) == 0 {
+				found = false
+				break
+			}
+		}
+		if found {
+			return true
 		}
 	}
-	return true
+	return false
 }
+
+func (b *diskHeadBloom) sizeBytes() int64 {
+	n := int64(cap(b.segments)) * 32
+	for _, segment := range b.segments {
+		n += int64(cap(segment.words)) * 8
+	}
+	return n
+}
+
+func diskBloomHashes(id signal.SeriesID) (uint64, uint64) {
+	return mixDiskBloom(id.Lo ^ bits.RotateLeft64(id.Hi, 17)), mixDiskBloom(id.Hi^bits.RotateLeft64(id.Lo, 31)^0x9e3779b97f4a7c15) | 1
+}
+
+func mixDiskBloom(x uint64) uint64 {
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	return x ^ (x >> 31)
+}
+
+func (s *diskHeadState) note(id signal.SeriesID)            { s.bloom.add(id) }
+func (s *diskHeadState) mayContain(id signal.SeriesID) bool { return s.bloom.contains(id) }
 
 func (s *diskHeadState) remember(id signal.SeriesID, newest int64) {
 	if _, ok := s.cache[id]; !ok {

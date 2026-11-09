@@ -425,3 +425,49 @@ func TestDiskHeadFailedPreloadReleasesBatchState(t *testing.T) {
 	require.Zero(t, e.Stats().HeadSamples)
 	require.EqualValues(t, 1, e.Stats().Series)
 }
+
+func TestDiskHeadBloomBoundedGrowth(t *testing.T) {
+	t.Parallel()
+	filter := newDiskHeadBloom(128, 2048)
+	require.Zero(t, filter.sizeBytes(), "empty tenant filters allocate lazily")
+	const admitted = 12000
+	for i := range admitted {
+		filter.add(signal.SeriesID{Lo: uint64(i)})
+	}
+	require.Greater(t, len(filter.segments), 1)
+	for i := range admitted {
+		require.True(t, filter.contains(signal.SeriesID{Lo: uint64(i)}), "growth never loses admitted IDs")
+	}
+	const probes = 20000
+	falsePositives := 0
+	for i := range probes {
+		if filter.contains(signal.SeriesID{Lo: uint64(admitted + i)}) {
+			falsePositives++
+		}
+	}
+	require.Less(t, falsePositives, probes/10, "growing filters keep cold ID probes selective")
+	// Exhaust the final segment without allocating beyond the configured geometric cap.
+	for i := admitted; i < 100000; i++ {
+		filter.add(signal.SeriesID{Lo: uint64(i)})
+	}
+	require.Len(t, filter.segments, 5)
+	require.LessOrEqual(t, filter.sizeBytes(), int64(32<<10))
+	for i := range 100000 {
+		require.True(t, filter.contains(signal.SeriesID{Lo: uint64(i)}))
+	}
+}
+
+func TestDiskHeadHistoricalRegistrationDoesNotFillBloom(t *testing.T) {
+	t.Parallel()
+	e := New(Config{Backend: backend.Memory(), Prefix: "bloom-head", DiskSeries: true})
+	s := benchSeries(1)
+	for i := range 4 {
+		ok, err := e.Append(s, int64(i), 1)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.NoError(t, e.Flush(t.Context()))
+	}
+	require.Len(t, e.head.disk.bloom.segments, 1)
+	require.EqualValues(t, 1, e.head.disk.bloom.segments[0].inserted)
+	require.EqualValues(t, 1, e.Stats().Series)
+}

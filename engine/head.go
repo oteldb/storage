@@ -116,7 +116,7 @@ func (h *head) identityBytes() int64 {
 		n += memsize.Map(h.nonStringLabels)
 	}
 	if h.disk != nil {
-		n += int64(cap(h.disk.bloom))*8 + int64(cap(h.disk.order))*16 + memsize.Map(h.disk.cache)
+		n += h.disk.bloom.sizeBytes() + int64(cap(h.disk.order))*16 + memsize.Map(h.disk.cache)
 	}
 	return n
 }
@@ -208,8 +208,8 @@ func (h *head) register(id signal.SeriesID, s signal.Series) {
 	if h.disk != nil {
 		if !historical.historical {
 			h.disk.count++
+			h.disk.note(id)
 		}
-		h.disk.note(id)
 		if historical.seen {
 			ref, _ := h.series.Ref(id)
 			h.slots.set(h.stateRefs[ref], historical.newest)
