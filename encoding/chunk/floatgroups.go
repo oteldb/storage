@@ -71,9 +71,9 @@ func (e *FloatGroupEncoder) EncodeGroupWithCost(dst []byte, values []float64, co
 	if group.codec == CodecNone {
 		return out, nil
 	}
+	// Encode retained both nonconstant candidates in the reusable scratch.
 	best := cost(out[start:])
 	if group.codec != CodecGorilla {
-		e.gorilla = EncodeFloats(e.gorilla[:0], values)
 		e.candidate = singleFloatGroup(e.candidate[:0], len(values), CodecGorilla, e.gorilla)
 		if n := cost(e.candidate); n < best {
 			out = append(out[:start], e.candidate...)
@@ -81,7 +81,6 @@ func (e *FloatGroupEncoder) EncodeGroupWithCost(dst []byte, values []float64, co
 		}
 	}
 	if group.codec != CodecDecimal {
-		e.decimal = encodeFloatsDecimal(e.decimal[:0], values, 64, &e.decimalWork)
 		var used int
 		e.decoded, used, err = DecodeFloatsDecimal(e.decoded[:0], e.decimal)
 		if err == nil && used == len(e.decimal) && equalFloatBits(values, e.decoded) {
