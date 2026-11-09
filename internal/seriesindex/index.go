@@ -52,19 +52,20 @@ type valuePosting struct {
 
 // Builder owns one output part's metadata. Callers include Bytes in their build admission.
 type Builder struct {
-	registry                   *series.Index
-	records                    []record
-	names                      map[string]*namePosting
-	values                     map[string]*valuePosting
-	bytes                      int64
-	canonicalScratch           []byte
-	parentDigest               [32]byte
-	encodedRaw, encodedRecords int64
+	registry                     *series.Index
+	records                      []record
+	names                        map[string]*namePosting
+	values                       map[string]*valuePosting
+	bytes                        int64
+	canonicalScratch             []byte
+	valueScratch, postingScratch []byte
+	parentDigest                 [32]byte
+	encodedRaw, encodedRecords   int64
 }
 
 // Bytes bounds retained metadata and sorting/directory scratch during writing.
 func (b *Builder) Bytes() int64 {
-	n := b.bytes + int64(cap(b.canonicalScratch))
+	n := b.bytes + int64(cap(b.canonicalScratch)) + int64(cap(b.valueScratch)) + int64(cap(b.postingScratch))
 	if b.registry != nil {
 		n += b.registry.SizeBytes()
 	}
@@ -372,16 +373,19 @@ func (b *Builder) addLabel(ref uint32, name []byte, value signal.Value) {
 		n.refs = append(n.refs, ref)
 		b.bytes += int64(cap(n.refs)-prior) * 4
 	}
-	key := appendEscaped([]byte{'p'}, name)
-	nameBytes := len(key)
-	key = appendEscaped(key, signal.AppendValue(nil, value))
-	b.encodedRaw = buildbudget.Add(b.encodedRaw, 2*int64(nameBytes)+int64(len(key))+129)
+	b.valueScratch = signal.AppendValue(b.valueScratch[:0], value)
+	b.postingScratch = append(b.postingScratch[:0], 'p')
+	b.postingScratch = appendEscaped(b.postingScratch, name)
+	nameBytes := len(b.postingScratch)
+	b.postingScratch = appendEscaped(b.postingScratch, b.valueScratch)
+	b.encodedRaw = buildbudget.Add(b.encodedRaw, 2*int64(nameBytes)+int64(len(b.postingScratch))+129)
 	b.encodedRecords = buildbudget.Add(b.encodedRecords, 3)
-	p := b.values[string(key)]
+	// Keep the lookup conversion temporary; only newly stored keys own a copy.
+	p := b.values[string(b.postingScratch)]
 	if p == nil {
-		p = &valuePosting{key: string(key)}
+		p = &valuePosting{key: string(b.postingScratch)}
 		b.values[p.key] = p
-		b.bytes += int64(len(key)) + memsize.MapEntry[string, *valuePosting]() + memsize.Of[valuePosting]()
+		b.bytes += int64(len(b.postingScratch)) + memsize.MapEntry[string, *valuePosting]() + memsize.Of[valuePosting]()
 	}
 	if len(p.refs) > 0 && p.refs[len(p.refs)-1] == ref {
 		return
