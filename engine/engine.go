@@ -171,6 +171,9 @@ type Config struct {
 	MetricSeriesChunks bool
 	// DiskSeries stores historical identities/postings in immutable per-part indexes.
 	DiskSeries bool
+	// ResidentHeadBytes flushes disk-indexed heads under memory pressure. Zero uses 128 MiB.
+	// One atomic caller batch may exceed the target and flushes before the next write.
+	ResidentHeadBytes int64
 	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
 	// still has it, and says whether the part is gone from every owner. The cluster layer supplies
 	// it over its transport; a single-node store supplies one that fetches nothing and answers for
@@ -385,6 +388,12 @@ var _ fetch.Fetcher = (*Engine)(nil)
 
 // New returns an engine with an empty head.
 func New(cfg Config) *Engine {
+	if cfg.DiskSeries {
+		cfg.RecentWindow = 0
+		if cfg.ResidentHeadBytes <= 0 {
+			cfg.ResidentHeadBytes = defaultResidentHeadBytes
+		}
+	}
 	if cfg.Obs == nil {
 		cfg.Obs = obs.NewNop()
 	}
@@ -405,6 +414,9 @@ func New(cfg Config) *Engine {
 		e.putF64(b.Values)
 	}
 
+	if cfg.DiskSeries {
+		e.head.disk = newDiskHeadState()
+	}
 	e.walB = newWALBatch()
 
 	if cfg.WAL != nil {
@@ -444,10 +456,19 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 		return false, err
 	}
 
+	if err := e.flushResidentHead(); err != nil {
+		return false, err
+	}
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
-
-	if e.cfg.WAL == nil {
+	if err := e.flushResidentHeadLocked(); err != nil {
+		return false, err
+	}
+	if err := e.preloadDiskSeriesLocked([]signal.SeriesID{s.Hash()}); err != nil {
+		return false, err
+	}
+	defer e.clearDiskPendingLocked()
+	if e.cfg.WAL == nil && !e.cfg.DiskSeries {
 		_, accepted, _ := e.head.append(s, ts, value, e.cfg.OOOWindow)
 
 		return accepted, nil
@@ -486,6 +507,9 @@ func (e *Engine) AppendBatch(
 		return AppendResult{}, err
 	}
 
+	if err := e.flushResidentHead(); err != nil {
+		return AppendResult{}, err
+	}
 	eligible := e.cfg.WAL != nil && (limits.Overflow == nil || limits.MaxSeriesSoft <= 0) &&
 		len(ids) >= minPreparedBatchSamples && len(ids) <= maxPreparedBatchSamples
 	if !eligible || !e.mu.TryLockWriter() {
@@ -499,7 +523,13 @@ func (e *Engine) AppendBatch(
 		e.mu.LockWriter()
 	}
 	defer e.mu.UnlockWriter()
-
+	if err := e.flushResidentHeadLocked(); err != nil {
+		return AppendResult{}, err
+	}
+	if err := e.preloadDiskSeriesLocked(ids); err != nil {
+		return AppendResult{}, err
+	}
+	defer e.clearDiskPendingLocked()
 	// One closure for the whole run (not one per point): bi selects the current sample for
 	// the lazy materializer, which fires only on a newly-seen series.
 	var bi int
@@ -508,8 +538,9 @@ func (e *Engine) AppendBatch(
 
 	var res AppendResult
 
-	if e.cfg.WAL != nil {
+	if e.cfg.WAL != nil || e.cfg.DiskSeries {
 		defer e.walB.reset()
+		limits = e.diskOverflowLimits(limits, e.walB, false)
 		err := e.mu.WithReaders(func() error {
 			var err error
 			res, err = e.stageWALBatch(ids, ts, values, sf, materialize, limits)
@@ -619,7 +650,7 @@ func (e *Engine) Stats() Stats {
 	request := e.retentionRequest()
 	s := Stats{
 		RetainFrom: request.Cutoff, RetentionBoundBy: request.Bound,
-		Series:        int64(e.head.series.Len()),
+		Series:        e.diskSeriesCountLocked(),
 		OutOfSpace:    e.space.Exhausted(),
 		HeadBytes:     e.head.inFlightBytes(),
 		HeadSamples:   e.head.bytes / SampleBytes,
@@ -1409,6 +1440,9 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.head.memory.release()
 	e.head.frozenMemory.release()
 	e.head = newHead()
+	if e.cfg.DiskSeries {
+		e.head.disk = newDiskHeadState()
+	}
 	e.identityOrder.reset()
 	e.flushing = nil        // discarded with the head: Reset drops the samples, it does not flush them
 	e.identityDirty = false // nothing is left to prune
@@ -1496,12 +1530,20 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 		return nil, AppendResult{}, err
 	}
 
+	if err = e.flushResidentHead(); err != nil {
+		return nil, AppendResult{}, err
+	}
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
+	if err = e.flushResidentHeadLocked(); err != nil {
+		return nil, AppendResult{}, err
+	}
+	defer e.clearDiskPendingLocked()
 
 	// Decided into the staged batch, logged, then applied, as a durable AppendBatch is: an error leaves
 	// the head untouched (see [walBatch]).
 	defer e.walB.reset()
+	limits = e.diskOverflowLimits(limits, e.walB, true)
 
 	byID := make(map[signal.SeriesID]signal.Series)
 
@@ -1526,6 +1568,9 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 
 	if err := wal.Replay(data, wal.Handlers{
 		OnSeries: func(id signal.SeriesID, s signal.Series) error {
+			if err := e.preloadOneDiskSeriesLocked(id); err != nil {
+				return err
+			}
 			byID[id] = s
 
 			return nil
@@ -1562,9 +1607,19 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 // replicas hold identical data. A replica holds the unflushed head this way; after a flush the
 // shared object store reconciles them. Safe for concurrent use.
 func (e *Engine) ApplyReplicated(data []byte) error {
+	if err := e.flushResidentHead(); err != nil {
+		return err
+	}
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
 
+	if e.cfg.DiskSeries {
+		if err := e.flushResidentHeadLocked(); err != nil {
+			return err
+		}
+		defer e.clearDiskPendingLocked()
+		return e.applyDiskReplicatedLocked(data)
+	}
 	return wal.Replay(data, e.replayHandlers())
 }
 
@@ -1587,7 +1642,7 @@ func (e *Engine) SeriesCount() int {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	return e.head.series.Len()
+	return int(e.diskSeriesCountLocked())
 }
 
 func (e *Engine) observeFlush(ctx context.Context, flush func(context.Context) (int, int64, error)) error {
@@ -1740,6 +1795,7 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 	e.head.frozenMemory = sampleArena{}
 	e.head.detachedBytes = 0
 	e.head.detachedKnown = false
+	e.compactDiskHeadLocked()
 	if err == nil {
 		err = e.checkpointLocked(checkpointSeq)
 	}
@@ -2077,17 +2133,32 @@ func bufHasInWindow(buf *sampleBuf, start, end int64) bool {
 // durable-restart [Engine.Replay] and the trusting [Engine.ApplyReplicated]. The caller holds e.mu.
 func (e *Engine) replayHandlers() wal.Handlers {
 	return wal.Handlers{
-		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
+		OnSeries: func(id signal.SeriesID, s signal.Series) error {
+			if e.cfg.DiskSeries {
+				if err := e.replayResidentGuard(0); err != nil {
+					return err
+				}
+				if err := e.preloadOneDiskSeriesLocked(id); err != nil {
+					return err
+				}
+			}
 			e.head.registerSeries(s)
+			e.clearDiskPendingLocked()
 
 			return nil
 		},
 		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
+			if err := e.replayResidentGuard(len(ts)); err != nil {
+				return err
+			}
 			e.head.replaySamples(id, ts, values)
 
 			return nil
 		},
 		OnSamplesSF: func(id signal.SeriesID, ts []int64, values, sf []float64) error {
+			if err := e.replayResidentGuard(len(ts)); err != nil {
+				return err
+			}
 			e.head.replaySamplesSF(id, ts, values, sf)
 
 			return nil

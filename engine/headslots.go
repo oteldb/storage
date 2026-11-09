@@ -134,16 +134,24 @@ func (s *headBuffers) sizeBytes() int64 {
 }
 
 type headSeriesState struct {
-	buffer *sampleBuf
-	newest int64
-	ref    uint32
-	seen   bool
-	known  bool
+	historical bool
+	buffer     *sampleBuf
+	newest     int64
+	ref        uint32
+	seen       bool
+	known      bool
 }
 
 func (h *head) seriesState(id signal.SeriesID) headSeriesState {
 	ref, ok := h.series.Ref(id)
 	if !ok {
+		if h.disk != nil {
+			entry, ok := h.disk.pending[id]
+			if !ok {
+				entry = h.disk.cache[id]
+			}
+			return headSeriesState{newest: entry.newest, seen: entry.exists, historical: entry.exists}
+		}
 		return headSeriesState{}
 	}
 	slot := h.stateRefs[ref]

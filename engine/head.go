@@ -25,6 +25,7 @@ var (
 // plus per-series sample buffers in arrival order (sorted on read). It is not safe for
 // concurrent use; the [Engine] holds the lock.
 type head struct {
+	disk                         *diskHeadState
 	sym                          *symbols.Table
 	series                       *series.Index
 	post                         *postings.Dense
@@ -114,6 +115,9 @@ func (h *head) identityBytes() int64 {
 	if h.nonStringLabels != nil {
 		n += memsize.Map(h.nonStringLabels)
 	}
+	if h.disk != nil {
+		n += int64(cap(h.disk.bloom))*8 + int64(cap(h.disk.order))*16 + memsize.Map(h.disk.cache)
+	}
 	return n
 }
 
@@ -196,9 +200,20 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 
 // register records and indexes an identity known not to be present.
 func (h *head) register(id signal.SeriesID, s signal.Series) {
+	historical := h.seriesState(id)
 	h.registerIndex(id, s)
 	for len(h.stateRefs) < h.series.Len() {
 		h.stateRefs = append(h.stateRefs, h.slots.alloc())
+	}
+	if h.disk != nil {
+		if !historical.historical {
+			h.disk.count++
+		}
+		h.disk.note(id)
+		if historical.seen {
+			ref, _ := h.series.Ref(id)
+			h.slots.set(h.stateRefs[ref], historical.newest)
+		}
 	}
 }
 
@@ -316,7 +331,7 @@ func (h *head) appendByID(
 func (h *head) admitNew(
 	id signal.SeriesID, ts int64, value, sf float64, limits AppendLimits, materialize func() signal.Series,
 ) (out admitOutcome, effID signal.SeriesID, isNew bool, s signal.Series, done bool) {
-	cardinality := int64(h.series.Len())
+	cardinality := h.cardinality()
 
 	// Hard ceiling: reject a new series that would exceed MaxSeries. Existing series are never
 	// blocked, so a query keeps returning what is already admitted.

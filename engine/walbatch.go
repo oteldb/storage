@@ -24,10 +24,11 @@ const maxWALIdentityAttributes = 4096
 // starting a buffer) rather than one frame per sample, and it is reused across writes under the engine
 // lock, keeping its buffers' capacity, so a steady-state durable append allocates nothing here.
 type walBatch struct {
-	order []signal.SeriesID       // series in first-admitted order; order[k] ↔ accs[k]
-	pos   map[signal.SeriesID]int // id → its index in order/accs (for this write only)
-	accs  []walSeriesAcc
-	attrs signal.Attributes
+	lookupErr error
+	order     []signal.SeriesID       // series in first-admitted order; order[k] ↔ accs[k]
+	pos       map[signal.SeriesID]int // id → its index in order/accs (for this write only)
+	accs      []walSeriesAcc
+	attrs     signal.Attributes
 
 	// samples is the admitted sample count and registered the new identities the write registers; both
 	// are what [head.appendByID] would have added to the head's in-flight bytes and series count.
@@ -44,6 +45,7 @@ type walBatch struct {
 }
 
 type walSeriesAcc struct {
+	historical  bool
 	isNew       bool // the series starts a buffer, so its identity record is logged
 	register    bool // the identity is not in the head's index yet
 	knownRef    bool
@@ -108,7 +110,7 @@ func (b *walBatch) admit(
 		newest, seen = state.newest, state.seen
 	}
 	acc := walSeriesAcc{buffer: state.buffer, priorNewest: newest, hadNewest: seen,
-		identityRef: state.ref, knownRef: state.known}
+		identityRef: state.ref, knownRef: state.known, historical: state.historical}
 	if acc.buffer != nil {
 		b.add(b.start(id, acc), ts, value, sf)
 		return admitted
@@ -119,12 +121,12 @@ func (b *walBatch) admit(
 		return admitted
 	}
 
-	cardinality := int64(h.series.Len() + b.registered)
-	if limits.MaxSeries > 0 && cardinality >= limits.MaxSeries {
+	cardinality := h.cardinality() + int64(b.registered)
+	if !state.historical && limits.MaxSeries > 0 && cardinality >= limits.MaxSeries {
 		return rejectCardinality
 	}
 
-	if limits.Overflow != nil && limits.MaxSeriesSoft > 0 && cardinality >= limits.MaxSeriesSoft {
+	if !state.historical && limits.Overflow != nil && limits.MaxSeriesSoft > 0 && cardinality >= limits.MaxSeriesSoft {
 		ov := limits.Overflow(materialize())
 		oid := ov.Hash()
 		if k, ok := b.pos[oid]; ok {
@@ -132,7 +134,7 @@ func (b *walBatch) admit(
 		} else {
 			state := h.seriesState(oid)
 			a := walSeriesAcc{buffer: state.buffer, priorNewest: state.newest, hadNewest: state.seen,
-				identityRef: state.ref, knownRef: state.known}
+				identityRef: state.ref, knownRef: state.known, historical: state.historical}
 			a.isNew = a.buffer == nil
 			if a.isNew {
 				a.register, a.series = !a.knownRef, ov
@@ -166,7 +168,7 @@ func (b *walBatch) start(id signal.SeriesID, acc walSeriesAcc) int {
 	} else {
 		b.accs = append(b.accs, acc)
 	}
-	if acc.register {
+	if acc.register && !acc.historical {
 		b.registered++
 	}
 	b.relog = b.relog || (acc.isNew && !acc.register)
@@ -209,6 +211,9 @@ func (e *Engine) flushBatchWALLocked(b *walBatch, everySeries bool) error {
 }
 
 func (e *Engine) encodeWriteBatch(b *walBatch, everySeries bool) error {
+	if b.lookupErr != nil {
+		return b.lookupErr
+	}
 	view := b.encodingView(e.head, everySeries)
 	if err := b.encode(view, everySeries); err != nil {
 		return err
@@ -315,9 +320,7 @@ func (b *walBatch) apply(h *head) {
 		}
 
 		h.grow(int64(len(a.ts)) * SampleBytes)
-		if !a.hadNewest || a.newest > a.priorNewest {
-			h.slots.set(h.stateRefs[ref], a.newest)
-		}
+		h.slots.set(h.stateRefs[ref], a.admissionNewest())
 		h.newest = max(h.newest, a.newest)
 	}
 
@@ -327,6 +330,7 @@ func (b *walBatch) apply(h *head) {
 }
 
 func (b *walBatch) reset() {
+	b.lookupErr = nil
 	clear(b.attrs[:cap(b.attrs)])
 	if cap(b.attrs) > maxWALIdentityAttributes {
 		b.attrs = nil

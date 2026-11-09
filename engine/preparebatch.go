@@ -144,6 +144,13 @@ func (e *Engine) appendPreparedLocked(
 	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series, limits AppendLimits,
 	p *preparedBatch,
 ) (AppendResult, error) {
+	if err := e.flushResidentHeadLocked(); err != nil {
+		return AppendResult{}, err
+	}
+	if err := e.preloadDiskSeriesLocked(ids); err != nil {
+		return AppendResult{}, err
+	}
+	defer e.clearDiskPendingLocked()
 	var res AppendResult
 	err := e.mu.WithReaders(func() error {
 		var err error
@@ -228,11 +235,11 @@ func (p *preparedBatch) admit(
 		newest, seen = state.newest, state.seen
 	}
 	acc := walSeriesAcc{buffer: state.buffer, priorNewest: newest, hadNewest: seen,
-		identityRef: state.ref, knownRef: state.known}
+		identityRef: state.ref, knownRef: state.known, historical: state.historical}
 	if acc.buffer == nil {
 		acc.isNew = true
 		if !acc.knownRef {
-			if limits.MaxSeries > 0 && int64(h.series.Len()+b.registered) >= limits.MaxSeries {
+			if !state.historical && limits.MaxSeries > 0 && h.cardinality()+int64(b.registered) >= limits.MaxSeries {
 				return rejectCardinality
 			}
 			acc.register, acc.series = true, materialize()
@@ -246,7 +253,7 @@ func (p *preparedBatch) admit(
 	acc.values = p.values[g.offset:g.offset:end]
 	acc.sf = p.sf[g.offset:g.offset:end]
 	b.accs[k] = acc
-	if acc.register {
+	if acc.register && !acc.historical {
 		b.registered++
 	}
 	b.relog = b.relog || (acc.isNew && !acc.register)
