@@ -168,6 +168,9 @@ func (sw *SegmentWriter) Epoch() uint64 { return sw.epoch }
 // but not necessarily a power loss).
 func (sw *SegmentWriter) SetSync(on bool) { sw.sync = on }
 
+// SyncOnWrite reports whether each framed write fsyncs. Callers own synchronization.
+func (sw *SegmentWriter) SyncOnWrite() bool { return sw.sync }
+
 // SetEpoch stamps subsequent segments with epoch (a flush generation). Because [SegmentWriter.Checkpoint]
 // closes the current segment without opening a new one, the next write starts a segment carrying the
 // epoch set here — so each segment self-describes the generation of its records, and
