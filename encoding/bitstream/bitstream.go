@@ -151,11 +151,29 @@ func (w *Writer) WriteBits(u uint64, nbits int) {
 		w.count = 0
 	}
 
-	// Write whole bytes directly.
-	for nbits >= 8 {
-		w.stream = append(w.stream, byte(u>>56))
-		u <<= 8
-		nbits -= 8
+	// Copy multi-byte fields in one append; keep single-byte fields direct.
+	if nbits >= 8 {
+		switch {
+		case nbits < 16:
+			w.stream = append(w.stream, byte(u>>56))
+			u <<= 8
+			nbits -= 8
+		case nbits < 24:
+			w.stream = append(w.stream, byte(u>>56), byte(u>>48))
+			u <<= 16
+			nbits -= 16
+		case nbits < 32:
+			w.stream = append(w.stream, byte(u>>56), byte(u>>48), byte(u>>40))
+			u <<= 24
+			nbits -= 24
+		default:
+			var whole [8]byte
+			binary.BigEndian.PutUint64(whole[:], u)
+			count := nbits / 8
+			w.stream = append(w.stream, whole[:count]...)
+			u <<= uint(count * 8)
+			nbits -= count * 8
+		}
 	}
 
 	// Trailing partial byte: start a new byte, high-justified.
