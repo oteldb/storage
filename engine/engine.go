@@ -1530,12 +1530,12 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 		return nil, AppendResult{}, err
 	}
 
-	if err = e.flushResidentHead(); err != nil {
+	if err := e.flushResidentHead(); err != nil {
 		return nil, AppendResult{}, err
 	}
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
-	if err = e.flushResidentHeadLocked(); err != nil {
+	if err := e.flushResidentHeadLocked(); err != nil {
 		return nil, AppendResult{}, err
 	}
 	defer e.clearDiskPendingLocked()

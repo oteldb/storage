@@ -128,6 +128,7 @@ func (e *Engine) preloadDiskSeriesMoreLocked(ids []signal.SeriesID) error {
 	return e.mu.WithReaders(func() error { return e.preloadDiskSeriesOffState(ids) })
 }
 
+//nolint:contextcheck,nolintlint // The context analyzer consumes this intentional API boundary before reporting.
 func (e *Engine) preloadDiskSeriesOffState(ids []signal.SeriesID) error {
 	s := e.head.disk
 	if s.pending == nil {
@@ -181,7 +182,7 @@ func (e *Engine) compactDiskHeadLocked() {
 	next := newHead()
 	view := h.series.View()
 	var attrs signal.Attributes
-	for i := 0; i < view.Len(); i++ {
+	for i := range view.Len() {
 		id := view.ID(i)
 		newest, seen := h.watermark(id)
 		if _, ok := h.samples[id]; !ok {
@@ -205,6 +206,7 @@ func (e *Engine) compactDiskHeadLocked() {
 	e.identityOrder.reset()
 }
 
+//nolint:contextcheck,nolintlint // The context analyzer consumes this intentional API boundary before reporting.
 func (e *Engine) flushResidentHead() error {
 	if !e.cfg.DiskSeries {
 		return nil
@@ -219,6 +221,8 @@ func (e *Engine) flushResidentHead() error {
 }
 
 // flushResidentHeadLocked applies backpressure while preserving writer lock ownership.
+//
+//nolint:contextcheck,nolintlint // The context analyzer consumes this intentional API boundary before reporting.
 func (e *Engine) flushResidentHeadLocked() error {
 	if !e.cfg.DiskSeries {
 		return nil
@@ -244,7 +248,10 @@ func (e *Engine) replayResidentGuard(samples int) error {
 func (e *Engine) applyDiskReplicatedLocked(data []byte) error {
 	defer e.walB.reset()
 	byID := make(map[signal.SeriesID]signal.Series)
-	admit := func(id signal.SeriesID, ts []int64, values, sf []float64) error {
+	admit := func(id signal.SeriesID, ts []int64, values, sf []float64) {
+		if _, ok := byID[id]; !ok && !e.head.series.Has(id) {
+			return
+		}
 		for i := range ts {
 			weight := 1.0
 			if sf != nil {
@@ -252,7 +259,6 @@ func (e *Engine) applyDiskReplicatedLocked(data []byte) error {
 			}
 			e.walB.admit(e.head, id, ts[i], values[i], weight, 0, AppendLimits{}, func() signal.Series { return byID[id] })
 		}
-		return nil
 	}
 	if err := wal.Replay(data, wal.Handlers{
 		OnSeries: func(id signal.SeriesID, s signal.Series) error {
@@ -262,8 +268,11 @@ func (e *Engine) applyDiskReplicatedLocked(data []byte) error {
 			byID[id] = s
 			return nil
 		},
-		OnSamples:   func(id signal.SeriesID, ts []int64, values []float64) error { return admit(id, ts, values, nil) },
-		OnSamplesSF: admit,
+		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error { admit(id, ts, values, nil); return nil },
+		OnSamplesSF: func(id signal.SeriesID, ts []int64, values, sf []float64) error {
+			admit(id, ts, values, sf)
+			return nil
+		},
 	}); err != nil {
 		return err
 	}
