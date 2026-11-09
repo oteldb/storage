@@ -3,6 +3,9 @@ package metric
 import "github.com/oteldb/storage/signal"
 
 func (p *projector) projectPoints(b *Batch, points []NumberPoint) {
+	if len(points) >= 4 && p.projectRepeatedPoints(b, points) {
+		return
+	}
 	// Probe once: repeatedly comparing unrelated identities costs more than hashing them.
 	if len(points) < 2 || (!sameAttributeStorage(points[0].Attributes, points[1].Attributes) &&
 		!points[0].Attributes.Equal(points[1].Attributes)) {

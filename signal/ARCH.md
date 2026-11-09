@@ -45,6 +45,10 @@ once per metric in sorted-key order. Series-shaped metrics reuse an ID across po
 immutable attribute vector; an initially uniform run also recognizes equal independent copies.
 A single initial probe keeps clearly mixed metrics on the independent hashing loop; after the
 first identity change, the run path only reuses shared vectors, avoiding repeated deep comparisons.
+Initially periodic two/four-vector inputs use a four-entry, stack-local identity cache keyed by
+attribute backing storage and length. It is scoped to one metric's projection, so resource/scope
+or descriptor changes cannot reuse an old identity. Sixteen consecutive misses disable the cache;
+unrelated inputs retain independent hashing without a map or extra allocations.
 Reuse is scoped to one metric and one projection; no ID survives a resource/scope/metric boundary.
 Other points merge their sorted attributes in one pass — never materializing a combined sorted
 `[]KeyValue`. The result is byte-identical to the reference materialization (fuzz-pinned), which
