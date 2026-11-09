@@ -40,6 +40,11 @@ func TestDiskMetricMatchersDuplicateSources(t *testing.T) {
 					require.NoError(t, ref.LoadPartsReadOnly(t.Context()))
 					require.NoError(t, e.LoadPartsReadOnly(t.Context()))
 				}
+				want, err := ref.LabelValues(t.Context(), fetch.Request{Start: 0, End: 20}, []byte("zone"))
+				require.NoError(t, err)
+				got, err := e.LabelValues(t.Context(), fetch.Request{Start: 0, End: 20}, []byte("zone"))
+				require.NoError(t, err)
+				require.Equal(t, want, got, "unfiltered values disk=%v phase=%d", disk, phase)
 				for _, value := range sources {
 					spec := fetch.EqualMatcher{Name: "zone", Value: string(value.AppendText(nil))}
 					r := fetch.Request{Start: 0, End: 20, Matchers: []fetch.Matcher{{Name: []byte("zone"), Match: spec.Predicate(), Spec: &spec}}}

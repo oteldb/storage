@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"slices"
 
@@ -89,6 +90,31 @@ func (c *diskLabelCollector) project(s signal.Series) error {
 	return err
 }
 
+// Broad dictionaries expose every OTel source's values, while filtered projections use precedence.
+func (c *diskLabelCollector) projectBroad(s signal.Series) error {
+	if !c.values {
+		return c.project(s)
+	}
+	for _, attrs := range [3]signal.Attributes{s.Resource.Attributes, s.Scope.Attributes, s.Attributes} {
+		for _, kv := range attrs {
+			if bytes.Equal(kv.Key, c.name) {
+				if err := c.addValue(kv.Value); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if bytes.Equal(c.name, labelScopeName) && len(s.Scope.Name) > 0 {
+		if err := c.addValue(signal.StringValue(s.Scope.Name)); err != nil {
+			return err
+		}
+	}
+	if bytes.Equal(c.name, labelScopeVersion) && len(s.Scope.Version) > 0 {
+		return c.addValue(signal.StringValue(s.Scope.Version))
+	}
+	return nil
+}
+
 func (c *diskLabelCollector) collectMatched(ctx context.Context) error {
 	p := c.plan
 	for _, pt := range p.liveParts {
@@ -122,7 +148,7 @@ func (e *Engine) captureDiskLabelHead(ctx context.Context, r fetch.Request, c *d
 				continue
 			}
 			if s, ok := e.head.series.Get(id); ok {
-				if err := c.project(s); err != nil {
+				if err := c.projectBroad(s); err != nil {
 					return err
 				}
 			}
@@ -160,7 +186,7 @@ func (c *diskLabelCollector) collectPart(ctx context.Context, r fetch.Request, p
 		if err != nil {
 			return err
 		}
-		return c.project(s)
+		return c.projectBroad(s)
 	})
 }
 
