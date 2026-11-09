@@ -279,12 +279,16 @@ func InMemory(opts ...Option) (*Storage, error) {
 
 // Close releases all resources. It is idempotent. After [Close], every method on s
 // returns [ErrClosed].
-func (s *Storage) Close(ctx context.Context) error {
+func (s *Storage) Close(ctx context.Context) (retErr error) {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
 
-	s.obs.Logger(ctx).Debug("storage closing")
+	ctx = obs.WithShutdown(ctx)
+	log := s.obs.Logger(ctx).With(zap.String("component", "storage"))
+	done := obs.ShutdownPhase(ctx, log, "storage_close")
+	defer func() { done(retErr) }()
+	maintenanceDone := obs.ShutdownPhase(ctx, log, "maintenance_workers")
 
 	if s.stopCh != nil {
 		close(s.stopCh)
@@ -294,6 +298,8 @@ func (s *Storage) Close(ctx context.Context) error {
 		s.wg.Wait()
 	}
 
+	maintenanceDone(nil)
+
 	// Final flush: drain every engine's head to a durable part.
 	var firstErr error
 
@@ -301,12 +307,17 @@ func (s *Storage) Close(ctx context.Context) error {
 	// is any tenure's, and the engine closes below would leave every head to the WAL, to be flushed
 	// again by whichever node replays or re-replicates it.
 	if s.cluster != nil && !s.opts.ReadOnly {
+		phaseDone := obs.ShutdownPhase(ctx, log, "flush_owned")
 		firstErr = s.flushOwned(ctx)
+		phaseDone(firstErr)
 	}
 
 	// Leave the cluster first (revoke lease, stop the replica server) so peers stop routing here.
 	if s.cluster != nil {
-		if err := s.cluster.close(ctx); err != nil && firstErr == nil {
+		phaseDone := obs.ShutdownPhase(ctx, log, "cluster_close")
+		err := s.cluster.close(ctx)
+		phaseDone(err)
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -314,7 +325,10 @@ func (s *Storage) Close(ctx context.Context) error {
 	// A read-only store has no head to drain and no WAL to close, and closing an engine flushes —
 	// so skipping the engine closes is what keeps [Options.ReadOnly]'s promise at the last step.
 	if !s.opts.ReadOnly {
-		if err := s.closeEngines(ctx); err != nil && firstErr == nil {
+		phaseDone := obs.ShutdownPhase(ctx, log, "close_engines")
+		err := s.closeEngines(ctx)
+		phaseDone(err)
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -1444,6 +1458,9 @@ func (s *Storage) maintainOneEngine(
 // Per-engine flush ownership serializes the two workers' flushes.
 func (s *Storage) runMaintenance(ctx context.Context, interval time.Duration) {
 	defer s.wg.Done()
+	defer func() {
+		s.obs.Logger(ctx).Info("maintenance worker stopped", zap.String("worker", "runMaintenance"), zap.NamedError("context_error", ctx.Err()))
+	}()
 
 	t := time.NewTicker(interval)
 	defer t.Stop()

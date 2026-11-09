@@ -15,6 +15,17 @@ tenant normalizes to `"default"`.
 
 ## Observe
 
+### Shutdown logging
+
+`Close` logs phase starts and completions at info level, including elapsed time,
+context deadline/remaining budget, and cancellation or operation errors. Engine logs
+identify `prefix` and `signal`. Failed phases are warnings. Maintenance drain,
+cluster departure, final flush admission/snapshot/build/write/publish/checkpoint,
+lock acquisition, WAL close, and reclamation are distinguished. The last phase
+start without a completion identifies work still running when the embedder exits.
+Normal maintenance flushes do not emit these phase logs. Cancellation-triggered
+rollback logs its cleanup phase even when the flush began before shutdown.
+
 Backend read-cache statistics include whole objects and immutable index pages in one byte budget.
 `CacheStats.Items` counts cache entries, including pages; `Bytes` counts their retained value bytes.
 
