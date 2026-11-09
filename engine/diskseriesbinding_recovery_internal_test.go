@@ -127,7 +127,7 @@ func TestDiskSeriesWholePartCopyPreservesBinding(t *testing.T) {
 	require.True(t, found)
 	require.EqualValues(t, 20, meta.Covered)
 	require.True(t, meta.HasStats)
-	require.Equal(t, float64(30), meta.Stats.Sum)
+	require.InDelta(t, 30, meta.Stats.Sum, 0)
 	it, err := reader.Fetch(ctx, fetch.Request{Start: 0, End: 30})
 	require.NoError(t, err)
 	rows, err := fetch.Drain(ctx, it)

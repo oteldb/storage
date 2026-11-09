@@ -525,25 +525,33 @@ func DecodeManifest(src []byte) (Manifest, error) {
 		m.Columns = append(m.Columns, c)
 	}
 
-	// Optional, in order: absent in a manifest written before they existed, which reads as 0.
-	if diskBytes, err := r.ReadUvarint(); err == nil {
-		if m.DiskBytes, err = toInt64(diskBytes, "diskBytes"); err != nil {
-			return Manifest{}, err
-		}
-
-		if raw, err := r.ReadUvarint(); err == nil {
-			if m.RawBytes, err = toInt64(raw, "rawBytes"); err != nil {
-				return Manifest{}, err
-			}
-
-			if !decodeBindingNonce(r, &m.BindingNonce) {
-				m.Rollup = decodeRollup(r)
-				decodeBindingNonce(r, &m.BindingNonce)
-			}
-		}
+	if err := m.decodeTrailer(r); err != nil {
+		return Manifest{}, err
 	}
-
 	return m, nil
+}
+
+// Optional fields are ordered; absent sizing fields read as zero.
+func (m *Manifest) decodeTrailer(r *bitstream.Reader) error {
+	diskBytes, err := r.ReadUvarint()
+	if err != nil {
+		return nil
+	}
+	if m.DiskBytes, err = toInt64(diskBytes, "diskBytes"); err != nil {
+		return err
+	}
+	raw, err := r.ReadUvarint()
+	if err != nil {
+		return nil
+	}
+	if m.RawBytes, err = toInt64(raw, "rawBytes"); err != nil {
+		return err
+	}
+	if !decodeBindingNonce(r, &m.BindingNonce) {
+		m.Rollup = decodeRollup(r)
+		decodeBindingNonce(r, &m.BindingNonce)
+	}
+	return nil
 }
 
 // encodeTrailer writes the optional fields that follow the column descriptors.
