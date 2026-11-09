@@ -58,6 +58,7 @@ func (p *batchPreparations) release(b *preparedBatch) {
 	clear(b.next[:cap(b.next)])
 	clear(b.created[:cap(b.created)])
 	b.warm = false
+	b.commit = preparedCommit{}
 	p.free <- b
 	<-p.active
 }
@@ -84,6 +85,7 @@ type preparedBatch struct {
 	refs      []uint32
 	masks     []reservationMask
 	maskOrder []uint32
+	commit    preparedCommit
 }
 
 func (p *preparedBatch) prepare(ids []signal.SeriesID) {

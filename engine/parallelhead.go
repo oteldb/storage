@@ -17,11 +17,13 @@ type parallelHeadHooks struct {
 	owned         func()
 	beforeWAL     func()
 	beforePublish func()
+	queued        func()
 	fallback      func()
 }
 
 type parallelHead struct {
 	reservations publicationReservations
+	commits      commitQueue
 	walMu        sync.Mutex
 	pending      atomic.Int64
 	hooks        *parallelHeadHooks
@@ -102,22 +104,10 @@ func (e *Engine) appendKnownPrepared(
 	if err := p.batch.encode(p.batch.encodingView(e.head, false), false); err != nil {
 		return AppendResult{}, true, err
 	}
-	ph.walMu.Lock()
-	defer ph.walMu.Unlock()
-	if ph.hooks != nil && ph.hooks.beforeWAL != nil {
-		ph.hooks.beforeWAL()
-	}
-	if err := e.cfg.WAL.WriteFrames(p.batch.frames.Bytes()); err != nil {
+	if err := e.commitPrepared(p); err != nil {
 		return AppendResult{}, true, err
 	}
-	if ph.hooks != nil && ph.hooks.beforePublish != nil {
-		ph.hooks.beforePublish()
-	}
-	e.mu.Publish(func() {
-		p.publishTails(e.head)
-		ph.pending.Add(-bytes)
-		reserved = false
-	})
+	reserved = false
 	return res, true, nil
 }
 

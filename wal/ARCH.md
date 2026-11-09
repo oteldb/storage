@@ -234,6 +234,10 @@ What each policy guarantees, precisely:
 | `Interval` | every acknowledged record | every record synced by the last tick (200 ms window by default) |
 | `Always` | every acknowledged record | every acknowledged record |
 
+`SegmentWriter.SyncOnWrite` exposes the configured per-write fsync policy without changing it.
+The metric engine uses this capability to coalesce ready independent writes under `Always`;
+each caller returns only after their combined append and fsync succeed.
+
 `Always` earns the second column only because **the directory is synced too**. An fsync commits a
 segment's bytes and says nothing about the entry naming them, so a directory sync is required once
 per segment (in `openNext`, before any record lands in it) and once per `CheckpointThrough` (so a

@@ -33,11 +33,13 @@ larger work falls back. The existing eight-slot preparation pool bounds active p
 Accepted sample bytes reserve head admission capacity through an atomic pending counter read
 alongside head bytes under the state read lock. A batch that cannot reserve its complete accepted
 set falls back to existing pointwise admission, preserving partial-success classifications.
-Numeric copies and frame encoding run off state. One WAL owner retains order through an atomic
-header/metadata publication; its revision changes with that complete batch. Pending bytes become
-visible head bytes under the same publication lock. Sync, seal, reset, repair and pruning drain
-shared writer leases, retaining WAL and checkpoint ordering. No extra background worker or file
-format is introduced.
+Numeric copies and frame encoding run off state. WAL ownership spans complete header/metadata
+publication; pending bytes become visible head bytes under that lock. Sync, seal, reset, repair
+and pruning drain shared writer leases, retaining WAL and checkpoint ordering.
+
+Per-write fsync combines ready independent batches in a bounded caller-owned queue, without a timer
+or background worker. Combined frames use at most eight reusable 4 MiB buffers globally; page-cache
+writes retain their existing physical writer path. WAL failure publishes none of the grouped batches.
 
 Metrics `HasWants` first tries catalog ownership to read all three obligation sets; ingestion
 never mutates them. A busy catalog falls back to the state read lock, preserving reader progress
