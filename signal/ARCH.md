@@ -41,7 +41,10 @@ misses occur in one append. Known identities that need WAL relogging come from t
 
 **The series id is computed without allocating or sorting**: the resource‖scope hash pre-image is
 built once per scope group and kept resident at the front of a reused buffer; the reserved labels
-once per metric in sorted-key order. Series-shaped metrics reuse an ID across points sharing an
+once per distinct adjacent metric descriptor in sorted-key order. Descriptor equality includes
+name, unit, kind, temporality and monotonicity. Name/unit snapshots borrow their owned encoding,
+so input descriptor reuse and in-place byte changes cannot hide invalidation; no input is retained
+across projection calls. Series-shaped metrics reuse an ID across points sharing an
 immutable attribute vector; an initially uniform run also recognizes equal independent copies.
 A single initial probe keeps clearly mixed metrics on the independent hashing loop; after the
 first identity change, the run path only reuses shared vectors, avoiding repeated deep comparisons.
