@@ -890,7 +890,7 @@ func (e *Engine) Flush(ctx context.Context) error {
 	if err != nil {
 		span.RecordError(err)
 		log.Error("flush failed",
-			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix), zap.Error(err))
+			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix), zap.Error(err), zap.Duration("elapsed", time.Since(startNs)))
 
 		return err
 	}
@@ -1435,11 +1435,16 @@ func (p *fetchPlan) releaseParts() {
 // metadata publish run under it. Only the background maintenance task (or Close) calls flush, so the
 // parts mutation has a single writer.
 func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error) {
+	log := e.cfg.Obs.Logger(ctx).With(zap.String("prefix", e.cfg.Prefix), zap.String("signal", e.cfg.Signal))
+	phaseDone := obs.ShutdownPhase(ctx, log, "flush_admission")
 	unlock, err := e.admitFlushWork(ctx)
+	phaseDone(err)
 	if unlock == nil {
 		return 0, 0, err
 	}
 	defer unlock()
+	phaseDone = obs.ShutdownPhase(ctx, log, "flush_snapshot")
+	defer func() { phaseDone(err) }()
 
 	// Plan (under lock): detach the head's record buffers (keeping them readable via e.flushing so a
 	// concurrent fetch never loses them), snapshot the side-store delta atomically with the detach (so
@@ -1517,6 +1522,8 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 
 	e.mu.Unlock()
 
+	phaseDone(nil)
+	phaseDone = obs.ShutdownPhase(ctx, log, "flush_memory_admission")
 	release, err := e.reserveFlush(ctx, detached, detachedBytes, side)
 	if err != nil {
 		return 0, 0, e.abortFlush(ctx, detached, detachedBytes, side, err)
@@ -1529,6 +1536,9 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 	// large I/Os that previously blocked the whole engine. The detached buffers must be treated as
 	// read-only here: a concurrent fetch still reads them through e.flushing until the part publishes.
 	defer e.releaseFlushScratch()
+	phaseDone(nil)
+	phaseDone = obs.ShutdownPhase(ctx, log, "flush_build_columns",
+		zap.Int("detached_series", len(detached)), zap.Int64("detached_bytes", detachedBytes))
 	f := buildFlushColumns(e.cfg.Schema, detached, e.flushBuf)
 	e.flushBuf = f // reused by the next flush; only this single flusher touches it
 	rows = f.len()
@@ -1550,6 +1560,9 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		}
 	}
 
+	phaseDone(nil)
+	phaseDone = obs.ShutdownPhase(ctx, log, "flush_write_parts",
+		zap.Int("detached_series", len(detached)), zap.Int64("detached_bytes", detachedBytes))
 	for _, rg := range ranges {
 		sub := f
 		if len(ranges) > 1 {
@@ -1588,6 +1601,8 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		newParts = append(newParts, p)
 	}
 
+	phaseDone(nil)
+	phaseDone = obs.ShutdownPhase(ctx, log, "flush_publish_checkpoint")
 	// Commit the candidate while the frozen head stays readable, then install both sides of the swap.
 	// A WAL checkpoint follows only a confirmed catalog commit.
 	e.mu.Lock()
@@ -1609,6 +1624,8 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 		return rows, written, err
 	}
 
+	phaseDone(nil)
+	phaseDone = obs.ShutdownPhase(ctx, log, "flush_reclaim")
 	e.reclaimRetired(ctx)
 
 	return rows, written, nil
@@ -1625,6 +1642,10 @@ func (e *Engine) abortFlush(
 	side map[string][]byte,
 	cause error,
 ) error {
+	log := e.cfg.Obs.Logger(ctx).With(zap.String("prefix", e.cfg.Prefix), zap.String("signal", e.cfg.Signal))
+	done := obs.ShutdownPhase(ctx, log, "flush_rollback")
+	var rollbackErr error
+	defer func() { done(rollbackErr) }()
 	e.space.Observe(cause)
 
 	e.mu.Lock()
@@ -1638,6 +1659,7 @@ func (e *Engine) abortFlush(
 		e.sideAbsorbed = true
 
 		if err := e.cfg.SideStore.Restore(side); err != nil {
+			rollbackErr = err
 			// The rows are back in the head but their side data is not: report it rather than let the
 			// next flush write a part whose sidecars are missing entries the records reference.
 			zctx.From(ctx).Error("restore side store after failed flush",

@@ -1,6 +1,10 @@
 package storage
 
-import "context"
+import (
+	"context"
+
+	"go.uber.org/zap"
+)
 
 func (s *Storage) mergeMemoryBytes() int64 {
 	if s.mergePool == nil {
@@ -26,6 +30,9 @@ func (s *Storage) flushAdmission() func(context.Context, int64) (func(), error) 
 // runPressureFlush owns one bounded pressure pass independently of the merge scheduler.
 func (s *Storage) runPressureFlush(ctx context.Context) {
 	defer s.wg.Done()
+	defer func() {
+		s.obs.Logger(ctx).Info("maintenance worker stopped", zap.String("worker", "runPressureFlush"), zap.NamedError("context_error", ctx.Err()))
+	}()
 	for {
 		select {
 		case <-s.stopCh:

@@ -1588,7 +1588,7 @@ func (e *Engine) observeFlush(ctx context.Context, flush func(context.Context) (
 	rows, written, err := flush(ctx)
 	if err != nil {
 		span.RecordError(err)
-		log.Error("flush failed", zap.String("prefix", e.cfg.Prefix), zap.Error(err))
+		log.Error("flush failed", zap.String("prefix", e.cfg.Prefix), zap.Error(err), zap.Duration("elapsed", time.Since(startNs)))
 
 		return err
 	}
@@ -1611,7 +1611,10 @@ func (e *Engine) observeFlush(ctx context.Context, flush func(context.Context) (
 // head detach and the metadata publish run under it. Only the background maintenance task (or Close)
 // calls flush, so the parts mutation has a single writer.
 func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error) {
+	log := e.cfg.Obs.Logger(ctx).With(zap.String("prefix", e.cfg.Prefix), zap.String("signal", "metric"))
+	phaseDone := obs.ShutdownPhase(ctx, log, "flush_admission")
 	unlock, err := e.admitFlushWork(ctx)
+	phaseDone(err)
 	if unlock == nil {
 		return 0, 0, err
 	}
@@ -1621,6 +1624,9 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 }
 
 func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, err error) {
+	log := e.cfg.Obs.Logger(ctx).With(zap.String("prefix", e.cfg.Prefix), zap.String("signal", "metric"))
+	phaseDone := obs.ShutdownPhase(ctx, log, "flush_snapshot")
+	defer func() { phaseDone(err) }()
 	// Plan (under lock): detach the head's sample buffers, keeping them readable via e.flushing so a
 	// concurrent fetch never loses them.
 	e.mu.Lock()
@@ -1672,7 +1678,7 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 		if serr != nil {
 			e.mu.Unlock()
 
-			return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, errors.Wrap(serr, "seal wal"))
+			return 0, 0, e.abortFlush(ctx, detached, detachedBytes, detachedSince, errors.Wrap(serr, "seal wal"))
 		}
 
 		checkpointSeq = seq
@@ -1680,11 +1686,16 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 
 	e.mu.Unlock()
 
+	phaseDone(nil)
+	phaseDone = obs.ShutdownPhase(ctx, log, "flush_write_parts",
+		zap.Int("detached_series", len(detached)), zap.Int64("detached_bytes", detachedBytes))
 	newParts, rows, err := e.streamHead(ctx, detached)
 	if err != nil || rows == 0 {
-		return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
+		return 0, 0, e.abortFlush(ctx, detached, detachedBytes, detachedSince, err)
 	}
 
+	phaseDone(nil)
+	phaseDone = obs.ShutdownPhase(ctx, log, "flush_publish_checkpoint")
 	// Commit the candidate while the frozen head stays readable, then install both sides of the swap.
 	// A WAL checkpoint follows only a confirmed catalog commit.
 	e.mu.Lock()
@@ -1694,7 +1705,7 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 	if err := e.fenceLocked(); err != nil {
 		e.mu.Unlock()
 
-		return 0, 0, e.abortFlush(detached, detachedBytes, detachedSince, err)
+		return 0, 0, e.abortFlush(ctx, detached, detachedBytes, detachedSince, err)
 	}
 
 	next := e.parts
@@ -1723,6 +1734,8 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 		return rows, written, err
 	}
 
+	phaseDone(nil)
+	phaseDone = obs.ShutdownPhase(ctx, log, "flush_reclaim")
 	e.reclaimRetired(ctx)
 
 	return rows, written, nil
@@ -1733,11 +1746,15 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 // holding them stay in scope for the next flush's checkpoint instead of being stranded in e.flushing
 // (which the next flush overwrites). It returns cause, so callers can `return e.abortFlush(…, err)`.
 func (e *Engine) abortFlush(
+	ctx context.Context,
 	detached map[signal.SeriesID]*sampleBuf,
 	detachedBytes int64,
 	detachedSince time.Time,
 	cause error,
 ) error {
+	log := e.cfg.Obs.Logger(ctx).With(zap.String("prefix", e.cfg.Prefix), zap.String("signal", "metric"))
+	done := obs.ShutdownPhase(ctx, log, "flush_rollback")
+	defer done(nil)
 	e.space.Observe(cause)
 
 	e.mu.Lock()

@@ -13,6 +13,7 @@ import (
 
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/internal/mergestream"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/timebucket"
 )
 
@@ -94,7 +95,7 @@ func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool
 	if err != nil {
 		span.RecordError(err)
 		log.Error("merge failed",
-			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix), zap.Error(err))
+			zap.String("signal", e.cfg.Signal), zap.String("prefix", e.cfg.Prefix), zap.Error(err), zap.Duration("elapsed", time.Since(startNs)))
 
 		return false, err
 	}
@@ -714,7 +715,12 @@ func (e *Engine) openGranted(
 
 // Close flushes any buffered records to a part and closes the WAL. It does not stop a background
 // loop — the owner ([storage.Storage]) does that before calling Close.
-func (e *Engine) Close(ctx context.Context) error {
+func (e *Engine) Close(ctx context.Context) (retErr error) {
+	ctx = obs.WithShutdown(ctx)
+	log := e.cfg.Obs.Logger(ctx).With(zap.String("prefix", e.cfg.Prefix), zap.String("signal", e.cfg.Signal))
+	done := obs.ShutdownPhase(ctx, log, "engine_close")
+	defer func() { done(retErr) }()
+	flushDone := obs.ShutdownPhase(ctx, log, "final_flush")
 	// A clustered engine without the shard's claim leaves its head to the WAL, for the next start
 	// to replay, rather than failing to close. A flush that failed otherwise still closes the WAL:
 	// its segments hold the head for the next start either way.
@@ -722,15 +728,23 @@ func (e *Engine) Close(ctx context.Context) error {
 	if errors.Is(flushErr, bucketindex.ErrSuperseded) {
 		flushErr = nil
 	}
+	flushDone(flushErr)
 
+	waitDone := obs.ShutdownPhase(ctx, log, "close_flush_lock")
 	e.flushMu.Lock()
+	waitDone(nil)
 	defer e.flushMu.Unlock()
+	waitDone = obs.ShutdownPhase(ctx, log, "close_state_lock")
 	e.mu.Lock()
+	waitDone(nil)
 	defer e.mu.Unlock()
 	e.head.clearReusable()
 
 	if e.cfg.WAL != nil {
-		if err := e.mu.WithReaders(e.cfg.WAL.Close); err != nil && flushErr == nil {
+		walDone := obs.ShutdownPhase(ctx, log, "wal_close")
+		err := e.mu.WithReaders(e.cfg.WAL.Close)
+		walDone(err)
+		if err != nil && flushErr == nil {
 			return err
 		}
 	}
