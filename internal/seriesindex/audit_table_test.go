@@ -14,6 +14,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/backendtest"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/readbudget"
 )
 
@@ -187,6 +188,11 @@ func TestOpenTableNativeSizeAndOpaqueBudget(t *testing.T) {
 	counted.Reset()
 	_, err = OpenTable(ctx, opaque, "index")
 	require.ErrorIs(t, err, readbudget.ErrExceeded)
+	require.Zero(t, counted.Bytes())
+	noRanges := faultbackend.Wrap(counted)
+	_, err = OpenTable(ctx, noRanges, "index")
+	require.ErrorIs(t, err, readbudget.ErrExceeded)
+	require.Empty(t, noRanges.Ops(), "native sizes must not hide a whole-object range fallback")
 	require.Zero(t, counted.Bytes())
 }
 
