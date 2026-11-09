@@ -22,7 +22,7 @@ func init() {
 // hot path ([chunk.EncodeBytes]) where Go's built-in map[string]int is bottlenecked
 // by string-key overhead and a slower hash function.
 //
-// The zero value is not usable; create one with [NewByteIntMap]. [Reset] clears it
+// Initialize with [NewByteIntMap] or [ByteIntMap.Reset] before use. [Reset] clears it
 // for reuse without freeing the backing arrays (so a pooled instance amortizes
 // allocation). Not safe for concurrent use; callers own synchronization or pool per-goroutine.
 //
@@ -42,8 +42,14 @@ type ByteIntMap struct {
 // via [ByteIntMap.Reset] so its backing arrays are retained; a fresh one allocates
 // at the initial capacity.
 func NewByteIntMap() *ByteIntMap {
-	const initial = 1 << 5 // 32 slots
 	m := byteIntMapPool.Get().(*ByteIntMap)
+	m.Reset()
+	return m
+}
+
+// Reset initializes a zero-value map or clears it for reuse without freeing its backing arrays.
+func (m *ByteIntMap) Reset() {
+	const initial = 1 << 5
 	if m.keys == nil {
 		m.keys = make([][]byte, initial)
 		m.values = make([]int, initial)
@@ -51,15 +57,9 @@ func NewByteIntMap() *ByteIntMap {
 		m.mask = initial - 1
 		m.growAt = initial * 3 / 4
 	} else {
-		m.Reset() // clear stale data from a previous use
+		clear(m.hashes)
+		clear(m.keys)
 	}
-	return m
-}
-
-// Reset clears the map for reuse without freeing the backing arrays.
-func (m *ByteIntMap) Reset() {
-	clear(m.hashes)
-	clear(m.keys)
 	m.count = 0
 	m.used = 0
 }

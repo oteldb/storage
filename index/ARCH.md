@@ -18,6 +18,10 @@ temporality, profile type) folds into the pre-image as reserved labels at the si
 
 ## `symbols`
 
+Owned symbol tables initialize a small private byte map instead of borrowing temporary encoder
+capacity from the shared pool. Pruning therefore sizes a rebuilt index for its surviving symbols;
+unrelated dictionary workloads cannot inflate the resident identity state.
+
 `[]byte → uint32` interning table over `pool.ByteIntMap` (no string conversion), CRC32C-framed
 (`OTSY`). Names and typed-value encodings intern to small ids.
 
