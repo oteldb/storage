@@ -37,7 +37,7 @@ framing, independently of compression ratio or identity interning.
 |---|---|---|
 | `c` | empty | distinct series count |
 | `h` | escaped label name, chunk's last uint32 reference | label-presence references |
-| `i` | canonical 128-bit SeriesID | uint32 part-local reference |
+| `i` | canonical 128-bit SeriesID | uint32 reference, coverage timestamp, stats flag, optional raw stats |
 | `n` | escaped label name | non-string-value flag |
 | `p` | escaped name, escaped typed value, chunk's last reference | matching references |
 | `s` | uint32 reference | canonical ID, coverage timestamp, optional raw stats, canonical identity |
@@ -47,10 +47,17 @@ references; typed values preserve the existing missing-label predicate semantics
 hints seek directly only when that label contains no non-string values. Bitmap unions bound work
 over many matching values by part cardinality; the existing postings iterators intersect the
 result without intermediate ID lists. Selected identity payloads can be copied after caller
-admission; unselected identities are not materialized. Coverage metadata supports timestamp
-admission without loading attributes. Historical append probes sort pending IDs and prune each
-part by its validated ID bounds. One operation-local pair of reusable ID/descriptor cursors serves
-the whole batch for that part; identity pages are not retained in a global cache.
+admission; unselected identities are not materialized. New ID values are 13 bytes without stats
+and 45 bytes with stats. Four-byte legacy values remain readable through their descriptor fallback.
+A complete ID traversal validates canonical reference ordinals and the exact footer count, retaining
+only a success flag; engines already perform that scan against SIDX before publication. Metadata
+probes then avoid descriptor pages. Full identity lookups check agreement with inline metadata.
+
+Historical append probes sort pending IDs and prune each part by its validated ID bounds. One
+operation-local ID cursor serves the whole batch; legacy values lazily add a descriptor cursor.
+Identity-free counts read selected canonical IDs from the corresponding SIDX ordinals, while
+label-bearing queries still load the selected identities. No global identity page cache is retained.
+
 
 The sorted prefix-key/cursor model follows VictoriaMetrics'
 [mergeset searches](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/lib/mergeset/table_search.go).

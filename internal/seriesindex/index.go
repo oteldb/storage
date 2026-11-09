@@ -8,6 +8,8 @@ import (
 	"io"
 	"math"
 	"slices"
+	"sync"
+	"sync/atomic"
 
 	"github.com/go-faster/errors"
 
@@ -107,7 +109,7 @@ func (b *Builder) Add(id signal.SeriesID, s signal.Series, meta Metadata) error 
 		b.names, b.values = make(map[string]*namePosting), make(map[string]*valuePosting)
 		b.bytes += 2 * memsize.MapBase
 	}
-	b.encodedRaw = buildbudget.Add(b.encodedRaw, int64(len(b.canonicalScratch))+143)
+	b.encodedRaw = buildbudget.Add(b.encodedRaw, int64(len(b.canonicalScratch))+184)
 	b.encodedRecords = buildbudget.Add(b.encodedRecords, 2)
 	ref := uint32(len(b.records))
 	prior := cap(b.records)
@@ -201,9 +203,11 @@ func (b *Builder) Write(dst io.Writer) error {
 			return err
 		}
 	}
+	var idValue []byte
 	for i, r := range b.records {
-		binary.BigEndian.PutUint32(count[:], uint32(i))
-		if err := w.Append(idKey(r.id), count[:]); err != nil {
+		idValue = binary.BigEndian.AppendUint32(idValue[:0], uint32(i))
+		idValue = appendMetadata(idValue, r.meta)
+		if err := w.Append(idKey(r.id), idValue); err != nil {
 			return err
 		}
 	}
@@ -231,18 +235,7 @@ func (b *Builder) Write(dst io.Writer) error {
 	for i, r := range b.records {
 		value = binary.BigEndian.AppendUint64(value[:0], r.id.Hi)
 		value = binary.BigEndian.AppendUint64(value, r.id.Lo)
-		value = binary.BigEndian.AppendUint64(value, uint64(r.meta.Covered))
-		flag := byte(0)
-		if r.meta.HasStats {
-			flag = 1
-		}
-		value = append(value, flag)
-		if r.meta.HasStats {
-			value = binary.BigEndian.AppendUint64(value, uint64(r.meta.Stats.Count))
-			for _, f := range []float64{r.meta.Stats.Sum, r.meta.Stats.Min, r.meta.Stats.Max} {
-				value = binary.BigEndian.AppendUint64(value, math.Float64bits(f))
-			}
-		}
+		value = appendMetadata(value, r.meta)
 		entry := b.Entry(i, attrs)
 		value = entry.Series.AppendHashInput(value)
 		attrs = entry.Series.Attributes
@@ -268,8 +261,10 @@ func (b *Builder) WriteObject(ctx context.Context, dst backend.Backend, key stri
 
 // Index opens identities by canonical ID and local reference, retaining no per-series map.
 type Index struct {
-	table *Table
-	count uint32
+	referencesMu      sync.Mutex
+	referencesChecked atomic.Bool
+	table             *Table
+	count             uint32
 }
 
 // Open validates the index header using bounded ranged reads.
@@ -304,16 +299,19 @@ func (r *Index) Lookup(ctx context.Context, id signal.SeriesID) (signal.Series, 
 	if !bytes.Equal(c.Key(), key) {
 		return signal.Series{}, Metadata{}, false, nil
 	}
-	if len(c.Value()) != 4 {
-		return signal.Series{}, Metadata{}, false, errors.Wrap(ErrCorrupt, "reference")
+	ref, inlineMeta, inline, err := decodeIDValue(c.Value())
+	if err != nil {
+		return signal.Series{}, Metadata{}, false, err
 	}
-	ref := binary.BigEndian.Uint32(c.Value())
 	got, s, meta, err := r.Series(ctx, ref)
 	if err != nil {
 		return signal.Series{}, Metadata{}, false, err
 	}
 	if got != id {
 		return signal.Series{}, Metadata{}, false, errors.Wrap(ErrCorrupt, "reference identity mismatch")
+	}
+	if inline && !equalMetadata(inlineMeta, meta) {
+		return signal.Series{}, Metadata{}, false, errors.Wrap(ErrCorrupt, "ID metadata mismatch")
 	}
 	return s, meta, true, nil
 }
@@ -354,24 +352,11 @@ func decodeRecord(data []byte) (signal.SeriesID, []byte, Metadata, error) {
 		return signal.SeriesID{}, nil, Metadata{}, errors.Wrap(ErrCorrupt, "short identity")
 	}
 	id := signal.SeriesID{Hi: binary.BigEndian.Uint64(data), Lo: binary.BigEndian.Uint64(data[8:])}
-	meta := Metadata{Covered: int64(binary.BigEndian.Uint64(data[16:]))}
-	flags := data[24]
-	data = data[25:]
-	if flags > 1 {
-		return signal.SeriesID{}, nil, Metadata{}, errors.Wrap(ErrCorrupt, "identity flags")
+	meta, raw, err := decodeMetadata(data[16:])
+	if err != nil {
+		return signal.SeriesID{}, nil, Metadata{}, err
 	}
-	if flags == 1 {
-		if len(data) < 32 {
-			return signal.SeriesID{}, nil, Metadata{}, errors.Wrap(ErrCorrupt, "short stats")
-		}
-		meta.HasStats = true
-		meta.Stats = Stats{Count: int64(binary.BigEndian.Uint64(data)),
-			Sum: math.Float64frombits(binary.BigEndian.Uint64(data[8:])),
-			Min: math.Float64frombits(binary.BigEndian.Uint64(data[16:])),
-			Max: math.Float64frombits(binary.BigEndian.Uint64(data[24:]))}
-		data = data[32:]
-	}
-	return id, data, meta, nil
+	return id, raw, meta, nil
 }
 
 func (b *Builder) addLabel(ref uint32, name []byte, value signal.Value) {

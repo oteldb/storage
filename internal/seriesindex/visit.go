@@ -50,6 +50,9 @@ func (r *Index) Visit(ctx context.Context, refs postings.Postings,
 
 // Metadata finds a series' covered timestamp without materializing attributes.
 func (r *Index) Metadata(ctx context.Context, id signal.SeriesID) (Metadata, bool, error) {
+	if err := r.validateReferences(ctx); err != nil {
+		return Metadata{}, false, err
+	}
 	c := r.table.Cursor(ctx)
 	key := idKey(id)
 	if !c.Seek(key) {
@@ -58,12 +61,15 @@ func (r *Index) Metadata(ctx context.Context, id signal.SeriesID) (Metadata, boo
 	if !bytes.Equal(c.Key(), key) {
 		return Metadata{}, false, nil
 	}
-	if len(c.Value()) != 4 {
-		return Metadata{}, false, errors.Wrap(ErrCorrupt, "metadata reference")
+	ref, inlineMeta, inline, err := decodeIDValue(c.Value())
+	if err != nil {
+		return Metadata{}, false, err
 	}
-	ref := binary.BigEndian.Uint32(c.Value())
 	if ref >= r.count {
 		return Metadata{}, false, errors.Wrap(ErrCorrupt, "metadata reference bounds")
+	}
+	if inline {
+		return inlineMeta, true, nil
 	}
 	key = recordKey(ref)
 	if !c.Seek(key) {

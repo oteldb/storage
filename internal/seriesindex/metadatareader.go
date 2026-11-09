@@ -10,7 +10,8 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// MetadataReader reuses separate ID and descriptor pages for operation-local watermark probes.
+// MetadataReader reuses the compact ID page for operation-local watermark probes.
+// Legacy four-byte references allocate a separate descriptor cursor on first use.
 type MetadataReader struct {
 	index        *Index
 	ids, records *Cursor
@@ -20,11 +21,14 @@ type MetadataReader struct {
 
 // MetadataReader returns a scoped reader without caching historical identity payloads globally.
 func (r *Index) MetadataReader(ctx context.Context) *MetadataReader {
-	return &MetadataReader{index: r, ids: r.table.Cursor(ctx), records: r.table.Cursor(ctx)}
+	return &MetadataReader{index: r, ids: r.table.Cursor(ctx)}
 }
 
 // Lookup returns one identity's covered timestamp and optional aggregate without decoding attributes.
 func (r *MetadataReader) Lookup(id signal.SeriesID) (Metadata, bool, error) {
+	if err := r.index.validateReferences(r.ids.ctx); err != nil {
+		return Metadata{}, false, err
+	}
 	r.idKey[0] = 'i'
 	binary.BigEndian.PutUint64(r.idKey[1:9], id.Hi)
 	binary.BigEndian.PutUint64(r.idKey[9:], id.Lo)
@@ -34,12 +38,18 @@ func (r *MetadataReader) Lookup(id signal.SeriesID) (Metadata, bool, error) {
 	if !bytes.Equal(r.ids.Key(), r.idKey[:]) {
 		return Metadata{}, false, nil
 	}
-	if len(r.ids.Value()) != 4 {
-		return Metadata{}, false, errors.Wrap(ErrCorrupt, "metadata reference")
+	ref, inlineMeta, inline, err := decodeIDValue(r.ids.Value())
+	if err != nil {
+		return Metadata{}, false, err
 	}
-	ref := binary.BigEndian.Uint32(r.ids.Value())
 	if ref >= r.index.count {
 		return Metadata{}, false, errors.Wrap(ErrCorrupt, "metadata reference bounds")
+	}
+	if inline {
+		return inlineMeta, true, nil
+	}
+	if r.records == nil {
+		r.records = r.index.table.Cursor(r.ids.ctx)
 	}
 	r.recordKey[0] = 's'
 	binary.BigEndian.PutUint32(r.recordKey[1:], ref)

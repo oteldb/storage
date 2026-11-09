@@ -214,10 +214,13 @@ func (p *refBitmap) Err() error          { return nil }
 
 // IDs scans canonical IDs without decoding identity payloads.
 func (r *Index) IDs(ctx context.Context) postings.Postings {
-	return &idPostings{cursor: r.table.Cursor(ctx)}
+	return &idPostings{index: r, cursor: r.table.Cursor(ctx)}
 }
 
 type idPostings struct {
+	index   *Index
+	seen    uint32
+	full    bool
 	cursor  *Cursor
 	started bool
 	done    bool
@@ -225,8 +228,12 @@ type idPostings struct {
 }
 
 func (p *idPostings) Next() bool {
+	if p.done {
+		return false
+	}
 	if !p.started {
 		p.started = true
+		p.full = true
 		return p.current(p.cursor.Seek([]byte{'i'}))
 	}
 	return p.current(p.cursor.Next())
@@ -239,6 +246,7 @@ func (p *idPostings) Seek(id signal.SeriesID) bool {
 		return p.cursor.Err() == nil
 	}
 	p.started = true
+	p.full = false
 	return p.current(p.cursor.Seek(idKey(id)))
 }
 func (p *idPostings) At() signal.SeriesID { return p.id }
@@ -311,11 +319,30 @@ func (p *refBitmap) nextFrom(target uint64) bool {
 func (p *idPostings) current(ok bool) bool {
 	if !ok || len(p.cursor.Key()) == 0 || p.cursor.Key()[0] != 'i' {
 		p.done = true
+		if p.full && p.cursor.Err() == nil {
+			if p.seen != p.index.count {
+				p.cursor.err = errors.Wrap(ErrCorrupt, "canonical ID count")
+			} else {
+				p.index.referencesChecked.Store(true)
+			}
+		}
 		return false
 	}
-	if len(p.cursor.Key()) != 17 || len(p.cursor.Value()) != 4 {
+	if len(p.cursor.Key()) != 17 {
 		p.cursor.err = errors.Wrap(ErrCorrupt, "canonical ID entry")
 		return false
+	}
+	ref, _, _, err := decodeIDValue(p.cursor.Value())
+	if err != nil {
+		p.cursor.err = err
+		return false
+	}
+	if ref >= p.index.count || (p.full && ref != p.seen) {
+		p.cursor.err = errors.Wrap(ErrCorrupt, "canonical ID ordinal")
+		return false
+	}
+	if p.full {
+		p.seen++
 	}
 	p.id = signal.SeriesID{Hi: binary.BigEndian.Uint64(p.cursor.Key()[1:]), Lo: binary.BigEndian.Uint64(p.cursor.Key()[9:])}
 	return true
