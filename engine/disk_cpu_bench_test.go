@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -335,6 +336,7 @@ func BenchmarkDiskSeriesCPURetained(b *testing.B) {
 		b.ReportMetric(f.flushTime.Seconds(), "fixture-flush-s")
 		b.ReportMetric(float64(cpuProcessRSS()), "rss-B")
 		b.ReportMetric(float64(len(f.engine.parts)), "parts")
+		f.reportDiskBytes(b)
 		runtime.KeepAlive(f)
 		previous = f
 	}
@@ -399,4 +401,34 @@ func cpuQueryProfile(b *testing.B) func() {
 		write(".allocs.after", "allocs")
 		write(".heap.after", "heap")
 	}
+}
+
+func (f *cpuFixture) reportDiskBytes(b *testing.B) {
+	b.Helper()
+	var total, index, identity int64
+	if err := filepath.WalkDir(filepath.Join(f.root, "parts"), func(_ string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		total += info.Size()
+		switch entry.Name() {
+		case "series-index":
+			index += info.Size()
+		case "identity":
+			identity += info.Size()
+		}
+		return nil
+	}); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportMetric(float64(total), "parts-disk-B")
+	b.ReportMetric(float64(index), "index-disk-B")
+	b.ReportMetric(float64(identity), "identity-disk-B")
 }
