@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"math"
 	"slices"
 
 	"github.com/go-faster/errors"
@@ -16,9 +17,11 @@ import (
 )
 
 type diskSelection struct {
-	series signal.Series
-	head   int
+	head     uint32
+	identity uint32
 }
+
+const diskNoHead = math.MaxUint32
 
 func diskQueryBudget(ctx context.Context) (context.Context, *readbudget.Budget) {
 	budget := readbudget.From(ctx)
@@ -51,11 +54,7 @@ func (e *Engine) snapshotDiskQuery(
 	}
 	selected := make(map[signal.SeriesID]diskSelection, len(p.ids))
 	for i, id := range p.ids {
-		s := diskSelection{head: i}
-		if withIdentity {
-			s.series = p.series[i]
-		}
-		selected[id] = s
+		selected[id] = diskSelection{head: uint32(i), identity: uint32(i)}
 	}
 	if !countOnly {
 		p.diskMetadata = make(map[*part]map[signal.SeriesID]seriesindex.Metadata)
@@ -123,7 +122,7 @@ func (e *Engine) captureDiskHead(
 }
 
 func (e *Engine) diskHeadSelectionBytes(ids []signal.SeriesID, withIdentity, countOnly bool) int64 {
-	n := buildbudget.Add(4*memsize.MapBase, buildbudget.Mul(int64(len(ids)), diskSelectionBytes()))
+	n := buildbudget.Add(4*memsize.MapBase, buildbudget.Mul(int64(len(ids)), diskSelectionBytes(withIdentity)))
 	view := e.head.series.View()
 	for _, id := range ids {
 		if withIdentity {
@@ -186,7 +185,7 @@ func (p *enginePlan) addDiskSelection(
 	if _, exists := selected[id]; exists {
 		return nil
 	}
-	n := diskSelectionBytes()
+	n := diskSelectionBytes(withIdentity)
 	if withIdentity {
 		// DecodeSeries aliases the canonical body and allocates attribute/value headers.
 		n = buildbudget.Add(n, buildbudget.Mul(int64(len(raw)), 128))
@@ -194,7 +193,7 @@ func (p *enginePlan) addDiskSelection(
 	if err := p.reserveSelection(n); err != nil {
 		return err
 	}
-	s := diskSelection{head: -1}
+	s := diskSelection{head: diskNoHead}
 	if withIdentity {
 		owned := bytes.Clone(raw)
 		decoded, used, err := signal.DecodeSeries(owned)
@@ -204,7 +203,11 @@ func (p *enginePlan) addDiskSelection(
 		if used != len(owned) {
 			return errors.New("disk series identity has trailing bytes")
 		}
-		s.series = decoded
+		if uint64(len(p.series)) >= math.MaxUint32 {
+			return errors.Wrap(readbudget.ErrExceeded, "too many selected identities")
+		}
+		s.identity = uint32(len(p.series))
+		p.series = append(p.series, decoded)
 	}
 	selected[id] = s
 	return nil
@@ -226,19 +229,23 @@ func (p *enginePlan) finishDiskSelection(selected map[signal.SeriesID]diskSelect
 	for i, id := range p.ids {
 		s := selected[id]
 		if withIdentity {
-			p.series[i] = s.series
+			p.series[i] = oldSeries[s.identity]
 		}
-		if countOnly && s.head >= 0 {
+		if countOnly && s.head != diskNoHead {
 			p.memActive[i] = oldActive[s.head]
 		}
 	}
 	clear(oldSeries)
-	p.engine.putSeriesSlice(oldSeries)
 }
 
-func diskSelectionBytes() int64 {
-	// Map growth, old/new sorted slices, identity headers and head batch-map slots coexist.
-	return 4 * (memsize.MapEntry[signal.SeriesID, diskSelection]() + memsize.Of[signal.Series]() + 128)
+func diskSelectionBytes(withIdentity bool) int64 {
+	// A compact map entry, sorted ID and presence flag cost about 64 bytes per match.
+	// Identity-bearing reads also hold growing and reordered series-header slabs.
+	n := int64(64)
+	if withIdentity {
+		n = buildbudget.Add(n, 3*memsize.Of[signal.Series]())
+	}
+	return n
 }
 
 func (p *enginePlan) reserveSelection(n int64) error {
