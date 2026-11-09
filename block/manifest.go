@@ -568,7 +568,7 @@ func (m Manifest) encodeTrailer(w *bitstream.Writer) {
 const bindingNonceMagic = 0x4f54424e // OTBN.
 
 func decodeBindingNonce(r *bitstream.Reader, nonce *[16]byte) bool {
-	if r.Remaining() != 20 {
+	if r.Remaining() < 20 {
 		return false
 	}
 	probe := *r
