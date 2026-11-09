@@ -169,6 +169,8 @@ type Config struct {
 	MetricFloatGroups bool
 	// MetricSeriesChunks isolates each series in independently framed numeric chunks.
 	MetricSeriesChunks bool
+	// DiskSeries stores historical identities/postings in immutable per-part indexes.
+	DiskSeries bool
 	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
 	// still has it, and says whether the part is gone from every owner. The cluster layer supplies
 	// it over its transport; a single-node store supplies one that fetches nothing and answers for

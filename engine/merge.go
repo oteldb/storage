@@ -252,7 +252,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{parts: dropped}, err
 	}
 
-	if len(selected) == 1 && !splitsOutput(selected, start) {
+	if len(selected) == 1 && !splitsOutput(selected, start) && !e.cfg.DiskSeries {
 		// A single forced part: decode it (bounded — one part) and apply retention/downsample.
 		if single, err = e.compactParts(ctx, selected, start, plan.tiers); err != nil {
 			return mergeResult{parts: dropped}, err

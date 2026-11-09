@@ -10,6 +10,7 @@ import (
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/index/series"
+	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
@@ -28,9 +29,11 @@ const (
 //
 // Rows must arrive in the part's sort order; consecutive chunks of one series are coalesced.
 type partStreamWriter struct {
-	e      *Engine
-	w      *block.StreamWriter
-	prefix string
+	seriesBuilder *seriesindex.Builder
+	seriesAttrs   signal.Attributes
+	e             *Engine
+	w             *block.StreamWriter
+	prefix        string
 
 	// runs is the series column's run-length form: one entry per series, feeding both the id column
 	// and the series-index sidecar.
@@ -202,6 +205,7 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 			agg.addSample(v, 1) // the sidecar is written only for an unsampled part; see encodeSeriesStats
 		}
 	}
+	p.updateDiskSeriesMetadata()
 
 	return nil
 }
@@ -231,6 +235,9 @@ func (p *partStreamWriter) residentBytes() int64 {
 	)
 
 	total := p.w.ResidentBytes() + int64(cap(p.runs))*runBytes
+	if p.seriesBuilder != nil {
+		total += p.seriesBuilder.Bytes()
+	}
 	total += int64(cap(p.statsIDs))*idBytes + int64(cap(p.stats))*aggBytes
 	total += int64(cap(p.wmarks)) * wmarkBytes
 	total += int64(cap(p.ones)) * 8
@@ -300,6 +307,11 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 
 	if err := p.writeIdentity(ctx, identities); err != nil {
 		return nil, err
+	}
+	if p.e.cfg.DiskSeries {
+		if err := p.writeDiskSeries(ctx, identities); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := backend.WriteDeferred(ctx, p.e.cfg.Backend, watermark.Key(prefix), watermark.Encode(nil, p.wmarks)); err != nil {

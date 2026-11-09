@@ -79,6 +79,17 @@ func writeIdentity(ctx context.Context, b backend.Backend, prefix string, entrie
 }
 
 func (p *partStreamWriter) writeIdentity(ctx context.Context, entries identitySnapshot) error {
+	if p.seriesBuilder != nil {
+		w, err := backend.CreateObjectDeferred(ctx, p.e.cfg.Backend, identityKey(p.prefix))
+		if err != nil {
+			return err
+		}
+		defer w.Abort()
+		if _, err := identity.WriteSorted(w, p.seriesBuilder.Count(), p.seriesBuilder.Entry); err != nil {
+			return err
+		}
+		return w.Commit(ctx)
+	}
 	if !p.streamIdentities {
 		return writeIdentity(ctx, p.e.cfg.Backend, p.prefix, entries)
 	}

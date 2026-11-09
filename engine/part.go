@@ -18,6 +18,7 @@ import (
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/readerpool"
+	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
@@ -419,6 +420,9 @@ type part struct {
 	// head, and identityPresent whether it had one. A reloaded index reuses the handle, and the
 	// object is immutable, so the (uncached) read is not repeated per refresh.
 	identityLoaded, identityPresent bool
+	metadataMu                      sync.Mutex
+	metadata                        *seriesindex.Index
+	metadataChecked                 bool
 }
 
 func (p *part) acquire() { p.refs.Add(1); p.reader.AcquireReaders() }
