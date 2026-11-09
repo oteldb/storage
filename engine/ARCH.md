@@ -238,6 +238,8 @@ streaming union after load, repair and retention, rather than sums of overlappin
 write. One atomic caller batch may exceed the target. This mode disables the optional recent tier.
 An oversized old WAL fails recovery without advancing epochs or changing journal bytes; increase
 this budget to recover it. Unknown local identities are refused while historical parts need repair.
+A replica without a cluster claim refreshes published primary parts under pressure; if its head
+stays full, `ErrReplicaHeadFull` asks replication to retry without publishing or checkpointing.
 `Stats.SeriesComplete=false` marks the preserved count as unavailable until recount succeeds.
 
 **`AppendBatch`** takes a precomputed `SeriesID`, columns, and a `materialize` callback used only on

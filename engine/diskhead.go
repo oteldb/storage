@@ -18,6 +18,9 @@ const diskHeadCacheEntries = 8192
 const diskHeadBloomWords = 1 << 17
 const diskHeadBloomMaxWords = 32 * diskHeadBloomWords
 
+// ErrReplicaHeadFull asks replication to retry after the primary publishes more parts.
+var ErrReplicaHeadFull = errors.New("engine: replica resident head is full; retry after primary part publication")
+
 type diskHeadEntry struct {
 	newest int64
 	exists bool
@@ -303,34 +306,53 @@ func (e *Engine) compactDiskHeadLocked() {
 	e.identityOrder.reset()
 }
 
-//nolint:contextcheck,nolintlint // The context analyzer consumes this intentional API boundary before reporting.
 func (e *Engine) flushResidentHead() error {
 	if !e.cfg.DiskSeries {
 		return nil
 	}
 	e.mu.RLock()
-	over := e.head.bytes > 0 && e.head.identityBytes()+e.head.inFlightBytes() >= e.cfg.ResidentHeadBytes
+	over := e.residentHeadOverBudgetLocked()
 	e.mu.RUnlock()
 	if over {
-		return e.Flush(context.Background())
+		return e.relieveResidentHeadPressure()
 	}
 	return nil
 }
 
 // flushResidentHeadLocked applies backpressure while preserving writer lock ownership.
-//
-//nolint:contextcheck,nolintlint // The context analyzer consumes this intentional API boundary before reporting.
 func (e *Engine) flushResidentHeadLocked() error {
 	if !e.cfg.DiskSeries {
 		return nil
 	}
-	for e.head.bytes > 0 && e.head.identityBytes()+e.head.inFlightBytes() >= e.cfg.ResidentHeadBytes {
+	for e.residentHeadOverBudgetLocked() {
 		e.mu.UnlockWriter()
-		err := e.Flush(context.Background())
+		err := e.relieveResidentHeadPressure()
 		e.mu.LockWriter()
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (e *Engine) residentHeadOverBudgetLocked() bool {
+	return e.head.bytes > 0 && e.head.identityBytes()+e.head.inFlightBytes() >= e.cfg.ResidentHeadBytes
+}
+
+//nolint:contextcheck,nolintlint // The context analyzer consumes this intentional API boundary before reporting.
+func (e *Engine) relieveResidentHeadPressure() error {
+	// A zero cluster term means this node has no claim and cannot publish a catalog.
+	if e.cfg.Term == nil || e.term() != 0 {
+		return e.Flush(context.Background())
+	}
+	if err := e.RefreshReplica(context.Background()); err != nil {
+		return err
+	}
+	e.mu.RLock()
+	over := e.residentHeadOverBudgetLocked()
+	e.mu.RUnlock()
+	if over {
+		return ErrReplicaHeadFull
 	}
 	return nil
 }
