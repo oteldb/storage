@@ -239,9 +239,9 @@ func (p *enginePlan) finishDiskSelection(selected map[signal.SeriesID]diskSelect
 }
 
 func diskSelectionBytes(withIdentity bool) int64 {
-	// A compact map entry, sorted ID and presence flag cost about 64 bytes per match.
+	// Map growth and old/new ID and presence slices coexist until selection finishes.
 	// Identity-bearing reads also hold growing and reordered series-header slabs.
-	n := int64(64)
+	n := int64(96)
 	if withIdentity {
 		n = buildbudget.Add(n, 3*memsize.Of[signal.Series]())
 	}
