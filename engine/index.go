@@ -910,18 +910,9 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 
 	covered := make(map[signal.SeriesID]int64)
 	if e.cfg.DiskSeries {
-		for id := range e.head.samples {
-			for _, p := range e.parts {
-				meta, ok, err := p.diskSeriesMetadata(ctx, id)
-				if err != nil {
-					return errors.Wrap(err, "replica disk series coverage")
-				}
-				if prev, found := covered[id]; ok && (!found || meta.Covered > prev) {
-					covered[id] = meta.Covered
-				}
-			}
+		if err := e.trimDiskReplicaLocked(ctx); err != nil {
+			return err
 		}
-		e.head.trimBelowCovered(covered)
 		for id, buf := range e.head.samples {
 			if len(buf.ts) == 0 {
 				delete(e.head.samples, id)

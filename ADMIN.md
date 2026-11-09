@@ -103,8 +103,13 @@ Opt-in metrics `Options.MetricDiskSeries` (`WithMetricDiskSeries`, or `engine.Co
 Its `MetricResidentHeadBytes` target defaults to 128 MiB; a write flushes an over-target head before
 admission, while one atomic batch may exceed the target. The optional recent tier is disabled.
 `engine.Stats.SeriesComplete` is false while historical metadata is unavailable; `Series` then
-preserves the last complete count. Unknown identities wait for repair. An old WAL exceeding the
+preserves the last complete count. All live local admission and head publication wait for repair;
+accepted WAL and replica payloads still restore into the head, with checkpoints unchanged.
+Historical OOO watermarks are restored before admission resumes. An old WAL exceeding the
 resident budget fails replay with its journal and epoch intact; increase the budget to recover.
+Replica pressure refresh removes only unambiguous persisted `(timestamp, value bits, weight bits)`
+matches. Unsupported or over-budget proofs retain samples and return `ErrReplicaHeadFull` while
+pressure remains; replicas never publish or checkpoint without the primary claim.
 
 `SignalStats` (one per `(tenant, signal)`):
 

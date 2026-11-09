@@ -1655,7 +1655,7 @@ func (e *Engine) HeadSampleCount() int {
 	return n
 }
 
-// SeriesCount returns the number of distinct series in the head.
+// SeriesCount returns distinct indexed series, including immutable parts in disk-index mode.
 func (e *Engine) SeriesCount() int {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -1725,6 +1725,12 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 		return 0, 0, err
 	}
 
+	if e.head.bytes > 0 {
+		if err := e.checkDiskAdmissionLocked(); err != nil {
+			e.mu.Unlock()
+			return 0, 0, err
+		}
+	}
 	detached, detachedBytes, detachedSince := e.head.detach()
 	if detached == nil {
 		e.mu.Unlock()
@@ -2156,9 +2162,7 @@ func (e *Engine) replayHandlers() wal.Handlers {
 				if err := e.replayResidentGuard(0); err != nil {
 					return err
 				}
-				if err := e.preloadOneDiskSeriesLocked(id); err != nil {
-					return err
-				}
+				e.preloadAuthoritativeSeriesLocked(id)
 			}
 			e.head.registerSeries(s)
 			e.clearDiskPendingLocked()

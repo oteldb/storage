@@ -206,7 +206,7 @@ func (h *head) register(id signal.SeriesID, s signal.Series) {
 		h.stateRefs = append(h.stateRefs, h.slots.alloc())
 	}
 	if h.disk != nil {
-		if !historical.historical {
+		if !historical.historical && h.disk.complete {
 			h.disk.count++
 			h.disk.note(id)
 		}

@@ -374,8 +374,8 @@ func TestDiskHeadUnknownMembershipDuringReadGap(t *testing.T) {
 			require.Same(t, before, e.head.disk)
 			require.False(t, e.head.series.Has(fresh.Hash()))
 			ok, err = e.Append(known, 101, 2)
-			require.NoError(t, err)
-			require.True(t, ok, "already active series retain their normal admission path")
+			require.ErrorIs(t, err, bucketindex.ErrFenced)
+			require.False(t, ok, "active identities also need complete historical OOO state")
 			if gap != "fenced" {
 				e.mu.Lock()
 				err = e.rebuildDiskStateLocked(t.Context())

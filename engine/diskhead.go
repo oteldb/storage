@@ -163,6 +163,7 @@ func (e *Engine) rebuildDiskStateLocked(ctx context.Context) (err error) {
 	}
 	slices.SortFunc(headIDs, signal.SeriesID.Compare)
 	parts := e.readablePartsLocked()
+	var watermarks []diskHeadEntry
 	if err := e.mu.WithReaders(func() error {
 		its := []postings.Postings{postings.FromSlice(headIDs)}
 		for _, p := range parts {
@@ -177,9 +178,24 @@ func (e *Engine) rebuildDiskStateLocked(ctx context.Context) (err error) {
 			next.count++
 			next.note(it.At())
 		}
-		return it.Err()
+		if err := it.Err(); err != nil {
+			return err
+		}
+		if !e.head.disk.complete {
+			var err error
+			watermarks, err = e.diskWatermarksForHead(ctx, parts, headIDs)
+			return err
+		}
+		return nil
 	}); err != nil {
 		return err
+	}
+	for i, entry := range watermarks {
+		if entry.exists {
+			ref, _ := e.head.series.Ref(headIDs[i])
+			e.head.slots.set(e.head.stateRefs[ref], entry.newest)
+			e.head.newest = max(e.head.newest, entry.newest)
+		}
 	}
 	e.head.disk = next
 	return nil
@@ -210,6 +226,9 @@ func (e *Engine) preloadDiskSeriesMoreLocked(ids []signal.SeriesID) error {
 }
 
 func (e *Engine) preloadDiskSeriesOffState(ids []signal.SeriesID) error {
+	if err := e.checkDiskAdmissionLocked(); err != nil {
+		return err
+	}
 	s := e.head.disk
 	if s.pending == nil {
 		s.pending = make(map[signal.SeriesID]diskHeadEntry)
@@ -218,15 +237,6 @@ func (e *Engine) preloadDiskSeriesOffState(ids []signal.SeriesID) error {
 	for _, id := range ids {
 		if e.head.series.Has(id) {
 			continue
-		}
-		if !s.complete {
-			return errors.Wrap(bucketindex.ErrFenced, "historical series count is incomplete")
-		}
-		if err := e.fenceLocked(); err != nil {
-			return err
-		}
-		if err := e.diskHistoryGapLocked(); err != nil {
-			return err
 		}
 		if _, ok := s.pending[id]; ok {
 			continue
@@ -381,9 +391,7 @@ func (e *Engine) applyDiskReplicatedLocked(data []byte) error {
 	}
 	if err := wal.Replay(data, wal.Handlers{
 		OnSeries: func(id signal.SeriesID, s signal.Series) error {
-			if err := e.preloadOneDiskSeriesLocked(id); err != nil {
-				return err
-			}
+			e.preloadAuthoritativeSeriesLocked(id)
 			byID[id] = s
 			return nil
 		},
@@ -447,4 +455,48 @@ func (e *Engine) diskSeriesCompleteLocked() bool {
 		}
 	}
 	return true
+}
+
+func (e *Engine) checkDiskAdmissionLocked() error {
+	if e.cfg.DiskSeries && !e.diskSeriesCompleteLocked() {
+		return errors.Wrap(bucketindex.ErrFenced, "historical series state is incomplete")
+	}
+	return nil
+}
+
+// preloadAuthoritativeSeriesLocked preserves accepted writes even while history needs repair.
+func (e *Engine) preloadAuthoritativeSeriesLocked(id signal.SeriesID) {
+	if !e.cfg.DiskSeries {
+		return
+	}
+	if !e.diskSeriesCompleteLocked() {
+		e.head.disk.complete = false
+		return
+	}
+	if err := e.preloadOneDiskSeriesLocked(id); err != nil {
+		e.clearDiskPendingLocked()
+		e.head.disk.complete = false
+	}
+}
+
+func (e *Engine) diskWatermarksForHead(ctx context.Context, parts []*part, ids []signal.SeriesID) ([]diskHeadEntry, error) {
+	bounds := make([]diskHeadEntry, len(ids))
+	for i, id := range ids {
+		newest, seen := e.head.watermark(id)
+		entry := diskHeadEntry{newest: newest, exists: seen}
+		for _, p := range parts {
+			meta, found, err := p.diskSeriesMetadata(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			if found {
+				if !entry.exists || meta.Covered > entry.newest {
+					entry.newest = meta.Covered
+				}
+				entry.exists = true
+			}
+		}
+		bounds[i] = entry
+	}
+	return bounds, nil
 }

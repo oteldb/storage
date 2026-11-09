@@ -237,9 +237,16 @@ streaming union after load, repair and retention, rather than sums of overlappin
 `ResidentHeadBytes` defaults to 128 MiB and applies synchronous flush backpressure before the next
 write. One atomic caller batch may exceed the target. This mode disables the optional recent tier.
 An oversized old WAL fails recovery without advancing epochs or changing journal bytes; increase
-this budget to recover it. Unknown local identities are refused while historical parts need repair.
+this budget to recover it. All local admission and head publication wait while historical state is
+incomplete. Accepted WAL and primary replica payloads still restore into the head, preserving
+journals and checkpoints until repair. A successful recount restores historical watermarks for
+these active identities before lifting admission's fence.
 A replica without a cluster claim refreshes published primary parts under pressure; if its head
 stays full, `ErrReplicaHeadFull` asks replication to retry without publishing or checkpointing.
+Disk-mode refresh trims only samples whose timestamp, value bits and scale-factor bits match
+unambiguous persisted rows. Conflicting same-timestamp updates, rolled/unsupported layouts,
+series above 65,536 active samples and scans above 16 MiB retain their head data. Scoped immutable
+part pins and bounded block decoders protect this proof; legacy trimming is unchanged.
 `Stats.SeriesComplete=false` marks the preserved count as unavailable until recount succeeds.
 
 **`AppendBatch`** takes a precomputed `SeriesID`, columns, and a `materialize` callback used only on
