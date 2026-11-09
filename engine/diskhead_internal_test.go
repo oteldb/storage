@@ -400,3 +400,28 @@ func TestDiskHeadUnknownMembershipDuringReadGap(t *testing.T) {
 		})
 	}
 }
+
+func TestDiskHeadFailedPreloadReleasesBatchState(t *testing.T) {
+	t.Parallel()
+	be := faultbackend.Wrap(backend.Memory())
+	e := New(Config{Backend: be, Prefix: "preload-head", DiskSeries: true})
+	old, fresh := benchSeries(1), benchSeries(2)
+	ok, err := e.Append(old, 100, 1)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NoError(t, e.Flush(t.Context()))
+	clear(e.head.disk.cache)
+	be.Add(faultbackend.Rule{Kind: faultbackend.Read, Err: errInjectedWAL})
+	result, err := e.AppendBatch([]signal.SeriesID{fresh.Hash(), old.Hash()}, []int64{101, 101}, []float64{2, 2}, nil, func(i int) signal.Series {
+		if i == 0 {
+			return fresh
+		}
+		return old
+	}, AppendLimits{})
+	require.ErrorIs(t, err, errInjectedWAL)
+	require.Zero(t, result.Accepted)
+	require.Nil(t, e.head.disk.pending, "failed preloads do not retain per-batch historical state")
+	require.Zero(t, e.head.series.Len())
+	require.Zero(t, e.Stats().HeadSamples)
+	require.EqualValues(t, 1, e.Stats().Series)
+}

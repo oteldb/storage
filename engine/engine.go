@@ -169,7 +169,7 @@ type Config struct {
 	MetricFloatGroups bool
 	// MetricSeriesChunks isolates each series in independently framed numeric chunks.
 	MetricSeriesChunks bool
-	// DiskSeries stores historical identities/postings in immutable per-part indexes.
+	// DiskSeries stores historical identities/postings in immutable per-part indexes and disables RecentWindow.
 	DiskSeries bool
 	// ResidentHeadBytes flushes disk-indexed heads under memory pressure. Zero uses 128 MiB.
 	// One atomic caller batch may exceed the target and flushes before the next write.

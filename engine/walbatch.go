@@ -30,7 +30,7 @@ type walBatch struct {
 	accs      []walSeriesAcc
 	attrs     signal.Attributes
 
-	// samples is the admitted sample count and registered the new identities the write registers; both
+	// samples is the admitted sample count and registered counts globally new identities; both
 	// are what [head.appendByID] would have added to the head's in-flight bytes and series count.
 	samples    int
 	registered int

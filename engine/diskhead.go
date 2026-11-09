@@ -125,7 +125,11 @@ func (e *Engine) preloadDiskSeriesLocked(ids []signal.SeriesID) error {
 		return nil
 	}
 	e.head.disk.pending = nil
-	return e.preloadDiskSeriesMoreLocked(ids)
+	if err := e.preloadDiskSeriesMoreLocked(ids); err != nil {
+		e.head.disk.pending = nil
+		return err
+	}
+	return nil
 }
 
 func (e *Engine) preloadOneDiskSeriesLocked(id signal.SeriesID) error {
