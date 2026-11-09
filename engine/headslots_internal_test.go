@@ -72,8 +72,11 @@ func TestHeadSlotsDetachReattachAndPrune(t *testing.T) {
 	rebuilt := rebuildIdentity(snap, keep, h.stateRefs)
 	// Admission during the off-lock rebuild must remain visible after the swap.
 	h.noteTS(live.Hash(), 10)
+	headers, numerics := h.memory.headers, h.memory.numeric
 	h.swapIdentity(rebuilt, snap, h.series.View(), deadPositions(snap, keep))
 	state = h.seriesState(live.Hash())
+	require.Same(t, headers, h.memory.headers)
+	require.Same(t, numerics, h.memory.numeric)
 	require.Zero(t, state.ref)
 	require.Equal(t, liveSlot, h.stateRefs[state.ref])
 	require.EqualValues(t, 10, state.newest)
@@ -132,6 +135,7 @@ func FuzzHeadSlotsLifetimes(f *testing.F) {
 						h.reattach(frozen, frozenBytes, since)
 					} else {
 						h.detachedBytes, h.detachedKnown = 0, false
+						h.frozenMemory.release()
 					}
 					frozen = nil
 				}

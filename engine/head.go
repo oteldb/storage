@@ -34,9 +34,10 @@ type head struct {
 	bufferedMin, detachedMin     int64
 	bufferedKnown, detachedKnown bool
 
-	stateRefs []uint32
-	slots     headSlots
-	buffers   headBuffers
+	stateRefs            []uint32
+	slots                headSlots
+	buffers              headBuffers
+	memory, frozenMemory sampleArena
 
 	bytes         int64 // active buffered sample bytes (SampleBytes each)
 	detachedBytes int64 // resident samples held by the single in-flight flush
@@ -238,6 +239,7 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 		ref, _ = h.series.Ref(id)
 	}
 	buf := h.bufForRef(id, ref)
+	h.memory.initColumns(buf, len(buf.ts)+1)
 	buf.appendSample(ts, value, 1)
 	h.grow(SampleBytes)
 	h.noteTSRef(ref, ts)
@@ -299,6 +301,7 @@ func (h *head) appendByID(
 		buf = h.bufForRef(id, ref)
 	}
 
+	h.memory.initColumns(buf, len(buf.ts)+1)
 	buf.appendSample(ts, value, sf)
 	h.grow(SampleBytes)
 	h.noteTSRef(ref, ts)
@@ -354,6 +357,7 @@ func (h *head) appendOverflow(ov signal.Series, ts int64, value, sf float64) (ad
 		buf = h.bufForRef(oid, ref)
 	}
 
+	h.memory.initColumns(buf, len(buf.ts)+1)
 	buf.appendSample(ts, value, sf)
 	h.grow(SampleBytes)
 	// The sample lands under the overflow identity, so that is the series whose lateness bound it
@@ -442,6 +446,7 @@ func (h *head) replaySamples(id signal.SeriesID, ts []int64, values []float64) {
 	}
 
 	buf := h.bufForRef(id, ref)
+	h.memory.initColumns(buf, len(buf.ts)+len(ts))
 	buf.ts = append(buf.ts, ts...)
 	buf.values = append(buf.values, values...)
 	// The WAL does not yet carry scale factors, so replayed samples take weight 1; keep the sf
@@ -470,6 +475,7 @@ func (h *head) replaySamplesSF(id signal.SeriesID, ts []int64, values, sf []floa
 	}
 
 	buf := h.bufForRef(id, ref)
+	h.memory.initColumns(buf, len(buf.ts)+len(ts))
 	for i := range ts {
 		buf.appendSample(ts[i], values[i], sf[i])
 		h.noteTSRef(ref, ts[i])
@@ -665,6 +671,7 @@ func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 	}
 
 	detached, bytes, since := h.samples, h.bytes, h.since
+	h.frozenMemory, h.memory = h.memory, sampleArena{}
 	h.samples = make(map[signal.SeriesID]*sampleBuf)
 	h.buffers = headBuffers{}
 	h.bytes = 0
@@ -681,20 +688,14 @@ func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 // buffers are appended onto the detached ones rather than the reverse, and the merged buffer
 // replaces the live one.
 func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, since time.Time) {
+	h.memory.adopt(&h.frozenMemory)
 	if len(detached) > len(h.samples) {
 		h.samples = reuseDetachedSamples(detached, h.samples)
 	} else {
-		for id, buf := range detached {
-			if len(buf.ts) == 0 {
-				continue
-			}
-			if live := h.samples[id]; live != nil {
-				appendLiveSamples(buf, live)
-			}
-			h.samples[id] = buf
-		}
+		h.samples = reuseActiveSamples(detached, h.samples)
 	}
 
+	h.memory.abandon()
 	h.resetBuffers()
 	if !h.detachedKnown || h.bytes > 0 && !h.bufferedKnown {
 		h.bufferedMin = minInt64
@@ -713,25 +714,56 @@ func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, si
 	}
 }
 
+func reuseActiveSamples(detached, active map[signal.SeriesID]*sampleBuf) map[signal.SeriesID]*sampleBuf {
+	for id, live := range active {
+		if older := detached[id]; older == nil || len(older.ts) == 0 {
+			active[id] = cloneLiveSamples(live)
+		}
+	}
+	for id, buf := range detached {
+		if len(buf.ts) == 0 {
+			if buf != active[id] {
+				*buf = sampleBuf{}
+			}
+			continue
+		}
+		if live := active[id]; live != nil {
+			appendLiveSamples(buf, live)
+		}
+		active[id] = buf
+	}
+	return active
+}
+
 func reuseDetachedSamples(detached, active map[signal.SeriesID]*sampleBuf) map[signal.SeriesID]*sampleBuf {
 	for id, buf := range detached {
 		if len(buf.ts) == 0 {
 			delete(detached, id)
+			*buf = sampleBuf{}
 		}
 	}
 	for id, live := range active {
 		if older := detached[id]; older != nil {
 			appendLiveSamples(older, live)
 		} else {
-			detached[id] = live
+			detached[id] = cloneLiveSamples(live)
 		}
 	}
 	return detached
 }
 
+func cloneLiveSamples(live *sampleBuf) *sampleBuf {
+	out := &sampleBuf{ts: slices.Clone(live.ts), values: slices.Clone(live.values), sf: slices.Clone(live.sf)}
+	*live = sampleBuf{}
+	return out
+}
+
 func appendLiveSamples(older, live *sampleBuf) {
 	for i := range live.ts {
 		older.appendSample(live.ts[i], live.values[i], bufSF(live, i))
+	}
+	if older != live {
+		*live = sampleBuf{}
 	}
 }
 

@@ -160,7 +160,7 @@ func (h *head) bufForRef(id signal.SeriesID, ref uint32) *sampleBuf {
 	slot := h.stateRefs[ref]
 	buf := h.buffers.get(slot)
 	if buf == nil {
-		buf = &sampleBuf{}
+		buf = h.memory.buffer()
 		h.setBuffer(id, ref, buf)
 	}
 	return buf

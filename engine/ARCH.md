@@ -172,6 +172,19 @@ one flush generation and drop at detach; watermark pages persist and track prese
 from timestamp zero. The canonical-ID buffer map remains the source for enumeration and frozen
 flush/query snapshots. Failed-flush reattachment rebuilds the active pointer pages.
 
+Small sample columns and buffer headers share pages owned by one head generation. A frozen
+flush retains its pages until publication removes the frozen map under state exclusion; query
+plans already own window copies. Failed flushes return both active and frozen ownership to the
+head. Rollback copies active-only buffers out of their pages, clears discarded overlapping headers,
+and severs page ownership links. Surviving frozen buffers keep their addresses; GC reclaims the
+unused pages instead of retaining a sparsely occupied page for each failed generation.
+Parallel preparers own private pages until successful WAL publication transfers them to
+that generation. Larger tails grow independently, allowing superseded large arrays to be collected;
+their initial small columns remain in their generation page until publication. This trades a small
+amount of retained tail capacity for far fewer allocator and GC objects.
+A process-wide bounded recycler retains at most 512 numeric pages and 128 cleared header pages
+(about 11.4 MiB); excess pages are released rather than retaining per-series capacity indefinitely.
+
 Pruning builds the surviving registry-to-slot mapping off-lock. Tail registrations and revived
 series retain their slots at installation; only dead slots are cleared and recycled. Updates
 made while rebuilding therefore keep their watermarks, and a reused slot inherits no old bound.
