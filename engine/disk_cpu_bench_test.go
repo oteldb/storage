@@ -16,7 +16,6 @@ import (
 
 	"github.com/go-faster/errors"
 
-	"github.com/oteldb/storage/backend/backendtest"
 	backendfile "github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -62,7 +61,7 @@ func cpuBenchInt(b *testing.B, key string, fallback, maximum int) int {
 
 type cpuFixture struct {
 	engine                *Engine
-	counter               backendtest.SizedByteCounter
+	counter               *cpuFixtureFile
 	options               cpuFixtureOptions
 	appendTime, flushTime time.Duration
 	root                  string
@@ -97,7 +96,7 @@ func buildCPUFixture(b *testing.B, options cpuFixtureOptions) *cpuFixture {
 	if err != nil {
 		b.Fatal(err)
 	}
-	f.counter = backendtest.NewSizedByteCounter(files)
+	f.counter = &cpuFixtureFile{File: files}
 	w, err := wal.Create(filepath.Join(f.root, "wal"), 0)
 	if err != nil {
 		b.Fatal(err)
@@ -108,7 +107,7 @@ func buildCPUFixture(b *testing.B, options cpuFixtureOptions) *cpuFixture {
 		DecodeCacheBytes: 16 << 20, DecodeMemoryBytes: 256 << 20, FlushMemoryBytes: 64 << 20})
 	b.Cleanup(func() {
 		if f.engine != nil {
-			_ = f.engine.CloseWAL()
+			_ = f.engine.Close(context.WithoutCancel(b.Context()))
 		}
 	})
 	for generation := range options.generations {
@@ -120,7 +119,7 @@ func buildCPUFixture(b *testing.B, options cpuFixtureOptions) *cpuFixture {
 		f.flushTime += time.Since(start)
 	}
 	if options.reopen {
-		if err := f.engine.CloseWAL(); err != nil {
+		if err := f.engine.Close(b.Context()); err != nil {
 			b.Fatal(err)
 		}
 		cfg := f.engine.cfg
@@ -285,14 +284,16 @@ func BenchmarkDiskSeriesCPUIngest(b *testing.B) {
 		f := buildCPUFixture(b, options)
 		appendTime += f.appendTime
 		flushTime += f.flushTime
-		if err := f.engine.CloseWAL(); err != nil {
+		b.StopTimer()
+		if err := f.engine.Close(b.Context()); err != nil {
 			b.Fatal(err)
 		}
 		f.engine = nil
-		f.counter = backendtest.SizedByteCounter{}
+		f.counter = nil
 		if err := os.RemoveAll(f.root); err != nil {
 			b.Fatal(err)
 		}
+		b.StartTimer()
 	}
 	samples := float64(options.hosts * len(cpuFixtureModes) * options.generations * options.points * b.N)
 	b.ReportMetric(samples/appendTime.Seconds(), "append-samples/s")
@@ -310,11 +311,11 @@ func BenchmarkDiskSeriesCPURetained(b *testing.B) {
 	var previous *cpuFixture
 	for b.Loop() {
 		if previous != nil {
-			if err := previous.engine.CloseWAL(); err != nil {
+			if err := previous.engine.Close(b.Context()); err != nil {
 				b.Fatal(err)
 			}
 			previous.engine = nil
-			previous.counter = backendtest.SizedByteCounter{}
+			previous.counter = nil
 			if err := os.RemoveAll(previous.root); err != nil {
 				b.Fatal(err)
 			}
@@ -330,6 +331,8 @@ func BenchmarkDiskSeriesCPURetained(b *testing.B) {
 		b.ReportMetric(float64(after.HeapAlloc), "heap-B")
 		b.ReportMetric(float64(int64(after.HeapObjects)-int64(before.HeapObjects)), "heap-delta-objects")
 		b.ReportMetric(float64(stats.IdentityBytes), "identity-B")
+		b.ReportMetric(f.appendTime.Seconds(), "fixture-append-s")
+		b.ReportMetric(f.flushTime.Seconds(), "fixture-flush-s")
 		b.ReportMetric(float64(cpuProcessRSS()), "rss-B")
 		b.ReportMetric(float64(len(f.engine.parts)), "parts")
 		runtime.KeepAlive(f)
