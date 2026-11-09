@@ -331,6 +331,8 @@ func (s *Storage) Close(ctx context.Context) (retErr error) {
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
+	} else {
+		s.releaseWALs()
 	}
 
 	if firstErr != nil {
@@ -901,9 +903,7 @@ func (s *Storage) closeEngines(ctx context.Context) error {
 	return firstErr
 }
 
-// releaseWALs closes every engine's WAL without flushing, for an [Open] that fails after recovery
-// created engines: nothing was acknowledged, and a flush would write parts from a store that never
-// opened. The segments stay for the next Open to replay.
+// releaseWALs releases WALs and readers without flushing, for failed Open or read-only Close.
 func (s *Storage) releaseWALs() {
 	for _, eng := range s.allEngines() {
 		_ = eng.CloseWAL()

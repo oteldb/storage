@@ -3,6 +3,8 @@ package block
 import (
 	"context"
 	"unsafe"
+
+	"github.com/oteldb/storage/internal/readerpool"
 )
 
 // Clone shares immutable metadata and creates independent decode state. Frame reads use ctx.
@@ -10,7 +12,7 @@ func (d *Decoder) Clone(ctx context.Context) *Decoder {
 	dir := d.streams.dir
 	if src := dir.src; src != nil {
 		dir.src = &frameSource{
-			ctx: ctx, b: src.b, key: src.key, base: src.base,
+			ctx: readerpool.Rebind(ctx, src.ctx), b: src.b, key: src.key, base: src.base,
 			window: src.window, frameOff: src.frameOff,
 		}
 	}

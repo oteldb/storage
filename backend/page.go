@@ -22,6 +22,7 @@ type readCacheKey struct {
 	generation *pageGeneration
 	offset     int64
 	length     int64
+	owner      uint64
 }
 
 func (c *cachedBackend) invalidate(key string) {
@@ -34,14 +35,15 @@ func (c *cachedBackend) ReadPageView(ctx context.Context, key string, off, n int
 	if off < 0 || n < 0 {
 		return ReadAt(ctx, c.inner, key, off, n)
 	}
-	if v, ok := c.values.GetIfPresent(readCacheKey{name: key}); ok {
+	if v, ok := c.values.GetIfPresent(c.readKey(ctx, key)); ok {
 		return clampRange(v, off, n), nil
 	}
 	generation, ok := c.pages.Load(key)
 	if !ok {
 		generation, _ = c.pages.LoadOrStore(key, &pageGeneration{})
 	}
-	cacheKey := readCacheKey{name: key, generation: generation.(*pageGeneration), offset: off, length: n}
+	cacheKey := c.readKey(ctx, key)
+	cacheKey.generation, cacheKey.offset, cacheKey.length = generation.(*pageGeneration), off, n
 	v, err := c.values.Get(ctx, cacheKey, c.load)
 	if err != nil {
 		return nil, err

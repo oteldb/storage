@@ -48,6 +48,7 @@ engines over the fetch seam (`query/fetch`).
 | [`recordengine/ARCH.md`](recordengine/ARCH.md) | the shared record engine for logs/traces/profiles/exemplars |
 | [`query/ARCH.md`](query/ARCH.md) | fetch contract, scale decorators, PromQL adapter, EXPLAIN ANALYZE |
 | [`cluster/ARCH.md`](cluster/ARCH.md) | ring, membership, replication, rebalance, sharding, partsync, erasure coding |
+| [`internal/readerpool/ARCH.md`](internal/readerpool/ARCH.md) | bounded immutable-file retention, operation generations and publication invalidation |
 | [`internal/vfs/ARCH.md`](internal/vfs/ARCH.md) | the filesystem seam, `SyncDir`, and what each crash mode of the fake does and does not model |
 | [`internal/mergestream/ARCH.md`](internal/mergestream/ARCH.md) | the seam both merge engines share: the k-way key union, the two seal units, the forward-cursor contract, the conformance suite |
 | [`internal/engineguard/ARCH.md`](internal/engineguard/ARCH.md) | catalog, writer and reader ownership; bounded identity capture and confirmed publication use `identitysnapshot`/`indexcommit`; `buildbudget` estimates flush work |

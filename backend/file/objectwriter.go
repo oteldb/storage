@@ -10,6 +10,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/readerpool"
 	"github.com/oteldb/storage/internal/vfs"
 )
 
@@ -139,6 +140,8 @@ func (w *objectWriter) Commit(_ context.Context) error {
 		return errors.Wrap(err, "close temp")
 	}
 
+	mutationDone := readerpool.BeginMutation(w.file.readerNamespace(), w.path)
+	defer mutationDone()
 	if err := w.root.Rename(name, w.path); err != nil {
 		_ = w.root.Remove(name)
 		_ = w.root.Close()

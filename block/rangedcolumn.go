@@ -44,6 +44,7 @@ func (r *PartReader) ColumnBlocks(ctx context.Context, name string) (*Decoder, e
 }
 
 func (r *PartReader) openDecoder(ctx context.Context, name string, window int64) (*Decoder, error) {
+	ctx = r.ReaderContext(ctx)
 	i, ok := r.byName[name]
 	if !ok {
 		return nil, errors.Errorf("block: no column %q", name)

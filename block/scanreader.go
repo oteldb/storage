@@ -13,6 +13,7 @@ import (
 
 // OpenColumnScan reuses a file handle and pooled read-ahead buffer. The caller must Close the decoder.
 func (r *PartReader) OpenColumnScan(ctx context.Context, name string, window int64) (*Decoder, error) {
+	ctx = r.ReaderContext(ctx)
 	d, err := r.ColumnScan(ctx, name, window)
 	if err != nil {
 		return nil, err

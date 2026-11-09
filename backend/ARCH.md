@@ -140,6 +140,15 @@ a demonstration.
 - **`backend.ReadAtAppend`** appends a clamped range into caller-owned capacity. `ReadAppender`
   permits direct reads into that destination; older backends fall back through their existing
   view/range path. Cached entries are copied into the destination, never exposed for mutation.
+- Immutable part reads use `internal/readerpool`: at most 256 retained raw handles across
+  the process, with no root-directory handles retained. Active part pins protect ordinary LRU retention; actual reader
+  leases prevent all eviction. Saturation or an in-flight same-key open declines retention;
+  the ordinary ranged-read fallback opens only for its I/O. No filesystem open/close runs
+  under the shared pool mutex. Mutable unscoped reads keep their existing semantics.
+- File publication, deletion and streamed commit rotate affected scopes before and after
+  mutation. Per-operation generations namespace cached whole objects and pages, so restored
+  same-key columns are visible to future reads while active leases retain their original inode.
+  A fallback or cold open crossing a publication boundary fails instead of mixing generations.
 - **`backend.OpenReader`** optionally opens a seekable object handle. File handles retain one
   opened generation without reopening/statting each range; closing the root leaves the object
   handle valid. `ReaderMemory` bounds retained state before admission, including any backend
@@ -528,3 +537,8 @@ A fresh process serves what a previous one flushed, from the backend alone:
 object); `Storage.Open` → `recover` discovers tenants by their bucket-index objects and loads each
 (no-op when ephemeral). The **unflushed head** comes from the WAL instead — see
 [`../wal/ARCH.md`](../wal/ARCH.md).
+
+Descriptor exhaustion (`EMFILE`/`ENFILE`) permits one bounded idle-eviction retry:
+current-generation handles with no actual reader lease may be evicted even while their
+part is active. Actual opened leases remain protected. If a repair races a later reopen,
+the generation fence reports a changed-object error instead of mixing metadata and bytes.

@@ -17,6 +17,7 @@ import (
 	"github.com/oteldb/storage/encoding/compress"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/obs"
+	"github.com/oteldb/storage/internal/readerpool"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
@@ -405,7 +406,8 @@ type part struct {
 	// lock, while the part is still live) the parts it will read and releases them when done; a retired
 	// part is not deleted from the backend until its refs reach zero, so a lock-free read never races a
 	// delete.
-	refs atomic.Int32
+	refs           atomic.Int32
+	readersClosing atomic.Bool
 
 	// seriesMaxMu guards seriesMax, the per-series watermarks of [part.forEachSeriesMaxTime]. A
 	// mutex rather than a sync.Once so a failed load (a transient backend error) is retried instead
@@ -419,14 +421,18 @@ type part struct {
 	identityLoaded, identityPresent bool
 }
 
-func (p *part) acquire() { p.refs.Add(1) }
+func (p *part) acquire() { p.refs.Add(1); p.reader.AcquireReaders() }
 
 // release drops one fetch's hold. When the last in-flight fetch lets go, a paged index's entries
 // view is released too, so between fetches the index bytes stay only in the (evictable) backend
 // read cache rather than pinned in the heap.
 func (p *part) release() {
+	p.reader.ReleaseReaders()
 	if p.refs.Add(-1) == 0 {
 		p.index.dropView()
+		if p.readersClosing.Load() {
+			_ = p.reader.Close()
+		}
 	}
 }
 
@@ -452,7 +458,10 @@ func openPart(
 
 	var idx partIndex
 
-	if paged, ok := openPagedIndex(ctx, b, prefix, r.RowCount(), corrupt); ok {
+	if paged, ok := openPagedIndex(r.ReaderContext(ctx), b, prefix, r.RowCount(), corrupt); ok {
+		if readerpool.Supported(b) {
+			paged.readContext = r.ReaderContext
+		}
 		idx = partIndex{paged: paged}
 	} else {
 		col, err := r.Column(ctx, colSeries)
@@ -505,7 +514,7 @@ func (p *part) seriesStat(ctx context.Context, id signal.SeriesID) (SeriesAgg, b
 			return
 		}
 
-		data, err := p.be.Read(ctx, statsKey(p.prefix))
+		data, err := p.be.Read(p.reader.ReaderContext(ctx), statsKey(p.prefix))
 		if err != nil {
 			return // absent ⇒ fall back to decode
 		}
@@ -629,7 +638,7 @@ func (p *part) sidecarWatermarks(ctx context.Context) ([]watermark.Entry, bool) 
 		return nil, false
 	}
 
-	data, err := p.be.Read(ctx, watermark.Key(p.prefix))
+	data, err := p.be.Read(p.reader.ReaderContext(ctx), watermark.Key(p.prefix))
 	if err != nil {
 		return nil, false
 	}
@@ -1070,4 +1079,22 @@ func (c partDecodeCache) get(ctx context.Context, p *part, decode decodeFunc) (*
 	c[p] = d
 
 	return d, nil
+}
+
+func (p *part) closeReaders() {
+	p.readersClosing.Store(true)
+	if p.refs.Load() == 0 {
+		_ = p.reader.Close()
+	}
+}
+
+func (e *Engine) closePartReadersLocked() {
+	for _, p := range e.foreignParts {
+		p.closeReaders()
+	}
+	for _, parts := range [][]*part{e.parts, e.retiring} {
+		for _, p := range parts {
+			p.closeReaders()
+		}
+	}
 }

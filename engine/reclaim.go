@@ -67,6 +67,9 @@ func partRows(parts []*part) int {
 // fetch can acquire them; their backend objects are deleted by [reclaimRetired] once their current
 // readers drain. Caller holds e.mu.
 func (e *Engine) retireLocked(parts []*part) {
+	for _, p := range parts {
+		p.closeReaders()
+	}
 	e.retiring = append(e.retiring, parts...)
 }
 

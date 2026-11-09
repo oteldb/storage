@@ -727,6 +727,7 @@ func (p *enginePlan) rangesFor(ctx context.Context, part *part) ([]rowRange, err
 }
 
 func (p *enginePlan) matchingRanges(ctx context.Context, part *part, positions bool) ([]rowRange, []uint32, error) {
+	ctx = part.reader.ReaderContext(ctx)
 	out := make([]rowRange, 0) // nil means a whole-part decode, not an empty selection.
 	var matched []uint32
 
@@ -1411,6 +1412,9 @@ func (e *Engine) Reset(ctx context.Context) error {
 
 	e.retireLocked(e.parts)
 	e.parts = nil
+	for _, p := range e.foreignParts {
+		p.closeReaders()
+	}
 	// Adopted parts are dropped, not retired: this engine does not own their objects. Reset wipes
 	// the whole prefix below, which is what makes it destructive.
 	e.foreign, e.foreignParts = nil, nil

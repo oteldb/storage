@@ -9,6 +9,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/internal/memsize"
+	"github.com/oteldb/storage/internal/readerpool"
 )
 
 var (
@@ -69,3 +70,5 @@ func (r *instrumentedObjectReader) record(start time.Time, n int, err error) {
 	}
 	r.b.m.Record(r.ctx, "read", result(err), time.Since(start), int64(n))
 }
+
+func (b *instrumentedBackend) RetainsImmutableReaders() bool { return readerpool.Supported(b.inner) }

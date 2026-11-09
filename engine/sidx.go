@@ -184,6 +184,7 @@ func sidxEntryStart(entries []byte, k int) int {
 // no cold-latency regression. With a Viewer (memory backend, or any backend behind
 // [backend.Cached]) a reload is a cache-hit view, so dropping is nearly free.
 type pagedIndex struct {
+	readContext func(context.Context) context.Context
 	be          backend.Backend
 	key         string
 	n           int // distinct series
@@ -201,6 +202,9 @@ type pagedIndex struct {
 // entries returns the sidecar's entry bytes, loading (and structurally re-validating) them through
 // the backend when dropped. Concurrent loads race benignly (identical immutable content).
 func (p *pagedIndex) entries(ctx context.Context) ([]byte, error) {
+	if p.readContext != nil {
+		ctx = p.readContext(ctx)
+	}
 	if v := p.view.Load(); v != nil {
 		return *v, nil
 	}

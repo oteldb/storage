@@ -88,7 +88,8 @@ type part struct {
 	// lock, while the part is still live) the parts it will read, releases them when done, and reads
 	// the backend objects between. A retired part (removed from the live set by flush/merge) is not
 	// deleted from the backend until its refs reach zero, so a lock-free reader never races a delete.
-	refs atomic.Int32
+	refs           atomic.Int32
+	readersClosing atomic.Bool
 	// tsDisorder is set once a merge finds a stream of this part out of timestamp order, so every
 	// later merge decodes it whole instead of reading it forward.
 	tsDisorder atomic.Bool
@@ -105,8 +106,13 @@ type part struct {
 	identityLoaded, identityPresent bool
 }
 
-func (p *part) acquire() { p.refs.Add(1) }
-func (p *part) release() { p.refs.Add(-1) }
+func (p *part) acquire() { p.refs.Add(1); p.reader.AcquireReaders() }
+func (p *part) release() {
+	p.reader.ReleaseReaders()
+	if p.refs.Add(-1) == 0 && p.readersClosing.Load() {
+		_ = p.reader.Close()
+	}
+}
 
 // deletePart removes every backend object of the part at prefix. See [block.DeletePart].
 func deletePart(ctx context.Context, b backend.Backend, prefix string) error {
@@ -188,7 +194,7 @@ func (p *part) sidecarWatermarks(ctx context.Context) ([]watermark.Entry, bool) 
 		return nil, false
 	}
 
-	data, err := p.be.Read(ctx, watermark.Key(p.prefix))
+	data, err := p.be.Read(p.reader.ReaderContext(ctx), watermark.Key(p.prefix))
 	if err != nil {
 		return nil, false
 	}
@@ -449,4 +455,22 @@ func (p *part) readBytes(ctx context.Context, name string, blocks []int) (byteCo
 	}
 
 	return out, nil
+}
+
+func (p *part) closeReaders() {
+	p.readersClosing.Store(true)
+	if p.refs.Load() == 0 {
+		_ = p.reader.Close()
+	}
+}
+
+func (e *Engine) closePartReadersLocked() {
+	for _, p := range e.foreignParts {
+		p.closeReaders()
+	}
+	for _, parts := range [][]*part{e.parts, e.retiring} {
+		for _, p := range parts {
+			p.closeReaders()
+		}
+	}
 }

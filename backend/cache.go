@@ -8,6 +8,8 @@ import (
 
 	"github.com/maypok86/otter/v2"
 	"github.com/maypok86/otter/v2/stats"
+
+	"github.com/oteldb/storage/internal/readerpool"
 )
 
 // Cached wraps a [Backend] with a bounded in-memory cache over read objects — the object-store read
@@ -187,7 +189,7 @@ func (c *cachedBackend) Read(ctx context.Context, key string) ([]byte, error) {
 // Concurrent misses on one key share a single inner read; the loader's error is propagated, never
 // cached, so the next call retries.
 func (c *cachedBackend) ReadView(ctx context.Context, key string) ([]byte, error) {
-	v, err := c.values.Get(ctx, readCacheKey{name: key}, c.load)
+	v, err := c.values.Get(ctx, c.readKey(ctx, key), c.load)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +210,7 @@ func (c *cachedBackend) ReadView(ctx context.Context, key string) ([]byte, error
 // would fetch the whole object to answer a range, which is exactly the cost the range exists to
 // avoid — and for a part column, one that does not fit the budget anyway. Implements [ReaderAt].
 func (c *cachedBackend) ReadAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
-	if v, ok := c.values.GetIfPresent(readCacheKey{name: key}); ok {
+	if v, ok := c.values.GetIfPresent(c.readKey(ctx, key)); ok {
 		return slices.Clone(clampRange(v, off, n)), nil
 	}
 
@@ -220,7 +222,7 @@ func (c *cachedBackend) ReadAtAppend(ctx context.Context, dst []byte, key string
 	if err := validateRange(key, off, n); err != nil {
 		return dst, err
 	}
-	if v, ok := c.values.GetIfPresent(readCacheKey{name: key}); ok {
+	if v, ok := c.values.GetIfPresent(c.readKey(ctx, key)); ok {
 		return append(dst, clampRange(v, off, n)...), nil
 	}
 	return ReadAtAppend(ctx, c.inner, dst, key, off, n)
@@ -245,7 +247,7 @@ func (c *cachedBackend) RangesNatively(ctx context.Context, key string) bool {
 // ReadViewAt is [cachedBackend.ReadAt] without the copy, under the [Viewer] contract: a resident
 // entry is never mutated in place, so a slice of one stays valid. Implements [ViewerAt].
 func (c *cachedBackend) ReadViewAt(ctx context.Context, key string, off, n int64) ([]byte, error) {
-	if v, ok := c.values.GetIfPresent(readCacheKey{name: key}); ok {
+	if v, ok := c.values.GetIfPresent(c.readKey(ctx, key)); ok {
 		return clampRange(v, off, n), nil
 	}
 
@@ -382,4 +384,16 @@ func ReadUncached(ctx context.Context, b Backend, key string) ([]byte, error) {
 	}
 
 	return b.Read(ctx, key)
+}
+
+func (c *cachedBackend) RetainsImmutableReaders() bool { return readerpool.Supported(c.inner) }
+
+func (c *cachedBackend) readKey(ctx context.Context, name string) readCacheKey {
+	key := readCacheKey{name: name}
+	if id := readerpool.ID(ctx); id != 0 {
+		if readerpool.Supported(c.inner) {
+			key.owner = id
+		}
+	}
+	return key
 }
