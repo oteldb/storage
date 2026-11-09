@@ -19,6 +19,9 @@ func (p *pagedIndex) lookup(ctx context.Context, id signal.SeriesID) (rowRange, 
 }
 
 func (p *pagedIndex) lookupPage(ctx context.Context, id signal.SeriesID, pageEntries int) (rowRange, bool, error) {
+	if p.readContext != nil {
+		ctx = p.readContext(ctx)
+	}
 	if view := p.view.Load(); view != nil {
 		k, ok := p.search(*view, id)
 		if !ok {

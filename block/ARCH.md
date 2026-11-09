@@ -311,6 +311,14 @@ Two things the batch writer settles by looking at a finished column, a streaming
 
 ## Reading a column by range
 
+A `PartReader` owns an immutable reader scope. `AcquireReaders` / `ReleaseReaders` protect
+its idle handles from ordinary LRU eviction while a query holds the part; `Close` retires cached file
+handles after those queries drain. Direct users should close readers when finished; a bounded
+process-wide LRU and scope cleanup cover forgotten owners. Each operation binds its current
+generation, including directory reads and later frame reads. A replacement rotates future
+operations without changing an already opened lease. File mutation invalidation is shared by
+backends rooted at the same filesystem identity, including path aliases.
+
 `PartReader.Column` reads a column object whole; `PartReader.ColumnBlocks(ctx, name)` reads only its
 **directory** and then fetches each compression frame with `backend.ReadAt` as blocks are decoded.
 Both are right for different callers: the whole-object form when a caller decodes the whole column,
@@ -607,3 +615,8 @@ CRC before decoding, bound `rawLen` by the manifest frame/granule counts, requir
 length, then validate the ordinary directory and its frame checksums. Input and scan admission
 include the transient directory buffer; LZ4 decoding needs no separate workspace. Default fixed-row writers keep
 their existing format; old readers reject the unknown extension bit.
+
+Descriptor exhaustion (`EMFILE`/`ENFILE`) permits one bounded idle-eviction retry:
+current-generation handles with no actual reader lease may be evicted even while their
+part is active. Actual opened leases remain protected. If a repair races a later reopen,
+the generation fence reports a changed-object error instead of mixing metadata and bytes.

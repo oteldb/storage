@@ -12,6 +12,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/encoding/compress"
+	"github.com/oteldb/storage/internal/readerpool"
 )
 
 // defaultGranuleSize is the sparse-index granularity in rows (ClickHouse default;
@@ -404,6 +405,7 @@ func DeletePart(ctx context.Context, b backend.Backend, prefix string) error {
 // columns and marks are read lazily, so a query touches only the objects it references
 // (DESIGN.md §7).
 type PartReader struct {
+	readers  *readerpool.Scope
 	b        backend.Backend
 	prefix   string
 	manifest Manifest
@@ -416,8 +418,8 @@ type PartReader struct {
 }
 
 // ResidentBytes bounds what the open reader holds: its decoded manifest — a descriptor, name, constant
-// value and name-index slot per column — and the reader itself. Columns it reads are not included;
-// each read is its caller's.
+// value and name-index slot per column — plus retained reader bookkeeping. Decoded columns remain
+// the caller's responsibility.
 func (r *PartReader) ResidentBytes() int64 {
 	const mapSlot = 64
 
@@ -428,6 +430,9 @@ func (r *PartReader) ResidentBytes() int64 {
 		n += 2*int64(len(c.Name)) + int64(len(c.ConstBytes)) + mapSlot
 	}
 
+	if r.readers != nil {
+		n += r.readers.ResidentBytes()
+	}
 	return n
 }
 
@@ -468,6 +473,7 @@ func OpenPart(ctx context.Context, b backend.Backend, prefix string, opts ...Rea
 	}
 
 	r := &PartReader{
+
 		b:        b,
 		prefix:   prefix,
 		manifest: m,
@@ -476,6 +482,11 @@ func OpenPart(ctx context.Context, b backend.Backend, prefix string, opts ...Rea
 		level:    compress.LevelDefault,
 	}
 
+	if readerpool.Supported(b) {
+		if _, known := backend.ReaderMemory(b, manifestKey(prefix)); known {
+			r.readers = readerpool.NewScope()
+		}
+	}
 	for _, opt := range opts {
 		opt(r)
 	}
@@ -525,6 +536,7 @@ func (r *PartReader) ColumnNames() []string {
 // Column returns a lazy reader for the named column. A constant column is synthesized
 // from the manifest with no I/O; otherwise its object is read from the backend.
 func (r *PartReader) Column(ctx context.Context, name string) (*ColumnReader, error) {
+	ctx = r.ReaderContext(ctx)
 	i, ok := r.byName[name]
 	if !ok {
 		return nil, errors.Errorf("block: no column %q", name)
@@ -565,6 +577,7 @@ func (r *PartReader) ColumnDescByName(name string) (ColumnDesc, bool) {
 // Marks reads the legacy sparse index; variable numeric chunks return an empty index.
 // Use [Decoder.BlockTimeBounds] for their inline bounds.
 func (r *PartReader) Marks(ctx context.Context) (Marks, error) {
+	ctx = r.ReaderContext(ctx)
 	for i := range r.manifest.Columns {
 		if r.manifest.Columns[i].MaxBlockRows > 0 {
 			return Marks{GranuleSize: r.manifest.GranuleSize}, nil
@@ -575,6 +588,36 @@ func (r *PartReader) Marks(ctx context.Context) (Marks, error) {
 		return Marks{}, errors.Wrap(err, "read marks")
 	}
 	return DecodeMarks(raw)
+}
+
+// ReaderContext binds immutable object reads to this part's operation generation.
+func (r *PartReader) ReaderContext(ctx context.Context) context.Context {
+	if r == nil || r.readers == nil {
+		return ctx
+	}
+	return r.readers.Context(ctx)
+}
+
+// AcquireReaders protects idle handles from ordinary LRU eviction during an operation.
+func (r *PartReader) AcquireReaders() {
+	if r != nil && r.readers != nil {
+		r.readers.Acquire()
+	}
+}
+
+// ReleaseReaders ends one [AcquireReaders] pin.
+func (r *PartReader) ReleaseReaders() {
+	if r != nil && r.readers != nil {
+		r.readers.Release()
+	}
+}
+
+// Close retires this part's retained file handles; active reads may finish first.
+func (r *PartReader) Close() error {
+	if r == nil || r.readers == nil {
+		return nil
+	}
+	return r.readers.Close()
 }
 
 func (r *PartReader) columnReader(desc ColumnDesc, obj []byte, comp *compress.Compressor) *ColumnReader {

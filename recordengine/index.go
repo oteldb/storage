@@ -201,6 +201,9 @@ func mergeHoles(cur, other []bucketindex.Entry) []bucketindex.Entry {
 // writer knows whether it is still live. Caller holds e.mu.
 func (e *Engine) openForeignLocked(ctx context.Context) {
 	if len(e.foreign) == 0 {
+		for _, p := range e.foreignParts {
+			p.closeReaders()
+		}
 		e.foreignParts = nil
 
 		return
@@ -236,6 +239,11 @@ func (e *Engine) openForeignLocked(ctx context.Context) {
 		}
 	}
 
+	for prefix, p := range e.foreignParts {
+		if open[prefix] != p {
+			p.closeReaders()
+		}
+	}
 	e.foreignParts = open
 }
 
@@ -660,6 +668,21 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 // adoptLoadLocked makes l the engine's state and lifts the commit fence. It cannot fail, which is
 // what makes a load all-or-nothing. Caller holds e.mu.
 func (e *Engine) adoptLoadLocked(l *indexLoad) {
+	kept := make(map[*part]struct{}, len(l.parts))
+	for _, p := range l.parts {
+		kept[p] = struct{}{}
+	}
+	for _, p := range e.parts {
+		if _, ok := kept[p]; !ok {
+			p.closeReaders()
+		}
+	}
+	for _, p := range e.foreignParts {
+		if _, ok := kept[p]; !ok {
+			p.closeReaders()
+		}
+	}
+
 	// The loaded index is the one the next commit conditions on, and it accounts for every entry it
 	// names, so nothing is foreign any more. The adopted handles' objects belong to their writer and
 	// are not deleted here.

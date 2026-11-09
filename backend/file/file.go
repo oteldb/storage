@@ -21,6 +21,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/readerpool"
 	"github.com/oteldb/storage/internal/vfs"
 )
 
@@ -205,6 +206,8 @@ func (f *File) PutIfAbsent(_ context.Context, key string, data []byte) (written 
 		return false, errors.Wrap(err, "close temp")
 	}
 
+	mutationDone := readerpool.BeginMutation(f.readerNamespace(), p)
+	defer mutationDone()
 	if err := root.Link(tmpName, p); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return false, nil // key already present
@@ -221,7 +224,10 @@ func (f *File) PutIfAbsent(_ context.Context, key string, data []byte) (written 
 }
 
 // Read returns the value stored under key, or an [backend.ErrNotExist]-wrapping error.
-func (f *File) Read(_ context.Context, key string) ([]byte, error) {
+func (f *File) Read(ctx context.Context, key string) ([]byte, error) {
+	if readerpool.Scoped(ctx) {
+		return f.ReadAtAppend(ctx, nil, key, 0, 1<<63-1)
+	}
 	p, err := f.rel(key)
 	if err != nil {
 		return nil, err
@@ -234,6 +240,9 @@ func (f *File) Read(_ context.Context, key string) ([]byte, error) {
 	defer func() { _ = root.Close() }()
 
 	data, err := root.ReadFile(p)
+	if readerpool.RelievePressure(err) {
+		data, err = root.ReadFile(p)
+	}
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, errors.Wrapf(backend.ErrNotExist, "read %q", key)
@@ -381,7 +390,13 @@ func (f *File) Delete(_ context.Context, key string) error {
 }
 
 // openRoot opens a filesystem handle for one operation. The caller closes it.
-func (f *File) openRoot() (vfs.FS, error) { return f.open() }
+func (f *File) openRoot() (vfs.FS, error) {
+	root, err := f.open()
+	if readerpool.RelievePressure(err) {
+		return f.open()
+	}
+	return root, err
+}
 
 // pruneParents removes the directories left empty by deleting p, up to (but never including)
 // the root. Without it a deleted part leaves its directories behind forever, and every List
@@ -489,6 +504,9 @@ func (f *File) removeEmptyDir(root vfs.FS, dir string) bool {
 // escape it. [os.Root] refuses an escaping path in the kernel too; this check runs first so the
 // caller is told which key was at fault rather than being handed a path error.
 func (f *File) rel(key string) (string, error) {
+	if fs.ValidPath(key) {
+		return key, nil
+	}
 	// Resolving against "/" collapses any leading "..", so a key that meant to climb out of the
 	// root no longer matches its own cleaned form.
 	p := strings.TrimPrefix(path.Clean("/"+key), "/")
@@ -543,6 +561,8 @@ func (f *File) write(key string, data []byte, durable bool) (rerr error) {
 		return errors.Wrap(err, "close temp")
 	}
 
+	mutationDone := readerpool.BeginMutation(f.readerNamespace(), p)
+	defer mutationDone()
 	if err := root.Rename(tmpName, p); err != nil {
 		return errors.Wrapf(err, "rename into %q", key)
 	}
@@ -570,6 +590,8 @@ func (f *File) remove(key string, durable bool) error {
 	}
 	defer func() { _ = root.Close() }()
 
+	mutationDone := readerpool.BeginMutation(f.readerNamespace(), p)
+	defer mutationDone()
 	if err := root.Remove(p); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return errors.Wrapf(backend.ErrNotExist, "delete %q", key)

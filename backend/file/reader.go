@@ -12,6 +12,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/readerpool"
 	"github.com/oteldb/storage/internal/vfs"
 )
 
@@ -21,9 +22,18 @@ var (
 )
 
 // ReadAtAppend appends a clamped range directly into caller-owned storage.
-func (f *File) ReadAtAppend(_ context.Context, dst []byte, key string, off, n int64) ([]byte, error) {
+func (f *File) ReadAtAppend(ctx context.Context, dst []byte, key string, off, n int64) ([]byte, error) {
 	if off < 0 || n < 0 {
 		return dst, errors.New("file: negative read range")
+	}
+	if readerpool.Scoped(ctx) {
+		if out, supported, err := f.readRetained(ctx, dst, key, off, n); supported || err != nil {
+			return out, err
+		}
+	}
+
+	if !readerpool.Valid(ctx) {
+		return dst, errors.New("file: object changed before read")
 	}
 	root, file, size, err := f.openRead(key)
 	if err != nil {
@@ -31,6 +41,9 @@ func (f *File) ReadAtAppend(_ context.Context, dst []byte, key string, off, n in
 	}
 	defer func() { _ = root.Close() }()
 	defer func() { _ = file.Close() }()
+	if !readerpool.Valid(ctx) {
+		return dst, errors.New("file: object changed while opening read")
+	}
 	if off >= size {
 		return dst, nil
 	}
@@ -43,10 +56,21 @@ func (f *File) ReadAtAppend(_ context.Context, dst []byte, key string, off, n in
 	if _, err := file.ReadAt(dst[start:], off); err != nil {
 		return dst[:start], errors.Wrapf(err, "read %q at [%d,+%d)", key, off, n)
 	}
+	if !readerpool.Valid(ctx) {
+		return dst[:start], errors.New("file: object changed during read")
+	}
 	return dst, nil
 }
 
 func (f *File) openRead(key string) (vfs.FS, vfs.File, int64, error) {
+	root, file, size, err := f.openReadOnce(key)
+	if readerpool.RelievePressure(err) {
+		return f.openReadOnce(key)
+	}
+	return root, file, size, err
+}
+
+func (f *File) openReadOnce(key string) (vfs.FS, vfs.File, int64, error) {
 	p, err := f.rel(key)
 	if err != nil {
 		return nil, nil, 0, err
@@ -81,20 +105,19 @@ func (f *File) OpenReader(ctx context.Context, key string) (backend.ObjectReader
 	if err := ctx.Err(); err != nil {
 		return nil, true, err
 	}
-	root, file, size, err := f.openRead(key)
+	name, err := f.rel(key)
 	if err != nil {
 		return nil, true, err
 	}
-	if err := root.Close(); err != nil {
-		_ = file.Close()
-		return nil, true, errors.Wrap(err, "close reader root")
-	}
-	return &objectReader{file: file, size: size}, true, nil
+	return readerpool.Open(ctx, f.readerNamespace(), name, func() (readerpool.Reader, error) { return f.openReaderObject(key) })
 }
+
+// RetainsImmutableReaders reports scoped file-generation support.
+func (*File) RetainsImmutableReaders() bool { return true }
 
 // ReaderMemory reserves file state and owned path strings; the handle has no internal byte buffer.
 func (f *File) ReaderMemory(key string) (int64, bool) {
-	return 1024 + 4*int64(len(f.dir)+len(key)), true
+	return 3072 + 4*int64(len(f.dir)+len(key)), true
 }
 
 type objectReader struct {
@@ -102,9 +125,12 @@ type objectReader struct {
 	size   int64
 	pos    int64
 	closed atomic.Bool
+	memory int64
 }
 
 func (r *objectReader) Size() int64 { return r.size }
+
+func (r *objectReader) MemoryBytes() int64 { return r.memory }
 
 func (r *objectReader) ReadAt(dst []byte, off int64) (int, error) {
 	if r.closed.Load() {
@@ -145,4 +171,35 @@ func (r *objectReader) Close() error {
 		return nil
 	}
 	return r.file.Close()
+}
+
+func (f *File) readRetained(ctx context.Context, dst []byte, key string, off, n int64) ([]byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return dst, true, err
+	}
+	name, err := f.rel(key)
+	if err != nil {
+		return dst, true, err
+	}
+	return readerpool.Append(ctx, f.readerNamespace(), name, dst, off, n, func() (readerpool.Reader, error) { return f.openReaderObject(key) })
+}
+
+func (f *File) openReaderObject(key string) (readerpool.Reader, error) {
+	root, file, size, err := f.openReadOnce(key)
+	if err != nil {
+		return nil, err
+	}
+	if err := root.Close(); err != nil {
+		_ = file.Close()
+		return nil, errors.Wrap(err, "close reader root")
+	}
+	memory, _ := f.ReaderMemory(key)
+	return &objectReader{file: file, size: size, memory: memory}, nil
+}
+
+func (f *File) readerNamespace() any {
+	if f.dirs != nil {
+		return f.dirs
+	}
+	return f
 }

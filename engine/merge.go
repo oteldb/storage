@@ -849,6 +849,11 @@ func (e *Engine) Close(ctx context.Context) (retErr error) {
 	e.mu.Lock()
 	waitDone(nil)
 	defer e.mu.Unlock()
+	defer func() {
+		readersDone := obs.ShutdownPhase(ctx, log, "release_part_readers")
+		e.closePartReadersLocked()
+		readersDone(nil)
+	}()
 
 	if e.cfg.WAL != nil {
 		walDone := obs.ShutdownPhase(ctx, log, "wal_close")
@@ -862,15 +867,12 @@ func (e *Engine) Close(ctx context.Context) (retErr error) {
 	return flushErr
 }
 
-// CloseWAL closes the engine's open WAL segment file handle without flushing the head or
-// checkpointing — modeling a process crash, where the OS reclaims open descriptors but the on-disk
-// WAL segments survive for replay. The head is left as-is (and lost, as a crash would lose it). A
-// crash-recovery test uses this to release the file handle so the WAL directory can be removed even
-// on platforms that refuse to delete a file held open by a live process (Windows). No-op without a
-// WAL.
+// CloseWAL releases WAL and part-reader ownership without flushing or checkpointing.
+// WAL segments remain for replay; active fetches keep their readers until release.
 func (e *Engine) CloseWAL() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	defer e.closePartReadersLocked()
 
 	if e.cfg.WAL != nil {
 		return e.mu.WithReaders(e.cfg.WAL.Close)
