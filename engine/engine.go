@@ -1117,6 +1117,13 @@ type sampleMerge struct {
 	ambiguous int
 }
 
+func (m *sampleMerge) reset() {
+	clear(m.runs)
+	m.runs = m.runs[:0]
+	m.layouts = nil
+	m.ambiguous = 0
+}
+
 // add registers a source's [start, end] window as a run. ts must be ascending; the window bounds are
 // found by binary search (a no-op clip for an already-windowed head/flush source). Empty windows are
 // skipped. sf carries each sample's weight (nil ⇒ every weight is 1); layout is the source's recorded

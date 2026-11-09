@@ -496,11 +496,12 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 	// Decode each source part once and reuse across all its series (compaction reads every
 	// series of every part), instead of re-decoding the whole part per series.
 	decoded := make(partDecodeCache, len(src))
+	var scratch rollupScratch
+	var m sampleMerge
 
 	for keys.Next() {
 		id := keys.Key()
-
-		var m sampleMerge
+		m.reset()
 
 		// Oldest → newest part, so a later part's value wins on a duplicate timestamp.
 		for i, p := range src {
@@ -522,7 +523,7 @@ func (e *Engine) compactParts(ctx context.Context, src []*part, start int64, tie
 			return nil, err
 		}
 
-		ts, values, sf, covered := rollSeries(&m, tiers)
+		ts, values, sf, covered := scratch.roll(&m, tiers)
 
 		u := idToU128(id)
 		for i := range ts {
@@ -687,12 +688,13 @@ func (e *Engine) compactStreamWithInputs(
 	defer router.Drop((*partStreamWriter).abort)
 
 	var identities mergeIdentityBatch
+	var output rollupScratch
+	var m sampleMerge
 	for identities.next(e, &keys) {
 		i := identities.at - 1
 		id, view, ref, found := identities.ids[i], identities.view, identities.refs[i], identities.found[i]
 
-		m, err := mergeStreamedSeries(src, streams, scratch, identities.ranges[i*len(src):(i+1)*len(src)], start)
-		if err != nil {
+		if err := mergeStreamedSeries(&m, src, streams, scratch, identities.ranges[i*len(src):(i+1)*len(src)], start); err != nil {
 			return nil, err
 		}
 
@@ -702,7 +704,7 @@ func (e *Engine) compactStreamWithInputs(
 		}
 
 		rs := rolledSeries{srcCovered: srcCovered}
-		rs.ts, rs.values, rs.sf, rs.covered = rollSeries(&m, plan.tiers)
+		rs.ts, rs.values, rs.sf, rs.covered = output.roll(&m, plan.tiers)
 
 		err = timebucket.Runs(rs.ts, func(lo, hi int) error {
 			return router.Append(rs.ts[lo], func(w *partStreamWriter) (bool, error) {
@@ -803,10 +805,10 @@ func rowCapFor(p *part, capBytes int64) int {
 // mergeStreamedSeries gathers one series' samples across the source parts (oldest → newest, so a
 // later part's value wins on a duplicate timestamp), each read through its forward stream cursor.
 func mergeStreamedSeries(
-	src []*part, streams []*partStream, scratch []rangeBuf,
+	m *sampleMerge, src []*part, streams []*partStream, scratch []rangeBuf,
 	ranges []rowRange, start int64,
-) (sampleMerge, error) {
-	var m sampleMerge
+) error {
+	m.reset()
 
 	for i, rng := range ranges {
 		if rng.start == rng.end {
@@ -815,13 +817,13 @@ func mergeStreamedSeries(
 
 		ts, vals, sf, err := streams[i].decodeRange(rng, &scratch[i])
 		if err != nil {
-			return m, err
+			return err
 		}
 
 		m.add(ts, vals, sf, src[i].rollup, start, maxInt64)
 	}
 
-	return m, nil
+	return nil
 }
 
 // Close flushes any buffered samples to a part and closes the WAL. It does not stop a background

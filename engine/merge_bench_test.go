@@ -37,6 +37,7 @@ func BenchmarkMergeResidentMemory(b *testing.B) {
 		{"500s400x4p", 500, 400, 4, memory},
 		{"file-500s400x4p", 500, 400, 4, onDisk},
 		{"file-500s2000x4p", 500, 2000, 4, onDisk},
+		{"file-80000s2x2p", 80000, 2, 2, onDisk},
 	} {
 		b.Run(cfg.name, func(b *testing.B) {
 			ctx := context.Background()

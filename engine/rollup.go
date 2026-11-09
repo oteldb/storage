@@ -522,15 +522,16 @@ func (e *Engine) rollupChanges(ctx context.Context, p *part, start int64, tiers 
 	var (
 		streams = []*partStream{s}
 		scratch = make([]rangeBuf, 1)
+		output  rollupScratch
+		m       sampleMerge
 	)
 
 	for keys.Next() {
-		m, err := mergeStreamedSeries(src, streams, scratch, keys.ranges, start)
-		if err != nil {
+		if err := mergeStreamedSeries(&m, src, streams, scratch, keys.ranges, start); err != nil {
 			return false, err
 		}
 
-		ts, vals, sf, tags := m.collectTagged()
+		ts, vals, sf, tags := output.collect(&m)
 
 		rolledTs, rolledVals, rolledSF, _ := downsampleCovering(ts, vals, sf, tags, tiers)
 		if !slices.Equal(rolledTs, ts) {

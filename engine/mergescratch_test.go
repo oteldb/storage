@@ -28,8 +28,8 @@ func TestMergeSeriesScratchRaw(t *testing.T) {
 		weighted bool
 		rowBytes int64
 	}{
-		{"unweighted", false, 48},
-		{"weighted", true, 72},
+		{"unweighted", false, 64},
+		{"weighted", true, 88},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()

@@ -32,7 +32,9 @@ func mergeSeriesScratchBound(src []*part, tiers []DownsampleTier) int64 {
 	if tagged {
 		gathered += memsize.Of[rollupTag]()
 	}
-	bound := buildbudget.Add(ranges, buildbudget.Mul(rows, gathered))
+	// Growing reusable output columns briefly retains both the old and replacement arrays.
+	growth := memsize.Of[int64]() + memsize.Of[float64]()
+	bound := buildbudget.Add(ranges, buildbudget.Mul(rows, gathered+growth))
 	header := 2 * (memsize.Of[tsRun]() + memsize.Of[[]DownsampleTier]())
 	bound = buildbudget.Add(bound, buildbudget.Mul(int64(len(src)), header+memsize.Of[rangeBuf]()))
 	bound = buildbudget.Add(bound, buildbudget.Mul(tierCount, 4*memsize.Of[DownsampleTier]()))
