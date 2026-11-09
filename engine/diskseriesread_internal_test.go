@@ -1,10 +1,10 @@
 package engine
 
 import (
+	"context"
 	"encoding/binary"
 	"slices"
 	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -17,6 +17,7 @@ import (
 	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/readbudget"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -174,7 +175,97 @@ func TestDiskSeriesLegacyWorkspaceIncludesTimestampFallback(t *testing.T) {
 	col, shared, err := wholeMergeColumnBytes(p, colTs)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, bytes, col+shared)
-	require.False(t, strings.Contains(b.Report(), "/identity"), "workspace sizing must precede payload reads")
+	require.NotContains(t, b.Report(), "/identity", "workspace sizing must precede payload reads")
 	require.NoError(t, p.visitDiskSeries(t.Context(), nil, func(signal.SeriesID, []byte, seriesindex.Metadata) error { return nil }))
 	require.Nil(t, p.seriesMax, "legacy per-operation fallback must not retain tenant-wide watermarks")
+}
+
+type opaqueDiskBackend struct {
+	backend.Backend
+
+	reads int
+}
+
+func (b *opaqueDiskBackend) Read(ctx context.Context, key string) ([]byte, error) {
+	b.reads++
+	return b.Backend.Read(ctx, key)
+}
+
+func TestDiskSeriesRejectsOpaqueReadsBeforeAdmission(t *testing.T) {
+	t.Parallel()
+	for _, cached := range []bool{false, true} {
+		t.Run(strconv.FormatBool(cached), func(t *testing.T) {
+			t.Parallel()
+			b := backend.Memory()
+			writer, identities := diskRecoveryFixture(t, b, 2)
+			original := writer.parts[0]
+			sorted := slices.Clone(identities)
+			slices.SortFunc(sorted, func(a, b signal.Series) int { return a.Hash().Compare(b.Hash()) })
+			builder := &seriesindex.Builder{}
+			for _, s := range sorted {
+				require.NoError(t, builder.Add(s.Hash(), s, seriesindex.Metadata{Covered: 99}))
+			}
+			require.NoError(t, builder.WriteObject(t.Context(), b, seriesIndexKey(original.prefix)))
+			opaque := &opaqueDiskBackend{Backend: b}
+			p := &part{reader: original.reader, be: opaque, prefix: original.prefix, index: original.index}
+			if cached {
+				_, err := p.seriesIndex(t.Context())
+				require.NoError(t, err)
+			}
+			opaque.reads = 0
+			ctx := readbudget.With(t.Context(), readbudget.New(1<<20))
+			_, err := p.diskSeriesWorkspace(ctx, 1)
+			require.ErrorIs(t, err, readbudget.ErrExceeded)
+			require.Zero(t, opaque.reads, "opaque index payload must not be read before admission")
+		})
+	}
+}
+
+func TestDiskSeriesCorruptIndexFencesRecovery(t *testing.T) {
+	t.Parallel()
+	b := backend.Memory()
+	writer, identities := diskRecoveryFixture(t, b, 1)
+	builder := &seriesindex.Builder{}
+	require.NoError(t, builder.Add(identities[0].Hash(), identities[0], seriesindex.Metadata{}))
+	key := seriesIndexKey(writer.parts[0].prefix)
+	require.NoError(t, builder.WriteObject(t.Context(), b, key))
+	raw, err := b.Read(t.Context(), key)
+	require.NoError(t, err)
+	raw[len(raw)-1] ^= 1
+	require.NoError(t, b.Write(t.Context(), key, raw))
+	reader := New(Config{Backend: b, Prefix: writer.cfg.Prefix, DiskSeries: true})
+	t.Cleanup(func() { require.NoError(t, reader.Close(t.Context())) })
+	require.ErrorIs(t, reader.LoadPartsReadOnly(t.Context()), seriesindex.ErrCorrupt)
+	require.True(t, reader.IndexFenced())
+	require.Empty(t, reader.parts)
+}
+
+func TestDiskSeriesRepairRestoresPartMetadata(t *testing.T) {
+	t.Parallel()
+	b := backend.Memory()
+	writer, identities := diskRecoveryFixture(t, b, 1)
+	prefix := writer.parts[0].prefix
+	builder := &seriesindex.Builder{}
+	require.NoError(t, builder.Add(identities[0].Hash(), identities[0], seriesindex.Metadata{Covered: 1}))
+	require.NoError(t, builder.WriteObject(t.Context(), b, seriesIndexKey(prefix)))
+	key := prefix + "/manifest"
+	manifest, err := b.Read(t.Context(), key)
+	require.NoError(t, err)
+	require.NoError(t, b.Delete(t.Context(), key))
+	reader := New(Config{Backend: b, Prefix: writer.cfg.Prefix, DiskSeries: true})
+	t.Cleanup(func() { require.NoError(t, reader.Close(t.Context())) })
+	require.NoError(t, reader.LoadPartsReadOnly(t.Context()))
+	require.True(t, reader.HasWants())
+	require.Zero(t, reader.SeriesCount())
+	require.NoError(t, b.Write(t.Context(), key, manifest))
+	reader.repairWants(t.Context())
+	require.False(t, reader.HasWants())
+	require.Equal(t, 1, reader.SeriesCount())
+	require.Zero(t, reader.head.series.Len())
+	require.Len(t, reader.parts, 1)
+	s, meta, found, err := reader.parts[0].lookupDiskSeries(t.Context(), identities[0].Hash())
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, s.Equal(identities[0]))
+	require.Equal(t, int64(1), meta.Covered)
 }

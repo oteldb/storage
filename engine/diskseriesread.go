@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"math"
+	"slices"
 
 	"github.com/go-faster/errors"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/readbudget"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -38,7 +40,7 @@ func (p *part) diskSeriesWorkspace(ctx context.Context, nMatchers int) (int64, e
 			return 0, err
 		}
 		if !known {
-			return math.MaxInt64, nil
+			return 0, errors.Wrap(readbudget.ErrExceeded, "cannot bound legacy identity object without native sizes")
 		}
 		if n < 0 || n > (math.MaxInt64-size)/(16) {
 			return 0, errors.New("legacy identity workspace overflow")
@@ -70,12 +72,7 @@ func diskObjectPresent(ctx context.Context, b backend.Backend, key string) (bool
 	if err != nil {
 		return false, err
 	}
-	for _, got := range keys {
-		if got == key {
-			return true, nil
-		}
-	}
-	return false, nil
+	return slices.Contains(keys, key), nil
 }
 
 func (p *part) diskIdentityKey(ctx context.Context) (string, error) {
@@ -93,7 +90,10 @@ func (p *part) diskIdentityKey(ctx context.Context) (string, error) {
 	return key, nil
 }
 
-func (p *part) visitDiskSeries(ctx context.Context, matchers []fetch.Matcher, visit func(signal.SeriesID, []byte, seriesindex.Metadata) error) error {
+func (p *part) visitDiskSeries(
+	ctx context.Context, matchers []fetch.Matcher,
+	visit func(signal.SeriesID, []byte, seriesindex.Metadata) error,
+) error {
 	idx, err := p.seriesIndex(ctx)
 	if err != nil {
 		return err
@@ -110,7 +110,10 @@ func (p *part) visitDiskSeries(ctx context.Context, matchers []fetch.Matcher, vi
 
 // Legacy objects are decoded once per operation; the admission estimate includes their input
 // and decoded symbol, watermark and aggregate storage.
-func (p *part) visitLegacyDiskSeries(ctx context.Context, matchers []fetch.Matcher, visit func(signal.SeriesID, []byte, seriesindex.Metadata) error) error {
+func (p *part) visitLegacyDiskSeries(
+	ctx context.Context, matchers []fetch.Matcher,
+	visit func(signal.SeriesID, []byte, seriesindex.Metadata) error,
+) error {
 	key, err := p.diskIdentityKey(ctx)
 	if err != nil {
 		return err
@@ -161,24 +164,9 @@ func (p *part) visitLegacyDiskSeries(ctx context.Context, matchers []fetch.Match
 		if !fetch.MatchesSeries(s, matchers) {
 			return nil
 		}
-		meta := seriesindex.Metadata{}
-		// Both the part index and watermark sidecar use canonical ID order.
-		lo, hi := 0, len(times)
-		for lo < hi {
-			mid := int(uint(lo+hi) >> 1)
-			if times[mid].ID.Compare(id) < 0 {
-				lo = mid + 1
-			} else {
-				hi = mid
-			}
-		}
-		if lo == len(times) || times[lo].ID != id {
-			return errors.Wrap(seriesindex.ErrCorrupt, "legacy watermark missing identity")
-		}
-		meta.Covered = times[lo].Max
-		if s, ok := stats[id]; ok {
-			meta.HasStats = true
-			meta.Stats = seriesindex.Stats{Count: s.Rows, Sum: s.Sum, Min: s.Min, Max: s.Max}
+		meta, err := legacySeriesMetadata(times, stats, id)
+		if err != nil {
+			return err
 		}
 		return visit(id, raw, meta)
 	}
@@ -194,6 +182,27 @@ func (p *part) visitLegacyDiskSeries(ctx context.Context, matchers []fetch.Match
 		return errors.Wrap(seriesindex.ErrCorrupt, "legacy identities do not cover part")
 	}
 	return nil
+}
+
+func legacySeriesMetadata(times []watermark.Entry, stats map[signal.SeriesID]SeriesAgg, id signal.SeriesID) (seriesindex.Metadata, error) {
+	lo, hi := 0, len(times)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if times[mid].ID.Compare(id) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == len(times) || times[lo].ID != id {
+		return seriesindex.Metadata{}, errors.Wrap(seriesindex.ErrCorrupt, "legacy watermark missing identity")
+	}
+	meta := seriesindex.Metadata{Covered: times[lo].Max}
+	if stat, ok := stats[id]; ok {
+		meta.HasStats = true
+		meta.Stats = seriesindex.Stats{Count: stat.Rows, Sum: stat.Sum, Min: stat.Min, Max: stat.Max}
+	}
+	return meta, nil
 }
 
 func (p *part) lookupDiskSeries(ctx context.Context, id signal.SeriesID) (signal.Series, seriesindex.Metadata, bool, error) {
@@ -237,6 +246,11 @@ func (p *part) diskSeriesMetadata(ctx context.Context, id signal.SeriesID) (seri
 	if err != nil || !present {
 		return seriesindex.Metadata{}, false, err
 	}
+	if covered, ok, err := p.legacyDiskWatermark(ctx, id); err != nil {
+		return seriesindex.Metadata{}, false, err
+	} else if ok {
+		return seriesindex.Metadata{Covered: covered}, true, nil
+	}
 	times, ok := p.sidecarWatermarks(ctx)
 	if !ok {
 		times, err = p.seriesMaxTimes(ctx)
@@ -267,7 +281,7 @@ func (p *part) diskSeriesIDs(ctx context.Context) (postings.Postings, error) {
 }
 
 type diskPartIDs struct {
-	ctx       context.Context
+	ctx       context.Context //nolint:containedctx // Postings has no context parameter; the iterator owns its read lifetime.
 	index     *pagedIndex
 	pos, base int
 	data      []byte
@@ -284,7 +298,8 @@ func (p *diskPartIDs) Next() bool {
 	if p.data == nil || p.pos >= p.base+len(p.data)/sidxEntryW {
 		p.base = p.pos
 		n := min(indexPageEntries, p.index.n-p.pos)
-		p.data, p.err = backend.ReadAtAppend(p.ctx, p.index.be, p.data[:0], p.index.key, p.index.offset+int64(p.pos*sidxEntryW), int64(n*sidxEntryW))
+		offset := p.index.offset + int64(p.pos*sidxEntryW)
+		p.data, p.err = backend.ReadAtAppend(p.ctx, p.index.be, p.data[:0], p.index.key, offset, int64(n*sidxEntryW))
 		if p.err != nil {
 			return false
 		}

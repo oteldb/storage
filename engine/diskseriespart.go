@@ -8,6 +8,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/seriesindex"
+	"github.com/oteldb/storage/readbudget"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -17,12 +18,35 @@ func (p *part) seriesIndex(ctx context.Context) (*seriesindex.Index, error) {
 	p.metadataMu.Lock()
 	defer p.metadataMu.Unlock()
 	if p.metadataChecked {
+		if p.metadata != nil && readbudget.From(ctx) != nil && !p.metadataBounded {
+			return nil, errors.Wrap(readbudget.ErrExceeded, "part series index requires bounded ranged reads")
+		}
 		return p.metadata, nil
+	}
+	_, known, err := backend.NativeSizeOf(ctx, p.be, seriesIndexKey(p.prefix))
+	if errors.Is(err, backend.ErrNotExist) {
+		p.metadataChecked = true
+		return p.metadata, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	bounded := known && backend.RangesNatively(ctx, p.be, seriesIndexKey(p.prefix))
+	if readbudget.From(ctx) != nil && !bounded {
+		present, err := diskObjectPresent(ctx, p.be, seriesIndexKey(p.prefix))
+		if err != nil {
+			return nil, err
+		}
+		if !present {
+			p.metadataChecked = true
+			return p.metadata, nil
+		}
+		return nil, errors.Wrap(readbudget.ErrExceeded, "part series index requires bounded ranged reads")
 	}
 	r, err := seriesindex.Open(p.reader.ReaderContext(ctx), p.be, seriesIndexKey(p.prefix))
 	if errors.Is(err, backend.ErrNotExist) {
 		p.metadataChecked = true
-		return nil, nil
+		return p.metadata, nil
 	}
 	if err != nil {
 		return nil, errors.Wrapf(err, "open series index %q", p.prefix)
@@ -30,7 +54,7 @@ func (p *part) seriesIndex(ctx context.Context) (*seriesindex.Index, error) {
 	if uint64(r.Count()) != uint64(p.index.seriesCount()) {
 		return nil, errors.Wrap(seriesindex.ErrCorrupt, "part/index series count mismatch")
 	}
-	p.metadata, p.metadataChecked = r, true
+	p.metadata, p.metadataChecked, p.metadataBounded = r, true, bounded
 	return r, nil
 }
 

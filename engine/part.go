@@ -424,6 +424,9 @@ type part struct {
 	metadataMu                      sync.Mutex
 	metadata                        *seriesindex.Index
 	metadataChecked                 bool
+	metadataBounded                 bool
+	diskWatermarkMu                 sync.Mutex
+	diskWatermark                   *watermark.Reader
 }
 
 func (p *part) acquire() { p.refs.Add(1); p.reader.AcquireReaders() }
