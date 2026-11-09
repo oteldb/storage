@@ -6,6 +6,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/readbudget"
@@ -53,6 +54,9 @@ func (p *part) seriesIndex(ctx context.Context) (*seriesindex.Index, error) {
 	}
 	if uint64(r.Count()) != uint64(p.index.seriesCount()) {
 		return nil, errors.Wrap(seriesindex.ErrCorrupt, "part/index series count mismatch")
+	}
+	if p.reader.Manifest().BindingNonce == ([16]byte{}) || r.ParentDigest() != p.reader.ManifestDigest() {
+		return nil, errors.Wrap(seriesindex.ErrCorrupt, "series index belongs to a different data manifest")
 	}
 	p.metadata, p.metadataChecked, p.metadataBounded = r, true, bounded
 	return r, nil
@@ -104,5 +108,10 @@ func (p *partStreamWriter) writeDiskSeries(ctx context.Context, entries identity
 	if p.seriesBuilder.Count() != len(p.runs) {
 		return errors.New("engine: incomplete series index")
 	}
+	digest, err := block.BindManifest(ctx, p.e.cfg.Backend, p.prefix)
+	if err != nil {
+		return err
+	}
+	p.seriesBuilder.BindParent(digest)
 	return p.seriesBuilder.WriteObject(ctx, p.e.cfg.Backend, seriesIndexKey(p.prefix))
 }

@@ -296,7 +296,7 @@ func TestDiskQuerySelectiveHintBudget(t *testing.T) {
 	require.Zero(t, e.head.series.Len())
 	equal := fetch.EqualMatcher{Name: "host", Value: "7"}
 	r := fetch.Request{Start: 0, End: 100, Matchers: []fetch.Matcher{{Name: []byte("host"), Match: equal.Predicate(), StringValues: [][]byte{[]byte("7")}}}}
-	b := readbudget.New(2 << 20)
+	b := readbudget.New(4 << 20)
 	selectedCtx := readbudget.With(ctx, b)
 	series, err := e.Series(selectedCtx, r)
 	require.NoError(t, err)
@@ -306,22 +306,22 @@ func TestDiskQuerySelectiveHintBudget(t *testing.T) {
 			require.Equal(t, signal.Series{}, s, "recycled slabs must not pin historical identities")
 		}
 	}
-	require.EqualValues(t, 2<<20, b.Remaining())
+	require.EqualValues(t, 4<<20, b.Remaining())
 	r.Matchers = nil
 	_, err = e.Series(selectedCtx, r)
 	require.ErrorIs(t, err, readbudget.ErrExceeded)
-	require.EqualValues(t, 2<<20, b.Remaining())
+	require.EqualValues(t, 4<<20, b.Remaining())
 	count, err := e.Count(selectedCtx, r)
 	require.NoError(t, err, "broad timestamp-only counts do not retain identity headers")
 	require.Equal(t, 2048, count)
-	require.EqualValues(t, 2<<20, b.Remaining())
+	require.EqualValues(t, 4<<20, b.Remaining())
 	names, err := e.LabelNames(selectedCtx, r)
 	require.NoError(t, err)
 	require.Equal(t, []string{"host", "job"}, names)
 	values, err := e.LabelValues(selectedCtx, r, []byte("host"))
 	require.NoError(t, err)
 	require.Len(t, values, 2048)
-	require.EqualValues(t, 2<<20, b.Remaining())
+	require.EqualValues(t, 4<<20, b.Remaining())
 	for _, p := range e.parts {
 		require.Zero(t, p.refs.Load())
 	}

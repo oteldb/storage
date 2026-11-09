@@ -18,8 +18,9 @@ entries and one selected page. Oversized records are bounded at 64 MiB and requi
 caller admission. Budgeted reads require native object sizes and ranged reads before opening.
 Unbudgeted opaque backends retain their whole-object fallback.
 
-The parent digest covers raw manifest bytes and excludes object paths, so part copies and renames
-preserve the binding. Engines reject missing or mismatched bindings before publishing a handle.
+The parent digest covers raw manifest bytes, including a persistent per-part nonce, and excludes
+object paths, so part copies and renames preserve the binding. The nonce distinguishes otherwise
+identical manifests whose per-series sample assignments differ. Engines reject missing or mismatched bindings before publishing a handle.
 Generic tables may carry a zero digest. A valid page is fully checked for strictly ordered keys
 before exposing records; writer errors and finalization are terminal.
 

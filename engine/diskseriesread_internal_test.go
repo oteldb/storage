@@ -61,7 +61,7 @@ func TestDiskSeriesLegacyRead(t *testing.T) {
 				for _, s := range sorted {
 					require.NoError(t, builder.Add(s.Hash(), s, seriesindex.Metadata{Covered: 99}))
 				}
-				require.NoError(t, builder.WriteObject(t.Context(), b, seriesIndexKey(p.prefix)))
+				bindTestSeriesIndex(t, b, p, builder)
 			}
 			reader := New(Config{Backend: b, Prefix: writer.cfg.Prefix, DiskSeries: true})
 			t.Cleanup(func() { require.NoError(t, reader.Close(t.Context())) })
@@ -214,7 +214,7 @@ func TestDiskSeriesRejectsOpaqueReadsBeforeAdmission(t *testing.T) {
 			for _, s := range sorted {
 				require.NoError(t, builder.Add(s.Hash(), s, seriesindex.Metadata{Covered: 99}))
 			}
-			require.NoError(t, builder.WriteObject(t.Context(), b, seriesIndexKey(original.prefix)))
+			bindTestSeriesIndex(t, b, original, builder)
 			opaque := &opaqueDiskBackend{Backend: b}
 			p := &part{reader: original.reader, be: opaque, prefix: original.prefix, index: original.index}
 			if cached {
@@ -256,7 +256,7 @@ func TestDiskSeriesRepairRestoresPartMetadata(t *testing.T) {
 	prefix := writer.parts[0].prefix
 	builder := &seriesindex.Builder{}
 	require.NoError(t, builder.Add(identities[0].Hash(), identities[0], seriesindex.Metadata{Covered: 1}))
-	require.NoError(t, builder.WriteObject(t.Context(), b, seriesIndexKey(prefix)))
+	bindTestSeriesIndex(t, b, writer.parts[0], builder)
 	key := prefix + "/manifest"
 	manifest, err := b.Read(t.Context(), key)
 	require.NoError(t, err)
@@ -286,7 +286,7 @@ func TestDiskSeriesWrongPartIndexFencesRecovery(t *testing.T) {
 	other := signal.Series{Attributes: signal.NewAttributes(signal.KeyValue{Key: []byte("other"), Value: signal.IntValue(99)})}
 	builder := &seriesindex.Builder{}
 	require.NoError(t, builder.Add(other.Hash(), other, seriesindex.Metadata{}))
-	require.NoError(t, builder.WriteObject(t.Context(), b, seriesIndexKey(writer.parts[0].prefix)))
+	bindTestSeriesIndex(t, b, writer.parts[0], builder)
 	reader := New(Config{Backend: b, Prefix: writer.cfg.Prefix, DiskSeries: true})
 	t.Cleanup(func() { require.NoError(t, reader.Close(t.Context())) })
 	require.ErrorIs(t, reader.LoadPartsReadOnly(t.Context()), seriesindex.ErrCorrupt)

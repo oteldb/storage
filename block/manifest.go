@@ -272,6 +272,8 @@ type Manifest struct {
 	// Rollup is the downsampling layout the part's rows have had applied. nil is unknown: what a
 	// manifest without it, or with a malformed one, decodes to. Trailing, after RawBytes.
 	Rollup *Rollup
+	// BindingNonce distinguishes immutable part instances with otherwise identical descriptors.
+	BindingNonce [16]byte
 }
 
 // Rollup is the downsampling layout a part was last written under. No tiers means none was
@@ -534,7 +536,10 @@ func DecodeManifest(src []byte) (Manifest, error) {
 				return Manifest{}, err
 			}
 
-			m.Rollup = decodeRollup(r)
+			if !decodeBindingNonce(r, &m.BindingNonce) {
+				m.Rollup = decodeRollup(r)
+				decodeBindingNonce(r, &m.BindingNonce)
+			}
 		}
 	}
 
@@ -546,17 +551,36 @@ func (m Manifest) encodeTrailer(w *bitstream.Writer) {
 	w.WriteUvarint(uint64(m.DiskBytes))
 	w.WriteUvarint(uint64(m.RawBytes))
 
-	if m.Rollup == nil {
-		return
+	if m.Rollup != nil {
+		w.WriteUvarint(uint64(len(m.Rollup.Tiers)))
+		for _, t := range m.Rollup.Tiers {
+			w.WriteVarint(t.Before)
+			w.WriteUvarint(uint64(t.Interval))
+			_ = w.WriteByte(t.Agg)
+		}
 	}
-
-	w.WriteUvarint(uint64(len(m.Rollup.Tiers)))
-
-	for _, t := range m.Rollup.Tiers {
-		w.WriteVarint(t.Before)
-		w.WriteUvarint(uint64(t.Interval))
-		_ = w.WriteByte(t.Agg)
+	if m.BindingNonce != ([16]byte{}) {
+		putU32(w, bindingNonceMagic)
+		w.WriteBytes(m.BindingNonce[:])
 	}
+}
+
+const bindingNonceMagic = 0x4f54424e // OTBN.
+
+func decodeBindingNonce(r *bitstream.Reader, nonce *[16]byte) bool {
+	if r.Remaining() != 20 {
+		return false
+	}
+	probe := *r
+	var magic [4]byte
+	if err := probe.ReadBytes(magic[:]); err != nil || binary.BigEndian.Uint32(magic[:]) != bindingNonceMagic {
+		return false
+	}
+	if err := probe.ReadBytes(nonce[:]); err != nil {
+		return false
+	}
+	*r = probe
+	return true
 }
 
 // rollupTierMinBytes is the smallest encoding of a [RollupTier]: one byte per field.

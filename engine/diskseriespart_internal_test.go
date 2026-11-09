@@ -7,10 +7,24 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
+
+func bindTestSeriesIndex(tb testing.TB, b backend.Backend, p *part, builder *seriesindex.Builder) {
+	tb.Helper()
+	digest, err := block.BindManifest(tb.Context(), b, p.prefix)
+	require.NoError(tb, err)
+	r, err := block.OpenPart(tb.Context(), b, p.prefix)
+	require.NoError(tb, err)
+	require.NoError(tb, p.reader.Close())
+	p.reader = r
+	builder.BindParent(digest)
+	require.NoError(tb, builder.WriteObject(tb.Context(), b, seriesIndexKey(p.prefix)))
+	p.metadata, p.metadataChecked = nil, false
+}
 
 func TestDiskSeriesPartPublicationAndLegacyRead(t *testing.T) {
 	t.Parallel()
