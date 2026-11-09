@@ -13,6 +13,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/index/series"
+	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/signal"
 )
@@ -49,21 +50,34 @@ type valuePosting struct {
 
 // Builder owns one output part's metadata. Callers include Bytes in their build admission.
 type Builder struct {
-	registry *series.Index
-	records  []record
-	names    map[string]*namePosting
-	values   map[string]*valuePosting
-	bytes    int64
+	registry                   *series.Index
+	records                    []record
+	names                      map[string]*namePosting
+	values                     map[string]*valuePosting
+	bytes                      int64
+	canonicalScratch           []byte
+	parentDigest               [32]byte
+	encodedRaw, encodedRecords int64
 }
 
 // Bytes bounds retained metadata and sorting/directory scratch during writing.
 func (b *Builder) Bytes() int64 {
-	n := b.bytes
+	n := b.bytes + int64(cap(b.canonicalScratch))
 	if b.registry != nil {
 		n += b.registry.SizeBytes()
 	}
 	return 3*n + 512<<10
 }
+
+// EncodedBound bounds the whole buffered output, including repeated canonical identities.
+func (b *Builder) EncodedBound() int64 {
+	raw := buildbudget.Add(b.encodedRaw, 35)
+	records := buildbudget.Add(b.encodedRecords, 1)
+	return buildbudget.Add(buildbudget.Add(buildbudget.Mul(raw, 2), buildbudget.Mul(records, 45)), footerSize)
+}
+
+// BindParent binds the index to the raw parent manifest digest.
+func (b *Builder) BindParent(digest [32]byte) { b.parentDigest = digest }
 
 // Count returns the number of appended identities.
 func (b *Builder) Count() int { return len(b.records) }
@@ -81,16 +95,20 @@ func (b *Builder) Add(id signal.SeriesID, s signal.Series, meta Metadata) error 
 	if len(b.records) > 0 && b.records[len(b.records)-1].id.Compare(id) >= 0 {
 		return errors.New("seriesindex: series are not ordered")
 	}
+	b.canonicalScratch = s.AppendHashInput(b.canonicalScratch[:0])
+	if signal.HashBytes(b.canonicalScratch) != id {
+		return errors.New("seriesindex: identity hash mismatch")
+	}
 	if b.registry == nil {
 		b.registry = series.New()
 	}
-	if b.registry.Add(s) != id {
-		return errors.New("seriesindex: identity hash mismatch")
-	}
+	b.registry.Add(s)
 	if b.names == nil {
 		b.names, b.values = make(map[string]*namePosting), make(map[string]*valuePosting)
 		b.bytes += 2 * memsize.MapBase
 	}
+	b.encodedRaw = buildbudget.Add(b.encodedRaw, int64(len(b.canonicalScratch))+143)
+	b.encodedRecords = buildbudget.Add(b.encodedRecords, 2)
 	ref := uint32(len(b.records))
 	prior := cap(b.records)
 	b.records = append(b.records, record{id: id, meta: meta})
@@ -167,6 +185,7 @@ func recordKey(ref uint32) []byte { return binary.BigEndian.AppendUint32([]byte{
 func (b *Builder) Write(dst io.Writer) error {
 	w := NewTableWriter(dst)
 	w.seriesCount = uint32(len(b.records))
+	w.parentDigest = b.parentDigest
 	var count [4]byte
 	binary.BigEndian.PutUint32(count[:], uint32(len(b.records)))
 	if err := w.Append([]byte{'c'}, count[:]); err != nil {
@@ -265,6 +284,9 @@ func Open(ctx context.Context, b backend.Backend, key string) (*Index, error) {
 	}
 	return &Index{table: t, count: count}, nil
 }
+
+// ParentDigest returns the parent manifest digest carried by the index.
+func (r *Index) ParentDigest() [32]byte { return r.table.parentDigest }
 
 // Count returns the number of distinct identities in this part.
 func (r *Index) Count() uint32 { return r.count }
@@ -366,7 +388,10 @@ func (b *Builder) addLabel(ref uint32, name []byte, value signal.Value) {
 		b.bytes += int64(cap(n.refs)-prior) * 4
 	}
 	key := appendEscaped([]byte{'p'}, name)
+	nameBytes := len(key)
 	key = appendEscaped(key, signal.AppendValue(nil, value))
+	b.encodedRaw = buildbudget.Add(b.encodedRaw, 2*int64(nameBytes)+int64(len(key))+129)
+	b.encodedRecords = buildbudget.Add(b.encodedRecords, 3)
 	p := b.values[string(key)]
 	if p == nil {
 		p = &valuePosting{key: string(key)}

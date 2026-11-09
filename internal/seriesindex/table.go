@@ -12,11 +12,12 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/encoding/compress"
+	"github.com/oteldb/storage/readbudget"
 )
 
 const (
 	tableMagic    = 0x4f534958
-	footerSize    = 40
+	footerSize    = 72
 	directorySize = 40
 	pageSize      = 64 << 10
 	maxPageSize   = 64 << 20
@@ -42,8 +43,10 @@ type TableWriter struct {
 	offset                   int64
 	count, total, maxRaw     uint32
 	seriesCount              uint32
+	parentDigest             [32]byte
 	limit                    int
 	err                      error
+	finished                 bool
 }
 
 // NewTableWriter constructs a streaming table writer; Finish does not close dst.
@@ -57,14 +60,21 @@ func (w *TableWriter) Append(key, value []byte) error {
 	if w.err != nil {
 		return w.err
 	}
-	if len(key)+len(value)+3*binary.MaxVarintLen64 > maxPageSize {
-		return errors.New("seriesindex: record exceeds page limit")
+	if w.finished {
+		w.err = errors.New("seriesindex: writer already finished")
+		return w.err
+	}
+	if len(key) > maxPageSize-3*binary.MaxVarintLen64 || len(value) > maxPageSize-3*binary.MaxVarintLen64-len(key) {
+		w.err = errors.New("seriesindex: record exceeds page limit")
+		return w.err
 	}
 	if w.total == math.MaxUint32 {
-		return errors.New("seriesindex: too many records")
+		w.err = errors.New("seriesindex: too many records")
+		return w.err
 	}
 	if w.total > 0 && bytes.Compare(w.last, key) >= 0 {
-		return errors.New("seriesindex: keys are not strictly increasing")
+		w.err = errors.New("seriesindex: keys are not strictly increasing")
+		return w.err
 	}
 	if w.count > 0 && len(w.buf)+len(key)+len(value)+30 > w.limit {
 		if err := w.flush(); err != nil {
@@ -95,6 +105,11 @@ func (w *TableWriter) Finish() error {
 	if w.err != nil {
 		return w.err
 	}
+	if w.finished {
+		w.err = errors.New("seriesindex: writer already finished")
+		return w.err
+	}
+	w.finished = true
 	if err := w.flush(); err != nil {
 		return err
 	}
@@ -125,7 +140,8 @@ func (w *TableWriter) Finish() error {
 	binary.BigEndian.PutUint32(footer[20:], w.total)
 	binary.BigEndian.PutUint32(footer[24:], w.maxRaw)
 	binary.BigEndian.PutUint32(footer[28:], w.seriesCount)
-	binary.BigEndian.PutUint32(footer[36:], crc32.Checksum(footer[:36], checksumTable))
+	copy(footer[32:64], w.parentDigest[:])
+	binary.BigEndian.PutUint32(footer[68:], crc32.Checksum(footer[:68], checksumTable))
 	return w.write(footer[:])
 }
 
@@ -136,6 +152,7 @@ type Table struct {
 	dir                  int64
 	pages, count, maxRaw uint32
 	seriesCount          uint32
+	parentDigest         [32]byte
 	codec                *compress.Compressor
 }
 
@@ -144,6 +161,9 @@ func OpenTable(ctx context.Context, b backend.Backend, key string) (*Table, erro
 	size, known, err := backend.NativeSizeOf(ctx, b, key)
 	if err != nil {
 		return nil, err
+	}
+	if readbudget.From(ctx) != nil && (!known || !backend.RangesNatively(ctx, b, key)) {
+		return nil, errors.Wrap(readbudget.ErrExceeded, "index requires bounded size and ranged reads")
 	}
 	if !known {
 		size, err = backend.SizeOf(ctx, b, key)
@@ -159,42 +179,45 @@ func OpenTable(ctx context.Context, b backend.Backend, key string) (*Table, erro
 		return nil, err
 	}
 	if len(data) != footerSize || binary.BigEndian.Uint32(data) != tableMagic ||
-		binary.BigEndian.Uint32(data[4:]) != 1 ||
-		crc32.Checksum(data[:36], checksumTable) != binary.BigEndian.Uint32(data[36:]) {
+		binary.BigEndian.Uint32(data[4:]) != 1 || binary.BigEndian.Uint32(data[64:]) != 0 ||
+		crc32.Checksum(data[:68], checksumTable) != binary.BigEndian.Uint32(data[68:]) {
 		return nil, errors.Wrap(ErrCorrupt, "footer")
 	}
 	dir := binary.BigEndian.Uint64(data[8:])
 	pages, count, raw := binary.BigEndian.Uint32(data[16:]), binary.BigEndian.Uint32(data[20:]), binary.BigEndian.Uint32(data[24:])
 	if dir > uint64(size-footerSize) || uint64(pages)*directorySize != uint64(size-footerSize)-dir ||
-		(pages == 0) != (count == 0) || pages > count || raw > maxPageSize || (pages > 0 && raw == 0) {
+		(pages == 0) != (count == 0) || pages > count || raw > maxPageSize ||
+		(pages == 0 && (raw != 0 || dir != 0)) || (pages > 0 && raw < 3) || uint64(count) > uint64(pages)*uint64(raw/3) ||
+		uint64(binary.BigEndian.Uint32(data[28:]))*2+1 > uint64(count) && binary.BigEndian.Uint32(data[28:]) > 0 {
 		return nil, errors.Wrap(ErrCorrupt, "directory bounds")
 	}
 	return &Table{b: b, key: key, dir: int64(dir), pages: pages, count: count, maxRaw: raw,
-		seriesCount: binary.BigEndian.Uint32(data[28:]),
-		codec:       compress.NewCompressor(compress.AlgorithmLZ4, compress.LevelDefault)}, nil
+		seriesCount: binary.BigEndian.Uint32(data[28:]), parentDigest: [32]byte(data[32:64]),
+		codec: compress.NewCompressor(compress.AlgorithmLZ4, compress.LevelDefault)}, nil
 }
 
 // Count returns the number of stored keys.
 func (t *Table) Count() uint32 { return t.count }
 
 // MaxPageBytes bounds the encoded/decoded buffers retained by one cursor.
-func (t *Table) MaxPageBytes() int64 { return int64(t.maxRaw)*2 + 64 }
+func (t *Table) MaxPageBytes() int64 { return int64(t.maxRaw)*8 + 1024 }
 
 // Cursor returns a forward cursor with caller-owned reusable buffers.
 func (t *Table) Cursor(ctx context.Context) *Cursor { return &Cursor{table: t, ctx: ctx, page: -1} }
 
 // Cursor yields key/value views valid until its next operation.
 type Cursor struct {
-	table                                     *Table
-	ctx                                       context.Context //nolint:containedctx // The cursor owns its scoped I/O lifetime.
-	page                                      int64
-	left                                      uint32
-	off                                       int
-	key, value, packed, raw, first, directory []byte
-	err                                       error
+	table                                           *Table
+	ctx                                             context.Context //nolint:containedctx // The cursor owns its scoped I/O lifetime.
+	page                                            int64
+	left                                            uint32
+	off                                             int
+	key, value, packed, raw, first, directory, last []byte
+	err                                             error
 }
 
 // Next advances to the next record, including the first before any seek.
+// Cancellation is checked at page I/O boundaries.
 func (c *Cursor) Next() bool {
 	if c.err != nil {
 		return false
@@ -289,8 +312,11 @@ func (w *TableWriter) flush() error {
 }
 
 func (c *Cursor) entry(i uint32) (pageInfo, error) {
+	if err := c.ctx.Err(); err != nil {
+		return pageInfo{}, err
+	}
 	var err error
-	c.directory, err = backend.ReadAtAppend(c.ctx, c.table.b, c.directory[:0], c.table.key,
+	c.directory, err = backend.ReadAtAppend(c.ctx, c.table.b, cursorBuffer(c.directory, directorySize), c.table.key,
 		c.table.dir+int64(i)*directorySize, directorySize)
 	if err != nil {
 		return pageInfo{}, err
@@ -302,12 +328,13 @@ func (c *Cursor) entry(i uint32) (pageInfo, error) {
 	keyOff, keyLen := binary.BigEndian.Uint64(d), binary.BigEndian.Uint32(d[8:])
 	off := binary.BigEndian.Uint64(d[16:])
 	packed, raw, count := binary.BigEndian.Uint32(d[24:]), binary.BigEndian.Uint32(d[28:]), binary.BigEndian.Uint32(d[32:])
-	if keyOff > uint64(c.table.dir) || uint64(keyLen) > uint64(c.table.dir)-keyOff || keyLen > maxPageSize ||
+	if keyOff > uint64(c.table.dir) || uint64(keyLen) > uint64(c.table.dir)-keyOff || keyLen > raw ||
 		off > uint64(c.table.dir) || uint64(packed) > uint64(c.table.dir)-off || packed < 5 ||
-		raw > c.table.maxRaw || raw == 0 || packed > raw+5 || count == 0 || count > raw/3 {
+		raw > c.table.maxRaw || raw == 0 || packed > raw+5 || count == 0 || count > raw/3 || count > c.table.count ||
+		keyOff < off+uint64(packed) {
 		return pageInfo{}, errors.Wrap(ErrCorrupt, "page bounds")
 	}
-	c.first, err = backend.ReadAtAppend(c.ctx, c.table.b, c.first[:0], c.table.key, int64(keyOff), int64(keyLen))
+	c.first, err = backend.ReadAtAppend(c.ctx, c.table.b, cursorBuffer(c.first, int(keyLen)), c.table.key, int64(keyOff), int64(keyLen))
 	if err != nil {
 		return pageInfo{}, err
 	}
@@ -323,7 +350,7 @@ func (c *Cursor) load(i uint32) bool {
 		c.err = err
 		return false
 	}
-	c.packed, err = backend.ReadAtAppend(c.ctx, c.table.b, c.packed[:0], c.table.key, p.offset, int64(p.packed))
+	c.packed, err = backend.ReadAtAppend(c.ctx, c.table.b, cursorBuffer(c.packed, int(p.packed)), c.table.key, p.offset, int64(p.packed))
 	if err != nil {
 		c.err = err
 		return false
@@ -345,7 +372,19 @@ func (c *Cursor) load(i uint32) bool {
 		c.err = errors.Wrap(ErrCorrupt, "page length")
 		return false
 	}
+	if c.page >= 0 && int64(i) == c.page+1 && bytes.Compare(c.last, p.first) >= 0 {
+		c.err = errors.Wrap(ErrCorrupt, "page keys are not ordered")
+		return false
+	}
 	c.page, c.left, c.off = int64(i), p.count, 0
+	c.key = c.key[:0]
+	for c.left > 0 {
+		if !c.advance() {
+			return false
+		}
+	}
+	c.last = append(cursorBuffer(c.last, len(c.key)), c.key...)
+	c.left, c.off = p.count, 0
 	c.key = c.key[:0]
 	if !c.advance() {
 		return false
@@ -368,6 +407,7 @@ func (c *Cursor) number() (uint64, bool) {
 }
 
 func (c *Cursor) advance() bool {
+	first := c.off == 0
 	prefix, ok := c.number()
 	if !ok {
 		return false
@@ -379,6 +419,19 @@ func (c *Cursor) advance() bool {
 	if prefix > uint64(len(c.key)) || suffix > uint64(len(c.raw)-c.off) {
 		c.err = errors.Wrap(ErrCorrupt, "record key")
 		return false
+	}
+	if !first && bytes.Compare(c.raw[c.off:c.off+int(suffix)], c.key[int(prefix):]) <= 0 {
+		c.err = errors.Wrap(ErrCorrupt, "record keys are not ordered")
+		return false
+	}
+	if prefix+suffix > uint64(c.table.maxRaw) {
+		c.err = errors.Wrap(ErrCorrupt, "decoded key exceeds page bound")
+		return false
+	}
+	if cap(c.key) < int(prefix+suffix) {
+		next := make([]byte, int(prefix), int(prefix+suffix))
+		copy(next, c.key)
+		c.key = next
 	}
 	c.key = append(c.key[:int(prefix)], c.raw[c.off:c.off+int(suffix)]...)
 	c.off += int(suffix)
@@ -398,4 +451,11 @@ func (c *Cursor) advance() bool {
 		return false
 	}
 	return true
+}
+
+func cursorBuffer(dst []byte, n int) []byte {
+	if cap(dst) < n {
+		return make([]byte, 0, n)
+	}
+	return dst[:0]
 }

@@ -320,3 +320,24 @@ func (p *idPostings) current(ok bool) bool {
 	p.id = signal.SeriesID{Hi: binary.BigEndian.Uint64(p.cursor.Key()[1:]), Lo: binary.BigEndian.Uint64(p.cursor.Key()[9:])}
 	return true
 }
+
+// MatchesSeries preserves metric matching: a name matches any value present across OTel sources.
+// A missing name is evaluated against EmptyValue; Match predicates must be non-nil.
+func MatchesSeries(s signal.Series, matchers []fetch.Matcher) bool {
+	for _, m := range matchers {
+		present, matched := false, false
+		visitLabels(s, func(name []byte, value signal.Value) {
+			if bytes.Equal(name, m.Name) {
+				present = true
+				matched = matched || m.Match(value)
+			}
+		})
+		if !present {
+			matched = m.Match(signal.EmptyValue())
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
