@@ -141,9 +141,15 @@ type Table struct {
 
 // OpenTable validates the fixed footer without loading a per-key directory.
 func OpenTable(ctx context.Context, b backend.Backend, key string) (*Table, error) {
-	size, err := backend.SizeOf(ctx, b, key)
+	size, known, err := backend.NativeSizeOf(ctx, b, key)
 	if err != nil {
 		return nil, err
+	}
+	if !known {
+		size, err = backend.SizeOf(ctx, b, key)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if size < footerSize {
 		return nil, errors.Wrap(ErrCorrupt, "short footer")

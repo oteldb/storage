@@ -636,6 +636,10 @@ func (e *Engine) compactStreamWithInputs(
 
 	// One forward cursor per source part; one reusable per-part destination per series range.
 	streams := make([]*partStream, len(src))
+	var metadata []*diskMergeSource
+	if e.cfg.DiskSeries {
+		metadata = make([]*diskMergeSource, len(src))
+	}
 	defer func() {
 		for _, stream := range streams {
 			stream.close()
@@ -648,6 +652,12 @@ func (e *Engine) compactStreamWithInputs(
 		}
 
 		streams[i] = s
+		if e.cfg.DiskSeries {
+			metadata[i], err = newDiskMergeSource(ctx, p)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	scratch := make([]rangeBuf, len(src))
@@ -690,26 +700,26 @@ func (e *Engine) compactStreamWithInputs(
 	var identities mergeIdentityBatch
 	var output rollupScratch
 	var m sampleMerge
-	for identities.next(e, &keys) {
-		i := identities.at - 1
-		id, view, ref, found := identities.ids[i], identities.view, identities.refs[i], identities.found[i]
-
-		if err := mergeStreamedSeries(&m, src, streams, scratch, identities.ranges[i*len(src):(i+1)*len(src)], start); err != nil {
-			return nil, err
-		}
-
-		srcCovered, err := sourceCovered(ctx, src, id)
+	var item mergeIdentityItem
+	for {
+		ok, err := item.next(ctx, e, &keys, &identities, src, metadata)
 		if err != nil {
 			return nil, err
 		}
+		if !ok {
+			break
+		}
+		if err := mergeStreamedSeries(&m, src, streams, scratch, item.ranges, start); err != nil {
+			return nil, err
+		}
 
-		rs := rolledSeries{srcCovered: srcCovered}
+		rs := rolledSeries{srcCovered: item.covered}
 		rs.ts, rs.values, rs.sf, rs.covered = output.roll(&m, plan.tiers)
 
 		err = timebucket.Runs(rs.ts, func(lo, hi int) error {
 			return router.Append(rs.ts[lo], func(w *partStreamWriter) (bool, error) {
 				ts, values, sf, watermark := rs.run(lo, hi)
-				if err := w.appendMergeSeries(view, ref, found, id, ts, values, sf, watermark); err != nil {
+				if err := item.appendTo(w, ts, values, sf, watermark); err != nil {
 					return false, err
 				}
 

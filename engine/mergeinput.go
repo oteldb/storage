@@ -71,8 +71,17 @@ func (e *Engine) selectMergeInputsWithWatermarks(ctx context.Context, cohorts []
 			return boundedMergeSelection{}, err
 		}
 		bound.resident = buildbudget.Add(bound.resident, mergeSeriesScratchBound(parts, tiers))
+		if e.cfg.DiskSeries {
+			for _, p := range parts {
+				n, err := p.diskSeriesWorkspace(ctx, 0)
+				if err != nil {
+					return boundedMergeSelection{}, err
+				}
+				bound.resident = buildbudget.Add(bound.resident, n)
+			}
+		}
 		floor := e.minimumMergeOutput(parts, selection.capBytes, opts, tiers)
-		if whole && buildbudget.Add(bound.bytes(), floor) <= limit {
+		if whole && !e.cfg.DiskSeries && buildbudget.Add(bound.bytes(), floor) <= limit {
 			floor = buildbudget.Add(floor, e.wholeMergeOutputBound(parts[0], selection.capBytes, opts, tiers))
 		}
 		if buildbudget.Add(bound.bytes(), floor) <= limit && (len(parts) <= minMergeParts || bound.bytes() <= limit/2) {

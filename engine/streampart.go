@@ -281,6 +281,9 @@ func (p *partStreamWriter) weights(sf []float64, n int) []float64 {
 // counterpart of [Engine.writeMergedPart]. At least one series must have been appended: an empty
 // part would mean a burnt part id and an unreadable prefix.
 func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
+	if p.e.cfg.DiskSeries && p.seriesBuilder != nil {
+		return p.finishWithIdentities(ctx, identitySnapshot{})
+	}
 	if b := p.mergeFinish; b != nil {
 		p.e.mu.RLock()
 		view := p.e.head.series.View()
