@@ -227,9 +227,10 @@ type projector struct {
 	buf       []byte
 	prefixLen int
 	reserved  [5]signal.KeyValue
-	// reservedBuf is the hash pre-image of reserved, serialized once per metric so the common
+	// reservedBuf is the hash pre-image of reserved, reused across equal descriptors so the common
 	// case can copy it per point instead of re-encoding five key/value pairs. See [projector.id].
-	reservedBuf []byte
+	reservedBuf                []byte
+	reservedName, reservedUnit []byte
 }
 
 // setGroup rebuilds the hoisted resource‖scope prefix at the front of buf for a new scope
@@ -242,6 +243,11 @@ func (p *projector) setGroup(r signal.Resource, sc signal.Scope) {
 // setMetric fills the five reserved labels for a metric, in sorted-by-key order:
 // __kind__ < __monotonic__ < __name__ < __temporality__ < __unit__.
 func (p *projector) setMetric(m *Metric) {
+	if len(p.reservedBuf) != 0 && bytes.Equal(m.Name, p.reservedName) && bytes.Equal(m.Unit, p.reservedUnit) &&
+		int64(m.Kind) == p.reserved[0].Value.Int() && m.Monotonic == p.reserved[1].Value.Bool() &&
+		int64(m.Temporality) == p.reserved[3].Value.Int() {
+		return
+	}
 	p.reserved[0] = signal.KeyValue{Key: LabelKind, Value: signal.IntValue(int64(m.Kind))}
 	p.reserved[1] = signal.KeyValue{Key: LabelMonotonic, Value: signal.BoolValue(m.Monotonic)}
 	p.reserved[2] = signal.KeyValue{Key: LabelName, Value: signal.StringValue(m.Name)}
@@ -249,9 +255,18 @@ func (p *projector) setMetric(m *Metric) {
 	p.reserved[4] = signal.KeyValue{Key: LabelUnit, Value: signal.StringValue(m.Unit)}
 
 	p.reservedBuf = p.reservedBuf[:0]
-	for i := range p.reserved {
+	for i := range 3 {
 		p.reservedBuf = signal.AppendKeyValueHashInput(p.reservedBuf, p.reserved[i].Key, p.reserved[i].Value)
 	}
+	nameEnd := len(p.reservedBuf)
+	for i := 3; i < len(p.reserved); i++ {
+		p.reservedBuf = signal.AppendKeyValueHashInput(p.reservedBuf, p.reserved[i].Key, p.reserved[i].Value)
+	}
+	// Own these snapshots so reusing or mutating an input descriptor cannot hide a change.
+	p.reservedName = p.reservedBuf[nameEnd-len(m.Name) : nameEnd]
+	p.reservedUnit = p.reservedBuf[len(p.reservedBuf)-len(m.Unit):]
+	p.reserved[2].Value = signal.StringValue(p.reservedName)
+	p.reserved[4].Value = signal.StringValue(p.reservedUnit)
 }
 
 // id computes the series id for a point with the given already-sorted attributes, reusing
