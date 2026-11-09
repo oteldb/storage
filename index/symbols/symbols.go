@@ -42,7 +42,10 @@ type Table struct {
 
 // New returns an empty [Table].
 func New() *Table {
-	return &Table{ids: pool.NewByteIntMap()}
+	// An owned table must not inherit a temporary encoder's oversized backing arrays.
+	ids := &pool.ByteIntMap{}
+	ids.Reset()
+	return &Table{ids: ids}
 }
 
 // Intern returns the id for b, inserting it (with an owned copy) if new. The caller may
