@@ -24,8 +24,10 @@ import (
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/repair"
 	"github.com/oteldb/storage/internal/retention"
+	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/pool"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/readbudget"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
 )
@@ -687,14 +689,17 @@ func (e *Engine) Stats() Stats {
 // (ref-held) in-window parts still to read, plus each series' identity and its already-snapshotted head
 // and mid-flush samples. Its [enginePlan.mergeSeries] does the part reads off the lock.
 type enginePlan struct {
-	tryDecode bool
-	ids       []signal.SeriesID
-	series    []signal.Series                  // matched-series identities, parallel to ids (zero value when absent)
-	headB     map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
-	flushB    map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
-	recentB   map[signal.SeriesID]*fetch.Batch // recent-tier samples (the in-RAM flush window)
-	liveParts []*part
-	decoded   partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
+	selectionBudget *readbudget.Budget
+	selectionBytes  int64
+	diskMetadata    map[*part]map[signal.SeriesID]seriesindex.Metadata
+	tryDecode       bool
+	ids             []signal.SeriesID
+	series          []signal.Series                  // matched-series identities, parallel to ids (zero value when absent)
+	headB           map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
+	flushB          map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
+	recentB         map[signal.SeriesID]*fetch.Batch // recent-tier samples (the in-RAM flush window)
+	liveParts       []*part
+	decoded         partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
 	// blockReaders streams a part's matched series straight from cached column blocks (no whole-part
 	// decodedPart); a part absent from the map (cache off, or a const/legacy-unblocked column) uses
 	// the decoded-part path instead. Built once in planFetch.
@@ -1071,6 +1076,7 @@ func (p *enginePlan) releaseSeriesPins() {
 }
 
 func (p *enginePlan) releaseParts() {
+	p.selectionBudget.Release(p.selectionBytes)
 	p.engine.budget.releaseFor(p.budgetScope, p.budgetBytes)
 
 	// Drop the block-slice readers' remaining references on the cache blocks they viewed (the scan
@@ -1116,7 +1122,16 @@ func (p *enginePlan) releaseParts() {
 
 	// The plan maps are dead now: the returned batches copied out their identity and samples. Clear
 	// and recycle the map structures so the next fetch reuses their capacity instead of re-making them.
-	p.engine.putSeriesSlice(p.series)
+	if p.selectionBudget != nil {
+		// Disk identities are query-owned; pooled slabs must not retain historical payloads.
+		clear(p.series)
+		p.series = nil
+		p.ids = nil
+		p.memActive = nil
+		p.diskMetadata = nil
+	} else {
+		p.engine.putSeriesSlice(p.series)
+	}
 	p.engine.putBatchMap(p.headB)
 	p.engine.putBatchMap(p.flushB)
 	p.engine.putBatchMap(p.recentB)
@@ -2036,7 +2051,7 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 
 	// The recent tier short-circuit: when the query range falls inside the tier's window, the tier ∪
 	// the mid-flush buffers ∪ the head cover it entirely, so no part is acquired or decoded.
-	if !e.recentEnabled() || r.Start < e.recentMin {
+	if e.cfg.DiskSeries || !e.recentEnabled() || r.Start < e.recentMin {
 		e.acquireWindowParts(p, r.Start, r.End, true)
 	}
 
@@ -2093,7 +2108,7 @@ func (e *Engine) planExistence(ids []signal.SeriesID, r fetch.Request, withIdent
 
 	// The recent tier short-circuit, as in planFetch: a window inside the tier is fully covered by
 	// the in-memory buffers, so no part is acquired or decoded.
-	if !e.recentEnabled() || r.Start < e.recentMin {
+	if e.cfg.DiskSeries || !e.recentEnabled() || r.Start < e.recentMin {
 		e.acquireWindowParts(p, r.Start, r.End, false)
 	}
 

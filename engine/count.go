@@ -5,6 +5,7 @@ import (
 	"context"
 	"slices"
 
+	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -76,6 +77,11 @@ func (e *Engine) CountBy(ctx context.Context, r fetch.Request, label []byte) (ma
 			scratch = v.AppendText(scratch)
 		}
 
+		if _, exists := groups[string(scratch)]; !exists {
+			if err := plan.reserveSelection(int64(len(scratch)) + 2*memsize.MapEntry[string, int]()); err != nil {
+				return nil, err
+			}
+		}
 		groups[string(scratch)]++
 	}
 
@@ -88,7 +94,10 @@ func (e *Engine) CountBy(ctx context.Context, r fetch.Request, label []byte) (ma
 // decode budget reserves timestamps only, and only window-edge parts ever decode. The caller must
 // releaseParts, unless it returned an error (the plan is released here).
 func (e *Engine) planCount(ctx context.Context, r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan, error) {
-	ids, plan := e.planLookup(r, withIdentity)
+	ids, plan, err := e.planLookup(ctx, r, withIdentity)
+	if err != nil {
+		return nil, nil, err
+	}
 	if !slices.Contains(plan.memActive, false) {
 		return ids, plan, nil
 	}
@@ -107,7 +116,14 @@ func (e *Engine) planCount(ctx context.Context, r fetch.Request, withIdentity bo
 // planLookup resolves r's matched ids under the read lock and builds the existence plan over them.
 // It reserves no decode budget: the caller adds one for the columns it will actually decode (none,
 // for the index-only [Engine.Series]). The caller must releaseParts.
-func (e *Engine) planLookup(r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan) {
+func (e *Engine) planLookup(ctx context.Context, r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan, error) {
+	if e.cfg.DiskSeries {
+		p, err := e.planDiskQuery(ctx, r, withIdentity, true)
+		if err != nil {
+			return nil, nil, err
+		}
+		return p.ids, p, nil
+	}
 	e.mu.RLock()
 	for !e.head.indexSorted() {
 		e.mu.RUnlock()
@@ -121,7 +137,7 @@ func (e *Engine) planLookup(r fetch.Request, withIdentity bool) ([]signal.Series
 	plan := e.planExistence(ids, r, withIdentity)
 	e.mu.RUnlock()
 
-	return ids, plan
+	return ids, plan, nil
 }
 
 // seriesLabelValue returns the series' value for the queryable label name, over the same flattened

@@ -28,7 +28,10 @@ import (
 // The returned identities alias engine-owned, immutable interned memory; copy them to retain past
 // an engine Reset.
 func (e *Engine) Series(ctx context.Context, r fetch.Request) ([]signal.Series, error) {
-	ids, plan := e.planLookup(r, true)
+	ids, plan, err := e.planLookup(ctx, r, true)
+	if err != nil {
+		return nil, err
+	}
 	defer plan.releaseParts()
 
 	// The in-memory tiers were folded in exactly under the plan lock; the parts add every matched id

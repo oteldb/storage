@@ -27,6 +27,9 @@ import (
 // probe stops at the first live series, so a live value costs one probe rather than a scan of its
 // postings list.
 func (e *Engine) LabelNames(ctx context.Context, r fetch.Request) ([]string, error) {
+	if e.cfg.DiskSeries {
+		return e.diskLabels(ctx, r, nil, false)
+	}
 	pr, err := e.newLabelProbe(ctx, r)
 	if err != nil {
 		return nil, err
@@ -72,6 +75,9 @@ func (e *Engine) LabelNames(ctx context.Context, r fetch.Request) ([]string, err
 // LabelValues returns, sorted, the distinct canonical-text values of name across the series matching
 // r.Matchers that hold samples in [r.Start, r.End]. See [Engine.LabelNames] for the shared contract.
 func (e *Engine) LabelValues(ctx context.Context, r fetch.Request, name []byte) ([]string, error) {
+	if e.cfg.DiskSeries {
+		return e.diskLabels(ctx, r, name, true)
+	}
 	pr, err := e.newLabelProbe(ctx, r)
 	if err != nil {
 		return nil, err

@@ -204,8 +204,12 @@ Feedback resets on process restart and does not change the storage format.
 - **`Cardinality(tenant, signal, topN) CardinalityStats`** — the first stop for a
   cardinality-explosion incident. `TotalSeries`, `DistinctLabelNames`, `SymbolCount` (interned
   symbols), and `TopLabelNames` (the top-N label names by series count, each with `Series` and
-  `DistinctValues`). `topN ≤ 0` returns every label name. Computed from the head's inverted index
-  (which spans head ∪ flushed series); no backend I/O.
+  `DistinctValues`). `topN ≤ 0` returns every resident indexed label name; no backend I/O.
+  Metrics with `DiskSeries` report a global `TotalSeries`. `TotalSeriesComplete=false` marks
+  missing historical parts or a failed recount; the last count is then incomplete. `IndexScope=resident_head`
+  marks label and symbol counts and `TopLabelNames` as resident active/frozen head metadata. The default
+  `resident_all_series` scope includes the historical registry. This polling call performs no I/O.
+
 - **`StreamCosts(ctx, tenant, signal, StreamCostOptions) ([]StreamCost, error)`** (`introspect.go`,
   record signals only) — the "**which service is costing me, and why**" drill-down: the flushed
   parts attributed to streams, or (with `GroupBy`, e.g. `service.name`) to a label's values.

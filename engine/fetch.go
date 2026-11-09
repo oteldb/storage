@@ -57,26 +57,39 @@ func (e *Engine) fetch(ctx context.Context, r fetch.Request, try bool) (fetch.It
 	// that one-time sort under the exclusive lock first: hold the read lock, and while the
 	// index is still unsorted, upgrade to sort and re-check. Once we hold the read lock with a
 	// sorted index, no writer can be running, so resolve only reads.
-	e.mu.RLock()
-	for !e.head.indexSorted() {
-		e.mu.RUnlock()
-		e.mu.LockState()
-		e.head.ensureIndexSorted()
-		e.mu.UnlockState()
+	var plan *enginePlan
+	if e.cfg.DiskSeries {
+		var err error
+		plan, err = e.planDiskQuery(ctx, r, true, false)
+		if err != nil {
+			span.RecordError(err)
+			span.End()
+			pf.End()
+			return nil, err
+		}
+	} else {
 		e.mu.RLock()
+		for !e.head.indexSorted() {
+			e.mu.RUnlock()
+			e.mu.LockState()
+			e.head.ensureIndexSorted()
+			e.mu.UnlockState()
+			e.mu.RLock()
+		}
+
+		_, rpf := profile.Begin(ctx, "resolve-matchers")
+		ids := e.head.resolve(r.Matchers)
+		rpf.Add("series_matched", int64(len(ids)))
+		rpf.End()
+
+		// Plan under the read lock: acquire the in-window parts to read and snapshot each series' head
+		// (and any mid-flush) samples + identity, so the part reads below run lock-free — appends and
+		// flush/merge proceed concurrently, and the acquired parts can't be reclaimed until released.
+		plan = e.planFetch(ids, r)
+		plan.tryDecode = try
+		e.mu.RUnlock()
 	}
-
-	_, rpf := profile.Begin(ctx, "resolve-matchers")
-	ids := e.head.resolve(r.Matchers)
-	rpf.Add("series_matched", int64(len(ids)))
-	rpf.End()
-
-	// Plan under the read lock: acquire the in-window parts to read and snapshot each series' head
-	// (and any mid-flush) samples + identity, so the part reads below run lock-free — appends and
-	// flush/merge proceed concurrently, and the acquired parts can't be reclaimed until released.
-	plan := e.planFetch(ids, r)
 	plan.tryDecode = try
-	e.mu.RUnlock()
 
 	// Reserve this fetch's decode footprint from the memory budget (blocks under concurrency
 	// pressure), off the engine lock, before any part is decoded. A fetch materializes ts+value.
