@@ -185,4 +185,8 @@ func TestDiskReplicaProofFailureKeepsAccountingCurrent(t *testing.T) {
 	require.Equal(t, 1, replica.HeadSampleCount())
 	require.EqualValues(t, 1, replica.Stats().HeadSamples)
 	require.EqualValues(t, SampleBytes, replica.HeadBytes(), "a later proof error cannot leave stale accounting for safely trimmed samples")
+	headers, numerics, rows := replicaArenaPages(replica.head.memory)
+	require.Equal(t, 1, headers)
+	require.Equal(t, 1, numerics)
+	require.Equal(t, 1, rows, "proof errors reclaim the first identity's drained arena ownership")
 }

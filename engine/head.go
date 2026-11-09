@@ -39,6 +39,7 @@ type head struct {
 	slots                headSlots
 	buffers              headBuffers
 	memory, frozenMemory sampleArena
+	replicaTrimmedBytes  int64
 
 	bytes         int64 // active buffered sample bytes (SampleBytes each)
 	detachedBytes int64 // resident samples held by the single in-flight flush
@@ -687,6 +688,7 @@ func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 
 	detached, bytes, since := h.samples, h.bytes, h.since
 	h.frozenMemory, h.memory = h.memory, sampleArena{}
+	h.replicaTrimmedBytes = 0
 	h.samples = make(map[signal.SeriesID]*sampleBuf)
 	h.buffers = headBuffers{}
 	h.bytes = 0

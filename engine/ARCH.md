@@ -191,6 +191,11 @@ amount of retained tail capacity for far fewer allocator and GC objects.
 A process-wide bounded recycler retains at most 512 numeric pages and 128 cleared header pages
 (about 11.4 MiB); excess pages are released rather than retaining per-series capacity indefinitely.
 
+Disk replica refresh releases an empty sample arena immediately. Once cumulative trimmed bytes
+reach half the remaining head bytes, survivors move into a fresh arena and buffer map before old
+pages return to the recycler. This also runs after partial proof errors, so one retained OOO row
+cannot pin every past generation. Writer/state ownership protects the swap; read plans own copies.
+
 Pruning builds the surviving registry-to-slot mapping off-lock. Tail registrations and revived
 series retain their slots at installation; only dead slots are cleared and recycled. Updates
 made while rebuilding therefore keep their watermarks, and a reused slot inherits no old bound.
