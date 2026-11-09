@@ -15,7 +15,7 @@ import (
 func (p *enginePlan) selectDiskCountPart(
 	ctx context.Context, pt *part, r fetch.Request, selected map[signal.SeriesID]diskSelection,
 ) (bool, error) {
-	baseWorkspace := int64(min(indexPageEntries, pt.index.seriesCount())*sidxEntryW + 4096)
+	baseWorkspace := int64(3*min(indexPageEntries, pt.index.seriesCount())*sidxEntryW + 4096)
 	if err := p.selectionBudget.Reserve(baseWorkspace); err != nil {
 		return true, err
 	}
