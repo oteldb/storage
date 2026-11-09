@@ -97,6 +97,7 @@ func (p *part) visitDiskSeries(
 	ctx context.Context, matchers []fetch.Matcher,
 	visit func(signal.SeriesID, []byte, seriesindex.Metadata) error,
 ) error {
+	ctx = p.reader.ReaderContext(ctx)
 	idx, err := p.seriesIndex(ctx)
 	if err != nil {
 		return err
@@ -117,6 +118,7 @@ func (p *part) visitLegacyDiskSeries(
 	ctx context.Context, matchers []fetch.Matcher,
 	visit func(signal.SeriesID, []byte, seriesindex.Metadata) error,
 ) error {
+	ctx = p.reader.ReaderContext(ctx)
 	key, err := p.diskIdentityKey(ctx)
 	if err != nil {
 		return err
@@ -209,6 +211,7 @@ func legacySeriesMetadata(times []watermark.Entry, stats map[signal.SeriesID]Ser
 }
 
 func (p *part) lookupDiskSeries(ctx context.Context, id signal.SeriesID) (signal.Series, seriesindex.Metadata, bool, error) {
+	ctx = p.reader.ReaderContext(ctx)
 	idx, err := p.seriesIndex(ctx)
 	if err != nil {
 		return signal.Series{}, seriesindex.Metadata{}, false, err
@@ -238,6 +241,7 @@ func (p *part) lookupDiskSeries(ctx context.Context, id signal.SeriesID) (signal
 }
 
 func (p *part) diskSeriesMetadata(ctx context.Context, id signal.SeriesID) (seriesindex.Metadata, bool, error) {
+	ctx = p.reader.ReaderContext(ctx)
 	idx, err := p.seriesIndex(ctx)
 	if err != nil {
 		return seriesindex.Metadata{}, false, err
@@ -270,6 +274,7 @@ func (p *part) diskSeriesMetadata(ctx context.Context, id signal.SeriesID) (seri
 }
 
 func (p *part) diskSeriesIDs(ctx context.Context) (postings.Postings, error) {
+	ctx = p.reader.ReaderContext(ctx)
 	idx, err := p.seriesIndex(ctx)
 	if err != nil {
 		return nil, err
@@ -278,6 +283,25 @@ func (p *part) diskSeriesIDs(ctx context.Context) (postings.Postings, error) {
 		return &verifiedDiskIDs{indexed: idx.IDs(ctx), rows: p.diskRowIDs(ctx)}, nil
 	}
 	return p.diskRowIDs(ctx), nil
+}
+
+func (p *part) validateDiskSeriesIDs(ctx context.Context) error {
+	p.diskIDsMu.Lock()
+	defer p.diskIDsMu.Unlock()
+	if p.diskIDsChecked {
+		return nil
+	}
+	ids, err := p.diskSeriesIDs(ctx)
+	if err != nil {
+		return err
+	}
+	for ids.Next() {
+	}
+	if err := ids.Err(); err != nil {
+		return err
+	}
+	p.diskIDsChecked = true
+	return nil
 }
 
 func (p *part) diskRowIDs(ctx context.Context) postings.Postings {

@@ -11,6 +11,7 @@ import (
 )
 
 func (p *part) legacyDiskWatermark(ctx context.Context, id signal.SeriesID) (int64, bool, error) {
+	ctx = p.reader.ReaderContext(ctx)
 	p.diskWatermarkMu.Lock()
 	reader := p.diskWatermark
 	if reader == nil {
