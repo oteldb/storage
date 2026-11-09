@@ -329,3 +329,32 @@ func TestDiskSeriesRefreshDropsTrimmedMetadata(t *testing.T) {
 	require.Zero(t, replica.head.series.Len(), "replica coverage trimming must reclaim active metadata")
 	require.Equal(t, 1, replica.SeriesCount())
 }
+
+func TestDiskSeriesAdoptionPreparesForeignMetadata(t *testing.T) {
+	t.Parallel()
+	for _, missing := range []bool{false, true} {
+		t.Run(strconv.FormatBool(missing), func(t *testing.T) {
+			t.Parallel()
+			b := backend.Memory()
+			writer, _ := diskRecoveryFixture(t, b, 2)
+			if missing {
+				require.NoError(t, b.Delete(t.Context(), writer.parts[0].prefix+"/manifest"))
+			}
+			reader := New(Config{Backend: b, Prefix: writer.cfg.Prefix, DiskSeries: true})
+			t.Cleanup(func() { require.NoError(t, reader.Close(t.Context())) })
+			reader.mu.Lock()
+			err := reader.adoptIndexLocked(t.Context())
+			reader.mu.Unlock()
+			if missing {
+				require.ErrorIs(t, err, backend.ErrNotExist)
+				require.True(t, reader.IndexFenced(), "an unreadable foreign part must not become a healthy partial view")
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, reader.foreignParts, 1)
+			require.Zero(t, reader.head.series.Len())
+			require.Equal(t, 2, reader.SeriesCount())
+			require.False(t, reader.IndexFenced())
+		})
+	}
+}

@@ -245,6 +245,10 @@ func (e *Engine) openForeignLocked(ctx context.Context) error {
 			return err
 		})
 		if err != nil {
+			if e.cfg.DiskSeries {
+				e.loadErr = err
+				return errors.Wrap(err, "open adopted disk part")
+			}
 			zctx.From(ctx).Debug("adopted part is not readable here",
 				zap.String("prefix", ent.Prefix), zap.Error(err))
 			e.countCorrupt(ctx, err, "part", obs.CorruptTolerated)
