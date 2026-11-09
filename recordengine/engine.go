@@ -1642,6 +1642,9 @@ func (e *Engine) abortFlush(
 	side map[string][]byte,
 	cause error,
 ) error {
+	if ctx.Err() != nil {
+		ctx = obs.WithShutdown(ctx)
+	}
 	log := e.cfg.Obs.Logger(ctx).With(zap.String("prefix", e.cfg.Prefix), zap.String("signal", e.cfg.Signal))
 	done := obs.ShutdownPhase(ctx, log, "flush_rollback")
 	var rollbackErr error

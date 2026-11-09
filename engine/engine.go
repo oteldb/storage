@@ -1752,6 +1752,9 @@ func (e *Engine) abortFlush(
 	detachedSince time.Time,
 	cause error,
 ) error {
+	if ctx.Err() != nil {
+		ctx = obs.WithShutdown(ctx)
+	}
 	log := e.cfg.Obs.Logger(ctx).With(zap.String("prefix", e.cfg.Prefix), zap.String("signal", "metric"))
 	done := obs.ShutdownPhase(ctx, log, "flush_rollback")
 	defer done(nil)
