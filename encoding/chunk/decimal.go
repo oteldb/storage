@@ -221,7 +221,7 @@ func floatToDecimal(f float64) (int64, int) {
 	)
 
 	// Round to nearest (not truncate) so a clean decimal survives the scaling and strips back to
-	// a small mantissa: 42.3 → round(42.3·1e12)=4.23e13 → strip → 423·10⁻². Truncation would
+	// a small mantissa: 42.3 → round(42.3·1e12)=4.23e13 → strip → 423·10⁻¹. Truncation would
 	// land on 422999999999xx and never strip, inflating the mantissa (and the encoded size) for
 	// every realistic fractional gauge. Rounding is also a strictly closer approximation, so it
 	// only improves the fractional round-trip.
