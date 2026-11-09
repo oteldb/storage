@@ -241,6 +241,9 @@ func (p *part) lookupDiskSeries(ctx context.Context, id signal.SeriesID) (signal
 }
 
 func (p *part) diskSeriesMetadata(ctx context.Context, id signal.SeriesID) (seriesindex.Metadata, bool, error) {
+	if !p.index.mayContainID(id) {
+		return seriesindex.Metadata{}, false, nil
+	}
 	ctx = p.reader.ReaderContext(ctx)
 	idx, err := p.seriesIndex(ctx)
 	if err != nil {
@@ -402,3 +405,31 @@ func (p *diskPartIDs) Seek(id signal.SeriesID) bool {
 }
 func (p *diskPartIDs) At() signal.SeriesID { return p.id }
 func (p *diskPartIDs) Err() error          { return p.err }
+
+// visitDiskMetadata retains only one part's two metadata cursors while probing sorted IDs.
+func (p *part) visitDiskMetadata(ctx context.Context, ids []signal.SeriesID, visit func(signal.SeriesID, seriesindex.Metadata)) error {
+	first, end := p.index.selectedIDRange(ids)
+	ids = ids[first:end]
+	if len(ids) == 0 {
+		return nil
+	}
+	ctx = p.reader.ReaderContext(ctx)
+	index, err := p.seriesIndex(ctx)
+	if err != nil {
+		return err
+	}
+	lookup := func(id signal.SeriesID) (seriesindex.Metadata, bool, error) { return p.diskSeriesMetadata(ctx, id) }
+	if index != nil {
+		lookup = index.MetadataReader(ctx).Lookup
+	}
+	for _, id := range ids {
+		meta, found, err := lookup(id)
+		if err != nil {
+			return err
+		}
+		if found {
+			visit(id, meta)
+		}
+	}
+	return nil
+}

@@ -9,6 +9,7 @@ import (
 
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/index/postings"
+	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
 )
@@ -226,14 +227,14 @@ func (e *Engine) preloadDiskSeriesMoreLocked(ids []signal.SeriesID) error {
 }
 
 func (e *Engine) preloadDiskSeriesOffState(ids []signal.SeriesID) error {
+	s := e.head.disk
 	if err := e.checkDiskAdmissionLocked(); err != nil {
 		return err
 	}
-	s := e.head.disk
 	if s.pending == nil {
 		s.pending = make(map[signal.SeriesID]diskHeadEntry)
 	}
-	parts := e.readablePartsLocked()
+	var historical []signal.SeriesID
 	for _, id := range ids {
 		if e.head.series.Has(id) {
 			continue
@@ -245,35 +246,34 @@ func (e *Engine) preloadDiskSeriesOffState(ids []signal.SeriesID) error {
 			s.pending[id] = hit
 			continue
 		}
-		entry, err := e.lookupHistoricalEntry(id, parts)
-		if err != nil {
-			return err
+		s.pending[id] = diskHeadEntry{}
+		if s.mayContain(id) {
+			historical = append(historical, id)
 		}
-		s.pending[id] = entry
 	}
-	return nil
+	slices.SortFunc(historical, signal.SeriesID.Compare)
+	return e.preloadHistoricalBatch(historical)
 }
 
-//nolint:contextcheck,nolintlint // The context analyzer consumes this intentional API boundary before reporting.
-func (e *Engine) lookupHistoricalEntry(id signal.SeriesID, parts []*part) (diskHeadEntry, error) {
-	var entry diskHeadEntry
-	if !e.head.disk.mayContain(id) {
-		return entry, nil
+//nolint:contextcheck,nolintlint // Append has no context; scoped reader I/O stays off state.
+func (e *Engine) preloadHistoricalBatch(ids []signal.SeriesID) error {
+	if len(ids) == 0 {
+		return nil
 	}
-	for _, p := range parts {
-		meta, ok, err := p.diskSeriesMetadata(context.Background(), id)
-		if err != nil {
-			return entry, errors.Wrap(err, "lookup historical series")
+	s := e.head.disk
+	for _, p := range e.readablePartsLocked() {
+		if err := p.visitDiskMetadata(context.Background(), ids, func(id signal.SeriesID, meta seriesindex.Metadata) {
+			entry := s.pending[id]
+			if !entry.exists || meta.Covered > entry.newest {
+				entry.newest = meta.Covered
+			}
+			entry.exists = true
+			s.pending[id] = entry
+		}); err != nil {
+			return errors.Wrap(err, "lookup historical series batch")
 		}
-		if !ok {
-			continue
-		}
-		if !entry.exists || meta.Covered > entry.newest {
-			entry.newest = meta.Covered
-		}
-		entry.exists = true
 	}
-	return entry, nil
+	return nil
 }
 
 func (e *Engine) clearDiskPendingLocked() {

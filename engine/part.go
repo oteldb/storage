@@ -63,6 +63,14 @@ type partIndex struct {
 	maxRows int
 }
 
+// mayContainID prunes probes outside the validated canonical-ID bounds without reading a page.
+func (idx partIndex) mayContainID(id signal.SeriesID) bool {
+	if p := idx.paged; p != nil {
+		return p.n > 0 && (!p.bounded || (id.Compare(p.first) >= 0 && id.Compare(p.last) <= 0))
+	}
+	return len(idx.ids) > 0 && id.Compare(idx.ids[0]) >= 0 && id.Compare(idx.ids[len(idx.ids)-1]) <= 0
+}
+
 func (idx partIndex) selectedIDRange(ids []signal.SeriesID) (first, end int) {
 	var low, high signal.SeriesID
 	if p := idx.paged; p != nil {

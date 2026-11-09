@@ -245,6 +245,15 @@ func (c *Cursor) Seek(key []byte) bool {
 	if c.err != nil || c.table.pages == 0 {
 		return false
 	}
+	// The page's final key was validated at load; forward probes need no directory I/O.
+	if c.page >= 0 && bytes.Compare(c.key, key) <= 0 && bytes.Compare(key, c.last) <= 0 {
+		for bytes.Compare(c.key, key) < 0 {
+			if !c.advance() {
+				return false
+			}
+		}
+		return true
+	}
 	lo, hi := uint32(0), c.table.pages
 	for lo < hi {
 		mid := lo + (hi-lo)/2
