@@ -9,6 +9,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestByteIntMapResetZeroValue(t *testing.T) {
+	t.Parallel()
+	var m ByteIntMap
+	m.Reset()
+	require.Len(t, m.hashes, 32)
+	m.Put([]byte("alive"), 7)
+	v, ok := m.Get([]byte("alive"))
+	require.True(t, ok)
+	require.Equal(t, 7, v)
+	capacity := m.SizeBytes()
+	m.Reset()
+	require.Equal(t, capacity, m.SizeBytes())
+	require.Zero(t, m.Len())
+	_, ok = m.Get([]byte("alive"))
+	require.False(t, ok)
+}
+
 func TestByteIntMapBasic(t *testing.T) {
 	t.Parallel()
 	m := NewByteIntMap()
