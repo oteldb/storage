@@ -525,31 +525,32 @@ func DecodeManifest(src []byte) (Manifest, error) {
 		m.Columns = append(m.Columns, c)
 	}
 
-	if err := m.decodeTrailer(r); err != nil {
+	if err := decodeManifestTrailer(r, &m); err != nil {
 		return Manifest{}, err
 	}
 	return m, nil
 }
 
 // Optional fields are ordered; absent sizing fields read as zero.
-func (m *Manifest) decodeTrailer(r *bitstream.Reader) error {
-	diskBytes, err := r.ReadUvarint()
-	if err != nil {
-		return nil
+func decodeManifestTrailer(r *bitstream.Reader, m *Manifest) error {
+	if diskBytes, err := r.ReadUvarint(); err == nil {
+		if m.DiskBytes, err = toInt64(diskBytes, "diskBytes"); err != nil {
+			return err
+		}
+		return decodeManifestRawTrailer(r, m)
 	}
-	if m.DiskBytes, err = toInt64(diskBytes, "diskBytes"); err != nil {
-		return err
-	}
-	raw, err := r.ReadUvarint()
-	if err != nil {
-		return nil
-	}
-	if m.RawBytes, err = toInt64(raw, "rawBytes"); err != nil {
-		return err
-	}
-	if !decodeBindingNonce(r, &m.BindingNonce) {
-		m.Rollup = decodeRollup(r)
-		decodeBindingNonce(r, &m.BindingNonce)
+	return nil
+}
+
+func decodeManifestRawTrailer(r *bitstream.Reader, m *Manifest) error {
+	if raw, err := r.ReadUvarint(); err == nil {
+		if m.RawBytes, err = toInt64(raw, "rawBytes"); err != nil {
+			return err
+		}
+		if !decodeBindingNonce(r, &m.BindingNonce) {
+			m.Rollup = decodeRollup(r)
+			decodeBindingNonce(r, &m.BindingNonce)
+		}
 	}
 	return nil
 }

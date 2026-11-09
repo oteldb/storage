@@ -23,9 +23,9 @@ type restoreIndexFetcher struct {
 func (f *restoreIndexFetcher) FetchWants(ctx context.Context, wants []bucketindex.Want) []bucketindex.FetchResult {
 	f.calls++
 	results := make([]bucketindex.FetchResult, len(wants))
-	for i, w := range wants {
+	for i := range wants {
 		err := f.backend.Write(ctx, f.key, f.data)
-		results[i] = bucketindex.FetchResult{Entry: w.Entry(), Outcome: bucketindex.WantSatisfied, Err: err}
+		results[i] = bucketindex.FetchResult{Entry: wants[i].Entry(), Outcome: bucketindex.WantSatisfied, Err: err}
 	}
 	return results
 }

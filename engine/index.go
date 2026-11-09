@@ -543,7 +543,7 @@ func (e *Engine) livePart(
 	ctx context.Context, ent *bucketindex.Entry, open map[string]*part,
 ) (*part, error) {
 	if p := open[ent.Prefix]; p != nil && p.matchesEntry(ent) &&
-		!(e.cfg.DiskSeries && errors.Is(e.loadErr, seriesindex.ErrCorrupt)) {
+		(!e.cfg.DiskSeries || !errors.Is(e.loadErr, seriesindex.ErrCorrupt)) {
 		live, err := block.PartPresent(ctx, e.cfg.Backend, ent.Prefix)
 		if err != nil {
 			return nil, errors.Wrapf(err, "probe part %q", ent.Prefix)
@@ -598,6 +598,18 @@ type indexLoad struct {
 // the same bar repair sets before concluding a part is gone ([repair.HoleConfirmations]).
 const corruptLoadsBeforeWant = repair.HoleConfirmations
 
+func (e *Engine) loadReferencedPart(ctx context.Context, ent *bucketindex.Entry, open map[string]*part) (*part, error) {
+	previous := open[ent.Prefix]
+	p, err := e.livePart(ctx, ent, open)
+	if err == nil && e.cfg.DiskSeries {
+		_, err = e.prepareDiskPart(ctx, p)
+	}
+	if err != nil && p != nil && p != previous {
+		p.closeReaders()
+	}
+	return p, err
+}
+
 // readIndexLocked loads the bucket index and opens the parts it names, writing nothing on the
 // engine. A load that failed on corrupt parts also returns every part it found corrupt. Caller holds
 // e.mu.
@@ -651,14 +663,8 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 		}
 
 		previous := open[ent.Prefix]
-		p, err := e.livePart(ctx, ent, open)
-		if err == nil && e.cfg.DiskSeries {
-			_, err = e.prepareDiskPart(ctx, p)
-		}
+		p, err := e.loadReferencedPart(ctx, ent, open)
 		if err != nil {
-			if p != nil && p != previous {
-				p.closeReaders()
-			}
 			switch {
 			case partGone(err):
 				zctx.From(ctx).Error("part named by the index is gone; recording a repair",
