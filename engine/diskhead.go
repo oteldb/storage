@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/index/postings"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
@@ -21,16 +22,17 @@ type diskHeadEntry struct {
 }
 
 type diskHeadState struct {
-	count   int64
-	bloom   []uint64
-	cache   map[signal.SeriesID]diskHeadEntry
-	order   []signal.SeriesID
-	next    int
-	pending map[signal.SeriesID]diskHeadEntry
+	complete bool
+	count    int64
+	bloom    []uint64
+	cache    map[signal.SeriesID]diskHeadEntry
+	order    []signal.SeriesID
+	next     int
+	pending  map[signal.SeriesID]diskHeadEntry
 }
 
 func newDiskHeadState() *diskHeadState {
-	return &diskHeadState{bloom: make([]uint64, diskHeadBloomWords), cache: make(map[signal.SeriesID]diskHeadEntry)}
+	return &diskHeadState{complete: true, bloom: make([]uint64, diskHeadBloomWords), cache: make(map[signal.SeriesID]diskHeadEntry)}
 }
 
 func (s *diskHeadState) note(id signal.SeriesID) {
@@ -74,8 +76,17 @@ func (e *Engine) diskSeriesCountLocked() int64 { return e.head.cardinality() }
 
 // rebuildDiskStateLocked recounts the streaming union after a catalog lifecycle change.
 // The caller excludes writers and owns state; disk reads admit readers.
-func (e *Engine) rebuildDiskStateLocked(ctx context.Context) error {
+func (e *Engine) rebuildDiskStateLocked(ctx context.Context) (err error) {
 	if !e.cfg.DiskSeries {
+		return nil
+	}
+	defer func() {
+		if err != nil {
+			e.head.disk.complete = false
+		}
+	}()
+	if e.diskHistoryGapLocked() != nil {
+		e.head.disk.complete = false
 		return nil
 	}
 	next := newDiskHeadState()
@@ -128,7 +139,6 @@ func (e *Engine) preloadDiskSeriesMoreLocked(ids []signal.SeriesID) error {
 	return e.mu.WithReaders(func() error { return e.preloadDiskSeriesOffState(ids) })
 }
 
-//nolint:contextcheck,nolintlint // The context analyzer consumes this intentional API boundary before reporting.
 func (e *Engine) preloadDiskSeriesOffState(ids []signal.SeriesID) error {
 	s := e.head.disk
 	if s.pending == nil {
@@ -139,6 +149,15 @@ func (e *Engine) preloadDiskSeriesOffState(ids []signal.SeriesID) error {
 		if e.head.series.Has(id) {
 			continue
 		}
+		if !s.complete {
+			return errors.Wrap(bucketindex.ErrFenced, "historical series count is incomplete")
+		}
+		if err := e.fenceLocked(); err != nil {
+			return err
+		}
+		if err := e.diskHistoryGapLocked(); err != nil {
+			return err
+		}
 		if _, ok := s.pending[id]; ok {
 			continue
 		}
@@ -146,24 +165,35 @@ func (e *Engine) preloadDiskSeriesOffState(ids []signal.SeriesID) error {
 			s.pending[id] = hit
 			continue
 		}
-		var entry diskHeadEntry
-		if s.mayContain(id) {
-			for _, p := range parts {
-				meta, ok, err := p.diskSeriesMetadata(context.Background(), id)
-				if err != nil {
-					return errors.Wrap(err, "lookup historical series")
-				}
-				if ok {
-					if !entry.exists || meta.Covered > entry.newest {
-						entry.newest = meta.Covered
-					}
-					entry.exists = true
-				}
-			}
+		entry, err := e.lookupHistoricalEntry(id, parts)
+		if err != nil {
+			return err
 		}
 		s.pending[id] = entry
 	}
 	return nil
+}
+
+//nolint:contextcheck,nolintlint // The context analyzer consumes this intentional API boundary before reporting.
+func (e *Engine) lookupHistoricalEntry(id signal.SeriesID, parts []*part) (diskHeadEntry, error) {
+	var entry diskHeadEntry
+	if !e.head.disk.mayContain(id) {
+		return entry, nil
+	}
+	for _, p := range parts {
+		meta, ok, err := p.diskSeriesMetadata(context.Background(), id)
+		if err != nil {
+			return entry, errors.Wrap(err, "lookup historical series")
+		}
+		if !ok {
+			continue
+		}
+		if !entry.exists || meta.Covered > entry.newest {
+			entry.newest = meta.Covered
+		}
+		entry.exists = true
+	}
+	return entry, nil
 }
 
 func (e *Engine) clearDiskPendingLocked() {
@@ -299,4 +329,33 @@ func (e *Engine) diskOverflowLimits(limits AppendLimits, b *walBatch, stateHeld 
 		return ov
 	}
 	return limits
+}
+
+func (e *Engine) diskHistoryGapLocked() error {
+	if e.hasWantsLocked() {
+		return errors.Wrap(bucketindex.ErrFenced, "historical series metadata is unavailable while parts need repair")
+	}
+	for i := range e.foreign {
+		entry := &e.foreign[i]
+		if e.foreignParts[entry.Prefix] == nil {
+			return errors.Wrapf(bucketindex.ErrFenced, "historical series metadata is unavailable for adopted part %q", entry.Prefix)
+		}
+	}
+	return nil
+}
+
+func (e *Engine) diskSeriesCompleteLocked() bool {
+	if !e.cfg.DiskSeries {
+		return true
+	}
+	if !e.head.disk.complete || e.loadErr != nil || e.hasWantsLocked() {
+		return false
+	}
+	for i := range e.foreign {
+		entry := &e.foreign[i]
+		if e.foreignParts[entry.Prefix] == nil {
+			return false
+		}
+	}
+	return true
 }

@@ -3,12 +3,17 @@ package engine
 import (
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/internal/vfs/faultfs"
+	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
 )
@@ -36,6 +41,7 @@ func TestDiskHeadEvictsHistoricalMetadata(t *testing.T) {
 		require.Empty(t, e.head.buffers.pages)
 		require.LessOrEqual(t, len(e.head.disk.cache), diskHeadCacheEntries)
 		require.EqualValues(t, (generation+1)*perGeneration, e.Stats().Series)
+		require.True(t, e.Stats().SeriesComplete)
 		require.Zero(t, e.identityOrder.bytes.Load())
 		require.Less(t, e.IdentityBytes(), int64(3<<20))
 	}
@@ -286,4 +292,111 @@ func TestDiskHeadCompactionPreservesActiveGeneration(t *testing.T) {
 	require.EqualValues(t, 105, e.head.seriesState(shared.Hash()).newest)
 	require.EqualValues(t, 3, e.Stats().Series)
 	e.head.frozenMemory.release()
+}
+
+func TestDiskHeadFlushPublicationPreservesSnapshots(t *testing.T) {
+	t.Parallel()
+	be := faultbackend.Wrap(backend.Memory())
+	e := New(Config{Backend: be, Prefix: "snapshot-head", DiskSeries: true})
+	old, shared, active := benchSeries(1), benchSeries(2), benchSeries(3)
+	for _, s := range []signal.Series{old, shared} {
+		ok, err := e.Append(s, 100, 1)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+	gate := faultbackend.NewGate()
+	release := sync.OnceFunc(gate.Release)
+	be.Add(gate.Rule(faultbackend.Write, func(op faultbackend.Op) bool { return strings.Contains(op.Key, "/c/") }))
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() { defer close(finished); done <- e.Flush(t.Context()) }()
+	t.Cleanup(func() { release(); <-finished })
+	gate.Await(t)
+	for _, s := range []signal.Series{shared, active} {
+		ok, err := e.Append(s, 105, 2)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+	it, err := e.Fetch(t.Context(), fetch.Request{Start: 0, End: 200})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, it.Close()) })
+	release()
+	require.NoError(t, <-done)
+	require.Equal(t, 2, e.head.series.Len())
+	require.EqualValues(t, 3, e.Stats().Series)
+	require.Equal(t, []int64{105}, e.head.samples[shared.Hash()].ts)
+	rows, err := fetch.Drain(t.Context(), it)
+	require.NoError(t, err)
+	require.Len(t, rows, 3)
+	for _, row := range rows {
+		switch row.Series.Hash() {
+		case old.Hash():
+			require.Equal(t, []int64{100}, row.Timestamps)
+		case shared.Hash():
+			require.Equal(t, []int64{100, 105}, row.Timestamps)
+		case active.Hash():
+			require.Equal(t, []int64{105}, row.Timestamps)
+		default:
+			t.Fatal("unexpected series")
+		}
+	}
+}
+
+func TestDiskHeadUnknownMembershipDuringReadGap(t *testing.T) {
+	t.Parallel()
+	for _, gap := range []string{"wanted", "pending", "adopted", "foreign", "fenced"} {
+		t.Run(gap, func(t *testing.T) {
+			t.Parallel()
+			e := New(Config{Backend: backend.Memory(), Prefix: "gap-head", DiskSeries: true})
+			known, fresh := benchSeries(1), benchSeries(2)
+			ok, err := e.Append(known, 100, 1)
+			require.NoError(t, err)
+			require.True(t, ok)
+			before := e.head.disk
+			want := bucketindex.Want{Prefix: "unreadable"}
+			switch gap {
+			case "wanted":
+				e.wants = []bucketindex.Want{want}
+			case "pending":
+				e.pendingWants = []bucketindex.Want{want}
+			case "adopted":
+				e.adoptedWants = []bucketindex.Want{want}
+			case "foreign":
+				e.foreign = []bucketindex.Entry{{Prefix: "unreadable"}}
+			case "fenced":
+				e.loadErr = errInjectedWAL
+			}
+			ok, err = e.Append(fresh, 101, 2)
+			require.ErrorIs(t, err, bucketindex.ErrFenced)
+			require.False(t, ok)
+			require.EqualValues(t, 1, e.Stats().Series)
+			require.False(t, e.Stats().SeriesComplete)
+			require.Same(t, before, e.head.disk)
+			require.False(t, e.head.series.Has(fresh.Hash()))
+			ok, err = e.Append(known, 101, 2)
+			require.NoError(t, err)
+			require.True(t, ok, "already active series retain their normal admission path")
+			if gap != "fenced" {
+				e.mu.Lock()
+				err = e.rebuildDiskStateLocked(t.Context())
+				e.mu.Unlock()
+				require.NoError(t, err, "known gaps retain partial reads and repair progress")
+				require.False(t, e.Stats().SeriesComplete)
+				require.Same(t, before, e.head.disk, "incomplete recount preserves the last complete count and membership state")
+			}
+
+			e.mu.Lock()
+			e.wants, e.pendingWants, e.adoptedWants = nil, nil, nil
+			e.foreign = nil
+			e.loadErr = nil
+			err = e.rebuildDiskStateLocked(t.Context())
+			e.mu.Unlock()
+			require.NoError(t, err)
+			require.True(t, e.Stats().SeriesComplete)
+			ok, err = e.Append(fresh, 102, 3)
+			require.NoError(t, err)
+			require.True(t, ok)
+			require.EqualValues(t, 2, e.Stats().Series)
+		})
+	}
 }

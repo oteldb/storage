@@ -99,6 +99,13 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   the page cache rather than on disk, so the interval's power-loss bound does not hold. The error is
   logged once when a failing run starts, and a recovery line once it ends.
 
+Opt-in metrics `engine.Config.DiskSeries` keeps historical identities/postings in immutable parts.
+Its `ResidentHeadBytes` target defaults to 128 MiB; a write flushes an over-target head before
+admission, while one atomic batch may exceed the target. The optional recent tier is disabled.
+`engine.Stats.SeriesComplete` is false while historical metadata is unavailable; `Series` then
+preserves the last complete count. Unknown identities wait for repair. An old WAL exceeding the
+resident budget fails replay with its journal and epoch intact; increase the budget to recover.
+
 `SignalStats` (one per `(tenant, signal)`):
 
 | Field | Meaning |

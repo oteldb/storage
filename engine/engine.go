@@ -602,9 +602,11 @@ type Stats struct {
 	RetainFrom int64
 	// RetentionBoundBy identifies the bound behind RetainFrom.
 	RetentionBoundBy RetentionBound
-	Series           int64 // distinct series ever seen (index span: head ∪ flushed)
-	HeadSamples      int64 // samples currently buffered in the head (unflushed)
-	HeadBytes        int64 // head's buffered sample bytes (the in-flight memory measure)
+	Series           int64 // distinct retained series (head ∪ flushed).
+	// SeriesComplete is false when historical metadata prevents an exact current count.
+	SeriesComplete bool
+	HeadSamples    int64 // samples currently buffered in the head (unflushed)
+	HeadBytes      int64 // head's buffered sample bytes (the in-flight memory measure)
 	// HeadAge is how long the head has been accumulating since its last flush (0 when empty) —
 	// the flush lag, which no data-time field here reports (backfill makes sample timestamps
 	// useless as a measure of it).
@@ -650,18 +652,19 @@ func (e *Engine) Stats() Stats {
 	request := e.retentionRequest()
 	s := Stats{
 		RetainFrom: request.Cutoff, RetentionBoundBy: request.Bound,
-		Series:        e.diskSeriesCountLocked(),
-		OutOfSpace:    e.space.Exhausted(),
-		HeadBytes:     e.head.inFlightBytes(),
-		HeadSamples:   e.head.bytes / SampleBytes,
-		HeadAge:       e.head.age(),
-		IdentityBytes: e.head.identityBytes() + e.identityOrder.bytes.Load(),
-		Parts:         len(e.parts),
-		WantedParts:   len(e.wants) + len(e.pendingWants) + len(e.adoptedWants),
-		Holes:         len(e.holes),
-		LostParts:     e.lostParts,
-		IndexFenced:   e.loadErr != nil,
-		IndexLoadErr:  e.loadErr,
+		Series:         e.diskSeriesCountLocked(),
+		SeriesComplete: e.diskSeriesCompleteLocked(),
+		OutOfSpace:     e.space.Exhausted(),
+		HeadBytes:      e.head.inFlightBytes(),
+		HeadSamples:    e.head.bytes / SampleBytes,
+		HeadAge:        e.head.age(),
+		IdentityBytes:  e.head.identityBytes() + e.identityOrder.bytes.Load(),
+		Parts:          len(e.parts),
+		WantedParts:    len(e.wants) + len(e.pendingWants) + len(e.adoptedWants),
+		Holes:          len(e.holes),
+		LostParts:      e.lostParts,
+		IndexFenced:    e.loadErr != nil,
+		IndexLoadErr:   e.loadErr,
 
 		TenureUnestablished: e.tenureUnestablishedLocked(),
 		MaxTime:             e.head.newest,

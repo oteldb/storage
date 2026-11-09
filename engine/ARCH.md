@@ -229,6 +229,17 @@ ones sharing the head, and a first sample is never late. Watermarks outlive a fl
 **The series index outlives a flush** — only sample buffers drain, so flushed series stay queryable
 and re-appends do not re-index.
 
+With `Config.DiskSeries`, immutable parts own historical identities and postings. Flush publication
+rebuilds resident metadata around active samples, with a fixed bloom filter and bounded watermark
+cache. Historical cache misses probe parts before admission; distinct-series counts come from a
+streaming union after load, repair and retention, rather than sums of overlapping parts.
+
+`ResidentHeadBytes` defaults to 128 MiB and applies synchronous flush backpressure before the next
+write. One atomic caller batch may exceed the target. This mode disables the optional recent tier.
+An oversized old WAL fails recovery without advancing epochs or changing journal bytes; increase
+this budget to recover it. Unknown local identities are refused while historical parts need repair.
+`Stats.SeriesComplete=false` marks the preserved count as unavailable until recount succeeds.
+
 **`AppendBatch`** takes a precomputed `SeriesID`, columns, and a `materialize` callback used only on
 first sight. `appendByID` does one map probe: a present buffer means the series is
 known, so no `signal.Series` is built or hashed. WAL frames group by series, one write a batch.
