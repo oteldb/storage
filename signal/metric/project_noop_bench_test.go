@@ -30,6 +30,10 @@ var projectNoopShapes = []projectNoopShape{
 	{name: "history/interleaved", series: 64, samples: 64, interleave: true},
 	{name: "cpu-10k/one-metric", series: 80_000},
 	{name: "cpu-10k/per-series-metric", series: 80_000, perSeries: true},
+	{name: "cpu-10k/history-per-series-shared", series: 80_000, samples: 4, perSeries: true},
+	{name: "cpu-10k/history-per-series-cloned", series: 80_000, samples: 4, perSeries: true, cloned: true},
+	{name: "cpu-10k/history-packed-grouped", series: 80_000, samples: 4},
+	{name: "cpu-10k/history-packed-interleaved", series: 80_000, samples: 4, interleave: true},
 }
 
 var projectedNoopPoints int
