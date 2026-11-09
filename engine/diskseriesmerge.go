@@ -18,6 +18,29 @@ type diskMergeSource struct {
 	attrs    signal.Attributes
 }
 
+func (e *Engine) openMetricMergeStreams(ctx context.Context, src []*part) ([]*partStream, []*diskMergeSource, error) {
+	streams := make([]*partStream, len(src))
+	var metadata []*diskMergeSource
+	if e.cfg.DiskSeries {
+		metadata = make([]*diskMergeSource, len(src))
+	}
+	for i, p := range src {
+		stream, err := newPartStream(ctx, p, e.mergeReadWindow)
+		if err == nil && e.cfg.DiskSeries {
+			metadata[i], err = newDiskMergeSource(ctx, p)
+		}
+		if err != nil {
+			stream.close()
+			for _, opened := range streams {
+				opened.close()
+			}
+			return nil, nil, err
+		}
+		streams[i] = stream
+	}
+	return streams, metadata, nil
+}
+
 type mergeIdentityItem struct {
 	id       signal.SeriesID
 	view     series.View

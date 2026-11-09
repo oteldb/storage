@@ -635,30 +635,15 @@ func (e *Engine) compactStreamWithInputs(
 	}
 
 	// One forward cursor per source part; one reusable per-part destination per series range.
-	streams := make([]*partStream, len(src))
-	var metadata []*diskMergeSource
-	if e.cfg.DiskSeries {
-		metadata = make([]*diskMergeSource, len(src))
+	streams, metadata, err := e.openMetricMergeStreams(ctx, src)
+	if err != nil {
+		return nil, err
 	}
 	defer func() {
 		for _, stream := range streams {
 			stream.close()
 		}
 	}()
-	for i, p := range src {
-		s, err := newPartStream(ctx, p, e.mergeReadWindow)
-		if err != nil {
-			return nil, err
-		}
-
-		streams[i] = s
-		if e.cfg.DiskSeries {
-			metadata[i], err = newDiskMergeSource(ctx, p)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
 
 	scratch := make([]rangeBuf, len(src))
 	comp, precision, withSF := mergeEncoding(src, capBytes, opts, plan.tiers)

@@ -237,6 +237,9 @@ func (p *partStreamWriter) residentBytes() int64 {
 	total := p.w.ResidentBytes() + int64(cap(p.runs))*runBytes
 	if p.seriesBuilder != nil {
 		total += p.seriesBuilder.Bytes()
+		if p.buffered {
+			total += 3 * p.seriesBuilder.EncodedBound()
+		}
 	}
 	total += int64(cap(p.statsIDs))*idBytes + int64(cap(p.stats))*aggBytes
 	total += int64(cap(p.wmarks)) * wmarkBytes

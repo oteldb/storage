@@ -166,7 +166,7 @@ func (p *part) visitLegacyDiskSeries(
 		if signal.HashBytes(raw) != id {
 			return errors.Wrap(seriesindex.ErrCorrupt, "legacy identity hash mismatch")
 		}
-		if !fetch.MatchesSeries(s, matchers) {
+		if !seriesindex.MatchesSeries(s, matchers) {
 			return nil
 		}
 		meta, err := legacySeriesMetadata(times, stats, id)
