@@ -29,6 +29,7 @@ type head struct {
 	series                       *series.Index
 	post                         *postings.Dense
 	nonStringLabels              map[uint32]struct{}
+	valueScratch                 []byte
 	samples                      map[signal.SeriesID]*sampleBuf
 	newest                       int64 // newest timestamp across every series (reported as Inspect.MaxTime)
 	bufferedMin, detachedMin     int64
@@ -110,7 +111,7 @@ func newHead() *head {
 // ([Stats.IdentityBytes]) because nothing else counts it, and it only grows.
 func (h *head) identityBytes() int64 {
 	n := h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
-		memsize.Slice(h.stateRefs) + h.slots.sizeBytes()
+		memsize.Slice(h.stateRefs) + h.slots.sizeBytes() + memsize.Slice(h.valueScratch)
 	if h.nonStringLabels != nil {
 		n += memsize.Map(h.nonStringLabels)
 	}
@@ -191,6 +192,7 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 
 	h.sym, h.series, h.post = rebuilt.sym, rebuilt.series, rebuilt.post
 	h.nonStringLabels = rebuilt.nonStringLabels
+	h.valueScratch = rebuilt.valueScratch
 	h.stateRefs = rebuilt.stateRefs
 }
 
@@ -511,9 +513,14 @@ func (h *head) indexLabels(id signal.SeriesID, s signal.Series) {
 	}
 }
 
+func (h *head) internValue(v signal.Value) uint32 {
+	h.valueScratch = signal.AppendValue(h.valueScratch[:0], v)
+	return uint32(h.sym.Intern(h.valueScratch))
+}
+
 func (h *head) addLabel(id uint32, name []byte, v signal.Value) {
 	nameID := uint32(h.sym.Intern(name))
-	valueID := uint32(h.sym.Intern(signal.AppendValue(nil, v)))
+	valueID := h.internValue(v)
 	if v.Kind() != signal.KindStr {
 		if h.nonStringLabels == nil {
 			h.nonStringLabels = make(map[uint32]struct{})
