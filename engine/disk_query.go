@@ -152,6 +152,11 @@ func (p *enginePlan) selectDiskPart(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if !withIdentity && !withMetadata {
+		if handled, err := p.selectDiskCountPart(ctx, pt, r, selected); handled {
+			return err
+		}
+	}
 	workspace, err := pt.diskSeriesWorkspace(ctx, len(r.Matchers))
 	if err != nil {
 		return err

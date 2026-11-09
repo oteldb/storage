@@ -256,6 +256,8 @@ func TestDiskQueryCorruptIndexCleanup(t *testing.T) {
 	pt := e.parts[0]
 	require.NoError(t, be.Write(t.Context(), seriesIndexKey(pt.prefix), []byte("corrupt")))
 	r := fetch.Request{Start: 0, End: 100}
+	filtered := r
+	filtered.Matchers = []fetch.Matcher{{Name: []byte("job"), Match: func(signal.Value) bool { return true }}}
 	for name, query := range map[string]func(context.Context) error{
 		"fetch": func(ctx context.Context) error {
 			it, err := e.Fetch(ctx, r)
@@ -265,12 +267,12 @@ func TestDiskQueryCorruptIndexCleanup(t *testing.T) {
 			return err
 		},
 		"series":    func(ctx context.Context) error { _, err := e.Series(ctx, r); return err },
-		"count":     func(ctx context.Context) error { _, err := e.Count(ctx, r); return err },
+		"count":     func(ctx context.Context) error { _, err := e.Count(ctx, filtered); return err },
 		"labels":    func(ctx context.Context) error { _, err := e.LabelNames(ctx, r); return err },
 		"values":    func(ctx context.Context) error { _, err := e.LabelValues(ctx, r, []byte("job")); return err },
 		"aggregate": func(ctx context.Context) error { _, err := e.AggregateRange(ctx, r); return err },
 		"grid": func(ctx context.Context) error {
-			_, err := e.CountGrid(ctx, r, fetch.WindowGrid{Start: 10, Width: 20, Step: 10, NumSteps: 2}, nil)
+			_, err := e.CountGrid(ctx, filtered, fetch.WindowGrid{Start: 10, Width: 20, Step: 10, NumSteps: 2}, nil)
 			return err
 		},
 	} {
