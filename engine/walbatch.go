@@ -308,6 +308,7 @@ func (b *walBatch) apply(h *head) {
 		if buf == nil {
 			buf = h.bufForRef(id, ref)
 		}
+		h.memory.initColumns(buf, len(buf.ts)+len(a.ts))
 		for i := range a.ts {
 			buf.appendSample(a.ts[i], a.values[i], a.sf[i])
 			h.noteBufferedTS(a.ts[i])

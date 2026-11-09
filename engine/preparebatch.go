@@ -45,6 +45,7 @@ func (p *batchPreparations) acquire() *preparedBatch {
 }
 
 func (p *batchPreparations) release(b *preparedBatch) {
+	b.memory.release()
 	b.batch.reset()
 	// An identity can be arbitrarily large; retain only bounded numeric/frame scratch.
 	if b.batch.frames.Cap() > maxPreparedFrameBytes {
@@ -68,6 +69,7 @@ type preparedGroup struct {
 }
 
 type preparedBatch struct {
+	memory    sampleArena
 	batch     *walBatch
 	positions []int
 	groups    []preparedGroup

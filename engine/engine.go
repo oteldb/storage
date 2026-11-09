@@ -1397,6 +1397,8 @@ func (e *Engine) Reset(ctx context.Context) error {
 	defer e.flushMu.Unlock()
 
 	e.mu.Lock()
+	e.head.memory.release()
+	e.head.frozenMemory.release()
 	e.head = newHead()
 	e.identityOrder.reset()
 	e.flushing = nil        // discarded with the head: Reset drops the samples, it does not flush them
@@ -1725,6 +1727,8 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 		e.populateRecent(detached)
 	}
 	e.flushing = nil
+	frozenMemory := e.head.frozenMemory
+	e.head.frozenMemory = sampleArena{}
 	e.head.detachedBytes = 0
 	e.head.detachedKnown = false
 	if err == nil {
@@ -1732,6 +1736,7 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 	}
 	e.mu.Unlock()
 
+	frozenMemory.release()
 	written = partsBytes(newParts)
 
 	if err != nil {

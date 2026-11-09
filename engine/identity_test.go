@@ -71,6 +71,7 @@ func TestIdentityBytesApproximatesHeap(t *testing.T) {
 	ctx := context.Background()
 	e := engine.New(engine.Config{Backend: backend.Memory(), Prefix: "t/identity-heap"})
 
+	engine.ClearSampleArenaPoolForTest()
 	base := int64(heaptest.Live())
 
 	for i := range series {
@@ -84,6 +85,8 @@ func TestIdentityBytesApproximatesHeap(t *testing.T) {
 	require.EqualValues(t, series, st.Series)
 
 	// Keep the engine (and so its identity state) reachable across the measurement.
+	// Shared sample-buffer recyclers are not per-engine identity state.
+	engine.ClearSampleArenaPoolForTest()
 	grew := int64(heaptest.Live()) - base
 	runtime.KeepAlive(e)
 

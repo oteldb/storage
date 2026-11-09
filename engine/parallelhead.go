@@ -163,6 +163,7 @@ func (p *preparedBatch) prepareTails() {
 			next = *a.buffer
 		}
 		prior := len(next.ts)
+		p.memory.initColumns(&next, prior+len(a.ts))
 		next.ts = append(next.ts, a.ts...)
 		next.values = append(next.values, a.values...)
 		if next.sf != nil {
@@ -176,13 +177,14 @@ func (p *preparedBatch) prepareTails() {
 		}
 		p.next[i] = next
 		if a.buffer == nil {
-			p.created[i] = &sampleBuf{}
+			p.created[i] = p.memory.buffer()
 			*p.created[i] = next
 		}
 	}
 }
 
 func (p *preparedBatch) publishTails(h *head) {
+	h.memory.adopt(&p.memory)
 	minTS := int64(math.MaxInt64)
 	for i, id := range p.batch.order {
 		a := &p.batch.accs[i]
