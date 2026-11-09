@@ -65,6 +65,12 @@ func (h *repairHost) CommitLocked(ctx context.Context) error {
 		return err
 	}
 	h.e.parts = h.next
+	if h.e.cfg.DiskSeries {
+		if err := h.e.rebuildDiskStateLocked(ctx); err != nil {
+			h.e.loadErr = err
+			return err
+		}
+	}
 	return nil
 }
 func (h *repairHost) RetireLocked(parts []*part)  { h.e.retireLocked(parts) }
@@ -85,6 +91,10 @@ func (h *repairHost) AdoptLocked(ctx context.Context, p *part, ent *bucketindex.
 	p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
 	p.blocks, p.claim, p.level, p.term = ent.Blocks, ent.Claim, ent.Level, ent.Term
 
+	if h.e.cfg.DiskSeries {
+		_, err := h.e.prepareDiskPart(ctx, p)
+		return err
+	}
 	_, err := h.e.registerPartIdentitiesLocked(ctx, ent.Prefix)
 
 	return err

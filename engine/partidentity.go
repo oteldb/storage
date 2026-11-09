@@ -137,6 +137,17 @@ func (e *Engine) captureIdentities(ids iter.Seq[signal.SeriesID], emit func(sign
 // part's identity object, plus the legacy whole-set object when the prefix still has one. It
 // returns whether every part carried its own identities. Caller holds e.mu.
 func (e *Engine) loadIdentitiesLocked(ctx context.Context, parts []*part) (bool, error) {
+	if e.cfg.DiskSeries {
+		complete := true
+		for _, p := range parts {
+			own, err := e.prepareDiskPart(ctx, p)
+			if err != nil {
+				return false, err
+			}
+			complete = complete && own
+		}
+		return complete, nil
+	}
 	// The legacy object first: on a prefix written by an older build it is the only place a part's
 	// identities exist. It is a superset (it never shrank), so loading it before the parts costs
 	// nothing but dead entries, which the identity prune reclaims.
@@ -214,4 +225,31 @@ func (e *Engine) registerPartIdentities(ctx context.Context, prefix string, admi
 	}
 
 	return true, nil
+}
+
+// prepareDiskPart opens only bounded index metadata; legacy payloads remain on demand.
+func (e *Engine) prepareDiskPart(ctx context.Context, p *part) (bool, error) {
+	idx, err := p.seriesIndex(ctx)
+	if err != nil {
+		return false, err
+	}
+	if idx != nil {
+		return true, nil
+	}
+	present, err := diskObjectPresent(ctx, p.be, identityKey(p.prefix))
+	if err != nil {
+		return false, err
+	}
+	if present {
+		return true, nil
+	}
+	present, err = diskObjectPresent(ctx, p.be, e.seriesKey())
+	if err != nil {
+		return false, err
+	}
+	if !present {
+		return false, errors.Wrap(backend.ErrNotExist, "part has no identity source")
+	}
+	p.legacyIdentityKey = e.seriesKey()
+	return false, nil
 }

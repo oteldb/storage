@@ -89,6 +89,19 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 	e.identityMu.Lock()
 	defer e.identityMu.Unlock()
 
+	if e.cfg.DiskSeries {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		before := e.head.series.Len()
+		e.compactDiskHeadLocked()
+		if err := e.rebuildDiskStateLocked(ctx); err != nil {
+			e.loadErr = err
+			return 0, err
+		}
+		e.identityDirty = false
+		return before - e.head.series.Len(), nil
+	}
+
 	e.mu.RLock()
 	// readablePartsLocked, not e.parts: the identities of an adopted part back rows this engine
 	// serves, and pruning them would leave the part open and unresolvable.

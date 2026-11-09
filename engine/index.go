@@ -187,7 +187,15 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	e.catalog = bucketindex.MergeLineage(e.catalog, ix.Catalog)
 
 	e.foreign = foreignEntries(ix.Entries, e.indexed, e.removals, e.wants)
-	e.openForeignLocked(ctx)
+	if err := e.openForeignLocked(ctx); err != nil {
+		return err
+	}
+	if e.cfg.DiskSeries {
+		if err := e.rebuildDiskStateLocked(ctx); err != nil {
+			e.loadErr = err
+			return err
+		}
+	}
 
 	return nil
 }
@@ -210,14 +218,14 @@ func mergeHoles(cur, other []bucketindex.Entry) []bucketindex.Entry {
 // that cannot be opened (a rival that merged it away between the two commits) is left out of the
 // readable set but kept in the index: the entry is what keeps the part reachable, and only its
 // writer knows whether it is still live. Caller holds e.mu.
-func (e *Engine) openForeignLocked(ctx context.Context) {
+func (e *Engine) openForeignLocked(ctx context.Context) error {
 	if len(e.foreign) == 0 {
 		for _, p := range e.foreignParts {
 			p.closeReaders()
 		}
 		e.foreignParts = nil
 
-		return
+		return nil
 	}
 
 	open := make(map[string]*part, len(e.foreign))
@@ -248,11 +256,13 @@ func (e *Engine) openForeignLocked(ctx context.Context) {
 		open[ent.Prefix] = p
 		fillRollup(ent, p)
 
-		// Without its identities the part is open but unresolvable: matchers resolve through the
-		// head's identity index, so the rows would be there and nothing would name them.
-		if _, err := e.registerPartIdentities(ctx, ent.Prefix, true); err != nil {
-			zctx.From(ctx).Debug("adopted part identities are not readable here",
-				zap.String("prefix", ent.Prefix), zap.Error(err))
+		if e.cfg.DiskSeries {
+			if _, err := e.prepareDiskPart(ctx, p); err != nil {
+				e.loadErr = err
+				return errors.Wrap(err, "prepare adopted part identities")
+			}
+		} else if _, err := e.registerPartIdentities(ctx, ent.Prefix, true); err != nil {
+			zctx.From(ctx).Debug("adopted part identities are not readable here", zap.String("prefix", ent.Prefix), zap.Error(err))
 		}
 	}
 
@@ -262,6 +272,7 @@ func (e *Engine) openForeignLocked(ctx context.Context) {
 		}
 	}
 	e.foreignParts = open
+	return nil
 }
 
 // readablePartsLocked is the part set a query may read: this engine's own, plus the ones it
@@ -625,6 +636,9 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 		}
 
 		p, err := e.livePart(ctx, ent, open)
+		if err == nil && e.cfg.DiskSeries {
+			_, err = e.prepareDiskPart(ctx, p)
+		}
 		if err != nil {
 			switch {
 			case partGone(err):
@@ -838,7 +852,14 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 
 	complete, err := e.loadIdentitiesLocked(ctx, l.parts)
 	if err != nil {
+		e.loadErr = err
 		return err
+	}
+	if e.cfg.DiskSeries {
+		if err := e.rebuildDiskStateLocked(ctx); err != nil {
+			e.loadErr = err
+			return err
+		}
 	}
 
 	// Identity and the next WAL epoch must be ready before the repair commit admits readers/writers.
@@ -853,7 +874,7 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 	// live that the parts do not — only identities whose data is gone. Deleting it completes the
 	// migration for a prefix written by an older build, and stops recovery from resurrecting dead
 	// identities on every restart.
-	if complete && sweep {
+	if complete && sweep && !e.cfg.DiskSeries {
 		if err := e.cfg.Backend.Delete(ctx, e.seriesKey()); err != nil && !errors.Is(err, backend.ErrNotExist) {
 			return errors.Wrap(err, "delete legacy series index")
 		}
@@ -884,6 +905,21 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 	}
 
 	covered := make(map[signal.SeriesID]int64)
+	if e.cfg.DiskSeries {
+		for id := range e.head.samples {
+			for _, p := range e.parts {
+				meta, ok, err := p.diskSeriesMetadata(ctx, id)
+				if err != nil {
+					return errors.Wrap(err, "replica disk series coverage")
+				}
+				if prev, found := covered[id]; ok && (!found || meta.Covered > prev) {
+					covered[id] = meta.Covered
+				}
+			}
+		}
+		e.head.trimBelowCovered(covered)
+		return e.rebuildDiskStateLocked(ctx)
+	}
 
 	// Each series is trimmed against its own newest flushed timestamp, not the newest in the part
 	// set: a series absent from every part keeps its whole head (a late-registered series whose
@@ -947,11 +983,14 @@ func decodeSeriesSetVisit(data []byte, fn func(signal.Series) error) error {
 		}
 		data = data[n:]
 
-		s, _, err := signal.DecodeSeries(data[:l])
+		s, consumed, err := signal.DecodeSeries(data[:l])
 		if err != nil {
 			return errors.Wrap(err, "decode series")
 		}
 
+		if consumed != int(l) {
+			return errors.Wrap(signal.ErrMalformed, "series trailing bytes")
+		}
 		if err := fn(s); err != nil {
 			return err
 		}

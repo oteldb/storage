@@ -38,14 +38,44 @@ func (p *part) diskSeriesWorkspace(ctx context.Context, nMatchers int) (int64, e
 			return 0, err
 		}
 		if !known {
-			return 0, errors.New("legacy identity admission requires native object sizes")
+			return math.MaxInt64, nil
 		}
-		if n > (math.MaxInt64-size)/(16) {
+		if n < 0 || n > (math.MaxInt64-size)/(16) {
 			return 0, errors.New("legacy identity workspace overflow")
 		}
 		size += 16 * n
 	}
-	return size + 512<<10, nil
+	column, shared, err := wholeMergeColumnBytes(p, colTs)
+	if err != nil {
+		return 0, err
+	}
+	if column > math.MaxInt64-shared || column+shared > math.MaxInt64-size-512<<10 {
+		return 0, errors.New("legacy timestamp workspace overflow")
+	}
+	return size + column + shared + 512<<10, nil
+}
+
+func diskObjectPresent(ctx context.Context, b backend.Backend, key string) (bool, error) {
+	_, known, err := backend.NativeSizeOf(ctx, b, key)
+	if errors.Is(err, backend.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if known {
+		return true, nil
+	}
+	keys, err := b.List(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	for _, got := range keys {
+		if got == key {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (p *part) diskIdentityKey(ctx context.Context) (string, error) {
@@ -53,12 +83,12 @@ func (p *part) diskIdentityKey(ctx context.Context) (string, error) {
 		return p.legacyIdentityKey, nil
 	}
 	key := identityKey(p.prefix)
-	_, known, err := backend.NativeSizeOf(ctx, p.be, key)
+	present, err := diskObjectPresent(ctx, p.be, key)
 	if err != nil {
-		return "", errors.Wrap(err, "locate part identity")
+		return "", err
 	}
-	if !known {
-		return "", errors.New("legacy identity lookup requires native object sizes")
+	if !present {
+		return "", errors.Wrap(backend.ErrNotExist, "part identity")
 	}
 	return key, nil
 }
@@ -103,6 +133,7 @@ func (p *part) visitLegacyDiskSeries(ctx context.Context, matchers []fetch.Match
 		}
 	}
 	count := 0
+	seen := make(map[signal.SeriesID]struct{})
 	var raw []byte
 	emit := func(id signal.SeriesID, s signal.Series) error {
 		if err := ctx.Err(); err != nil {
@@ -118,6 +149,10 @@ func (p *part) visitLegacyDiskSeries(ctx context.Context, matchers []fetch.Match
 			}
 			return nil
 		}
+		if _, duplicate := seen[id]; duplicate {
+			return errors.Wrap(seriesindex.ErrCorrupt, "duplicate legacy identity")
+		}
+		seen[id] = struct{}{}
 		count++
 		raw = s.AppendHashInput(raw[:0])
 		if signal.HashBytes(raw) != id {
