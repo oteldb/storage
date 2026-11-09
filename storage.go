@@ -1326,6 +1326,8 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		AggregateStats:     s.opts.AggregateStats,
 		MetricFloatGroups:  s.opts.MetricFloatGroups,
 		MetricSeriesChunks: s.opts.MetricSeriesChunks,
+		DiskSeries:         s.opts.MetricDiskSeries,
+		ResidentHeadBytes:  s.opts.MetricResidentHeadBytes,
 		// MaxPartBytes caps each flushed part; resolved from the tenant's policy, falling back to
 		// defaultMaxPartBytes when the policy leaves it unset. It is an operational/structural cap
 		// fixed at engine creation (unlike the per-write admission limits).

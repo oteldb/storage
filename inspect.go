@@ -48,6 +48,8 @@ type SignalStats struct {
 	Signal           signal.Signal
 	// Series is the distinct series/streams ever seen (index span: head ∪ flushed parts).
 	Series int64
+	// SeriesComplete is false when the local historical metric count is unavailable or stale.
+	SeriesComplete bool
 	// HeadItems is the samples (metrics) or records (logs/traces/profiles) buffered unflushed.
 	HeadItems int64
 	// HeadBytes is the head's buffered bytes — the in-flight memory measure a flush drains.
@@ -58,11 +60,8 @@ type SignalStats struct {
 	// flush lag. It is wall clock, not data time: a backfilled timestamp says nothing about how
 	// long the head has held the data.
 	HeadAge time.Duration
-	// IdentityBytes is the resident bytes of this engine's identity state: the symbol table, the
-	// series/stream index, the postings lists and the per-series out-of-order watermarks. A flush
-	// does **not** drain it — identities outlive their data — so it is reported separately from
-	// HeadBytes rather than folded into it, and it grows with Series (all-time), not with the
-	// buffered data.
+	// IdentityBytes is resident identity/index state, separate from buffered sample/record bytes.
+	// Disk-series metric engines reclaim historical metadata after publication; legacy engines retain it.
 	IdentityBytes int64
 	// Parts is the number of flushed immutable parts (the compaction-backlog proxy: many small
 	// parts means merge is behind).
@@ -284,8 +283,9 @@ func (s *Storage) Inspect() StoreStats {
 		ts := tenantStats(tid)
 		ts.Signals = append(ts.Signals, SignalStats{
 			Signal: signal.Metric, Series: es.Series, HeadItems: es.HeadSamples, HeadBytes: es.HeadBytes,
-			HeadAge:       es.HeadAge,
-			IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
+			SeriesComplete: es.SeriesComplete,
+			HeadAge:        es.HeadAge,
+			IdentityBytes:  es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
 			MergeRunning:  eng.MergeRunning(),
 			MergeDeferred: eng.MergeDeferred(),
 			SealedParts:   sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
@@ -317,9 +317,10 @@ func (s *Storage) Inspect() StoreStats {
 			ts := tenantStats(tid)
 			ts.Signals = append(ts.Signals, SignalStats{
 				Signal: sig, Series: es.Streams, HeadItems: es.HeadRecords, HeadBytes: es.HeadBytes,
-				ReusableBytes: es.ReusableBytes,
-				HeadAge:       es.HeadAge,
-				IdentityBytes: es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
+				SeriesComplete: es.WantedParts == 0 && es.Holes == 0 && es.LostParts == 0 && es.IndexLoadErr == nil,
+				ReusableBytes:  es.ReusableBytes,
+				HeadAge:        es.HeadAge,
+				IdentityBytes:  es.IdentityBytes, Parts: es.Parts, MinTimeUnixNano: es.MinTime, MaxTimeUnixNano: es.MaxTime,
 				MergeRunning:  eng.MergeRunning(),
 				MergeDeferred: eng.MergeDeferred(),
 				SealedParts:   sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,

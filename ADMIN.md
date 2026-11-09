@@ -99,8 +99,8 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   the page cache rather than on disk, so the interval's power-loss bound does not hold. The error is
   logged once when a failing run starts, and a recovery line once it ends.
 
-Opt-in metrics `engine.Config.DiskSeries` keeps historical identities/postings in immutable parts.
-Its `ResidentHeadBytes` target defaults to 128 MiB; a write flushes an over-target head before
+Opt-in metrics `Options.MetricDiskSeries` (`WithMetricDiskSeries`, or `engine.Config.DiskSeries`) keeps historical identities/postings in immutable parts.
+Its `MetricResidentHeadBytes` target defaults to 128 MiB; a write flushes an over-target head before
 admission, while one atomic batch may exceed the target. The optional recent tier is disabled.
 `engine.Stats.SeriesComplete` is false while historical metadata is unavailable; `Series` then
 preserves the last complete count. Unknown identities wait for repair. An old WAL exceeding the
@@ -114,7 +114,8 @@ resident budget fails replay with its journal and epoch intact; increase the bud
 | `HeadAge` | how long the head has been accumulating since its last flush (0 when empty) — the flush lag, in wall clock. Data time cannot express it: a backfilled timestamp says nothing about how long the head has held the row. Store-wide it is `storage.head.age` |
 | `HeadItems` / `HeadBytes` | unflushed samples/records and their in-flight bytes. For a record engine `HeadBytes` also counts the buffers an in-flight flush has detached but not yet published — they stay resident, and they are what `MaxInFlightBytes` and `FlushThresholdBytes` meter |
 | `ReusableBytes` | idle record-head buffer capacity, capped at 1 MiB per engine. It counts against `MaxInFlightBytes` until reused or evicted; eviction precedes admission rejection. It does not trigger a flush. Metrics report zero |
-| `IdentityBytes` | resident identity state: the symbol table, the series/stream index, the postings lists, per-series out-of-order watermarks and cached metric registry ordering. A flush does **not** drain it — identities outlive the data they named and are reclaimed only by `Reset` — so it is reported beside `HeadBytes` rather than folded into it (`MaxInFlightBytes` / `FlushThresholdBytes` would otherwise chase a number a flush cannot lower). It falls when the background maintenance prunes the identities retention left without data — on every node holding metric parts, owner or replica, since a part carries its own identities — so an unbounded rise means churn is outpacing retention |
+| `SeriesComplete` | whether the reported distinct count covers all locally required parts; false means historical metadata is unavailable or stale |
+| `IdentityBytes` | with disk-series metrics, active/frozen identity state plus bounded historical membership/watermark caches, reclaimed after flush. Otherwise resident identity state: the symbol table, the series/stream index, the postings lists, per-series out-of-order watermarks and cached metric registry ordering. A flush does **not** drain it — identities outlive the data they named and are reclaimed only by `Reset` — so it is reported beside `HeadBytes` rather than folded into it (`MaxInFlightBytes` / `FlushThresholdBytes` would otherwise chase a number a flush cannot lower). It falls when the background maintenance prunes the identities retention left without data — on every node holding metric parts, owner or replica, since a part carries its own identities — so an unbounded rise means churn is outpacing retention |
 | `Parts` | flushed immutable part count |
 | `MinTimeUnixNano` / `MaxTimeUnixNano` | data time span (min over parts; max includes the head) |
 | `RetainFromUnixNano` / `RetentionBoundBy` | last authorized requested cutoff and its winning bound (`none`, `age`, `signal_bytes`, `pooled_bytes`); zero on current replicas, ownership-fenced nodes or a different tenure. A deferred or failed cleanup, including an index-fenced engine that still owns its claim, keeps the request visible: it does not assert rows below the cutoff are gone |
