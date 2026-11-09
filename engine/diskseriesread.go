@@ -76,8 +76,11 @@ func diskObjectPresent(ctx context.Context, b backend.Backend, key string) (bool
 }
 
 func (p *part) diskIdentityKey(ctx context.Context) (string, error) {
-	if p.legacyIdentityKey != "" {
-		return p.legacyIdentityKey, nil
+	p.metadataMu.Lock()
+	legacyKey := p.legacyIdentityKey
+	p.metadataMu.Unlock()
+	if legacyKey != "" {
+		return legacyKey, nil
 	}
 	key := identityKey(p.prefix)
 	present, err := diskObjectPresent(ctx, p.be, key)

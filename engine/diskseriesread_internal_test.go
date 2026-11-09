@@ -291,6 +291,7 @@ func TestDiskSeriesWrongPartIndexFencesRecovery(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, reader.Close(t.Context())) })
 	require.ErrorIs(t, reader.LoadPartsReadOnly(t.Context()), seriesindex.ErrCorrupt)
 	require.True(t, reader.IndexFenced())
+	require.Empty(t, reader.parts, "a mismatched index must fail before readable publication")
 }
 
 func TestDiskSeriesPruneRecountsEmptyHead(t *testing.T) {

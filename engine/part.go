@@ -425,6 +425,8 @@ type part struct {
 	metadata                        *seriesindex.Index
 	metadataChecked                 bool
 	metadataBounded                 bool
+	diskIDsMu                       sync.Mutex
+	diskIDsChecked                  bool
 	diskWatermarkMu                 sync.Mutex
 	diskWatermark                   *watermark.Reader
 }

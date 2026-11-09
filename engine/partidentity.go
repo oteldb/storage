@@ -234,6 +234,20 @@ func (e *Engine) prepareDiskPart(ctx context.Context, p *part) (bool, error) {
 		return false, err
 	}
 	if idx != nil {
+		p.diskIDsMu.Lock()
+		defer p.diskIDsMu.Unlock()
+		if !p.diskIDsChecked {
+			ids, err := p.diskSeriesIDs(ctx)
+			if err != nil {
+				return false, err
+			}
+			for ids.Next() {
+			}
+			if err := ids.Err(); err != nil {
+				return false, err
+			}
+			p.diskIDsChecked = true
+		}
 		return true, nil
 	}
 	present, err := diskObjectPresent(ctx, p.be, identityKey(p.prefix))
@@ -250,6 +264,8 @@ func (e *Engine) prepareDiskPart(ctx context.Context, p *part) (bool, error) {
 	if !present {
 		return false, errors.Wrap(backend.ErrNotExist, "part has no identity source")
 	}
+	p.metadataMu.Lock()
 	p.legacyIdentityKey = e.seriesKey()
+	p.metadataMu.Unlock()
 	return false, nil
 }
