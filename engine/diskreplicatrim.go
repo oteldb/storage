@@ -37,6 +37,7 @@ func (e *Engine) trimDiskReplicaLocked(ctx context.Context) error {
 			part.release()
 		}
 	}()
+	defer e.head.recountBytes()
 	var proofs []replicaSampleProof
 	var scratch replicaTrimScratch
 	for id, buf := range e.head.samples {
@@ -68,7 +69,6 @@ func (e *Engine) trimDiskReplicaLocked(ctx context.Context) error {
 			trimProvenReplicaSamples(buf, proofs)
 		}
 	}
-	e.head.recountBytes()
 	return nil
 }
 

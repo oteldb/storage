@@ -2,12 +2,14 @@ package engine
 
 import (
 	"math"
+	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/faultbackend"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
@@ -154,4 +156,33 @@ func TestDiskReplicaRetainsUnsupportedCoverageProofs(t *testing.T) {
 			require.Equal(t, len(points), replica.HeadSampleCount())
 		})
 	}
+}
+
+func TestDiskReplicaProofFailureKeepsAccountingCurrent(t *testing.T) {
+	t.Parallel()
+	be := faultbackend.Wrap(backend.Memory())
+	owner := New(Config{Backend: be, Prefix: "proof-failure", DiskSeries: true})
+	a, b := benchSeries(1), benchSeries(2)
+	for i, s := range []signal.Series{a, b} {
+		ok, err := owner.Append(s, int64(100+i), float64(1+i))
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+	require.NoError(t, owner.Flush(t.Context()))
+	replica := New(Config{Backend: be, Prefix: "proof-failure", DiskSeries: true})
+	require.NoError(t, replica.LoadPartsUnclaimed(t.Context()))
+	require.NoError(t, replica.ApplyReplicated(replicaSamplePayload(t, a, replicaTestSample{100, 1, 1})))
+	require.NoError(t, replica.ApplyReplicated(replicaSamplePayload(t, b, replicaTestSample{101, 2, 1})))
+	// Stop the second identity's proof after the first identity has safely drained, independent of map order.
+	be.Add(faultbackend.Rule{Kind: faultbackend.Read, Err: errInjectedWAL, Match: func(op faultbackend.Op) bool {
+		samples := 0
+		for _, buf := range replica.head.samples {
+			samples += len(buf.ts)
+		}
+		return strings.Contains(op.Key, "/c/") && samples < 2
+	}})
+	require.ErrorIs(t, replica.RefreshReplica(t.Context()), errInjectedWAL)
+	require.Equal(t, 1, replica.HeadSampleCount())
+	require.EqualValues(t, 1, replica.Stats().HeadSamples)
+	require.EqualValues(t, SampleBytes, replica.HeadBytes(), "a later proof error cannot leave stale accounting for safely trimmed samples")
 }
