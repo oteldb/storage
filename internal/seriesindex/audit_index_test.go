@@ -437,3 +437,51 @@ func TestIndexDictionaryCorruption(t *testing.T) {
 		})
 	}
 }
+
+func TestLazyMetadataPageCorruptionFailsReads(t *testing.T) {
+	t.Parallel()
+	src := make([]signal.Series, 32)
+	for i := range src {
+		payload := append(bytes.Repeat([]byte{byte(i + 1)}, 4096), []byte(strconv.Itoa(i))...)
+		src[i] = signal.Series{Attributes: signal.NewAttributes(signal.KeyValue{Key: []byte("payload"), Value: signal.StringValue(payload)}, signal.KeyValue{Key: []byte("id"), Value: signal.IntValue(int64(i))})}
+	}
+	slices.SortFunc(src, func(a, b signal.Series) int { return a.Hash().Compare(b.Hash()) })
+	data, _ := buildIndex(t, src)
+	for _, kind := range []byte{'p', 's'} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
+			b := backend.Memory()
+			require.NoError(t, b.Write(t.Context(), "index", data))
+			r, err := Open(t.Context(), b, "index")
+			require.NoError(t, err)
+			directory := r.table.Cursor(t.Context())
+			found := false
+			var page pageInfo
+			for i := range r.table.pages {
+				page, err = directory.entry(i)
+				require.NoError(t, err)
+				if len(page.first) > 0 && page.first[0] == kind {
+					found = true
+					break
+				}
+			}
+			require.True(t, found, "fixture needs a separate lazy metadata page")
+			bad := bytes.Clone(data)
+			bad[page.offset] ^= 1
+			require.NoError(t, b.Write(t.Context(), "index", bad))
+			r, err = Open(t.Context(), b, "index")
+			require.NoError(t, err)
+			ids, err := postings.ToSlice(r.IDs(t.Context()))
+			require.NoError(t, err)
+			require.Len(t, ids, len(src), "canonical-ID validation intentionally leaves unrelated pages lazy")
+			if kind == 'p' {
+				_, err = r.Resolve(t.Context(), []fetch.Matcher{{Name: []byte("payload"), Match: func(signal.Value) bool { return true }}})
+				require.ErrorIs(t, err, ErrCorrupt)
+				return
+			}
+			ref := binary.BigEndian.Uint32(page.first[1:])
+			_, _, _, err = r.Lookup(t.Context(), src[ref].Hash())
+			require.ErrorIs(t, err, ErrCorrupt)
+		})
+	}
+}

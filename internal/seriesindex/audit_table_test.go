@@ -243,3 +243,24 @@ func FuzzTableRoundTrip(f *testing.F) {
 		}
 	})
 }
+
+func TestTableUnknownFooterFeaturesStayUnsupported(t *testing.T) {
+	t.Parallel()
+	for _, feature := range []string{"version", "flags"} {
+		t.Run(feature, func(t *testing.T) {
+			t.Parallel()
+			data := tableData(t, 1, 100)
+			footer := data[len(data)-footerSize:]
+			if feature == "version" {
+				binary.BigEndian.PutUint32(footer[4:], 2)
+			} else {
+				binary.BigEndian.PutUint32(footer[64:], 1)
+			}
+			binary.BigEndian.PutUint32(footer[68:], crc32.Checksum(footer[:68], checksumTable))
+			b := backend.Memory()
+			require.NoError(t, b.Write(t.Context(), "index", data))
+			_, err := OpenTable(t.Context(), b, "index")
+			require.ErrorIs(t, err, ErrUnsupportedVersion)
+		})
+	}
+}

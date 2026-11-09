@@ -1105,14 +1105,7 @@ func (s *Storage) recover(ctx context.Context) error {
 			return err
 		}
 
-		switch {
-		case s.opts.ReadOnly:
-			return e.LoadPartsReadOnly(ctx)
-		case s.opts.Cluster != nil:
-			return e.LoadPartsUnclaimed(ctx)
-		default:
-			return e.LoadParts(ctx)
-		}
+		return s.loadRecoveredParts(ctx, e)
 	}
 
 	metricSuffix := metricsPrefix + "/" + bucketindex.Object

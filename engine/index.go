@@ -15,6 +15,7 @@ import (
 	"github.com/oteldb/storage/internal/indexcommit"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/repair"
+	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -541,7 +542,8 @@ const (
 func (e *Engine) livePart(
 	ctx context.Context, ent *bucketindex.Entry, open map[string]*part,
 ) (*part, error) {
-	if p := open[ent.Prefix]; p != nil && p.matchesEntry(ent) {
+	if p := open[ent.Prefix]; p != nil && p.matchesEntry(ent) &&
+		!(e.cfg.DiskSeries && errors.Is(e.loadErr, seriesindex.ErrCorrupt)) {
 		live, err := block.PartPresent(ctx, e.cfg.Backend, ent.Prefix)
 		if err != nil {
 			return nil, errors.Wrapf(err, "probe part %q", ent.Prefix)
@@ -620,6 +622,15 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 		open[p.prefix] = p
 	}
 
+	var opened []*part
+	completed := false
+	defer func() {
+		if !completed {
+			for _, p := range opened {
+				p.closeReaders()
+			}
+		}
+	}()
 	named := make(map[string]struct{}, len(ix.Entries))
 
 	var (
@@ -639,11 +650,15 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 			continue
 		}
 
+		previous := open[ent.Prefix]
 		p, err := e.livePart(ctx, ent, open)
 		if err == nil && e.cfg.DiskSeries {
 			_, err = e.prepareDiskPart(ctx, p)
 		}
 		if err != nil {
+			if p != nil && p != previous {
+				p.closeReaders()
+			}
 			switch {
 			case partGone(err):
 				zctx.From(ctx).Error("part named by the index is gone; recording a repair",
@@ -676,6 +691,9 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 			continue
 		}
 
+		if p != previous {
+			opened = append(opened, p)
+		}
 		l.parts = append(l.parts, p)
 		// Only the parts that opened: a lost one left out is what keeps the next commit from also
 		// calling it a removal, which would restate a loss as a deliberate deletion.
@@ -701,6 +719,7 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 	}
 
 	l.dropped = len(open) > 0
+	completed = true
 
 	return l, nil, nil
 }

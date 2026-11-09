@@ -1334,6 +1334,15 @@ never observable as published; its objects are orphans, swept by a later open.
 
 ### Repair — a want is discharged by committing a part
 
+Disk-index footer, binding and canonical-ID corruption joins the existing repeated-load confirmation
+before becoming a repair want. Storage startup performs those bounded confirmations on the same
+engine so it can open and request repair; I/O errors and newer index features remain fatal. Read-only
+startup records only pending wants and writes no backend state.
+
+Lazy dictionary/descriptor pages are checked when read. Their CRC failures return errors and do not
+automatically create peer-repair wants. Restoring or explicitly replacing the affected part is
+required; a catalog reload alone may not touch the corrupt page.
+
 A part this engine's index names but cannot read is recorded as a `bucketindex.Want`, carried
 across every commit alongside the removals. Repair runs at the head of each merge cycle
 (`repair.go`), so a part pulled back joins the same compaction, and it **never fails the merge**: a

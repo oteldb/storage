@@ -84,7 +84,17 @@ func (h *repairHost) Identity(p *part) bucketindex.Entry {
 }
 
 func (h *repairHost) Open(ctx context.Context, prefix string) (*part, error) {
-	return openPart(ctx, h.e.cfg.Backend, prefix, h.e.cfg.Obs.Corruption, h.e.readCompressors)
+	p, err := openPart(ctx, h.e.cfg.Backend, prefix, h.e.cfg.Obs.Corruption, h.e.readCompressors)
+	if err != nil {
+		return nil, err
+	}
+	if h.e.cfg.DiskSeries {
+		if _, err := h.e.prepareDiskPart(ctx, p); err != nil {
+			p.closeReaders()
+			return nil, err
+		}
+	}
+	return p, nil
 }
 
 func (h *repairHost) AdoptLocked(ctx context.Context, p *part, ent *bucketindex.Entry) error {

@@ -28,6 +28,9 @@ var checksumTable = crc32.MakeTable(crc32.Castagnoli)
 // ErrCorrupt denotes malformed or checksum-invalid index data.
 var ErrCorrupt = errors.New("seriesindex: corrupt index")
 
+// ErrUnsupportedVersion identifies an intact index written by a newer format.
+var ErrUnsupportedVersion = errors.Wrap(ErrCorrupt, "unsupported index version")
+
 type pageInfo struct {
 	first              []byte
 	offset             int64
@@ -179,9 +182,14 @@ func OpenTable(ctx context.Context, b backend.Backend, key string) (*Table, erro
 		return nil, err
 	}
 	if len(data) != footerSize || binary.BigEndian.Uint32(data) != tableMagic ||
-		binary.BigEndian.Uint32(data[4:]) != 1 || binary.BigEndian.Uint32(data[64:]) != 0 ||
 		crc32.Checksum(data[:68], checksumTable) != binary.BigEndian.Uint32(data[68:]) {
 		return nil, errors.Wrap(ErrCorrupt, "footer")
+	}
+	if version := binary.BigEndian.Uint32(data[4:]); version != 1 {
+		return nil, errors.Wrapf(ErrUnsupportedVersion, "version %d", version)
+	}
+	if flags := binary.BigEndian.Uint32(data[64:]); flags != 0 {
+		return nil, errors.Wrapf(ErrUnsupportedVersion, "footer flags %x", flags)
 	}
 	dir := binary.BigEndian.Uint64(data[8:])
 	pages, count, raw := binary.BigEndian.Uint32(data[16:]), binary.BigEndian.Uint32(data[20:]), binary.BigEndian.Uint32(data[24:])

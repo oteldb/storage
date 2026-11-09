@@ -9,6 +9,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/internal/obs"
+	"github.com/oteldb/storage/internal/seriesindex"
 )
 
 // partGone reports whether err is the backend saying the object is not there, as opposed to
@@ -22,17 +23,17 @@ func partGone(err error) bool { return errors.Is(err, backend.ErrNotExist) }
 // persistent run of turns into a repair want. A newer format is not damage: that part is intact, and
 // a binary that can read it is the remedy, not a copy.
 func partCorrupt(err error) bool {
-	if errors.Is(err, block.ErrUnsupportedVersion) {
+	if errors.Is(err, block.ErrUnsupportedVersion) || errors.Is(err, seriesindex.ErrUnsupportedVersion) {
 		return false
 	}
 
-	return errors.Is(err, block.ErrCorrupt)
+	return errors.Is(err, block.ErrCorrupt) || errors.Is(err, seriesindex.ErrCorrupt)
 }
 
 // fenceReason classifies the error of a load that fenced the engine for the fenced-loads metric.
 func fenceReason(err error) string {
 	switch {
-	case errors.Is(err, block.ErrUnsupportedVersion):
+	case errors.Is(err, block.ErrUnsupportedVersion) || errors.Is(err, seriesindex.ErrUnsupportedVersion):
 		return obs.FenceUnsupportedVersion
 	case partCorrupt(err) || errors.Is(err, bucketindex.ErrCorrupt):
 		return obs.FenceCorrupt
@@ -44,7 +45,8 @@ func fenceReason(err error) string {
 // countCorrupt accounts err under component only when it carries a corruption sentinel, so a
 // backend that merely failed to answer is never reported as damaged data.
 func (e *Engine) countCorrupt(ctx context.Context, err error, component, disposition string) {
-	if errors.Is(err, block.ErrCorrupt) || errors.Is(err, bucketindex.ErrCorrupt) {
+	if errors.Is(err, block.ErrCorrupt) || errors.Is(err, bucketindex.ErrCorrupt) ||
+		(errors.Is(err, seriesindex.ErrCorrupt) && !errors.Is(err, seriesindex.ErrUnsupportedVersion)) {
 		e.cfg.Obs.Corruption.Detected(ctx, component, disposition)
 	}
 }
