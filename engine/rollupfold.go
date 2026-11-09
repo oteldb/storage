@@ -221,7 +221,23 @@ func repBucketShared(ts []int64, tags []rollupTag) bool {
 // rollSeries merges one series' sources and rolls the result up under tiers, combining the
 // representatives the sources recorded rather than re-aggregating them as raw samples.
 func rollSeries(m *sampleMerge, tiers []DownsampleTier) (ts []int64, values, sf []float64, covered []int64) {
-	ts, values, sf, tags := m.collectTagged()
+	var scratch rollupScratch
+	return scratch.roll(m, tiers)
+}
+
+type rollupScratch struct {
+	ts     []int64
+	values []float64
+}
+
+func (s *rollupScratch) collect(m *sampleMerge) (ts []int64, values, sf []float64, tags []rollupTag) {
+	s.ts, s.values, sf = m.gather(s.ts, s.values, &tags)
+	return s.ts, s.values, sf, tags
+}
+
+// roll's result is owned by the caller until the next use of s; source runs stay immutable.
+func (s *rollupScratch) roll(m *sampleMerge, tiers []DownsampleTier) (ts []int64, values, sf []float64, covered []int64) {
+	ts, values, sf, tags := s.collect(m)
 	n := 0
 	for i, t := range ts {
 		if i+1 < len(ts) && t == ts[i+1] && tagAt(tags, i).interval == 0 && tagAt(tags, i+1).interval == 0 {

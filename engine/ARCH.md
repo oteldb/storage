@@ -63,6 +63,10 @@ Merge sources and rollup probes own `OpenColumnScan` handles for their scoped wa
 and failure close every opened source before its part can retire; file windows return to their
 bounded pool after writer finalization. Source admission includes the handle's retained-state hint.
 
+Each compaction/probe reuses its run descriptors and gathered timestamp/value columns across series.
+Gathered columns remain separate from immutable source windows; output writers consume them before
+the next series overwrites them. Scratch admission includes old and replacement arrays during growth.
+
 Reset, repair and pruning take the build barrier exclusively. Pruning also excludes public
 reloads through an identity lifecycle gate; a newly adopted part cannot revive an identity
 between prune planning and installation. Full recovery/reload retains writer ordering while
