@@ -930,6 +930,10 @@ func (e *Engine) loadSeriesIndexLocked(ctx context.Context) error {
 // defensive against truncated input. Nothing writes this format any more; it is read to migrate a
 // prefix written by an older build.
 func decodeSeriesSet(data []byte, fn func(signal.Series)) error {
+	return decodeSeriesSetVisit(data, func(s signal.Series) error { fn(s); return nil })
+}
+
+func decodeSeriesSetVisit(data []byte, fn func(signal.Series) error) error {
 	count, n := binary.Uvarint(data)
 	if n <= 0 {
 		return errors.Wrap(signal.ErrMalformed, "series count")
@@ -948,7 +952,9 @@ func decodeSeriesSet(data []byte, fn func(signal.Series)) error {
 			return errors.Wrap(err, "decode series")
 		}
 
-		fn(s)
+		if err := fn(s); err != nil {
+			return err
+		}
 		data = data[l:]
 	}
 

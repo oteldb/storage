@@ -420,6 +420,7 @@ type part struct {
 	// head, and identityPresent whether it had one. A reloaded index reuses the handle, and the
 	// object is immutable, so the (uncached) read is not repeated per refresh.
 	identityLoaded, identityPresent bool
+	legacyIdentityKey               string
 	metadataMu                      sync.Mutex
 	metadata                        *seriesindex.Index
 	metadataChecked                 bool
