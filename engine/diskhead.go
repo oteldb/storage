@@ -261,8 +261,9 @@ func (e *Engine) preloadHistoricalBatch(ids []signal.SeriesID) error {
 		return nil
 	}
 	s := e.head.disk
+	var reader seriesindex.MetadataReader
 	for _, p := range e.readablePartsLocked() {
-		if err := p.visitDiskMetadata(context.Background(), ids, func(id signal.SeriesID, meta seriesindex.Metadata) {
+		if err := p.visitDiskMetadata(context.Background(), ids, &reader, func(id signal.SeriesID, meta seriesindex.Metadata) {
 			entry := s.pending[id]
 			if !entry.exists || meta.Covered > entry.newest {
 				entry.newest = meta.Covered

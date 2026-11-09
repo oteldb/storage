@@ -297,6 +297,15 @@ func (c *Cursor) Value() []byte { return c.value }
 // Err reports a terminal I/O or format error.
 func (c *Cursor) Err() error { return c.err }
 
+// reset replaces the owner and traversal state while retaining operation-local buffers.
+func (c *Cursor) reset(ctx context.Context, table *Table) {
+	*c = Cursor{ctx: ctx, table: table, page: -1, key: c.key[:0], packed: c.packed[:0], raw: c.raw[:0],
+		first: c.first[:0], directory: c.directory[:0], last: c.last[:0]}
+	if table == nil {
+		c.ctx = nil
+	}
+}
+
 func (w *TableWriter) write(data []byte) error {
 	n, err := w.dst.Write(data)
 	if n < 0 || n > len(data) {

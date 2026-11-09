@@ -21,11 +21,38 @@ type MetadataReader struct {
 
 // MetadataReader returns a scoped reader without caching historical identity payloads globally.
 func (r *Index) MetadataReader(ctx context.Context) *MetadataReader {
-	return &MetadataReader{index: r, ids: r.table.Cursor(ctx)}
+	reader := &MetadataReader{}
+	reader.Reset(ctx, r)
+	return reader
+}
+
+// Reset rebinds the reader while retaining page scratch for this operation only.
+// A nil index clears the old owner; Lookup requires a subsequent non-nil Reset.
+// Retained scratch follows the operation's largest page, not the new index's MaxPageBytes.
+func (r *MetadataReader) Reset(ctx context.Context, index *Index) {
+	r.index = index
+	var table *Table
+	if index != nil {
+		table = index.table
+	}
+	if r.ids == nil && index != nil {
+		r.ids = &Cursor{}
+	}
+	if r.ids != nil {
+		r.ids.reset(ctx, table)
+	}
+	if r.records != nil {
+		r.records.reset(ctx, table)
+	}
+	r.idKey = [17]byte{}
+	r.recordKey = [5]byte{}
 }
 
 // Lookup returns one identity's covered timestamp and optional aggregate without decoding attributes.
 func (r *MetadataReader) Lookup(id signal.SeriesID) (Metadata, bool, error) {
+	if r.index == nil {
+		return Metadata{}, false, errors.New("metadata reader is unbound")
+	}
 	if err := r.index.validateReferences(r.ids.ctx); err != nil {
 		return Metadata{}, false, err
 	}

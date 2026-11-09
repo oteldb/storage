@@ -64,3 +64,8 @@ The sorted prefix-key/cursor model follows VictoriaMetrics'
 Part-local references and iterator set operations follow the
 [Prometheus block index](https://github.com/prometheus/prometheus/blob/main/tsdb/index/postings.go).
 The backend range/admission boundary is shared with the existing recordengine lazy-projection path.
+
+Historical admission sorts only its current batch's unknown IDs and reuses one metadata reader
+across parts. Reset drops the previous owner, cursor state and errors while retaining owned
+page scratch. Scratch follows the largest visited page and dies at batch return; no global pool
+or historical identity cache is introduced. Legacy descriptor scratch remains lazy.

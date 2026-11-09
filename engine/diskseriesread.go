@@ -406,8 +406,9 @@ func (p *diskPartIDs) Seek(id signal.SeriesID) bool {
 func (p *diskPartIDs) At() signal.SeriesID { return p.id }
 func (p *diskPartIDs) Err() error          { return p.err }
 
-// visitDiskMetadata retains only one part's two metadata cursors while probing sorted IDs.
-func (p *part) visitDiskMetadata(ctx context.Context, ids []signal.SeriesID, visit func(signal.SeriesID, seriesindex.Metadata)) error {
+// visitDiskMetadata probes sorted IDs with the batch's operation-local metadata reader.
+func (p *part) visitDiskMetadata(ctx context.Context, ids []signal.SeriesID, reader *seriesindex.MetadataReader,
+	visit func(signal.SeriesID, seriesindex.Metadata)) error {
 	first, end := p.index.selectedIDRange(ids)
 	ids = ids[first:end]
 	if len(ids) == 0 {
@@ -419,8 +420,9 @@ func (p *part) visitDiskMetadata(ctx context.Context, ids []signal.SeriesID, vis
 		return err
 	}
 	lookup := func(id signal.SeriesID) (seriesindex.Metadata, bool, error) { return p.diskSeriesMetadata(ctx, id) }
+	reader.Reset(ctx, index)
 	if index != nil {
-		lookup = index.MetadataReader(ctx).Lookup
+		lookup = reader.Lookup
 	}
 	for _, id := range ids {
 		meta, found, err := lookup(id)
