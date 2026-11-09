@@ -918,6 +918,12 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 			}
 		}
 		e.head.trimBelowCovered(covered)
+		for id, buf := range e.head.samples {
+			if len(buf.ts) == 0 {
+				delete(e.head.samples, id)
+			}
+		}
+		e.compactDiskHeadLocked()
 		return e.rebuildDiskStateLocked(ctx)
 	}
 

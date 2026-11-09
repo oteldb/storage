@@ -272,13 +272,63 @@ func (p *part) diskSeriesIDs(ctx context.Context) (postings.Postings, error) {
 		return nil, err
 	}
 	if idx != nil {
-		return idx.IDs(ctx), nil
+		return &verifiedDiskIDs{indexed: idx.IDs(ctx), rows: p.diskRowIDs(ctx)}, nil
 	}
-	if p.index.paged == nil {
-		return postings.FromSlice(p.index.ids), nil
-	}
-	return &diskPartIDs{ctx: p.reader.ReaderContext(ctx), index: p.index.paged, pos: -1}, nil
+	return p.diskRowIDs(ctx), nil
 }
+
+func (p *part) diskRowIDs(ctx context.Context) postings.Postings {
+	if p.index.paged == nil {
+		return postings.FromSlice(p.index.ids)
+	}
+	return &diskPartIDs{ctx: p.reader.ReaderContext(ctx), index: p.index.paged, pos: -1}
+}
+
+type verifiedDiskIDs struct {
+	indexed, rows postings.Postings
+	err           error
+	done          bool
+	started       bool
+}
+
+func (p *verifiedDiskIDs) Next() bool {
+	if p.err != nil || p.done {
+		return false
+	}
+	p.started = true
+	have, want := p.indexed.Next(), p.rows.Next()
+	if err := p.indexed.Err(); err != nil {
+		p.err = err
+		return false
+	}
+	if err := p.rows.Err(); err != nil {
+		p.err = err
+		return false
+	}
+	if have != want || (have && p.indexed.At() != p.rows.At()) {
+		p.err = errors.Wrap(seriesindex.ErrCorrupt, "series index IDs differ from part rows")
+		return false
+	}
+	p.done = !have
+	return have
+}
+func (p *verifiedDiskIDs) Seek(id signal.SeriesID) bool {
+	if p.err != nil || p.done {
+		return false
+	}
+	// Seek walks the validated prefix too, so a skipped mismatch cannot become a false absence.
+	if p.started && p.At().Compare(id) >= 0 {
+		return true
+	}
+	for p.Next() {
+		if p.At().Compare(id) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+func (p *verifiedDiskIDs) At() signal.SeriesID { return p.indexed.At() }
+func (p *verifiedDiskIDs) Err() error          { return p.err }
 
 type diskPartIDs struct {
 	ctx       context.Context //nolint:containedctx // Postings has no context parameter; the iterator owns its read lifetime.

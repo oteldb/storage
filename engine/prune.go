@@ -77,7 +77,7 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 	}
 	if !opts.Force {
 		e.mu.RLock()
-		skip := !e.identityDirty || e.head.series.Len() < pruneMinIdentities
+		skip := !e.identityDirty || (!e.cfg.DiskSeries && e.head.series.Len() < pruneMinIdentities)
 		e.mu.RUnlock()
 		if skip {
 			return 0, nil

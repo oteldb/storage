@@ -81,7 +81,12 @@ func TestDiskSeriesLegacyRead(t *testing.T) {
 			require.NoError(t, err)
 			got, err := postings.ToSlice(ids)
 			require.NoError(t, err)
-			require.Len(t, got, len(identities))
+			expected := make([]signal.SeriesID, len(identities))
+			for i, s := range identities {
+				expected[i] = s.Hash()
+			}
+			slices.SortFunc(expected, signal.SeriesID.Compare)
+			require.Equal(t, expected, got)
 			var selected []signal.SeriesID
 			matcher := fetch.Matcher{Name: []byte("host"), Match: func(v signal.Value) bool { return string(v.AppendText(nil)) == "3" }}
 			require.NoError(t, p.visitDiskSeries(t.Context(), []fetch.Matcher{matcher}, func(id signal.SeriesID, raw []byte, m seriesindex.Metadata) error {
@@ -156,8 +161,12 @@ func TestDiskSeriesIDsPageBound(t *testing.T) {
 	require.NoError(t, err)
 	got, err := postings.ToSlice(ids)
 	require.NoError(t, err)
-	require.Len(t, got, len(identities))
-	require.True(t, slices.IsSortedFunc(got, signal.SeriesID.Compare))
+	expected := make([]signal.SeriesID, len(identities))
+	for i, s := range identities {
+		expected[i] = s.Hash()
+	}
+	slices.SortFunc(expected, signal.SeriesID.Compare)
+	require.Equal(t, expected, got)
 	require.LessOrEqual(t, b.Bytes(), int64(len(identities)*sidxEntryW))
 	require.Nil(t, p.index.paged.view.Load(), "streaming enumeration must not pin the entire sidx")
 	require.NotContains(t, b.Report(), "/identity")
@@ -268,4 +277,54 @@ func TestDiskSeriesRepairRestoresPartMetadata(t *testing.T) {
 	require.True(t, found)
 	require.True(t, s.Equal(identities[0]))
 	require.Equal(t, int64(1), meta.Covered)
+}
+
+func TestDiskSeriesWrongPartIndexFencesRecovery(t *testing.T) {
+	t.Parallel()
+	b := backend.Memory()
+	writer, _ := diskRecoveryFixture(t, b, 1)
+	other := signal.Series{Attributes: signal.NewAttributes(signal.KeyValue{Key: []byte("other"), Value: signal.IntValue(99)})}
+	builder := &seriesindex.Builder{}
+	require.NoError(t, builder.Add(other.Hash(), other, seriesindex.Metadata{}))
+	require.NoError(t, builder.WriteObject(t.Context(), b, seriesIndexKey(writer.parts[0].prefix)))
+	reader := New(Config{Backend: b, Prefix: writer.cfg.Prefix, DiskSeries: true})
+	t.Cleanup(func() { require.NoError(t, reader.Close(t.Context())) })
+	require.ErrorIs(t, reader.LoadPartsReadOnly(t.Context()), seriesindex.ErrCorrupt)
+	require.True(t, reader.IndexFenced())
+}
+
+func TestDiskSeriesPruneRecountsEmptyHead(t *testing.T) {
+	t.Parallel()
+	b := backend.Memory()
+	writer, _ := diskRecoveryFixture(t, b, 2)
+	reader := New(Config{Backend: b, Prefix: writer.cfg.Prefix, DiskSeries: true})
+	t.Cleanup(func() { require.NoError(t, reader.Close(t.Context())) })
+	require.NoError(t, reader.LoadPartsReadOnly(t.Context()))
+	require.Equal(t, 2, reader.SeriesCount())
+	reader.mu.Lock()
+	parts := reader.parts
+	reader.parts = nil
+	reader.identityDirty = true
+	reader.mu.Unlock()
+	removed, err := reader.PruneIdentities(t.Context())
+	require.NoError(t, err)
+	require.Zero(t, removed)
+	require.Zero(t, reader.SeriesCount(), "part-only cardinality must shrink even below head prune thresholds")
+	for _, p := range parts {
+		p.closeReaders()
+	}
+}
+
+func TestDiskSeriesRefreshDropsTrimmedMetadata(t *testing.T) {
+	t.Parallel()
+	b := backend.Memory()
+	writer, identities := diskRecoveryFixture(t, b, 1)
+	replica := New(Config{Backend: b, Prefix: writer.cfg.Prefix, DiskSeries: true})
+	t.Cleanup(func() { require.NoError(t, replica.Close(t.Context())) })
+	_, err := replica.Append(identities[0], 1, 0)
+	require.NoError(t, err)
+	require.NoError(t, replica.RefreshReplica(t.Context()))
+	require.Empty(t, replica.head.samples)
+	require.Zero(t, replica.head.series.Len(), "replica coverage trimming must reclaim active metadata")
+	require.Equal(t, 1, replica.SeriesCount())
 }
