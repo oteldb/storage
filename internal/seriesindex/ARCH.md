@@ -13,14 +13,16 @@ Keys are strictly ordered and prefix-compressed within independently LZ4-compres
 Each packed page has CRC32C. Its sparse directory entry contains the first-key offset/length/CRC,
 page offset, packed/raw lengths, record count, and an entry CRC (40 bytes). The 72-byte footer
 contains magic `OSIX`, version 1, directory offset, page/key/series counts, maximum decoded page
-size, a SHA256 digest of the parent manifest, reserved bytes, and CRC32C. Opening retains only this footer; seeks range-read directory
-entries and one selected page. Oversized records are bounded at 64 MiB and require corresponding
+size, a SHA256 digest of the parent manifest, reserved bytes, and CRC32C. Opening retains only this
+footer; seeks range-read directory entries and one selected page. Forward seeks inside a validated
+page avoid directory I/O. Oversized records are bounded at 64 MiB and require corresponding
 caller admission. Budgeted reads require native object sizes and ranged reads before opening.
 Unbudgeted opaque backends retain their whole-object fallback.
 
 The parent digest covers raw manifest bytes, including a persistent per-part nonce, and excludes
 object paths, so part copies and renames preserve the binding. The nonce distinguishes otherwise
-identical manifests whose per-series sample assignments differ. Engines reject missing or mismatched bindings before publishing a handle.
+identical manifests whose per-series sample assignments differ. Engines reject missing or mismatched
+bindings before publishing a handle.
 Generic tables may carry a zero digest. A valid page is fully checked for strictly ordered keys
 before exposing records; writer errors and finalization are terminal.
 
@@ -46,7 +48,9 @@ hints seek directly only when that label contains no non-string values. Bitmap u
 over many matching values by part cardinality; the existing postings iterators intersect the
 result without intermediate ID lists. Selected identity payloads can be copied after caller
 admission; unselected identities are not materialized. Coverage metadata supports timestamp
-admission without loading attributes.
+admission without loading attributes. Historical append probes sort pending IDs and prune each
+part by its validated ID bounds. One operation-local pair of reusable ID/descriptor cursors serves
+the whole batch for that part; identity pages are not retained in a global cache.
 
 The sorted prefix-key/cursor model follows VictoriaMetrics'
 [mergeset searches](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/lib/mergeset/table_search.go).
