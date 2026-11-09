@@ -312,6 +312,7 @@ func (e *Engine) compactDiskHeadLocked() {
 	next.disk = h.disk
 	h.sym, h.series, h.post = next.sym, next.series, next.post
 	h.nonStringLabels, h.stateRefs, h.slots = next.nonStringLabels, next.stateRefs, next.slots
+	h.valueScratch = next.valueScratch
 	h.resetBuffers()
 	e.identityOrder.reset()
 }
