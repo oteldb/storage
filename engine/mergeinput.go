@@ -122,8 +122,12 @@ func (e *Engine) minimumMergeOutput(src []*part, capBytes int64, opts MergeOptio
 		rows = DefaultMetricBlockRows
 	}
 	// Four typed columns have at most one bounded frame and pending granule each; codec pools are separate.
-	return buildbudget.Add(buildbudget.Add(buildbudget.Add(4<<20, buildbudget.Mul(int64(rows), 64)),
+	n := buildbudget.Add(buildbudget.Add(buildbudget.Add(4<<20, buildbudget.Mul(int64(rows), 64)),
 		coders.workspace()), mergeRangeBatchBytes(len(src)))
+	if e.cfg.MetricSeriesChunks {
+		n = buildbudget.Add(n, granulePlanBytes(len(src)))
+	}
+	return n
 }
 
 func (e *Engine) mergeInputBound(ctx context.Context, src []*part, whole bool) (mergeInputBound, error) {
@@ -162,6 +166,12 @@ func (e *Engine) partMergeInputBound(ctx context.Context, p *part, whole, fallba
 		return mergeInputBound{}, err
 	}
 	bound.include(columns)
+	if e.cfg.DiskSeries {
+		bound.resident = buildbudget.Add(bound.resident, mergeIdentityScratchBytes)
+	}
+	if e.cfg.MetricSeriesChunks {
+		bound.resident = buildbudget.Add(bound.resident, granuleReadBytes(p))
+	}
 	if whole {
 		bound.resident = buildbudget.Add(bound.resident, buildbudget.Mul(int64(p.rows()), 64))
 	}

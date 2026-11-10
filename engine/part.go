@@ -435,6 +435,7 @@ type part struct {
 	metadataBounded                 bool
 	diskIDsMu                       sync.Mutex
 	diskIDsChecked                  bool
+	idBloom                         atomic.Pointer[partIDBloom]
 	diskWatermarkMu                 sync.Mutex
 	diskWatermark                   *watermark.Reader
 }

@@ -650,9 +650,15 @@ func (e *Engine) compactStreamWithInputs(
 	coders := newMetricMergeCoders(src, comp)
 	budget := mergestream.Budget{DiskBytes: capBytes, ResidentBytes: allowance}
 	held := buildbudget.Add(buildbudget.Add(inputBytes, coders.workspace()), mergeRangeBatchBytes(len(src)))
+	if e.cfg.MetricSeriesChunks {
+		held = buildbudget.Add(held, granulePlanBytes(len(src)))
+	}
+
+	postingSources := diskMergeIndexes(metadata)
 
 	var newParts []*part
 	var buildScratch block.StreamBuildScratch
+	var closedBloomBytes int64
 
 	router := timebucket.Router[*partStreamWriter]{
 		Open: func(int64) (*partStreamWriter, error) {
@@ -662,6 +668,7 @@ func (e *Engine) compactStreamWithInputs(
 			}
 			w.mergeFinish = &mergeFinishBudget{}
 			w.buildScratch = &buildScratch
+			w.initMergePostings(ctx, postingSources)
 			return w, nil
 		},
 		Finish: func(w *partStreamWriter) error {
@@ -671,11 +678,14 @@ func (e *Engine) compactStreamWithInputs(
 			}
 
 			newParts = append(newParts, p)
+			closedBloomBytes = buildbudget.Add(closedBloomBytes, p.idBloom.Load().sizeBytes())
 
 			return nil
 		},
-		Resident:      (*partStreamWriter).mergeResidentBytes,
-		Held:          func() int64 { return buildbudget.Add(held, buildScratch.SizeBytes()) },
+		Resident: (*partStreamWriter).mergeResidentBytes,
+		Held: func() int64 {
+			return buildbudget.Add(buildbudget.Add(held, buildScratch.SizeBytes()), closedBloomBytes)
+		},
 		MaxOpen:       timebucket.MaxOpenWriters,
 		ResidentLimit: budget.ResidentBytes,
 	}
@@ -688,6 +698,10 @@ func (e *Engine) compactStreamWithInputs(
 	var output rollupScratch
 	var m sampleMerge
 	var item mergeIdentityItem
+	encoded := e.newEncodedMergePlan(precision, withSF, plan.tiers)
+	reached := func(w *partStreamWriter) bool {
+		return budget.Reached(w.encodedBytes(), buildbudget.Add(held, w.mergeResidentBytes()))
+	}
 	for {
 		ok, err := item.next(ctx, e, &keys, &identities, src, metadata)
 		if err != nil {
@@ -695,6 +709,13 @@ func (e *Engine) compactStreamWithInputs(
 		}
 		if !ok {
 			break
+		}
+		copied, err := encoded.copySeries(&item, streams, &router, start, reached)
+		if err != nil {
+			return nil, err
+		}
+		if copied {
+			continue
 		}
 		if err := mergeStreamedSeries(&m, src, streams, scratch, item.ranges, start); err != nil {
 			return nil, err

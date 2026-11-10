@@ -93,6 +93,9 @@ func (d *Decoder) BlockForRow(row int) (int, error) {
 
 // EndGroup completes one streaming row group without sharing its chunks with another group.
 func (w *StreamWriter) EndGroup() error {
+	if err := w.flushEncodedRun(); err != nil {
+		return err
+	}
 	if !w.independentGroups {
 		return errors.New("block: independent groups are disabled")
 	}

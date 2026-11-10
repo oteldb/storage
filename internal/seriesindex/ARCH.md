@@ -8,7 +8,7 @@ including repeated shared attributes; one reusable serialization buffer belongs 
 Legacy identity objects remain available to earlier readers.
 `Builder.AddView` copies from an immutable compact registry using its established canonical ID and
 encoded point attributes. Public `Add` still checks externally supplied identities against their
-IDs. Postings consume typed encoded bytes; descriptor and legacy identity writers read compact
+IDs through one checked registry insertion, reusing its canonical length for bounds. Postings consume typed encoded bytes; descriptor and legacy identity writers read compact
 views directly, avoiding repeated materialization and rehashing. Each output registry owns its
 symbols and resource/scope context; source-local ordinals are remapped, never persisted or borrowed.
 
@@ -78,3 +78,29 @@ Historical admission sorts only its current batch's unknown IDs and reuses one m
 across parts. Reset drops the previous owner, cursor state and errors while retaining owned
 page scratch. Scratch follows the largest visited page and dies at batch return; no global pool
 or historical identity cache is introduced. Legacy descriptor scratch remains lazy.
+
+Compaction checks every contributing descriptor and combines coverage before decoding one canonical
+identity per output ID. Equal-ID new-format payloads must agree byte-for-byte; legacy registries
+already contain validated canonical identities. The selected descriptor is consumed into owned
+compact output state before any source cursor advances. Source hash checks and checked output
+insertion remain independent validation boundaries.
+
+Compaction can register checked identities without rebuilding their label maps. `PostingMerge`
+retains sorted source/output reference pairs and streams the source presence/name/value key spaces
+into the output table. Equal keys merge sorted references, dropping duplicates and excluded series.
+
+A source mapping every output reference supplies all memberships because source descriptors already
+agree with the checked canonical output identities. The smallest covering index alone is read.
+Otherwise broad unions use the merged path only when at most two source references map to each
+output series on average. Sparse or duplicate-heavy outputs rebuild from owned compact identities.
+
+Source-local ordinals never escape their parent index. Dense remapping windows are used only when
+at most four slots cover each selected reference; sparse mappings stay compact. Source pages,
+owned grouping keys, chunk buffers, remapping windows and sparse-fallback construction are admitted.
+Outputs selecting less than a quarter of the chosen sources' references avoid rescanning their
+postings and rebuild from compact identities instead.
+
+Reuse trusts the same posting membership semantics as query resolution. Every visited source page,
+escaped key, typed value, reference range, chunk order and name flag is checked, even for excluded
+references. Unused membership indexes need no reads; all contributing identity descriptors retain
+their independent validation. CRC-valid missing postings are not reconstructed on this path.

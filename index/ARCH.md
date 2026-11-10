@@ -31,6 +31,9 @@ unrelated dictionary workloads cannot inflate the resident identity state.
 identity/postings indexes, with bounded ranged reads and typed local-reference postings.
 
 `SeriesID ↔ Series`. Canonical hashes and durable formats use the full typed identity.
+`Index.AddChecked` verifies an expected canonical hash before changing identity state and returns
+the encoded length, so checked output builders do not encode/hash the identity twice. The ordinary
+`Index.Add` ingestion path is unchanged.
 The resident registry uses 32-byte rows: hash, value-arena offset, shared resource/scope
 context, and shared attribute-name schema. Values occupy four-byte typed-symbol references;
 attribute-name sequences are stored once per schema rather than repeated for every series.

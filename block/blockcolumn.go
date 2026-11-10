@@ -264,7 +264,6 @@ func (d blockDir) decompress(comp *compress.Compressor, dst []byte, f int, raw [
 	}
 
 	out, err := decode(comp, dst, raw, limit, exact)
-
 	if err != nil {
 		return nil, errors.Wrapf(err, "decompress frame %d", f)
 	}
@@ -1425,8 +1424,8 @@ type rowCursor[T any] interface {
 
 // blockedCursor is a forward cursor over a blocked column: it decodes one block at a time, opening
 // the next block when the current is exhausted, so it spans block boundaries transparently. Each
-// block is an independent codec stream (its row 0 is absolute), so crossing a boundary just starts a
-// fresh per-block decoder — no cross-block state.
+// block is an independent codec stream (its row 0 is absolute). Crossing a boundary resets the
+// per-block decoder where supported, retaining only reusable scratch.
 type blockedCursor[T any, C rowCursor[T]] struct {
 	streams blockStreams
 	codec   chunk.Codec
@@ -1454,6 +1453,23 @@ func newBlockedFloatCursor(dir blockDir, comp *compress.Compressor, codec chunk.
 func (c *blockedCursor[T, C]) Len() int { return c.rows }
 func (c *blockedCursor[T, C]) Pos() int { return c.pos }
 
+// SkipToRow advances to a granule boundary or the end without decoding skipped rows.
+func (c *blockedCursor[T, C]) SkipToRow(row int) error {
+	if row < c.pos || row > c.rows {
+		return errors.New("block: skip outside forward cursor range")
+	}
+	target := c.streams.dir.nBlocks()
+	if row < c.rows {
+		target = c.streams.dir.blockAt(row)
+		lo, _ := c.streams.dir.span(target, c.rows)
+		if lo != row {
+			return errors.New("block: skip requires granule boundary")
+		}
+	}
+	c.pos, c.blk, c.opened = row, target-1, false
+	return nil
+}
+
 func (c *blockedCursor[T, C]) Next() (T, error) {
 	var zero T
 
@@ -1468,7 +1484,11 @@ func (c *blockedCursor[T, C]) Next() (T, error) {
 			return zero, err
 		}
 
-		c.cur, err = c.open(c.codec, stream)
+		if reset, ok := any(c.cur).(interface{ Reset(src []byte) error }); ok {
+			err = reset.Reset(stream)
+		} else {
+			c.cur, err = c.open(c.codec, stream)
+		}
 		if err != nil {
 			c.opened = false
 

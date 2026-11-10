@@ -592,16 +592,13 @@ func (e *Engine) HeadBytes() int64 {
 	return e.head.inFlightBytes()
 }
 
-// IdentityBytes returns the resident bytes of the engine's identity state — the symbol table, the
-// series index, the postings lists and the per-series out-of-order watermarks. It is reported
-// separately from [Engine.HeadBytes] because a flush does not drain it: identities outlive their
-// samples and are cleared only by [Engine.Reset], so this number tracks the engine's all-time
-// series count, not its buffered data.
+// IdentityBytes returns resident identity state, historical caches and immutable part-ID filters.
+// It is separate from buffered sample bytes; flushing does not reclaim historical state.
 func (e *Engine) IdentityBytes() int64 {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	return e.head.identityBytes() + e.identityOrder.bytes.Load()
+	return e.identityBytesLocked()
 }
 
 // Stats is an in-memory snapshot of an engine's state for introspection (no backend I/O, no decode).
@@ -619,8 +616,7 @@ type Stats struct {
 	// the flush lag, which no data-time field here reports (backfill makes sample timestamps
 	// useless as a measure of it).
 	HeadAge time.Duration
-	// IdentityBytes is the resident identity state (symbols + series index + postings + OOO
-	// watermarks) — memory a flush does not drain, and which no other counter here reports.
+	// IdentityBytes includes head identity state, historical caches and retained part-ID filters.
 	IdentityBytes int64
 	Parts         int   // flushed immutable parts
 	MinTime       int64 // oldest flushed sample time (unix ns); 0 when no parts
@@ -666,7 +662,7 @@ func (e *Engine) Stats() Stats {
 		HeadBytes:      e.head.inFlightBytes(),
 		HeadSamples:    e.head.bytes / SampleBytes,
 		HeadAge:        e.head.age(),
-		IdentityBytes:  e.head.identityBytes() + e.identityOrder.bytes.Load(),
+		IdentityBytes:  e.identityBytesLocked(),
 		Parts:          len(e.parts),
 		WantedParts:    len(e.wants) + len(e.pendingWants) + len(e.adoptedWants),
 		Holes:          len(e.holes),

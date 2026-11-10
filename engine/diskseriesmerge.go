@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/go-faster/errors"
@@ -12,10 +13,12 @@ import (
 )
 
 type diskMergeSource struct {
+	index    *seriesindex.Index
 	cursor   *seriesindex.SeriesCursor
 	legacy   *series.Index
 	metadata []seriesindex.Metadata
 	attrs    signal.Attributes
+	identity signal.Series
 }
 
 func (e *Engine) openMetricMergeStreams(ctx context.Context, src []*part) ([]*partStream, []*diskMergeSource, error) {
@@ -42,23 +45,27 @@ func (e *Engine) openMetricMergeStreams(ctx context.Context, src []*part) ([]*pa
 }
 
 type mergeIdentityItem struct {
-	id       signal.SeriesID
-	view     series.View
-	ref      uint32
-	found    bool
-	ranges   []rowRange
-	identity signal.Series
-	covered  int64
+	id        signal.SeriesID
+	view      series.View
+	ref       uint32
+	found     bool
+	ranges    []rowRange
+	identity  signal.Series
+	covered   int64
+	positions []mergestream.Position
 }
 
 func (item *mergeIdentityItem) next(ctx context.Context, e *Engine, keys *seriesMerge,
 	legacy *mergeIdentityBatch, parts []*part, sources []*diskMergeSource,
 ) (bool, error) {
 	if e.cfg.DiskSeries {
+		item.identity = signal.Series{}
+		releaseMergeIdentityScratch(sources)
 		if !keys.Next() {
 			return false, nil
 		}
 		item.id, item.ranges = keys.Key(), keys.ranges
+		item.positions = keys.positions
 		var err error
 		item.identity, item.covered, err = mergeDiskIdentity(item.id, keys.positions, sources)
 		return err == nil, err
@@ -77,7 +84,7 @@ func (item *mergeIdentityItem) next(ctx context.Context, e *Engine, keys *series
 
 func (item *mergeIdentityItem) appendTo(w *partStreamWriter, ts []int64, values, sf []float64, covered int64) error {
 	if w.e.cfg.DiskSeries {
-		return w.appendDiskMergeSeries(item.id, item.identity, ts, values, sf, covered)
+		return w.appendDiskMergeSeries(item.id, item.identity, ts, values, sf, covered, item.positions)
 	}
 	return w.appendMergeSeries(item.view, item.ref, item.found, item.id, ts, values, sf, covered)
 }
@@ -88,7 +95,7 @@ func newDiskMergeSource(ctx context.Context, p *part) (*diskMergeSource, error) 
 		return nil, err
 	}
 	if idx != nil {
-		return &diskMergeSource{cursor: idx.SeriesCursor(ctx)}, nil
+		return &diskMergeSource{index: idx, cursor: idx.SeriesCursor(ctx)}, nil
 	}
 	out := &diskMergeSource{legacy: series.New()}
 	err = p.visitLegacyDiskSeries(ctx, nil, func(id signal.SeriesID, raw []byte, meta seriesindex.Metadata) error {
@@ -108,56 +115,113 @@ func newDiskMergeSource(ctx context.Context, p *part) (*diskMergeSource, error) 
 	return out, nil
 }
 
-func (s *diskMergeSource) at(id signal.SeriesID, pos int) (signal.Series, seriesindex.Metadata, error) {
+func (s *diskMergeSource) at(id signal.SeriesID, pos int) ([]byte, seriesindex.Metadata, error) {
 	if s.cursor != nil {
 		got, raw, meta, err := s.cursor.At(uint32(pos))
 		if err != nil {
-			return signal.Series{}, seriesindex.Metadata{}, err
+			return nil, seriesindex.Metadata{}, err
 		}
 		if got != id {
-			return signal.Series{}, seriesindex.Metadata{}, errors.Wrap(seriesindex.ErrCorrupt, "merge descriptor ID")
+			return nil, seriesindex.Metadata{}, errors.Wrap(seriesindex.ErrCorrupt, "merge descriptor ID")
 		}
-		identity, n, err := signal.DecodeSeries(raw)
-		if err != nil || n != len(raw) {
-			return signal.Series{}, seriesindex.Metadata{}, errors.Wrap(seriesindex.ErrCorrupt, "merge descriptor")
+		if len(raw) == 0 {
+			return nil, seriesindex.Metadata{}, errors.Wrap(seriesindex.ErrCorrupt, "merge descriptor")
 		}
-		return identity, meta, nil
+		return raw, meta, nil
 	}
 	ref, ok := s.legacy.Ref(id)
 	if !ok || int(ref) >= len(s.metadata) {
-		return signal.Series{}, seriesindex.Metadata{}, errors.Wrap(seriesindex.ErrCorrupt, "legacy merge reference")
+		return nil, seriesindex.Metadata{}, errors.Wrap(seriesindex.ErrCorrupt, "legacy merge reference")
 	}
-	identity := s.legacy.View().At(int(ref), s.attrs)
-	s.attrs = identity.Attributes
-	return identity, s.metadata[ref], nil
+	return nil, s.metadata[ref], nil
 }
 
 func mergeDiskIdentity(id signal.SeriesID, positions []mergestream.Position,
 	sources []*diskMergeSource,
 ) (signal.Series, int64, error) {
-	var result signal.Series
+	var selected []byte
+	var owner *diskMergeSource
+	var legacy *diskMergeSource
 	covered := minInt64
 	for _, pos := range positions {
-		identity, meta, err := sources[pos.Source].at(id, pos.Index)
+		source := sources[pos.Source]
+		raw, meta, err := source.at(id, pos.Index)
 		if err != nil {
 			return signal.Series{}, 0, err
 		}
-		result = identity
+		if raw != nil {
+			if selected != nil && !bytes.Equal(selected, raw) {
+				return signal.Series{}, 0, errors.Wrap(seriesindex.ErrCorrupt, "merge descriptors differ")
+			}
+			selected = raw
+			owner = source
+		} else {
+			legacy = source
+		}
 		covered = max(covered, meta.Covered)
 	}
-	return result, covered, nil
+	if selected != nil {
+		n, err := signal.DecodeSeriesInto(&owner.identity, selected)
+		if err != nil || n != len(selected) {
+			return signal.Series{}, 0, errors.Wrap(seriesindex.ErrCorrupt, "merge descriptor")
+		}
+		return owner.identity, covered, nil
+	}
+	if legacy == nil {
+		return signal.Series{}, 0, errors.Wrap(seriesindex.ErrCorrupt, "merge identity missing")
+	}
+	identity, ok := legacy.legacy.GetInto(id, legacy.attrs)
+	if !ok {
+		return signal.Series{}, 0, errors.Wrap(seriesindex.ErrCorrupt, "legacy merge identity missing")
+	}
+	legacy.attrs = identity.Attributes
+	return identity, covered, nil
 }
 
 func (p *partStreamWriter) appendDiskMergeSeries(id signal.SeriesID, identity signal.Series,
-	ts []int64, values, sf []float64, covered int64,
+	ts []int64, values, sf []float64, covered int64, positions []mergestream.Position,
 ) error {
 	if len(ts) > 0 && (len(p.runs) == 0 || u128ToID(p.runs[len(p.runs)-1].Value) != id) {
-		if p.seriesBuilder == nil {
-			p.seriesBuilder = &seriesindex.Builder{}
-		}
-		if err := p.seriesBuilder.Add(id, identity, seriesindex.Metadata{}); err != nil {
+		if err := p.addMergedDiskIdentity(id, identity, positions); err != nil {
 			return err
 		}
 	}
 	return p.appendSeries(idToU128(id), ts, values, sf, covered)
+}
+
+func (p *partStreamWriter) addMergedDiskIdentity(id signal.SeriesID, identity signal.Series, positions []mergestream.Position) error {
+	if p.seriesBuilder == nil {
+		p.seriesBuilder = &seriesindex.Builder{}
+	}
+	if p.postingMerge == nil {
+		return p.seriesBuilder.Add(id, identity, seriesindex.Metadata{})
+	}
+	p.seriesBuilder.MergePostings(p.postingMerge)
+	if err := p.seriesBuilder.AddIdentity(id, identity, seriesindex.Metadata{}); err != nil {
+		return err
+	}
+	ref := uint32(p.seriesBuilder.Count() - 1)
+	for _, pos := range positions {
+		if err := p.postingMerge.Append(pos.Source, uint32(pos.Index), ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func diskMergeIndexes(metadata []*diskMergeSource) []*seriesindex.Index {
+	out := make([]*seriesindex.Index, 0, len(metadata))
+	for _, source := range metadata {
+		if source.index == nil {
+			return nil
+		}
+		out = append(out, source.index)
+	}
+	return out
+}
+
+func (p *partStreamWriter) initMergePostings(ctx context.Context, sources []*seriesindex.Index) {
+	if len(sources) > 0 {
+		p.postingMerge = seriesindex.NewPostingMerge(ctx, sources)
+	}
 }

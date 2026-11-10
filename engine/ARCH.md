@@ -61,6 +61,21 @@ come directly from the captured index entries; encoding does not binary-search e
 The 256-series identity batch retains the corresponding range matrix, charged to output scratch,
 so identity lookahead cannot move the range used for decoding. Sources are consumed oldest first.
 
+Independent raw metric chunks can concatenate encoded payloads in canonical-series/time order.
+Timestamp preflight checks alignment, strict ordering and non-overlap before writing a series.
+The value codec is walked without sample arrays to retain corruption checks and fold aggregates in
+their original timestamp order; the destination reapplies its outer compression profile.
+
+Partial retention/day cuts, overlapping timestamps, incompatible chunk caps/codecs, sampling and
+rollups use the decoded merge. Whole excluded chunks still validate their value payloads. Copied
+rows advance the same numeric cursors before later decoded series resume. Encoded reads retain a
+separate bounded frame workspace, included in merge input admission.
+
+Each indexed merge source reuses independent resource, scope and point attribute headers. The next
+identity releases borrowed references after the previous output registry has consumed them. Arrays
+larger than 16 KiB are dropped; the 48 KiB per-source retained limit is charged to merge input
+admission. Nested values retain the ordinary decoder's allocation behavior.
+
 Merge sources and rollup probes own `OpenColumnScan` handles for their scoped walks. Completion
 and failure close every opened source before its part can retire; file windows return to their
 bounded pool after writer finalization. Source admission includes the handle's retained-state hint.
@@ -241,6 +256,15 @@ flushes: pointer-free, 16-way buckets grow in 256 hash shards and evict within a
 `SeriesCacheBytes` defaults to 512 MiB per engine, allocated as the working set grows; negative disables
 it. The limit covers retained arrays and their headers; shard growth also temporarily owns its old
 array until collection. Warm probes allocate nothing and retain no attributes or head references.
+Immutable indexed parts build a four-hash ID Bloom filter during the existing verified
+series-index/SIDX ID scan. Fresh outputs seed it from the ordered writer IDs after checking the
+output descriptor IDs; this does not mark a future on-disk validation as complete. Only a successful
+complete scan or output check publishes it; absent or unfinished
+filters always fall back to lookup, and legacy parts keep their on-demand path. Filters target
+at least ten bits per ID up to 1 MiB per part; larger parts can become less selective without
+introducing false negatives. They retire with their part handle. Negative probes skip metadata
+page reads and decompression before reader setup. `IdentityBytes` includes these filters,
+including retired pinned parts, while resident-head flush pressure excludes them.
 Historical cache misses probe parts before admission; a complete successful scan can cache positive
 membership, while unaccepted writes never advance watermarks. Load, adoption, repair, pruning and
 reset invalidate this advisory cache. Recounts hydrate active watermarks from the resulting catalog,
@@ -2010,3 +2034,8 @@ Streaming metric flushes and merges keep separate operation-owned build scratch.
 finalization is sequential across router writers, so one workspace serves those outputs; its retained
 capacity is charged to the router's held bytes. Flush scratch is charged to the builder's base bytes.
 Published raw marks remain owned by their original writer and are never recycled with build scratch.
+
+Disk-series merges whose sources all have immutable indexes record source/output reference pairs
+alongside checked output identities. Finalization remaps and merges source postings directly; mixed
+legacy inputs retain label-based construction. Output mappings follow each time-bucket writer, so
+retention, size splitting and overlapping series preserve the output's own canonical reference order.

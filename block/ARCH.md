@@ -91,7 +91,9 @@ primitives the engines need:
 - `DecodeBlocksInt64/Float64` — decode a chosen *set* of blocks into a full-length slice (the
   series-skip primitive).
 - `TsCursor`/`FloatCursor` — forward streaming cursors that span block boundaries transparently,
-  so the merge reads blocked parts unchanged.
+  so the merge reads blocked parts unchanged. Grouped-float and adaptive-timestamp cursors reset
+  in place between blocks; float fragment capacity survives the reset, while validation and borrowed
+  source state belong only to the new block.
 
 Block boundaries align with marks granules, so marks already carry each block's time bounds.
 Unblocked columns keep the single-stream layout byte-for-byte. Metric parts are block-framed
@@ -634,3 +636,23 @@ Descriptor exhaustion (`EMFILE`/`ENFILE`) permits one bounded idle-eviction retr
 current-generation handles with no actual reader lease may be evicted even while their
 part is active. Actual opened leases remain protected. If a repair races a later reopen,
 the generation fence reports a changed-object error instead of mixing metadata and bytes.
+
+Independent timestamp and grouped-float decoders expose read-only encoded granules until the next
+decoder read or close. Frame CRC and bounded decompression precede a complete nested-codec walk;
+timestamp bounds and strict ordering come from the actual values, with a constant-time cadence check
+when arithmetic cannot wrap. A scalar float visitor feeds aggregates in original sample order without
+materializing sample slices. Forward cursors can skip only to chunk boundaries or the column end.
+
+`AppendEncodedGranule` copies validated inner bytes into the target writer's own compression frame,
+rebuilding row counts, directories and bounds under its compression policy. It requires an empty
+staging chunk; callers end a group before switching append paths. Encoded float appends force a
+non-constant column because bounds cannot prove signed-zero or NaN-payload identity. No format changes
+are needed, and borrowed payload mutation is rejected before append.
+
+`AppendEncodedRun` stages an owned aligned timestamp/value pair. Consecutive regular cadence chunks
+join up to the row cap by rewriting the timestamp header and the grouped-float container counts;
+float fragments remain bit-identical. A single timestamp can infer its stride from the next chunk.
+Irregular cadence, a gap, a changed stride, the cap, a normal numeric append, `EndGroup`, or finishing
+flushes the pair. Logical rows are visible while staged; encoding and directory accounting happen
+once on flush. Residency and finishing bounds include owned fragments, assembled packets and the
+target compressor's transient memory. The exact metadata seal and payload CRC allocate no scratch.
