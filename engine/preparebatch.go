@@ -59,6 +59,7 @@ func (p *batchPreparations) release(b *preparedBatch) {
 	clear(b.created[:cap(b.created)])
 	b.warm = false
 	b.commit = preparedCommit{}
+	b.lookup.reset()
 	p.free <- b
 	<-p.active
 }
@@ -86,6 +87,7 @@ type preparedBatch struct {
 	masks     []reservationMask
 	maskOrder []uint32
 	commit    preparedCommit
+	lookup    diskSeriesLookup
 }
 
 func (p *preparedBatch) prepare(ids []signal.SeriesID) {
@@ -147,7 +149,7 @@ func (e *Engine) appendPreparedLocked(
 	if err := e.flushResidentHeadLocked(); err != nil {
 		return AppendResult{}, err
 	}
-	if err := e.preloadDiskSeriesLocked(ids); err != nil {
+	if err := e.preloadPreparedDiskSeriesLocked(ids, &p.lookup); err != nil {
 		return AppendResult{}, err
 	}
 	defer e.clearDiskPendingLocked()

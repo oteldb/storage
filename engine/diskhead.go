@@ -253,22 +253,30 @@ func (e *Engine) preloadHistoricalBatch(ids []signal.SeriesID) error {
 		return nil
 	}
 	s := e.head.disk
-	var reader seriesindex.MetadataReader
-	for _, p := range e.readablePartsLocked() {
-		if err := p.visitDiskMetadata(context.Background(), ids, &reader, func(id signal.SeriesID, meta seriesindex.Metadata) {
-			entry := s.pending[id]
-			if !entry.exists || meta.Covered > entry.newest {
-				entry.newest = meta.Covered
-			}
-			entry.exists = true
-			s.pending[id] = entry
-		}); err != nil {
-			return errors.Wrap(err, "lookup historical series batch")
-		}
+	if err := lookupDiskSeries(e.readablePartsLocked(), ids, s.pending); err != nil {
+		return err
 	}
 	for _, id := range ids {
 		if entry := s.pending[id]; entry.exists {
 			s.remember(id, entry.newest)
+		}
+	}
+	return nil
+}
+
+//nolint:contextcheck,nolintlint // Append has no context; scoped reader I/O stays off state.
+func lookupDiskSeries(parts []*part, ids []signal.SeriesID, pending map[signal.SeriesID]diskHeadEntry) error {
+	var reader seriesindex.MetadataReader
+	for _, p := range parts {
+		if err := p.visitDiskMetadata(context.Background(), ids, &reader, func(id signal.SeriesID, meta seriesindex.Metadata) {
+			entry := pending[id]
+			if !entry.exists || meta.Covered > entry.newest {
+				entry.newest = meta.Covered
+			}
+			entry.exists = true
+			pending[id] = entry
+		}); err != nil {
+			return errors.Wrap(err, "lookup historical series batch")
 		}
 	}
 	return nil

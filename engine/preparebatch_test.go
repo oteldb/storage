@@ -115,9 +115,17 @@ func TestPreparedBatchReleasesReferences(t *testing.T) {
 		func(int) signal.Series { return s }, AppendLimits{}, p)
 	require.NoError(t, err)
 	p.batch.attrs = slices.Clone(s.Attributes)
+	p.lookup.head = e.head
+	p.lookup.parts = append(p.lookup.parts, &part{})
+	p.lookup.pending = map[signal.SeriesID]diskHeadEntry{s.Hash(): {exists: true, newest: 1}}
 	p.batch.frames.Grow(maxPreparedFrameBytes + 1)
 	pool.release(p)
 	assert.Zero(t, p.batch.frames.Cap())
+	assert.Nil(t, p.lookup.head)
+	assert.Empty(t, p.lookup.pending)
+	for _, pt := range p.lookup.parts[:cap(p.lookup.parts)] {
+		assert.Nil(t, pt)
+	}
 	for _, a := range p.batch.accs {
 		assert.Equal(t, signal.Series{}, a.series)
 		assert.Nil(t, a.buffer)

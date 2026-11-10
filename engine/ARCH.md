@@ -22,7 +22,13 @@ Anonymous standalone WAL engines allow contended 1,024–4,096-point batches to 
 when every identity already exists and soft-overflow routing is inactive. Transient uint32-reference
 bitmaps use 64 reservation stripes; conflicting batches roll back reservations and enter existing
 ordered admission. The shared writer lease pins references and head generation until completion.
-Cluster-owned, new-identity and other batch shapes retain exclusive writer ownership.
+Cluster-owned, new-identity and other batch shapes retain ordered admission and publication.
+
+Standalone disk-series batches in the bounded preparation pool pin immutable part handles and
+resolve historical watermarks outside writer ownership. Lookup maps are private; cache and Bloom
+access stays ordered. Head/disk identity, catalog generation and readable handles are revalidated
+before admission uses current watermarks and limits. A changed snapshot falls back to one ordered
+lookup, bounding retries. Pool release clears part/head references and reuses numeric lookup scratch.
 
 Readers see only published slice lengths. A reserved series may prepare appends beyond that prefix
 in spare numeric capacity; growth uses private arrays. Existing prefix values and visible headers
