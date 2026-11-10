@@ -32,6 +32,7 @@ var cpuFixtureModes = [...]string{"idle", "user", "system", "iowait", "irq", "so
 type cpuFixtureOptions struct {
 	hosts, generations, points int
 	flushMemoryBytes           int64
+	readCache                  bool
 	disk, sync, reopen         bool
 }
 
@@ -44,6 +45,7 @@ func cpuBenchOptions(b *testing.B) cpuFixtureOptions {
 		generations: cpuBenchInt(b, "OTELDB_BENCH_CPU_GENERATIONS", 4, 4),
 		points:      cpuBenchInt(b, "OTELDB_BENCH_CPU_POINTS", 16, 64),
 		disk:        os.Getenv("OTELDB_BENCH_DISK_SERIES") == "true",
+		readCache:   os.Getenv("OTELDB_BENCH_CPU_READ_CACHE") == "true",
 		sync:        os.Getenv("OTELDB_BENCH_WAL_SYNC") != "false",
 		reopen:      os.Getenv("OTELDB_BENCH_CPU_REOPEN") == "true",
 	}
@@ -91,22 +93,21 @@ func cpuMetricSeries(i int) signal.Series {
 	}
 }
 
-// buildCPUFixture retains no input identity vector or source query after ingestion.
-func buildCPUFixture(b *testing.B, options cpuFixtureOptions) *cpuFixture {
-	b.Helper()
-	f := &cpuFixture{root: b.TempDir(), options: options}
+func newCPUFixture(tb testing.TB, ctx context.Context, options cpuFixtureOptions) *cpuFixture {
+	tb.Helper()
+	f := &cpuFixture{root: tb.TempDir(), options: options}
 	files, err := backendfile.New(filepath.Join(f.root, "parts"))
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	f.counter = &cpuFixtureFile{File: files}
 	w, err := wal.Create(filepath.Join(f.root, "wal"), 0)
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	w.SetSync(options.sync)
 	var source backend.Backend = f.counter
-	if os.Getenv("OTELDB_BENCH_CPU_READ_CACHE") == "true" {
+	if options.readCache {
 		source = backend.Cached(source, 256<<20)
 	}
 	flushBytes := options.flushMemoryBytes
@@ -116,11 +117,18 @@ func buildCPUFixture(b *testing.B, options cpuFixtureOptions) *cpuFixture {
 	f.engine = New(Config{Backend: source, WAL: w, Prefix: "cpu", DiskSeries: options.disk,
 		MetricSeriesChunks: true, MetricBlockRows: 1024, AggregateStats: true,
 		DecodeCacheBytes: 16 << 20, DecodeMemoryBytes: 256 << 20, FlushMemoryBytes: flushBytes})
-	b.Cleanup(func() {
+	tb.Cleanup(func() {
 		if f.engine != nil {
-			_ = f.engine.Close(context.WithoutCancel(b.Context()))
+			_ = f.engine.Close(context.WithoutCancel(ctx))
 		}
 	})
+	return f
+}
+
+// buildCPUFixture retains no input identity vector or source query after ingestion.
+func buildCPUFixture(b *testing.B, options cpuFixtureOptions) *cpuFixture {
+	b.Helper()
+	f := newCPUFixture(b, b.Context(), options)
 	for generation := range options.generations {
 		f.appendGeneration(b, generation)
 		start := time.Now()
@@ -286,7 +294,8 @@ func BenchmarkDiskSeriesCPUQuery(b *testing.B) {
 	}
 }
 
-// BenchmarkDiskSeriesCPUIngest reports append and flush phases for a complete durable fixture.
+// BenchmarkDiskSeriesCPUIngest measures the complete end-to-end fixture, including input generation.
+// Its ns/B/allocs include setup; use BenchmarkDiskSeriesCPUStorage for isolated storage phases.
 // Fixed -benchtime=1x avoids retaining several fixtures during benchmark calibration.
 func BenchmarkDiskSeriesCPUIngest(b *testing.B) {
 	options := cpuBenchOptions(b)
@@ -375,7 +384,11 @@ func cpuProcessRSS() int64 {
 // cpuQueryProfile excludes ingestion/setup and supplies allocation snapshots for pprof -base.
 func cpuQueryProfile(b *testing.B) func() {
 	b.Helper()
-	prefix := os.Getenv("OTELDB_BENCH_CPU_PROFILE")
+	return cpuPhaseProfile(b, os.Getenv("OTELDB_BENCH_CPU_PROFILE"))
+}
+
+func cpuPhaseProfile(b *testing.B, prefix string) func() {
+	b.Helper()
 	if prefix == "" {
 		return func() {}
 	}
@@ -393,6 +406,8 @@ func cpuQueryProfile(b *testing.B) func() {
 			b.Fatal(closeErr)
 		}
 	}
+	// Allocation profiles can lag by two GC cycles.
+	runtime.GC()
 	runtime.GC()
 	write(".allocs.before", "allocs")
 	file, err := os.Create(prefix + ".cpu")
@@ -408,6 +423,7 @@ func cpuQueryProfile(b *testing.B) func() {
 		if err := file.Close(); err != nil {
 			b.Fatal(err)
 		}
+		runtime.GC()
 		runtime.GC()
 		write(".allocs.after", "allocs")
 		write(".heap.after", "heap")
