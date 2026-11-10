@@ -103,15 +103,14 @@ func (b *Builder) Add(id signal.SeriesID, s signal.Series, meta Metadata) error 
 	if err := b.checkID(id); err != nil {
 		return err
 	}
-	b.canonicalScratch = s.AppendHashInput(b.canonicalScratch[:0])
-	if signal.HashBytes(b.canonicalScratch) != id {
-		return errors.New("seriesindex: identity hash mismatch")
-	}
 	if b.registry == nil {
 		b.registry = series.New()
 	}
-	b.registry.Add(s)
-	ref := b.appendRecord(id, meta)
+	canonicalBytes, ok := b.registry.AddChecked(id, s)
+	if !ok {
+		return errors.New("seriesindex: identity hash mismatch")
+	}
+	ref := b.appendRecord(id, meta, canonicalBytes)
 	visitLabels(s, func(name []byte, value signal.Value) { b.addLabel(ref, name, value) })
 	return nil
 }
@@ -127,7 +126,7 @@ func (b *Builder) AddView(view series.View, i int, meta Metadata) error {
 		b.registry = series.New()
 	}
 	b.registry.AddView(view, i)
-	ref := b.appendRecord(id, meta)
+	ref := b.appendRecord(id, meta, len(b.canonicalScratch))
 	resource, scope := view.Context(i)
 	visitLabels(signal.Series{Resource: resource, Scope: scope}, func(name []byte, value signal.Value) {
 		b.addLabel(ref, name, value)
@@ -293,12 +292,12 @@ func (b *Builder) checkID(id signal.SeriesID) error {
 	return nil
 }
 
-func (b *Builder) appendRecord(id signal.SeriesID, meta Metadata) uint32 {
+func (b *Builder) appendRecord(id signal.SeriesID, meta Metadata, canonicalBytes int) uint32 {
 	if b.names == nil {
 		b.names, b.values = make(map[string]*namePosting), make(map[string]*valuePosting)
 		b.bytes += 2 * memsize.MapBase
 	}
-	b.encodedRaw = buildbudget.Add(b.encodedRaw, int64(len(b.canonicalScratch))+184)
+	b.encodedRaw = buildbudget.Add(b.encodedRaw, int64(canonicalBytes)+184)
 	b.encodedRecords = buildbudget.Add(b.encodedRecords, 2)
 	ref := uint32(len(b.records))
 	prior := cap(b.records)

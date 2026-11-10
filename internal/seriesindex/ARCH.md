@@ -8,7 +8,7 @@ including repeated shared attributes; one reusable serialization buffer belongs 
 Legacy identity objects remain available to earlier readers.
 `Builder.AddView` copies from an immutable compact registry using its established canonical ID and
 encoded point attributes. Public `Add` still checks externally supplied identities against their
-IDs. Postings consume typed encoded bytes; descriptor and legacy identity writers read compact
+IDs through one checked registry insertion, reusing its canonical length for bounds. Postings consume typed encoded bytes; descriptor and legacy identity writers read compact
 views directly, avoiding repeated materialization and rehashing. Each output registry owns its
 symbols and resource/scope context; source-local ordinals are remapped, never persisted or borrowed.
 
@@ -78,3 +78,9 @@ Historical admission sorts only its current batch's unknown IDs and reuses one m
 across parts. Reset drops the previous owner, cursor state and errors while retaining owned
 page scratch. Scratch follows the largest visited page and dies at batch return; no global pool
 or historical identity cache is introduced. Legacy descriptor scratch remains lazy.
+
+Compaction checks every contributing descriptor and combines coverage before decoding one canonical
+identity per output ID. Equal-ID new-format payloads must agree byte-for-byte; legacy registries
+already contain validated canonical identities. The selected descriptor is consumed into owned
+compact output state before any source cursor advances. Source hash checks and checked output
+insertion remain independent validation boundaries.
