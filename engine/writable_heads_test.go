@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/go-faster/errors"
 
 	backendfile "github.com/oteldb/storage/backend/file"
+	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
@@ -18,11 +20,16 @@ import (
 // writableHeads is a test-only composition, with independent existing engine/WAL lanes.
 // It has no tenant policy, cluster routing, persistent lane configuration or batch atomicity.
 type writableHeads struct {
-	root      string
-	heads     []*Engine
-	cfgs      []Config
-	prepared  bool
-	buildWork chan struct{}
+	root           string
+	heads          []*Engine
+	cfgs           []Config
+	prepared       bool
+	buildWork      chan struct{}
+	sharedMetadata bool
+	contexts       *series.Contexts
+	queued         bool
+	dispatch       *headDispatcher
+	hooks          *headDispatchHooks
 }
 
 func newWritableHeads(tb testing.TB, n int) *writableHeads {
@@ -95,6 +102,9 @@ func (f *writableHeads) walDir(lane int) string {
 }
 
 func (f *writableHeads) open(ctx context.Context, replay bool) error {
+	if f.sharedMetadata {
+		f.contexts = series.NewContexts(32 << 20)
+	}
 	for i := range f.heads {
 		w, err := wal.Create(f.walDir(i), 0)
 		if err != nil {
@@ -102,6 +112,10 @@ func (f *writableHeads) open(ctx context.Context, replay bool) error {
 		}
 		w.SetSync(false)
 		cfg := f.cfgs[i]
+		if f.sharedMetadata {
+			cfg.SeriesContexts = f.contexts
+			cfg.SeriesCacheBytes = headBudget(480<<20, len(f.heads), i)
+		}
 		cfg.WAL = w
 		f.heads[i] = New(cfg)
 		if err := f.heads[i].LoadParts(ctx); err != nil {
@@ -113,10 +127,16 @@ func (f *writableHeads) open(ctx context.Context, replay bool) error {
 			}
 		}
 	}
+	if f.queued {
+		f.dispatch = newHeadDispatcher(ctx, f.heads, f.prepared, f.hooks)
+	}
 	return nil
 }
 
 func (f *writableHeads) close() error {
+	if f.dispatch != nil {
+		f.dispatch.close()
+	}
 	var result error
 	for i, h := range f.heads {
 		if h != nil {
@@ -164,12 +184,25 @@ type headRouteBatch struct {
 	ids                      []signal.SeriesID
 	ts                       []int64
 	values, sf               []float64
+	requests                 []headRequest
+	weighted                 bool
+	materializeMu            sync.Mutex
 }
 
 func (b *headRouteBatch) append(
-	f *writableHeads, ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(int) signal.Series,
+	ctx context.Context, f *writableHeads, ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(int) signal.Series,
 ) (AppendResult, error) {
-	if len(f.heads) == 1 {
+	dispatch := f.dispatch
+	if dispatch != nil {
+		if len(ids) > maxPreparedBatchSamples {
+			return AppendResult{}, errors.New("prototype dispatch accepts at most 4096 points")
+		}
+		if err := dispatch.begin(ctx); err != nil {
+			return AppendResult{}, err
+		}
+		defer dispatch.end()
+	}
+	if len(f.heads) == 1 && dispatch == nil {
 		return f.appendLane(f.heads[0], ids, ts, values, sf, materialize)
 	}
 	n := len(f.heads)
@@ -189,6 +222,7 @@ func (b *headRouteBatch) append(
 	if sf != nil {
 		b.sf = resize(b.sf, len(ids))
 	}
+	b.weighted = sf != nil
 	for i, id := range ids {
 		lane := id.Lo % uint64(n)
 		j := b.cursors[lane]
@@ -197,6 +231,9 @@ func (b *headRouteBatch) append(
 		if sf != nil {
 			b.sf[j] = sf[i]
 		}
+	}
+	if dispatch != nil {
+		return b.dispatchBatch(ctx, dispatch, materialize)
 	}
 	var result AppendResult
 	for lane, h := range f.heads {
@@ -221,12 +258,5 @@ func (b *headRouteBatch) append(
 
 func (f *writableHeads) appendLane(h *Engine, ids []signal.SeriesID, ts []int64, values, sf []float64,
 	materialize func(int) signal.Series) (AppendResult, error) {
-	if f.prepared {
-		if p := metricBatchPreparations.acquire(); p != nil {
-			defer metricBatchPreparations.release(p)
-			p.prepare(ids)
-			return h.appendPrepared(ids, ts, values, sf, materialize, AppendLimits{}, p)
-		}
-	}
-	return h.AppendBatch(ids, ts, values, sf, materialize, AppendLimits{})
+	return appendHeadLane(h, f.prepared, ids, ts, values, sf, materialize)
 }

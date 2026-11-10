@@ -83,7 +83,7 @@ func TestWritableHeadsRecovery(t *testing.T) {
 			values[2] = math.Inf(-1)
 			values[3] = math.SmallestNonzeroFloat64
 			var route headRouteBatch
-			r, err := route.append(f, ids, ts, values, weights, func(i int) signal.Series { return benchSeries(i % count) })
+			r, err := route.append(t.Context(), f, ids, ts, values, weights, func(i int) signal.Series { return benchSeries(i % count) })
 			require.NoError(t, err)
 			require.Equal(t, len(ids), r.Accepted)
 			want := snapshotWritableHeads(t, f)
@@ -102,7 +102,7 @@ func TestWritableHeadsRecovery(t *testing.T) {
 			for i := range count {
 				ts[i], values[i] = 102, float64(i)
 			}
-			r, err = route.append(f, ids[:count], ts[:count], values[:count], nil, benchSeries)
+			r, err = route.append(t.Context(), f, ids[:count], ts[:count], values[:count], nil, benchSeries)
 			require.NoError(t, err)
 			require.Equal(t, count, r.Accepted)
 			want = snapshotWritableHeads(t, f)
@@ -119,7 +119,7 @@ func TestWritableHeadsRecovery(t *testing.T) {
 			for i := range count {
 				ts[i] = 80
 			}
-			r, err = route.append(f, ids[:count], ts[:count], values[:count], nil, benchSeries)
+			r, err = route.append(t.Context(), f, ids[:count], ts[:count], values[:count], nil, benchSeries)
 			require.NoError(t, err)
 			require.Equal(t, AppendResult{RejectedOOO: count}, r)
 			require.NoError(t, f.flush(t.Context()))
@@ -157,7 +157,7 @@ func TestWritableHeadsConcurrentRecovery(t *testing.T) {
 				for i := range ts {
 					ts[i], values[i] = int64(100+round), float64(round)
 				}
-				r, err := route.append(f, ids, ts, values, nil, func(i int) signal.Series { return benchSeries(worker*series + i) })
+				r, err := route.append(t.Context(), f, ids, ts, values, nil, func(i int) signal.Series { return benchSeries(worker*series + i) })
 				if err != nil {
 					failures <- err
 					return
@@ -205,7 +205,7 @@ func TestWritableHeadsIndependentWriters(t *testing.T) {
 	go func() {
 		defer close(finished)
 		var route headRouteBatch
-		r, err := route.append(f, []signal.SeriesID{second.Hash()}, []int64{100}, []float64{1}, nil, func(int) signal.Series { return second })
+		r, err := route.append(t.Context(), f, []signal.SeriesID{second.Hash()}, []int64{100}, []float64{1}, nil, func(int) signal.Series { return second })
 		done <- parallelAppendResult{r, err}
 	}()
 	t.Cleanup(func() { release(); <-finished })
@@ -218,7 +218,7 @@ func TestWritableHeadsIndependentWriters(t *testing.T) {
 	}
 	release()
 	var route headRouteBatch
-	r, err := route.append(f, []signal.SeriesID{first.Hash()}, []int64{100}, []float64{1}, nil, func(int) signal.Series { return first })
+	r, err := route.append(t.Context(), f, []signal.SeriesID{first.Hash()}, []int64{100}, []float64{1}, nil, func(int) signal.Series { return first })
 	require.NoError(t, err)
 	require.Equal(t, 1, r.Accepted)
 }
@@ -235,7 +235,7 @@ func TestWritableHeadsPartialWALFailure(t *testing.T) {
 	src := []signal.Series{seriesForLane(0, 2), seriesForLane(1, 2)}
 	ids := []signal.SeriesID{src[0].Hash(), src[1].Hash()}
 	var route headRouteBatch
-	r, err := route.append(f, ids, []int64{100, 100}, []float64{1, 2}, nil, func(i int) signal.Series { return src[i] })
+	r, err := route.append(t.Context(), f, ids, []int64{100, 100}, []float64{1, 2}, nil, func(i int) signal.Series { return src[i] })
 	require.ErrorIs(t, err, errInjectedWAL)
 	require.Equal(t, 1, r.Accepted, "the prototype reports committed earlier lanes; it is not batch-atomic")
 	require.EqualValues(t, 1, f.heads[0].Stats().HeadSamples)

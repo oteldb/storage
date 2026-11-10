@@ -21,29 +21,51 @@ func BenchmarkWritableHeads(b *testing.B) {
 		for _, prepared := range []bool{false, true} {
 			for _, heads := range []int{1, 2, 4, 8, 16} {
 				b.Run(fmt.Sprintf("%s/prepared=%t/heads=%d", phase, prepared, heads), func(b *testing.B) {
-					benchmarkWritableHeads(b, phase, heads, prepared)
+					benchmarkWritableHeads(b, phase, heads, prepared, "base")
 				})
 			}
 		}
 	}
 }
 
-func benchmarkWritableHeads(b *testing.B, phase string, heads int, prepared bool) {
+func BenchmarkHeadDispatch(b *testing.B) {
+	for _, phase := range []string{"cold", "historical", "resident"} {
+		for _, variant := range []string{"base", "shared", "queued", "combined"} {
+			for _, heads := range []int{1, 4, 8} {
+				b.Run(fmt.Sprintf("%s/%s/heads=%d", phase, variant, heads), func(b *testing.B) {
+					benchmarkWritableHeads(b, phase, heads, true, variant)
+				})
+			}
+		}
+	}
+}
+
+func benchmarkWritableHeads(b *testing.B, phase string, heads int, prepared bool, variant string) {
 	b.Helper()
 	const points, writers = 4096, 8
 	seedInput := newCPUStorageInput(cpuFixtureOptions{hosts: 10000, points: 1}, 0)
 	input := seedInput.generation(1)
 	f := newWritableHeads(b, heads)
 	f.prepared = prepared
+	if variant != "base" {
+		if err := f.close(); err != nil {
+			b.Fatal(err)
+		}
+		f.sharedMetadata = variant == "shared" || variant == "combined"
+		f.queued = variant == "queued" || variant == "combined"
+		if err := f.open(b.Context(), false); err != nil {
+			b.Fatal(err)
+		}
+	}
 	var seedRoute headRouteBatch
-	appendInput := func(route *headRouteBatch, input *cpuStorageInput, offset int) (AppendResult, error) {
+	appendInput := func(ctx context.Context, route *headRouteBatch, input *cpuStorageInput, offset int) (AppendResult, error) {
 		hi := min(offset+points, len(input.ids))
-		return route.append(f, input.ids[offset:hi], input.ts[offset:hi], input.values[offset:hi], nil,
+		return route.append(ctx, f, input.ids[offset:hi], input.ts[offset:hi], input.values[offset:hi], nil,
 			func(i int) signal.Series { return input.identities[offset+i] })
 	}
 	seed := func() {
 		for offset := 0; offset < len(input.ids); offset += points {
-			if _, err := appendInput(&seedRoute, seedInput, offset); err != nil {
+			if _, err := appendInput(b.Context(), &seedRoute, seedInput, offset); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -94,13 +116,13 @@ func benchmarkWritableHeads(b *testing.B, phase string, heads int, prepared bool
 		}
 		start := make(chan struct{})
 		var wg sync.WaitGroup
-		pprof.Do(b.Context(), pprof.Labels("phase", "storage"), func(context.Context) {
+		pprof.Do(b.Context(), pprof.Labels("phase", "storage"), func(ctx context.Context) {
 			for worker := range writers {
 				wg.Go(func() {
 					<-start
 					for offset := worker * points; offset < len(input.ids); offset += writers * points {
 						begin := time.Now()
-						r, err := appendInput(&routes[worker], input, offset)
+						r, err := appendInput(ctx, &routes[worker], input, offset)
 						latencies[worker] = append(latencies[worker], time.Since(begin).Nanoseconds())
 						if err != nil || r.Accepted != min(points, len(input.ids)-offset) {
 							b.Errorf("append: %+v, %v", r, err)
