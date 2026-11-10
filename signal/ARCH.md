@@ -4,6 +4,11 @@
 enum (the shared rollup vocabulary), and the typed identity primitives — see
 [`../index/ARCH.md`](../index/ARCH.md).
 
+`DecodeSeriesInto` reuses separate resource, scope and point attribute headers; nested maps/slices
+still allocate. Overlapping destination buffers detach before decoding. Every byte field borrows
+the input, so consumers must copy/intern before cursor advance or scratch reuse. Success and failure
+release old borrowed references; failure leaves an empty identity with cleared header capacity.
+
 Each sub-package holds one signal's **ingest batch** and its **projection** into engine columns.
 
 ## Common shape

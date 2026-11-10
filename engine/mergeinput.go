@@ -166,6 +166,9 @@ func (e *Engine) partMergeInputBound(ctx context.Context, p *part, whole, fallba
 		return mergeInputBound{}, err
 	}
 	bound.include(columns)
+	if e.cfg.DiskSeries {
+		bound.resident = buildbudget.Add(bound.resident, mergeIdentityScratchBytes)
+	}
 	if e.cfg.MetricSeriesChunks {
 		bound.resident = buildbudget.Add(bound.resident, granuleReadBytes(p))
 	}

@@ -2,7 +2,9 @@ package signal
 
 import (
 	"encoding/binary"
+	"runtime"
 	"slices"
+	"unsafe"
 
 	"github.com/go-faster/errors"
 )
@@ -60,62 +62,115 @@ func DecodeValue(src []byte) (Value, int, error) {
 // DecodeSeries parses the canonical binary form produced by [Series.AppendHashInput]:
 // resource, then scope, then data-point attributes. All byte fields alias src.
 func DecodeSeries(src []byte) (Series, int, error) {
-	res, rn, err := decodeResource(src)
+	var dst Series
+	n, err := DecodeSeriesInto(&dst, src)
 	if err != nil {
-		return Series{}, 0, errors.Wrap(err, "resource")
+		return Series{}, 0, err
 	}
-
-	sc, sn, err := decodeScope(src[rn:])
-	if err != nil {
-		return Series{}, 0, errors.Wrap(err, "scope")
-	}
-
-	attrs, an, err := DecodeAttributes(src[rn+sn:])
-	if err != nil {
-		return Series{}, 0, errors.Wrap(err, "attributes")
-	}
-
-	return Series{Resource: res, Scope: sc, Attributes: attrs}, rn + sn + an, nil
+	return dst, n, nil
 }
 
-func decodeResource(src []byte) (Resource, int, error) {
+// DecodeSeriesInto replaces dst, reusing its three top-level attribute slices; nested values may allocate.
+// Byte fields borrow src. Reusing dst invalidates its previous contents; errors leave an empty identity.
+func DecodeSeriesInto(dst *Series, src []byte) (int, error) {
+	resetDecodedSeries(dst)
+	if attributesOverlap(dst.Resource.Attributes, dst.Scope.Attributes) {
+		dst.Scope.Attributes = nil
+	}
+	if attributesOverlap(dst.Resource.Attributes, dst.Attributes) || attributesOverlap(dst.Scope.Attributes, dst.Attributes) {
+		dst.Attributes = nil
+	}
+	n, err := decodeSeriesInto(dst, src)
+	if err != nil {
+		resetDecodedSeries(dst)
+	}
+	return n, err
+}
+
+//nolint:gosec // Address-only comparison; uintptr values are never converted back to pointers.
+func attributesOverlap(a, b Attributes) bool {
+	if cap(a) == 0 || cap(b) == 0 {
+		return false
+	}
+	aStart := uintptr(unsafe.Pointer(unsafe.SliceData(a)))
+	bStart := uintptr(unsafe.Pointer(unsafe.SliceData(b)))
+	overlap := aStart < bStart+uintptr(cap(b))*unsafe.Sizeof(KeyValue{}) &&
+		bStart < aStart+uintptr(cap(a))*unsafe.Sizeof(KeyValue{})
+	runtime.KeepAlive(a)
+	runtime.KeepAlive(b)
+	return overlap
+}
+
+func resetDecodedSeries(dst *Series) {
+	r, s, a := dst.Resource.Attributes, dst.Scope.Attributes, dst.Attributes
+	clear(r)
+	clear(s)
+	clear(a)
+	*dst = Series{Resource: Resource{Attributes: r[:0]}, Scope: Scope{Attributes: s[:0]}, Attributes: a[:0]}
+}
+
+func decodeSeriesInto(dst *Series, src []byte) (int, error) {
+	rn, err := decodeResourceInto(&dst.Resource, src)
+	if err != nil {
+		return 0, errors.Wrap(err, "resource")
+	}
+
+	sn, err := decodeScopeInto(&dst.Scope, src[rn:])
+	if err != nil {
+		return 0, errors.Wrap(err, "scope")
+	}
+
+	var an int
+	dst.Attributes, an, err = AppendAttributes(dst.Attributes, src[rn+sn:])
+	if err != nil {
+		return 0, errors.Wrap(err, "attributes")
+	}
+
+	return rn + sn + an, nil
+}
+
+func decodeResourceInto(dst *Resource, src []byte) (int, error) {
 	schema, n, err := readLenBytes(src)
 	if err != nil {
-		return Resource{}, 0, errors.Wrap(err, "schema_url")
+		return 0, errors.Wrap(err, "schema_url")
 	}
 
-	attrs, an, err := DecodeAttributes(src[n:])
+	var an int
+	dst.Attributes, an, err = AppendAttributes(dst.Attributes, src[n:])
 	if err != nil {
-		return Resource{}, 0, err
+		return 0, err
 	}
 
-	return Resource{SchemaURL: schema, Attributes: attrs}, n + an, nil
+	dst.SchemaURL = schema
+	return n + an, nil
 }
 
-func decodeScope(src []byte) (Scope, int, error) {
+func decodeScopeInto(dst *Scope, src []byte) (int, error) {
 	name, n1, err := readLenBytes(src)
 	if err != nil {
-		return Scope{}, 0, errors.Wrap(err, "name")
+		return 0, errors.Wrap(err, "name")
 	}
 
 	version, n2, err := readLenBytes(src[n1:])
 	if err != nil {
-		return Scope{}, 0, errors.Wrap(err, "version")
+		return 0, errors.Wrap(err, "version")
 	}
 
 	schema, n3, err := readLenBytes(src[n1+n2:])
 	if err != nil {
-		return Scope{}, 0, errors.Wrap(err, "schema_url")
+		return 0, errors.Wrap(err, "schema_url")
 	}
 
 	off := n1 + n2 + n3
 
-	attrs, an, err := DecodeAttributes(src[off:])
+	var an int
+	dst.Attributes, an, err = AppendAttributes(dst.Attributes, src[off:])
 	if err != nil {
-		return Scope{}, 0, err
+		return 0, err
 	}
 
-	return Scope{Name: name, Version: version, SchemaURL: schema, Attributes: attrs}, off + an, nil
+	dst.Name, dst.Version, dst.SchemaURL = name, version, schema
+	return off + an, nil
 }
 
 // DecodeAttributes parses the canonical binary form produced by

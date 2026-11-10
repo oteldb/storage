@@ -71,6 +71,11 @@ rollups use the decoded merge. Whole excluded chunks still validate their value 
 rows advance the same numeric cursors before later decoded series resume. Encoded reads retain a
 separate bounded frame workspace, included in merge input admission.
 
+Each indexed merge source reuses independent resource, scope and point attribute headers. The next
+identity releases borrowed references after the previous output registry has consumed them. Arrays
+larger than 16 KiB are dropped; the 48 KiB per-source retained limit is charged to merge input
+admission. Nested values retain the ordinary decoder's allocation behavior.
+
 Merge sources and rollup probes own `OpenColumnScan` handles for their scoped walks. Completion
 and failure close every opened source before its part can retire; file windows return to their
 bounded pool after writer finalization. Source admission includes the handle's retained-state hint.

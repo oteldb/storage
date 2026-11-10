@@ -18,6 +18,7 @@ type diskMergeSource struct {
 	legacy   *series.Index
 	metadata []seriesindex.Metadata
 	attrs    signal.Attributes
+	identity signal.Series
 }
 
 func (e *Engine) openMetricMergeStreams(ctx context.Context, src []*part) ([]*partStream, []*diskMergeSource, error) {
@@ -58,6 +59,8 @@ func (item *mergeIdentityItem) next(ctx context.Context, e *Engine, keys *series
 	legacy *mergeIdentityBatch, parts []*part, sources []*diskMergeSource,
 ) (bool, error) {
 	if e.cfg.DiskSeries {
+		item.identity = signal.Series{}
+		releaseMergeIdentityScratch(sources)
 		if !keys.Next() {
 			return false, nil
 		}
@@ -137,6 +140,7 @@ func mergeDiskIdentity(id signal.SeriesID, positions []mergestream.Position,
 	sources []*diskMergeSource,
 ) (signal.Series, int64, error) {
 	var selected []byte
+	var owner *diskMergeSource
 	var legacy *diskMergeSource
 	covered := minInt64
 	for _, pos := range positions {
@@ -150,17 +154,18 @@ func mergeDiskIdentity(id signal.SeriesID, positions []mergestream.Position,
 				return signal.Series{}, 0, errors.Wrap(seriesindex.ErrCorrupt, "merge descriptors differ")
 			}
 			selected = raw
+			owner = source
 		} else {
 			legacy = source
 		}
 		covered = max(covered, meta.Covered)
 	}
 	if selected != nil {
-		identity, n, err := signal.DecodeSeries(selected)
+		n, err := signal.DecodeSeriesInto(&owner.identity, selected)
 		if err != nil || n != len(selected) {
 			return signal.Series{}, 0, errors.Wrap(seriesindex.ErrCorrupt, "merge descriptor")
 		}
-		return identity, covered, nil
+		return owner.identity, covered, nil
 	}
 	if legacy == nil {
 		return signal.Series{}, 0, errors.Wrap(seriesindex.ErrCorrupt, "merge identity missing")

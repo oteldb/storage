@@ -185,3 +185,22 @@ func TestMergeDiskIdentityOwnsAcrossDescriptorPages(t *testing.T) {
 		require.Equal(t, input[i].AppendHashInput(nil), builder.View().AppendCanonical(nil, i))
 	}
 }
+
+func TestMergeDiskIdentityReusesDifferentAttributeSets(t *testing.T) {
+	t.Parallel()
+	input := []signal.Series{mergedIdentitySeries(), benchSeries(500), {}}
+	slices.SortFunc(input, func(a, b signal.Series) int { return a.Hash().Compare(b.Hash()) })
+	sources := []*diskMergeSource{mergeIdentityFixture(t, input, 200, false), mergeIdentityFixture(t, input, 100, false)}
+	var builder seriesindex.Builder
+	for i := range input {
+		id := input[i].Hash()
+		positions := []mergestream.Position{{Source: i % 2, Index: i}, {Source: (i + 1) % 2, Index: i}}
+		got, covered, err := mergeDiskIdentity(id, positions, sources)
+		require.NoError(t, err)
+		require.Equal(t, input[i].AppendHashInput(nil), got.AppendHashInput(nil))
+		require.NoError(t, builder.Add(id, got, seriesindex.Metadata{Covered: covered}))
+	}
+	for i := range input {
+		require.Equal(t, input[i].AppendHashInput(nil), builder.View().AppendCanonical(nil, i))
+	}
+}
