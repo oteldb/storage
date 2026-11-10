@@ -15,6 +15,52 @@ import (
 
 // WriteSorted streams n sorted identities in the existing format. A buffered dst coalesces records.
 func WriteSorted(dst io.Writer, n int, entry func(int, signal.Attributes) series.Entry) (int64, error) {
+	var attrs signal.Attributes
+	return writeSorted(dst, n, func(enc *encoder, record []byte, i int) ([]byte, error) {
+		ent := entry(i, attrs)
+		record = enc.appendSeries(record, ent)
+		attrs = ent.Series.Attributes
+		return record, nil
+	})
+}
+
+// WriteViewSorted streams n ID-sorted compact identities without materializing point attributes.
+// A nil ref selects identity i; otherwise ref maps each output position to its view index.
+func WriteViewSorted(dst io.Writer, n int, view series.View, ref func(int) int) (int64, error) {
+	if ref == nil && n > view.Len() {
+		return 0, errors.New("identity: entry count exceeds view")
+	}
+	return writeSorted(dst, n, func(enc *encoder, record []byte, i int) ([]byte, error) {
+		if ref != nil {
+			i = ref(i)
+		}
+		if i < 0 || i >= view.Len() {
+			return record, errors.New("identity: view reference out of bounds")
+		}
+		return enc.appendView(record, view, i), nil
+	})
+}
+
+func (e *encoder) appendView(dst []byte, view series.View, ref int) []byte {
+	id := view.ID(ref)
+	dst = binary.BigEndian.AppendUint64(dst, id.Hi)
+	dst = binary.BigEndian.AppendUint64(dst, id.Lo)
+	resource, scope := view.Context(ref)
+	dst = e.appendSym(dst, resource.SchemaURL)
+	dst = e.appendAttrs(dst, resource.Attributes)
+	dst = e.appendSym(dst, scope.Name)
+	dst = e.appendSym(dst, scope.Version)
+	dst = e.appendSym(dst, scope.SchemaURL)
+	dst = e.appendAttrs(dst, scope.Attributes)
+	dst = binary.AppendUvarint(dst, uint64(view.AttributeCount(ref)))
+	view.EncodedAttributes(ref, func(key, value []byte) {
+		dst = e.appendSym(dst, key)
+		dst = e.appendSym(dst, value)
+	})
+	return dst
+}
+
+func writeSorted(dst io.Writer, n int, appendRecord func(*encoder, []byte, int) ([]byte, error)) (int64, error) {
 	if n < 0 {
 		return 0, errors.New("identity: negative entry count")
 	}
@@ -33,15 +79,16 @@ func WriteSorted(dst io.Writer, n int, entry func(int, signal.Attributes) series
 	if _, err := w.Write(binary.AppendUvarint(scratch[:0], uint64(n))); err != nil {
 		return w.written, err
 	}
-	var attrs signal.Attributes
 	record := scratch[:0]
 	for i := range n {
-		ent := entry(i, attrs)
-		record = enc.appendSeries(record[:0], ent)
+		var err error
+		record, err = appendRecord(&enc, record[:0], i)
+		if err != nil {
+			return w.written, err
+		}
 		if _, err := w.Write(record); err != nil {
 			return w.written, err
 		}
-		attrs = ent.Series.Attributes
 	}
 	bodyLen, bodyCRC := w.written-headerLen, w.crc
 	w.crc = 0

@@ -90,13 +90,18 @@ func (b *Builder) Entry(i int, attrs signal.Attributes) series.Entry {
 	return series.Entry{ID: b.records[i].id, Series: b.registry.View().At(i, attrs)}
 }
 
+// View borrows the builder's compact identities in canonical-ID order.
+func (b *Builder) View() series.View {
+	if b.registry == nil {
+		return series.View{}
+	}
+	return b.registry.View()
+}
+
 // Add appends a new canonical identity in strictly increasing ID order.
 func (b *Builder) Add(id signal.SeriesID, s signal.Series, meta Metadata) error {
-	if uint64(len(b.records)) >= math.MaxUint32 {
-		return errors.New("seriesindex: too many series")
-	}
-	if len(b.records) > 0 && b.records[len(b.records)-1].id.Compare(id) >= 0 {
-		return errors.New("seriesindex: series are not ordered")
+	if err := b.checkID(id); err != nil {
+		return err
 	}
 	b.canonicalScratch = s.AppendHashInput(b.canonicalScratch[:0])
 	if signal.HashBytes(b.canonicalScratch) != id {
@@ -106,17 +111,28 @@ func (b *Builder) Add(id signal.SeriesID, s signal.Series, meta Metadata) error 
 		b.registry = series.New()
 	}
 	b.registry.Add(s)
-	if b.names == nil {
-		b.names, b.values = make(map[string]*namePosting), make(map[string]*valuePosting)
-		b.bytes += 2 * memsize.MapBase
-	}
-	b.encodedRaw = buildbudget.Add(b.encodedRaw, int64(len(b.canonicalScratch))+184)
-	b.encodedRecords = buildbudget.Add(b.encodedRecords, 2)
-	ref := uint32(len(b.records))
-	prior := cap(b.records)
-	b.records = append(b.records, record{id: id, meta: meta})
-	b.bytes += int64(cap(b.records)-prior) * memsize.Of[record]()
+	ref := b.appendRecord(id, meta)
 	visitLabels(s, func(name []byte, value signal.Value) { b.addLabel(ref, name, value) })
+	return nil
+}
+
+// AddView copies an identity from a validated compact registry without decoding point attributes.
+func (b *Builder) AddView(view series.View, i int, meta Metadata) error {
+	id := view.ID(i)
+	if err := b.checkID(id); err != nil {
+		return err
+	}
+	b.canonicalScratch = view.AppendCanonical(b.canonicalScratch[:0], i)
+	if b.registry == nil {
+		b.registry = series.New()
+	}
+	b.registry.AddView(view, i)
+	ref := b.appendRecord(id, meta)
+	resource, scope := view.Context(i)
+	visitLabels(signal.Series{Resource: resource, Scope: scope}, func(name []byte, value signal.Value) {
+		b.addLabel(ref, name, value)
+	})
+	view.EncodedAttributes(i, func(name, encoded []byte) { b.addEncodedLabel(ref, name, encoded) })
 	return nil
 }
 
@@ -189,6 +205,7 @@ func (b *Builder) Write(dst io.Writer) error {
 	w := NewTableWriter(dst)
 	w.seriesCount = uint32(len(b.records))
 	w.parentDigest = b.parentDigest
+	postings := postingsWriter{table: w}
 	var count [4]byte
 	binary.BigEndian.PutUint32(count[:], uint32(len(b.records)))
 	if err := w.Append([]byte{'c'}, count[:]); err != nil {
@@ -200,15 +217,20 @@ func (b *Builder) Write(dst io.Writer) error {
 	}
 	slices.Sort(names)
 	for _, name := range names {
-		if err := b.writePostings(w, appendEscaped([]byte{'h'}, []byte(name)), b.names[name].refs); err != nil {
+		if err := postings.write(appendEscaped([]byte{'h'}, []byte(name)), b.names[name].refs); err != nil {
 			return err
 		}
 	}
-	var idValue []byte
+	var idKeyBuffer [17]byte
+	idKeyBuffer[0] = 'i'
+	var idValueBuffer [45]byte
+	idValue := idValueBuffer[:0]
 	for i, r := range b.records {
 		idValue = binary.BigEndian.AppendUint32(idValue[:0], uint32(i))
 		idValue = appendMetadata(idValue, r.meta)
-		if err := w.Append(idKey(r.id), idValue); err != nil {
+		binary.BigEndian.PutUint64(idKeyBuffer[1:9], r.id.Hi)
+		binary.BigEndian.PutUint64(idKeyBuffer[9:], r.id.Lo)
+		if err := w.Append(idKeyBuffer[:], idValue); err != nil {
 			return err
 		}
 	}
@@ -227,20 +249,21 @@ func (b *Builder) Write(dst io.Writer) error {
 	}
 	slices.Sort(values)
 	for _, key := range values {
-		if err := b.writePostings(w, []byte(key), b.values[key].refs); err != nil {
+		if err := postings.write([]byte(key), b.values[key].refs); err != nil {
 			return err
 		}
 	}
 	var value []byte
-	var attrs signal.Attributes
+	view := b.View()
+	var recordKeyBuffer [5]byte
+	recordKeyBuffer[0] = 's'
 	for i, r := range b.records {
 		value = binary.BigEndian.AppendUint64(value[:0], r.id.Hi)
 		value = binary.BigEndian.AppendUint64(value, r.id.Lo)
 		value = appendMetadata(value, r.meta)
-		entry := b.Entry(i, attrs)
-		value = entry.Series.AppendHashInput(value)
-		attrs = entry.Series.Attributes
-		if err := w.Append(recordKey(uint32(i)), value); err != nil {
+		value = view.AppendCanonical(value, i)
+		binary.BigEndian.PutUint32(recordKeyBuffer[1:], uint32(i))
+		if err := w.Append(recordKeyBuffer[:], value); err != nil {
 			return err
 		}
 	}
@@ -258,6 +281,30 @@ func (b *Builder) WriteObject(ctx context.Context, dst backend.Backend, key stri
 		return err
 	}
 	return w.Commit(ctx)
+}
+
+func (b *Builder) checkID(id signal.SeriesID) error {
+	if uint64(len(b.records)) >= math.MaxUint32 {
+		return errors.New("seriesindex: too many series")
+	}
+	if len(b.records) > 0 && b.records[len(b.records)-1].id.Compare(id) >= 0 {
+		return errors.New("seriesindex: series are not ordered")
+	}
+	return nil
+}
+
+func (b *Builder) appendRecord(id signal.SeriesID, meta Metadata) uint32 {
+	if b.names == nil {
+		b.names, b.values = make(map[string]*namePosting), make(map[string]*valuePosting)
+		b.bytes += 2 * memsize.MapBase
+	}
+	b.encodedRaw = buildbudget.Add(b.encodedRaw, int64(len(b.canonicalScratch))+184)
+	b.encodedRecords = buildbudget.Add(b.encodedRecords, 2)
+	ref := uint32(len(b.records))
+	prior := cap(b.records)
+	b.records = append(b.records, record{id: id, meta: meta})
+	b.bytes += int64(cap(b.records)-prior) * memsize.Of[record]()
+	return ref
 }
 
 // Index opens identities by canonical ID and local reference, retaining no per-series map.
@@ -361,23 +408,27 @@ func decodeRecord(data []byte) (signal.SeriesID, []byte, Metadata, error) {
 }
 
 func (b *Builder) addLabel(ref uint32, name []byte, value signal.Value) {
+	b.valueScratch = signal.AppendValue(b.valueScratch[:0], value)
+	b.addEncodedLabel(ref, name, b.valueScratch)
+}
+
+func (b *Builder) addEncodedLabel(ref uint32, name, encoded []byte) {
 	n := b.names[string(name)]
 	if n == nil {
 		n = &namePosting{}
 		b.names[string(name)] = n
 		b.bytes += int64(len(name)) + memsize.MapEntry[string, *namePosting]() + memsize.Of[namePosting]()
 	}
-	n.nonString = n.nonString || value.Kind() != signal.KindStr
+	n.nonString = n.nonString || signal.ValueKind(encoded[0]) != signal.KindStr
 	if len(n.refs) == 0 || n.refs[len(n.refs)-1] != ref {
 		prior := cap(n.refs)
 		n.refs = append(n.refs, ref)
 		b.bytes += int64(cap(n.refs)-prior) * 4
 	}
-	b.valueScratch = signal.AppendValue(b.valueScratch[:0], value)
 	b.postingScratch = append(b.postingScratch[:0], 'p')
 	b.postingScratch = appendEscaped(b.postingScratch, name)
 	nameBytes := len(b.postingScratch)
-	b.postingScratch = appendEscaped(b.postingScratch, b.valueScratch)
+	b.postingScratch = appendEscaped(b.postingScratch, encoded)
 	b.encodedRaw = buildbudget.Add(b.encodedRaw, 2*int64(nameBytes)+int64(len(b.postingScratch))+129)
 	b.encodedRecords = buildbudget.Add(b.encodedRecords, 3)
 	// Keep the lookup conversion temporary; only newly stored keys own a copy.
@@ -395,19 +446,23 @@ func (b *Builder) addLabel(ref uint32, name []byte, value signal.Value) {
 	b.bytes += int64(cap(p.refs)-prior) * 4
 }
 
-func (b *Builder) writePostings(w *TableWriter, prefix []byte, refs []uint32) error {
-	var key, value []byte
+type postingsWriter struct {
+	table      *TableWriter
+	key, value []byte
+}
+
+func (w *postingsWriter) write(prefix []byte, refs []uint32) error {
 	for len(refs) > 0 {
 		n := min(postingChunk, len(refs))
-		key = append(key[:0], prefix...)
-		key = binary.BigEndian.AppendUint32(key, refs[n-1])
-		value = binary.AppendUvarint(value[:0], uint64(n))
+		w.key = append(w.key[:0], prefix...)
+		w.key = binary.BigEndian.AppendUint32(w.key, refs[n-1])
+		w.value = binary.AppendUvarint(w.value[:0], uint64(n))
 		prior := uint32(0)
 		for _, ref := range refs[:n] {
-			value = binary.AppendUvarint(value, uint64(ref-prior))
+			w.value = binary.AppendUvarint(w.value, uint64(ref-prior))
 			prior = ref
 		}
-		if err := w.Append(key, value); err != nil {
+		if err := w.table.Append(w.key, w.value); err != nil {
 			return err
 		}
 		refs = refs[n:]

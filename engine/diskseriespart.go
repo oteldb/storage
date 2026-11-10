@@ -72,9 +72,10 @@ func (p *partStreamWriter) addDiskSeries(view series.View, ref uint32, id signal
 	if p.seriesBuilder == nil {
 		p.seriesBuilder = &seriesindex.Builder{}
 	}
-	s := view.At(int(ref), p.seriesAttrs)
-	p.seriesAttrs = s.Attributes
-	return p.seriesBuilder.Add(id, s, seriesindex.Metadata{})
+	if view.ID(int(ref)) != id {
+		return errors.New("engine: series-index identity mismatch")
+	}
+	return p.seriesBuilder.AddView(view, int(ref), seriesindex.Metadata{})
 }
 
 func (p *partStreamWriter) updateDiskSeriesMetadata() {
@@ -98,9 +99,7 @@ func (p *partStreamWriter) writeDiskSeries(ctx context.Context, entries identity
 			if i >= len(p.wmarks) || p.wmarks[i].ID != id {
 				return errors.New("engine: incomplete series-index identities")
 			}
-			ent := entries.view.At(int(ref), p.seriesAttrs)
-			p.seriesAttrs = ent.Attributes
-			if err := p.seriesBuilder.Add(id, ent, seriesindex.Metadata{Covered: p.wmarks[i].Max}); err != nil {
+			if err := p.seriesBuilder.AddView(entries.view, int(ref), seriesindex.Metadata{Covered: p.wmarks[i].Max}); err != nil {
 				return err
 			}
 		}
