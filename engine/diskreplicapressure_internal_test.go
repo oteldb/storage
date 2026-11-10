@@ -45,7 +45,7 @@ func TestDiskReplicaPressureRefreshesWithoutPublishing(t *testing.T) {
 			t.Cleanup(func() { _ = replicaWAL.Close() })
 			primary := New(Config{Backend: be, Prefix: "replica-pressure", DiskSeries: true, WAL: primaryWAL, WriterID: "primary", Term: func() uint64 { return 7 }})
 			replicaBackend := faultbackend.Wrap(be)
-			replica := New(Config{Backend: replicaBackend, Prefix: "replica-pressure", DiskSeries: true, WAL: replicaWAL, WriterID: "replica", Term: func() uint64 { return 0 }, ResidentHeadBytes: (1 << 20) + (64 << 10)})
+			replica := New(Config{Backend: replicaBackend, Prefix: "replica-pressure", DiskSeries: true, WAL: replicaWAL, WriterID: "replica", Term: func() uint64 { return 0 }, ResidentHeadBytes: 64 << 10})
 			old, fresh := benchSeries(1), benchSeries(2)
 			write := func(s signal.Series, start int64, n int) []byte {
 				ts := make([]int64, n)

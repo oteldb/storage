@@ -106,19 +106,20 @@ func newHead() *head {
 	}
 }
 
-// identityBytes is the resident footprint of the head's identity state — symbols, the series
-// index, the postings lists and the per-series OOO watermarks. It is deliberately **not** part of
-// [head.bytes]: a flush drains buffered samples but not identities, so folding the two would make
-// a size-triggered flush chase a number it cannot lower. Identity is reported on its own
-// ([Stats.IdentityBytes]) because nothing else counts it, and it only grows.
+// identityBytes includes resident identity metadata and separately bounded historical caches.
 func (h *head) identityBytes() int64 {
+	n := h.residentIdentityBytes()
+	if h.disk != nil {
+		n += h.disk.bloom.sizeBytes() + h.disk.cache.sizeBytes()
+	}
+	return n
+}
+
+func (h *head) residentIdentityBytes() int64 {
 	n := h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
 		memsize.Slice(h.stateRefs) + h.slots.sizeBytes() + memsize.Slice(h.valueScratch)
 	if h.nonStringLabels != nil {
 		n += memsize.Map(h.nonStringLabels)
-	}
-	if h.disk != nil {
-		n += h.disk.bloom.sizeBytes() + int64(cap(h.disk.order))*16 + memsize.Map(h.disk.cache)
 	}
 	return n
 }

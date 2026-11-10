@@ -101,7 +101,11 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
 
 Opt-in metrics `Options.MetricDiskSeries` (`WithMetricDiskSeries`, or `engine.Config.DiskSeries`) keeps historical identities/postings in immutable parts.
 Its `MetricResidentHeadBytes` target defaults to 128 MiB; a write flushes an over-target head before
-admission, while one atomic batch may exceed the target. The optional recent tier is disabled.
+admission, while one atomic batch may exceed the target. `MetricSeriesCacheBytes` separately bounds
+the historical ID/watermark cache per engine (512 MiB default, allocated on demand; negative disables).
+`IdentityBytes` includes its retained bytes and the Bloom filter, but head pressure excludes them
+because flushing cannot reclaim them. Catalog lifecycle changes invalidate the cache; ordinary
+flushes preserve it. The optional recent tier is disabled.
 `engine.Stats.SeriesComplete` is false while historical metadata is unavailable; `Series` then
 preserves the last complete count. All live local admission and head publication wait for repair;
 accepted WAL and replica payloads still restore into the head, with checkpoints unchanged.
@@ -120,7 +124,7 @@ pressure remains; replicas never publish or checkpoint without the primary claim
 | `HeadItems` / `HeadBytes` | unflushed samples/records and their in-flight bytes. For a record engine `HeadBytes` also counts the buffers an in-flight flush has detached but not yet published — they stay resident, and they are what `MaxInFlightBytes` and `FlushThresholdBytes` meter |
 | `ReusableBytes` | idle record-head buffer capacity, capped at 1 MiB per engine. It counts against `MaxInFlightBytes` until reused or evicted; eviction precedes admission rejection. It does not trigger a flush. Metrics report zero |
 | `SeriesComplete` | whether the reported distinct count covers all locally required parts; false means historical metadata is unavailable or stale |
-| `IdentityBytes` | with disk-series metrics, active/frozen identity state plus bounded historical membership/watermark caches, reclaimed after flush. Otherwise resident identity state: the symbol table, the series/stream index, the postings lists, per-series out-of-order watermarks and cached metric registry ordering. A flush does **not** drain it — identities outlive the data they named and are reclaimed only by `Reset` — so it is reported beside `HeadBytes` rather than folded into it (`MaxInFlightBytes` / `FlushThresholdBytes` would otherwise chase a number a flush cannot lower). It falls when the background maintenance prunes the identities retention left without data — on every node holding metric parts, owner or replica, since a part carries its own identities — so an unbounded rise means churn is outpacing retention |
+| `IdentityBytes` | with disk-series metrics, active/frozen identity state (reclaimed after flush) plus separately bounded historical Bloom and membership/watermark caches (retained across flushes). Otherwise resident identity state: the symbol table, the series/stream index, the postings lists, per-series out-of-order watermarks and cached metric registry ordering. A flush does **not** drain it — identities outlive the data they named and are reclaimed only by `Reset` — so it is reported beside `HeadBytes` rather than folded into it (`MaxInFlightBytes` / `FlushThresholdBytes` would otherwise chase a number a flush cannot lower). It falls when the background maintenance prunes the identities retention left without data — on every node holding metric parts, owner or replica, since a part carries its own identities — so an unbounded rise means churn is outpacing retention |
 | `Parts` | flushed immutable part count |
 | `MinTimeUnixNano` / `MaxTimeUnixNano` | data time span (min over parts; max includes the head) |
 | `RetainFromUnixNano` / `RetentionBoundBy` | last authorized requested cutoff and its winning bound (`none`, `age`, `signal_bytes`, `pooled_bytes`); zero on current replicas, ownership-fenced nodes or a different tenure. A deferred or failed cleanup, including an index-fenced engine that still owns its claim, keeps the request visible: it does not assert rows below the cutoff are gone |

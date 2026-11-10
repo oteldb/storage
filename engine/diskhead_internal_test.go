@@ -39,15 +39,16 @@ func TestDiskHeadEvictsHistoricalMetadata(t *testing.T) {
 		require.Zero(t, e.head.series.Len())
 		require.Zero(t, e.head.slots.seen)
 		require.Empty(t, e.head.buffers.pages)
-		require.LessOrEqual(t, len(e.head.disk.cache), diskHeadCacheEntries)
+		require.LessOrEqual(t, e.head.disk.cache.sizeBytes(), e.cfg.SeriesCacheBytes)
 		require.EqualValues(t, (generation+1)*perGeneration, e.Stats().Series)
 		require.True(t, e.Stats().SeriesComplete)
 		require.Zero(t, e.identityOrder.bytes.Load())
 		require.Less(t, e.IdentityBytes(), int64(3<<20))
 	}
-	// The first generation has left the bounded cache. Membership comes from immutable parts.
+	// A cold cache must resolve membership from immutable parts.
 	s := benchSeries(0)
-	_, cached := e.head.disk.cache[s.Hash()]
+	e.head.disk.cache.clear()
+	_, cached := e.head.disk.cache.get(s.Hash())
 	require.False(t, cached)
 	result, err := e.AppendBatch([]signal.SeriesID{s.Hash(), benchSeries(generations * perGeneration).Hash()}, []int64{101, 101}, []float64{2, 2}, nil, func(i int) signal.Series {
 		if i == 0 {
@@ -77,7 +78,7 @@ func TestDiskHeadHistoricalWatermarks(t *testing.T) {
 			require.True(t, ok)
 			require.NoError(t, e.Flush(t.Context()))
 			if !cached {
-				clear(e.head.disk.cache)
+				e.head.disk.cache.clear()
 			}
 			ok, err = e.Append(s, 89, 2)
 			require.NoError(t, err)
@@ -133,11 +134,14 @@ func TestDiskHeadFailedWALKeepsHistoricalState(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.NoError(t, e.Flush(t.Context()))
-	clear(e.head.disk.cache)
+	e.head.disk.cache.clear()
 	failNextWALWrite(fsys)
 	ok, err = e.Append(s, 200, 2)
 	require.ErrorIs(t, err, errInjectedWAL)
 	require.False(t, ok)
+	entry, hit := e.head.disk.cache.get(s.Hash())
+	require.True(t, hit)
+	require.EqualValues(t, 100, entry.newest, "failed WAL cannot cache an unaccepted timestamp")
 	require.Zero(t, e.head.series.Len())
 	require.EqualValues(t, 1, e.Stats().Series)
 	require.Zero(t, e.Stats().HeadSamples)
@@ -226,7 +230,7 @@ func TestDiskHeadOverflowHistoricalMembership(t *testing.T) {
 		require.True(t, ok)
 	}
 	require.NoError(t, e.Flush(t.Context()))
-	clear(e.head.disk.cache)
+	e.head.disk.cache.clear()
 	fresh := benchSeries(2)
 	result, err := e.AppendBatch([]signal.SeriesID{fresh.Hash()}, []int64{101}, []float64{2}, nil, func(int) signal.Series { return fresh }, AppendLimits{MaxSeries: 3, MaxSeriesSoft: 1, Overflow: func(signal.Series) signal.Series { return overflow }})
 	require.NoError(t, err)
@@ -235,7 +239,7 @@ func TestDiskHeadOverflowHistoricalMembership(t *testing.T) {
 	require.EqualValues(t, 2, e.Stats().Series, "re-registering an overflow identity does not grow global cardinality")
 	require.NoError(t, e.Flush(t.Context()))
 	payload := primaryPayload(t, seriesRun(fresh, []int64{102}, []float64{3}))
-	clear(e.head.disk.cache)
+	e.head.disk.cache.clear()
 	_, result, err = e.ApplyPrimary(payload, AppendLimits{MaxSeries: 3, MaxSeriesSoft: 1, Overflow: func(signal.Series) signal.Series { return overflow }})
 	require.NoError(t, err)
 	require.Equal(t, 1, result.Accepted)
@@ -250,7 +254,7 @@ func TestDiskHeadReplicaHistoricalMembershipAndMalformed(t *testing.T) {
 	payload := primaryPayload(t, seriesRun(s, []int64{100}, []float64{1}))
 	require.NoError(t, e.ApplyReplicated(payload))
 	require.NoError(t, e.Flush(t.Context()))
-	clear(e.head.disk.cache)
+	e.head.disk.cache.clear()
 	payload = primaryPayload(t, seriesRun(s, []int64{95}, []float64{2}), seriesRun(benchSeries(2), []int64{101}, []float64{3}))
 	require.Error(t, e.ApplyReplicated(payload[:len(payload)-1]))
 	require.Zero(t, e.head.series.Len())
@@ -410,7 +414,7 @@ func TestDiskHeadFailedPreloadReleasesBatchState(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.NoError(t, e.Flush(t.Context()))
-	clear(e.head.disk.cache)
+	e.head.disk.cache.clear()
 	be.Add(faultbackend.Rule{Kind: faultbackend.Read, Err: errInjectedWAL})
 	result, err := e.AppendBatch([]signal.SeriesID{fresh.Hash(), old.Hash()}, []int64{101, 101}, []float64{2, 2}, nil, func(i int) signal.Series {
 		if i == 0 {

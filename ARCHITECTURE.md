@@ -104,7 +104,8 @@ complete cluster inventory; `Owned` separately names held compaction claims.
   Metric flushes target the reserved quarter for incremental encoding workspace; frozen samples
   remain charged to head admission until publication. Opt-in `MetricDiskSeries` stores historical
   identities/postings inside each part and bounds active/frozen metadata with `MetricResidentHeadBytes`
-  pressure flushes; legacy resident registries remain unchanged. Sidecars share parent catalog
+  pressure flushes. `MetricSeriesCacheBytes` separately bounds retained ID/watermark cache memory
+  per engine (512 MiB default, allocated on demand); legacy resident registries remain unchanged. Sidecars share parent catalog
   publication, replication and repair. The maintenance workspace allowance is separate from head bytes.
   Catalog CAS/rebase admits ingestion, then installs a coherent read view before WAL checkpoint.
   Close cancels queued work and drains both workers. See `engine/ARCH.md` for lifetime and budgets.

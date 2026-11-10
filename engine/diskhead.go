@@ -15,7 +15,6 @@ import (
 )
 
 const defaultResidentHeadBytes = 128 << 20
-const diskHeadCacheEntries = 8192
 const diskHeadBloomWords = 1 << 17
 const diskHeadBloomMaxWords = 32 * diskHeadBloomWords
 
@@ -31,17 +30,19 @@ type diskHeadState struct {
 	complete bool
 	count    int64
 	bloom    diskHeadBloom
-	cache    map[signal.SeriesID]diskHeadEntry
-	order    []signal.SeriesID
-	next     int
+	cache    *diskSeriesCache
 	pending  map[signal.SeriesID]diskHeadEntry
 }
 
 func newDiskHeadState() *diskHeadState {
+	return newDiskHeadStateWithCache(defaultSeriesCacheBytes)
+}
+
+func newDiskHeadStateWithCache(budget int64) *diskHeadState {
 	return &diskHeadState{
 		complete: true,
 		bloom:    newDiskHeadBloom(diskHeadBloomWords, diskHeadBloomMaxWords),
-		cache:    make(map[signal.SeriesID]diskHeadEntry),
+		cache:    newDiskSeriesCache(budget),
 	}
 }
 
@@ -120,16 +121,7 @@ func (s *diskHeadState) note(id signal.SeriesID)            { s.bloom.add(id) }
 func (s *diskHeadState) mayContain(id signal.SeriesID) bool { return s.bloom.contains(id) }
 
 func (s *diskHeadState) remember(id signal.SeriesID, newest int64) {
-	if _, ok := s.cache[id]; !ok {
-		if len(s.order) < diskHeadCacheEntries {
-			s.order = append(s.order, id)
-		} else {
-			delete(s.cache, s.order[s.next])
-			s.order[s.next] = id
-			s.next = (s.next + 1) % diskHeadCacheEntries
-		}
-	}
-	s.cache[id] = diskHeadEntry{newest: newest, exists: true}
+	s.cache.put(id, newest)
 }
 
 func (h *head) cardinality() int64 {
@@ -156,7 +148,7 @@ func (e *Engine) rebuildDiskStateLocked(ctx context.Context) (err error) {
 		e.head.disk.complete = false
 		return nil
 	}
-	next := newDiskHeadState()
+	next := newDiskHeadStateWithCache(e.cfg.SeriesCacheBytes)
 	headIDs := make([]signal.SeriesID, e.head.series.Len())
 	view := e.head.series.View()
 	for i := range headIDs {
@@ -182,7 +174,7 @@ func (e *Engine) rebuildDiskStateLocked(ctx context.Context) (err error) {
 		if err := it.Err(); err != nil {
 			return err
 		}
-		if !e.head.disk.complete {
+		if len(headIDs) > 0 {
 			var err error
 			watermarks, err = e.diskWatermarksForHead(ctx, parts, headIDs)
 			return err
@@ -242,7 +234,7 @@ func (e *Engine) preloadDiskSeriesOffState(ids []signal.SeriesID) error {
 		if _, ok := s.pending[id]; ok {
 			continue
 		}
-		if hit, ok := s.cache[id]; ok {
+		if hit, ok := s.cache.get(id); ok {
 			s.pending[id] = hit
 			continue
 		}
@@ -272,6 +264,11 @@ func (e *Engine) preloadHistoricalBatch(ids []signal.SeriesID) error {
 			s.pending[id] = entry
 		}); err != nil {
 			return errors.Wrap(err, "lookup historical series batch")
+		}
+	}
+	for _, id := range ids {
+		if entry := s.pending[id]; entry.exists {
+			s.remember(id, entry.newest)
 		}
 	}
 	return nil
@@ -348,7 +345,7 @@ func (e *Engine) flushResidentHeadLocked() error {
 }
 
 func (e *Engine) residentHeadOverBudgetLocked() bool {
-	return e.head.bytes > 0 && e.head.identityBytes()+e.head.inFlightBytes() >= e.cfg.ResidentHeadBytes
+	return e.head.bytes > 0 && e.head.residentIdentityBytes()+e.head.inFlightBytes() >= e.cfg.ResidentHeadBytes
 }
 
 //nolint:contextcheck,nolintlint // The context analyzer consumes this intentional API boundary before reporting.
@@ -370,7 +367,7 @@ func (e *Engine) relieveResidentHeadPressure() error {
 }
 
 func (e *Engine) replayResidentGuard(samples int) error {
-	if e.cfg.DiskSeries && e.head.identityBytes()+e.head.inFlightBytes()+int64(samples)*SampleBytes > e.cfg.ResidentHeadBytes {
+	if e.cfg.DiskSeries && e.head.residentIdentityBytes()+e.head.inFlightBytes()+int64(samples)*SampleBytes > e.cfg.ResidentHeadBytes {
 		return errors.New("WAL replay exceeds resident head budget; journal preserved; increase ResidentHeadBytes to recover")
 	}
 	return nil
@@ -485,20 +482,23 @@ func (e *Engine) diskWatermarksForHead(ctx context.Context, parts []*part, ids [
 	bounds := make([]diskHeadEntry, len(ids))
 	for i, id := range ids {
 		newest, seen := e.head.watermark(id)
-		entry := diskHeadEntry{newest: newest, exists: seen}
-		for _, p := range parts {
-			meta, found, err := p.diskSeriesMetadata(ctx, id)
-			if err != nil {
-				return nil, err
+		bounds[i] = diskHeadEntry{newest: newest, exists: seen}
+	}
+	var reader seriesindex.MetadataReader
+	for _, p := range parts {
+		if err := p.visitDiskMetadata(ctx, ids, &reader, func(id signal.SeriesID, meta seriesindex.Metadata) {
+			i, found := slices.BinarySearchFunc(ids, id, signal.SeriesID.Compare)
+			if !found {
+				return
 			}
-			if found {
-				if !entry.exists || meta.Covered > entry.newest {
-					entry.newest = meta.Covered
-				}
-				entry.exists = true
+			entry := &bounds[i]
+			if !entry.exists || meta.Covered > entry.newest {
+				entry.newest = meta.Covered
 			}
+			entry.exists = true
+		}); err != nil {
+			return nil, err
 		}
-		bounds[i] = entry
 	}
 	return bounds, nil
 }

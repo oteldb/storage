@@ -40,7 +40,7 @@ func TestDiskHistoricalBatchPreservesNewest(t *testing.T) {
 		}
 		require.NoError(t, e.Flush(t.Context()))
 	}
-	clear(e.head.disk.cache)
+	e.head.disk.cache.clear()
 	result, err := e.AppendBatch([]signal.SeriesID{b.Hash(), a.Hash(), b.Hash()}, []int64{29, 28, 31}, []float64{1, 1, 1}, nil,
 		func(i int) signal.Series {
 			if i == 1 {

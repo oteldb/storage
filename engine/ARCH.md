@@ -235,12 +235,22 @@ ones sharing the head, and a first sample is never late. Watermarks outlive a fl
 and re-appends do not re-index.
 
 With `Config.DiskSeries`, immutable parts own historical identities and postings. Flush publication
-rebuilds resident metadata around active samples, with a bounded scalable bloom filter and bounded watermark
-cache. Historical cache misses probe parts before admission; distinct-series counts come from a
+rebuilds resident metadata around active samples. A bounded scalable bloom filter rejects definitely
+new IDs. A separate byte-budgeted cache retains only full 128-bit IDs and newest timestamps across
+flushes: pointer-free, 16-way buckets grow in 256 hash shards and evict within a full bucket.
+`SeriesCacheBytes` defaults to 512 MiB per engine, allocated as the working set grows; negative disables
+it. The limit covers retained arrays and their headers; shard growth also temporarily owns its old
+array until collection. Warm probes allocate nothing and retain no attributes or head references.
+Historical cache misses probe parts before admission; a complete successful scan can cache positive
+membership, while unaccepted writes never advance watermarks. Load, adoption, repair, pruning and
+reset invalidate this advisory cache. Recounts hydrate active watermarks from the resulting catalog,
+including higher timestamps introduced by another writer. Distinct-series counts come from a
 streaming union after load, repair and retention, rather than sums of overlapping parts.
 
 `ResidentHeadBytes` defaults to 128 MiB and applies synchronous flush backpressure before the next
-write. One atomic caller batch may exceed the target. This mode disables the optional recent tier.
+write. It counts active/frozen identities and samples, excluding the separately bounded historical
+cache and Bloom filter; flushing cannot reclaim those. `IdentityBytes` still reports all identity
+memory. One atomic caller batch may exceed the target. This mode disables the optional recent tier.
 An oversized old WAL fails recovery without advancing epochs or changing journal bytes; increase
 this budget to recover it. All local admission and head publication wait while historical state is
 incomplete. Accepted WAL and primary replica payloads still restore into the head, preserving

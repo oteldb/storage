@@ -213,6 +213,9 @@ type Options struct {
 	// MetricResidentHeadBytes is the disk-index mode's resident-head pressure target. Zero uses 128 MiB.
 	// One atomic append may exceed the target; pressure flushes happen before subsequent writes.
 	MetricResidentHeadBytes int64
+	// MetricSeriesCacheBytes bounds the historical ID/watermark cache per metric engine.
+	// Zero uses 512 MiB, allocated on demand; negative disables the cache.
+	MetricSeriesCacheBytes int64
 
 	// FlushInterval is the max age of unflushed head data: the cadence of the background loop that
 	// flushes each head to a part and runs compaction/retention. Zero ⇒ a sane default

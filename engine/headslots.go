@@ -148,7 +148,7 @@ func (h *head) seriesState(id signal.SeriesID) headSeriesState {
 		if h.disk != nil {
 			entry, ok := h.disk.pending[id]
 			if !ok {
-				entry = h.disk.cache[id]
+				entry, _ = h.disk.cache.get(id)
 			}
 			return headSeriesState{newest: entry.newest, seen: entry.exists, historical: entry.exists}
 		}
