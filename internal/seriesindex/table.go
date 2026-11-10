@@ -342,8 +342,7 @@ func (c *Cursor) entry(i uint32) (pageInfo, error) {
 		return pageInfo{}, err
 	}
 	var err error
-	c.directory, err = backend.ReadAtAppend(c.ctx, c.table.b, cursorBuffer(c.directory, directorySize), c.table.key,
-		c.table.dir+int64(i)*directorySize, directorySize)
+	c.directory, err = c.readPage(cursorBuffer(c.directory, directorySize), c.table.dir+int64(i)*directorySize, directorySize)
 	if err != nil {
 		return pageInfo{}, err
 	}
@@ -360,7 +359,7 @@ func (c *Cursor) entry(i uint32) (pageInfo, error) {
 		keyOff < off+uint64(packed) {
 		return pageInfo{}, errors.Wrap(ErrCorrupt, "page bounds")
 	}
-	c.first, err = backend.ReadAtAppend(c.ctx, c.table.b, cursorBuffer(c.first, int(keyLen)), c.table.key, int64(keyOff), int64(keyLen))
+	c.first, err = c.readPage(cursorBuffer(c.first, int(keyLen)), int64(keyOff), int64(keyLen))
 	if err != nil {
 		return pageInfo{}, err
 	}
@@ -376,7 +375,7 @@ func (c *Cursor) load(i uint32) bool {
 		c.err = err
 		return false
 	}
-	c.packed, err = backend.ReadAtAppend(c.ctx, c.table.b, cursorBuffer(c.packed, int(p.packed)), c.table.key, p.offset, int64(p.packed))
+	c.packed, err = c.readPage(cursorBuffer(c.packed, int(p.packed)), p.offset, int64(p.packed))
 	if err != nil {
 		c.err = err
 		return false

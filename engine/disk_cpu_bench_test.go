@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/backend"
 	backendfile "github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -103,7 +104,11 @@ func buildCPUFixture(b *testing.B, options cpuFixtureOptions) *cpuFixture {
 		b.Fatal(err)
 	}
 	w.SetSync(options.sync)
-	f.engine = New(Config{Backend: f.counter, WAL: w, Prefix: "cpu", DiskSeries: options.disk,
+	var source backend.Backend = f.counter
+	if os.Getenv("OTELDB_BENCH_CPU_READ_CACHE") == "true" {
+		source = backend.Cached(source, 256<<20)
+	}
+	f.engine = New(Config{Backend: source, WAL: w, Prefix: "cpu", DiskSeries: options.disk,
 		MetricSeriesChunks: true, MetricBlockRows: 1024, AggregateStats: true,
 		DecodeCacheBytes: 16 << 20, DecodeMemoryBytes: 256 << 20, FlushMemoryBytes: 64 << 20})
 	b.Cleanup(func() {
@@ -240,6 +245,7 @@ func (f *cpuFixture) countAll(ctx context.Context, _ int) error {
 
 // BenchmarkDiskSeriesCPUQuery uses one fixture per process mode. Select a single workload when profiling.
 // Set OTELDB_BENCH_DISK_SERIES=true for disk indexes; use a disk-backed TMPDIR for file/WAL timing.
+// OTELDB_BENCH_CPU_READ_CACHE=true enables a shared 256 MiB backend cache; read-B/op counts file reads.
 func BenchmarkDiskSeriesCPUQuery(b *testing.B) {
 	options := cpuBenchOptions(b)
 	f := buildCPUFixture(b, options)

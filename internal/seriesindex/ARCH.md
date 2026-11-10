@@ -18,6 +18,10 @@ footer; seeks range-read directory entries and one selected page. Forward seeks 
 page avoid directory I/O. Oversized records are bounded at 64 MiB and require corresponding
 caller admission. Budgeted reads require native object sizes and ranged reads before opening.
 Unbudgeted opaque backends retain their whole-object fallback.
+Directory entries, seek keys and compressed pages use the backend's immutable-range cache when
+available, sharing its configured byte budget with data columns. Cursors copy borrowed cache
+views into owned scratch before reuse; decoded pages remain operation-local. Bare backends keep
+reusable ranged reads.
 
 The parent digest covers raw manifest bytes, including a persistent per-part nonce, and excludes
 object paths, so part copies and renames preserve the binding. The nonce distinguishes otherwise
