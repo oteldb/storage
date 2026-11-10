@@ -130,3 +130,9 @@ are reused and charged; the existing packed writer retains its original selectio
 Adaptive timestamp mode 0 stores `(mode byte, row count uvarint, first varint, stride varint)`;
 empty chunks omit first and stride. Mode 1 prefixes an existing scaled delta-of-delta stream.
 Counts are capped at 1M rows, and readers reject extra bytes in either mode.
+
+Encoded-granule validation walks every Gorilla control/window and decimal varint with the same
+acceptance rules as ordinary decoding, including exact nested byte consumption. Its optional scalar
+visitor reconstructs one value at a time, preserving float bits and decimal accumulation order without
+sample buffers. Adaptive timestamp validation checks true min/max and strict ordering; regular cadence
+is constant-time when it cannot wrap, otherwise a cursor verifies the original wrapping semantics.

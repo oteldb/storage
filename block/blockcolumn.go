@@ -264,7 +264,6 @@ func (d blockDir) decompress(comp *compress.Compressor, dst []byte, f int, raw [
 	}
 
 	out, err := decode(comp, dst, raw, limit, exact)
-
 	if err != nil {
 		return nil, errors.Wrapf(err, "decompress frame %d", f)
 	}
@@ -1453,6 +1452,23 @@ func newBlockedFloatCursor(dir blockDir, comp *compress.Compressor, codec chunk.
 
 func (c *blockedCursor[T, C]) Len() int { return c.rows }
 func (c *blockedCursor[T, C]) Pos() int { return c.pos }
+
+// SkipToRow advances to a granule boundary or the end without decoding skipped rows.
+func (c *blockedCursor[T, C]) SkipToRow(row int) error {
+	if row < c.pos || row > c.rows {
+		return errors.New("block: skip outside forward cursor range")
+	}
+	target := c.streams.dir.nBlocks()
+	if row < c.rows {
+		target = c.streams.dir.blockAt(row)
+		lo, _ := c.streams.dir.span(target, c.rows)
+		if lo != row {
+			return errors.New("block: skip requires granule boundary")
+		}
+	}
+	c.pos, c.blk, c.opened = row, target-1, false
+	return nil
+}
 
 func (c *blockedCursor[T, C]) Next() (T, error) {
 	var zero T

@@ -28,8 +28,9 @@ import (
 type StreamWriter struct {
 	partConfig
 
-	cols  []*streamColumn
-	marks Marks
+	encodedRun encodedRun
+	cols       []*streamColumn
+	marks      Marks
 
 	// Set by NewStreamWriterTo: where a column's sealed frames go. ctx is held because rows arrive
 	// through the Append methods, which take none; it spans the writer's life, which is one merge's.
@@ -215,6 +216,9 @@ func (w *StreamWriter) AddColumn(c Column) error {
 
 // AppendFloat64Group appends rows, starting a logical group when begin is true.
 func (w *StreamWriter) AppendFloat64Group(i int, vals []float64, begin bool) error {
+	if err := w.flushEncodedRun(); err != nil {
+		return err
+	}
 	c, err := w.column(i, KindFloat64)
 	if err != nil {
 		return err
@@ -236,6 +240,9 @@ func (w *StreamWriter) AppendFloat64Group(i int, vals []float64, begin bool) err
 
 // AppendInt64 appends vals to the i-th column, encoding every granule they complete.
 func (w *StreamWriter) AppendInt64(i int, vals []int64) error {
+	if err := w.flushEncodedRun(); err != nil {
+		return err
+	}
 	c, err := w.column(i, KindInt64)
 	if err != nil {
 		return err
@@ -246,6 +253,9 @@ func (w *StreamWriter) AppendInt64(i int, vals []int64) error {
 
 // AppendFloat64 appends vals to the i-th column, encoding every granule they complete.
 func (w *StreamWriter) AppendFloat64(i int, vals []float64) error {
+	if err := w.flushEncodedRun(); err != nil {
+		return err
+	}
 	c, err := w.column(i, KindFloat64)
 	if err != nil {
 		return err
@@ -335,7 +345,7 @@ func (w *StreamWriter) EncodedBytes() int64 {
 // column's dictionary (bounded by [WithSharedDictBytes]), and stops tracking the part;
 // for a buffered one it tracks [StreamWriter.EncodedBytes] and grows without limit.
 func (w *StreamWriter) ResidentBytes() int64 {
-	var total int64
+	total := w.encodedRun.residentBytes()
 	for _, c := range w.cols {
 		total += c.residentBytes()
 	}
@@ -370,7 +380,7 @@ func (w *StreamWriter) FinishBytes() int64 {
 		transient = max(transient, t)
 	}
 
-	return retained + transient + w.buildBytes()
+	return retained + transient + w.buildBytes() + w.encodedRunFinishBytes()
 }
 
 // objectOpener returns the factory for column i's object writer, or nil when the writer buffers.
@@ -393,6 +403,9 @@ func (w *StreamWriter) build() (builtPart, error) {
 }
 
 func (w *StreamWriter) buildInto(scratch *StreamBuildScratch) (builtPart, error) {
+	if err := w.flushEncodedRun(); err != nil {
+		return builtPart{}, err
+	}
 	if len(w.cols) == 0 {
 		return builtPart{}, errors.New("block: part has no columns")
 	}
