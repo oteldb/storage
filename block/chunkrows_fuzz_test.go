@@ -12,7 +12,10 @@ import (
 
 func TestChunkRowsGolden(t *testing.T) {
 	t.Parallel()
-	a := blockAccum{variable: true, chunkRows: []int{2, 1, 3}, gLens: []int{7, 9, 11}, frameGranules: []int{1, 1, 1}, frameBytes: []int{4, 6, 8}, frameCRC: []uint32{0x12345678, 0x89abcdef, 0xdeadbeef}}
+	a := blockAccum{variable: true, chunkRows: []int{2, 1, 3}, gLens: []int{7, 9, 11}, frameCount: 3}
+	for i, crc := range []uint32{0x12345678, 0x89abcdef, 0xdeadbeef} {
+		a.frameDir = appendFrameMetadata(a.frameDir, 1, 4+i*2, crc)
+	}
 	raw := a.encodeDir(4)
 	require.Equal(t, "0304030104785634120106efcdab890108efbeadde07090b020103", hex.EncodeToString(raw[:len(raw)-4]))
 	require.NoError(t, verifyDirCRC(raw, len(raw)-4))

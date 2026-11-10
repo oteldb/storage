@@ -370,7 +370,7 @@ func (w *StreamWriter) FinishBytes() int64 {
 		transient = max(transient, t)
 	}
 
-	return retained + transient
+	return retained + transient + w.buildBytes()
 }
 
 // objectOpener returns the factory for column i's object writer, or nil when the writer buffers.
@@ -389,6 +389,10 @@ func (w *StreamWriter) objectOpener(i int) func() (backend.ObjectWriter, error) 
 // build serializes the part. Every column must have received the same number of rows, and the
 // writer must not be appended to afterwards.
 func (w *StreamWriter) build() (builtPart, error) {
+	return w.buildInto(&StreamBuildScratch{})
+}
+
+func (w *StreamWriter) buildInto(scratch *StreamBuildScratch) (builtPart, error) {
 	if len(w.cols) == 0 {
 		return builtPart{}, errors.New("block: part has no columns")
 	}
@@ -400,11 +404,8 @@ func (w *StreamWriter) build() (builtPart, error) {
 		}
 	}
 
-	descs := make([]ColumnDesc, len(w.cols))
-	objects := make([][]byte, len(w.cols))
-	// A streamed column's object is committed by finish rather than returned, so its byte size is
-	// carried separately: objects[i] is nil for it exactly as it is for a constant column.
-	sizes := make([]int64, len(w.cols))
+	descs := scratch.growDescriptors(len(w.cols))
+	objects := scratch.growObjects(len(w.cols))
 
 	for i, c := range w.cols {
 		desc, obj, n, err := c.finish(w.ctx, w.granuleSize, w.sizing)
@@ -413,13 +414,13 @@ func (w *StreamWriter) build() (builtPart, error) {
 		}
 
 		desc.Bytes = n
-		descs[i], objects[i], sizes[i] = desc, obj, n
+		descs[i], objects[i] = desc, obj
 	}
 
 	// Dropped whole, so the part looks as if the column had never been declared; always the last
 	// one, so the rest keep their object keys.
 	if i := w.omitConstAt; i == len(descs)-1 && descs[i].Const && descs[i].ConstFloat64 == w.omitConstVal {
-		descs, objects, sizes = descs[:i], objects[:i], sizes[:i]
+		descs, objects = descs[:i], objects[:i]
 	}
 
 	if len(descs) == 0 {
@@ -440,11 +441,12 @@ func (w *StreamWriter) build() (builtPart, error) {
 		m.MinTime, m.MaxTime = descs[idx].MinInt64, descs[idx].MaxInt64
 	}
 
-	encodedMarks := marks.Encode(nil)
+	scratch.marks = marks.Encode(scratch.marks[:0])
+	encodedMarks := scratch.marks
 
 	m.DiskBytes = int64(len(encodedMarks))
-	for _, n := range sizes {
-		m.DiskBytes += n
+	for i := range descs {
+		m.DiskBytes += descs[i].Bytes
 	}
 
 	// Only the columns the part keeps: an omitted const column contributes no decoded bytes to a
@@ -453,7 +455,8 @@ func (w *StreamWriter) build() (builtPart, error) {
 		m.RawBytes += c.raw
 	}
 
-	return builtPart{objects: objects, marks: encodedMarks, manifest: m.Encode(nil)}, nil
+	scratch.manifest = m.Encode(scratch.manifest[:0])
+	return builtPart{objects: objects, marks: encodedMarks, manifest: scratch.manifest}, nil
 }
 
 func (w *StreamWriter) column(i int, want Kind) (*streamColumn, error) {
@@ -496,11 +499,21 @@ func (w *StreamWriter) sortKeyIndex() int {
 // the part uncommitted (no manifest) but may leave column objects behind, exactly as a failure
 // partway through [WritePart] does.
 func WriteStreamPart(ctx context.Context, b backend.Backend, prefix string, w *StreamWriter) error {
+	return WriteStreamPartWithScratch(ctx, b, prefix, w, nil)
+}
+
+// WriteStreamPartWithScratch reuses caller-owned metadata buffers while writing w.
+// scratch must not be shared by concurrent writes; nil uses temporary buffers.
+func WriteStreamPartWithScratch(ctx context.Context, b backend.Backend, prefix string, w *StreamWriter, scratch *StreamBuildScratch) error {
+	if scratch == nil {
+		scratch = &StreamBuildScratch{}
+	}
+	defer scratch.reset()
 	if w.b != nil && prefix != w.prefix {
 		return errors.Errorf("block: stream writer targets prefix %q, not %q", w.prefix, prefix)
 	}
 
-	built, err := w.build()
+	built, err := w.buildInto(scratch)
 	if err != nil {
 		w.Abort()
 
@@ -858,7 +871,7 @@ func (c *streamColumn) finishBytes() (retained, transient int64) {
 
 	transient = max(c.blk.sealBytes(), c.alt.sealBytes())
 	if c.variable && c.blk != nil {
-		sizing := ColumnSizing{NumFrames: int64(len(c.blk.frameGranules) + 1), NumGranules: int64(len(c.blk.gLens) + 1)}
+		sizing := ColumnSizing{NumFrames: int64(c.blk.frameCount + 1), NumGranules: int64(len(c.blk.gLens) + 1)}
 		n := compactDirBound(sizing, c.timeBounds)
 		transient = max(transient, 2*n+c.blk.dirComp.CompressTransient(int(n), false)+c.blk.dirComp.EncodeWorkspace())
 	}
@@ -888,10 +901,7 @@ func (c *streamColumn) finishBytes() (retained, transient int64) {
 			retained = region
 		}
 	case buffered:
-		raw := int64(cap(c.blk.pending))
-		for _, f := range c.blk.frameRaw {
-			raw += int64(f)
-		}
+		raw := int64(cap(c.blk.pending)) + c.blk.sealedRaw
 
 		transient = max(transient, raw+c.comp.CompressTransient(int(raw), false))
 	}
@@ -1109,23 +1119,21 @@ type blockAccum struct {
 	dirComp               *compress.Compressor
 	compressBytes         int
 
-	frames [][]byte // retained frames; empty once a sink is attached
-	// Per sealed frame: its granule count and its compressed byte length. Kept apart from frames
-	// because a streamed frame is gone by the time the directory is written.
-	frameGranules    []int
-	frameBytes       []int
-	frameCRC         []uint32 // per sealed frame: CRC32C over its compressed bytes
-	frameRaw         []int    // per sealed frame: its decompressed length
-	variable         bool
-	timeBounds       bool
-	minKeys, maxKeys []int64
-	chunkRows        []int
-	gLens            []int // per-granule stream length within its frame
-	pending          []byte
-	packed           []byte
-	inFrame          int
-	bytes            int // compressed bytes sealed so far, the size the codec choice compares on
-	dirLen           int // the directory's encoded length, once finished
+	frames                     [][]byte // retained frames; empty once a sink is attached
+	frameDir                   []byte
+	frameCount                 int
+	maxFrameBytes, maxFrameRaw int
+	sealedRaw                  int64
+	variable                   bool
+	timeBounds                 bool
+	minKeys, maxKeys           []int64
+	chunkRows                  []int
+	gLens                      []int // per-granule stream length within its frame
+	pending                    []byte
+	packed                     []byte
+	inFrame                    int
+	bytes                      int // compressed bytes sealed so far, the size the codec choice compares on
+	dirLen                     int // the directory's encoded length, once finished
 
 	sink    backend.ObjectWriter
 	written int64 // bytes handed to the sink
@@ -1149,10 +1157,10 @@ func (a *blockAccum) residentBytes() int64 {
 		return 0
 	}
 
-	// Three ints per frame and one per granule, all in slices that grow amortized.
-	slots := cap(a.frameGranules) + cap(a.frameBytes) + cap(a.frameRaw) + cap(a.gLens) + cap(a.chunkRows)
+	// Frame records are already encoded; granule lengths and bounds remain numeric.
+	slots := cap(a.gLens) + cap(a.chunkRows)
 	slots += cap(a.minKeys) + cap(a.maxKeys)
-	dir := int64(slots)*8 + int64(cap(a.frameCRC))*4
+	dir := int64(slots)*8 + int64(cap(a.frameDir))
 
 	resident := int64(cap(a.pending)+cap(a.packed)) + dir + int64(cap(a.frames))*8
 	if a.sink == nil {
@@ -1242,10 +1250,11 @@ func (a *blockAccum) seal() error {
 	}
 	f := a.comp.Compress(dst, a.pending)
 
-	a.frameGranules = append(a.frameGranules, a.inFrame)
-	a.frameBytes = append(a.frameBytes, len(f))
-	a.frameCRC = append(a.frameCRC, crc32.Checksum(f, castagnoli))
-	a.frameRaw = append(a.frameRaw, len(a.pending))
+	a.frameDir = appendFrameMetadata(a.frameDir, a.inFrame, len(f), crc32.Checksum(f, castagnoli))
+	a.frameCount++
+	a.maxFrameBytes = max(a.maxFrameBytes, len(f))
+	a.maxFrameRaw = max(a.maxFrameRaw, len(a.pending))
+	a.sealedRaw += int64(len(a.pending))
 	a.bytes += len(f)
 	a.pending, a.inFrame = a.pending[:0], 0
 
@@ -1331,15 +1340,9 @@ func (a *blockAccum) finishBuffered(blockRows int, region []byte) []byte {
 
 // sizing is the finished column's [ColumnSizing].
 func (a *blockAccum) sizing() ColumnSizing {
-	s := ColumnSizing{DirLen: int64(a.dirLen), NumGranules: int64(len(a.gLens)), NumFrames: int64(len(a.frameGranules))}
+	s := ColumnSizing{DirLen: int64(a.dirLen), NumGranules: int64(len(a.gLens)), NumFrames: int64(a.frameCount)}
 
-	for _, n := range a.frameBytes {
-		s.MaxFrameBytes = max(s.MaxFrameBytes, int64(n))
-	}
-
-	for _, n := range a.frameRaw {
-		s.MaxFrameRaw = max(s.MaxFrameRaw, int64(n))
-	}
+	s.MaxFrameBytes, s.MaxFrameRaw = int64(a.maxFrameBytes), int64(a.maxFrameRaw)
 
 	for _, n := range a.gLens {
 		s.MaxGranuleRaw = max(s.MaxGranuleRaw, int64(n))
@@ -1381,13 +1384,9 @@ func (a *blockAccum) finishStreamed(ctx context.Context, region, dir []byte) (in
 func (a *blockAccum) encodeDir(blockRows int) []byte {
 	dir := binary.AppendUvarint(nil, uint64(len(a.gLens)))
 	dir = binary.AppendUvarint(dir, uint64(blockRows))
-	dir = binary.AppendUvarint(dir, uint64(len(a.frameGranules)))
+	dir = binary.AppendUvarint(dir, uint64(a.frameCount))
 
-	for i, n := range a.frameGranules {
-		dir = binary.AppendUvarint(dir, uint64(n))
-		dir = binary.AppendUvarint(dir, uint64(a.frameBytes[i]))
-		dir = binary.LittleEndian.AppendUint32(dir, a.frameCRC[i])
-	}
+	dir = append(dir, a.frameDir...)
 
 	for _, l := range a.gLens {
 		dir = binary.AppendUvarint(dir, uint64(l))

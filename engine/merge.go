@@ -652,6 +652,7 @@ func (e *Engine) compactStreamWithInputs(
 	held := buildbudget.Add(buildbudget.Add(inputBytes, coders.workspace()), mergeRangeBatchBytes(len(src)))
 
 	var newParts []*part
+	var buildScratch block.StreamBuildScratch
 
 	router := timebucket.Router[*partStreamWriter]{
 		Open: func(int64) (*partStreamWriter, error) {
@@ -660,6 +661,7 @@ func (e *Engine) compactStreamWithInputs(
 				return nil, err
 			}
 			w.mergeFinish = &mergeFinishBudget{}
+			w.buildScratch = &buildScratch
 			return w, nil
 		},
 		Finish: func(w *partStreamWriter) error {
@@ -673,7 +675,7 @@ func (e *Engine) compactStreamWithInputs(
 			return nil
 		},
 		Resident:      (*partStreamWriter).mergeResidentBytes,
-		Held:          func() int64 { return held },
+		Held:          func() int64 { return buildbudget.Add(held, buildScratch.SizeBytes()) },
 		MaxOpen:       timebucket.MaxOpenWriters,
 		ResidentLimit: budget.ResidentBytes,
 	}

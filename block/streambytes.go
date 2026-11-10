@@ -456,14 +456,20 @@ func (c *streamColumn) finishDict(
 func (a *blockAccum) unframeSelf(rows int) ([]byte, error) {
 	vals := make([][]byte, 0, rows)
 	g := 0
+	metadata := a.frameDir
 
-	for i, f := range a.frames {
+	for _, f := range a.frames {
 		frame, err := a.comp.Decompress(nil, f)
 		if err != nil {
 			return nil, errors.Wrap(err, "decompress own frame")
 		}
 
-		for range a.frameGranules[i] {
+		var count int
+		metadata, count, err = nextFrameGranules(metadata)
+		if err != nil {
+			return nil, err
+		}
+		for range count {
 			stream := frame[1:a.gLens[g]]
 			frame = frame[a.gLens[g]:]
 			g++
