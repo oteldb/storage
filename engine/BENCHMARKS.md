@@ -77,3 +77,15 @@ The phase benchmark also tags CPU samples with `phase` (`input-generation`, `eng
 `seed`, `storage`, `cleanup`) and `operation`. These labels help navigate a global CPU profile;
 CPU labels do not filter heap/allocation profiles and may omit separately created background
 workers. Prefer scoped captures for complete operation-window profiles.
+
+## Profile compaction only
+
+`BenchmarkDiskSeriesCPUMerge` supports the same `OTELDB_BENCH_CPU_PROFILE` prefix. It writes
+`<prefix>.merge.cpu`, `.merge.allocs.before`, `.merge.allocs.after` and `.merge.heap.after`.
+Generation, input appends/flushes and cleanup are outside the capture. Select `-count=1` and
+`-benchtime=1x`; repeated benchmark invocations with the same prefix overwrite the profiles.
+The matching binary can be retained with `-o` as above.
+
+The default fixture merges four parts holding 80,000 series and 16 samples per series each:
+**5,120,000 input samples**, not 80,000 samples. `series/op` and `samples/op` report these counts;
+MB/s measures logical timestamp/value bytes. Scoped profiles are separate from timing comparisons.
