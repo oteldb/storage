@@ -24,8 +24,8 @@ require (
 	go.etcd.io/etcd/api/v3 v3.7.3
 	go.etcd.io/etcd/client/v3 v3.7.3
 	go.etcd.io/etcd/server/v3 v3.7.3
-	go.opentelemetry.io/collector/pdata v1.70.0
-	go.opentelemetry.io/collector/pdata/pprofile v0.164.0
+	go.opentelemetry.io/collector/pdata v1.71.0
+	go.opentelemetry.io/collector/pdata/pprofile v0.165.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/metric v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0
@@ -89,7 +89,7 @@ require (
 	go.etcd.io/etcd/pkg/v3 v3.7.3 // indirect
 	go.etcd.io/raft/v3 v3.7.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
-	go.opentelemetry.io/collector/featuregate v1.70.0 // indirect
+	go.opentelemetry.io/collector/featuregate v1.71.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.71.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.46.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.46.0 // indirect
@@ -110,7 +110,7 @@ require (
 	golang.org/x/tools v0.51.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260928230214-8a89bd6388cc // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260928230214-8a89bd6388cc // indirect
-	google.golang.org/grpc v1.84.0 // indirect
+	google.golang.org/grpc v1.85.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
