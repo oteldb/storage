@@ -43,6 +43,7 @@ type headPartBuilder struct {
 	parts            []*part
 	rows             int
 	orderWorkspace   int64
+	buildScratch     block.StreamBuildScratch
 }
 
 func (e *Engine) flushMemoryBytes() int64 {
@@ -112,6 +113,7 @@ func (b *headPartBuilder) baseBytes() int64 {
 	}
 	n := buildbudget.Add(8<<20, buildbudget.Mul(int64(blockRows), 64))
 	n = buildbudget.Add(n, b.orderWorkspace)
+	n = buildbudget.Add(n, b.buildScratch.SizeBytes())
 	return buildbudget.Add(n, memsize.Slice(b.entries)+memsize.Slice(b.partRefs))
 }
 
@@ -252,6 +254,7 @@ func (b *headPartBuilder) append(id chunk.U128, ref uint32, ts []int64, values, 
 			if err != nil {
 				return err
 			}
+			b.writer.buildScratch = &b.buildScratch
 			if err := b.writer.reserveSeries(len(b.entries)); err != nil {
 				return err
 			}

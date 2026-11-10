@@ -54,11 +54,12 @@ type partStreamWriter struct {
 	sampled bool
 	ones    []float64 // unit weights an unsampled series contributes to a declared weight column
 
-	rows        int
-	minT, maxT  int64
-	haveTime    bool
-	buffered    bool
-	mergeFinish *mergeFinishBudget
+	rows         int
+	minT, maxT   int64
+	haveTime     bool
+	buffered     bool
+	mergeFinish  *mergeFinishBudget
+	buildScratch *block.StreamBuildScratch
 
 	streamIdentities    bool
 	identityWriterBytes int64
@@ -302,7 +303,7 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 
 	prefix := p.prefix
 
-	if err := block.WriteStreamPart(ctx, p.e.cfg.Backend, prefix, p.w); err != nil {
+	if err := block.WriteStreamPartWithScratch(ctx, p.e.cfg.Backend, prefix, p.w, p.buildScratch); err != nil {
 		return nil, errors.Wrapf(err, "write part %q", prefix)
 	}
 

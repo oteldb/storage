@@ -50,7 +50,7 @@ func BenchmarkChunkDirectoryFinishEstimate(b *testing.B) {
 			comp := compress.NewCompressor(compress.AlgorithmNone, 0)
 			c := streamColumn{variable: true, comp: comp, blk: &blockAccum{
 				comp: comp, dirComp: compress.NewCompressor(compress.AlgorithmLZ4, 0),
-				frameGranules: make([]int, chunks), gLens: make([]int, chunks),
+				frameCount: chunks, gLens: make([]int, chunks),
 			}}
 			b.ReportAllocs()
 			for b.Loop() {

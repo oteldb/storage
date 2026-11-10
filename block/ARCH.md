@@ -107,6 +107,11 @@ decodable on its own. Decode granularity stays `WithGranuleSize`; compression gr
 frame. Reads decompress one frame at a time and cache it (`blockStreams`), so any walk in granule
 order — whole column, row range, block set, cursor — decompresses each frame exactly once.
 
+Frame metadata is appended directly to its final varint/CRC representation as each frame seals.
+Only frame counts, maxima and the total raw size remain scalar; granule lengths stay numeric for
+buffered dictionary fallback. Finishing prepends the counts and appends those frame records without
+rebuilding four parallel per-frame arrays. The serialized directory and sizing values are unchanged.
+
 A framed column's directory normally *leads* its frames. `flagFooter` marks the one case it trails
 them, closed by a fixed 4-byte little-endian directory length so a reader finds its start from the
 object's end. The directory fields are identical either way; only where they sit differs. It exists
@@ -202,6 +207,10 @@ result. Measured on a real attributes column, whole-column decode: 324699 flat r
 After a successful `WriteStreamPart`, `StreamWriter.Marks` exposes its finalized sort-key bounds
 as an immutable view. The writer allocation can pass to a reader without re-reading the marks
 object; no format or durability step changes.
+`WriteStreamPartWithScratch` reuses caller-owned descriptor/object headers and encoded marks/manifest
+buffers. The backend write contract permits reuse after each call returns; cached writes invalidate
+rather than retain the caller's data. Raw marks are never pooled. Scratch clears pointer references
+on success and failure, retains at most 4 MiB, and must not be shared by concurrent writes.
 
 `PartWriter` takes whole columns and serializes them in one pass. `StreamWriter` builds the same
 part incrementally: the schema is declared up front, rows arrive through `AppendInt64` /

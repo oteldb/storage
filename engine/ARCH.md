@@ -2005,3 +2005,8 @@ replica application trust the already accepted payload instead of reapplying a m
 
 `WindowSpec.Validate` rejects nonpositive overlapping-window steps before planning or empty-range
 shortcuts. Disjoint step aggregates retain their step<=0 whole-range convention.
+
+Streaming metric flushes and merges keep separate operation-owned build scratch. Merge output
+finalization is sequential across router writers, so one workspace serves those outputs; its retained
+capacity is charged to the router's held bytes. Flush scratch is charged to the builder's base bytes.
+Published raw marks remain owned by their original writer and are never recycled with build scratch.
