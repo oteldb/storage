@@ -1,7 +1,6 @@
 package chunk
 
 import (
-	"math"
 	"testing"
 )
 
@@ -292,7 +291,7 @@ func BenchmarkU128DecodeReuseDst(b *testing.B) {
 func BenchmarkDecimalEncode(b *testing.B) {
 	vals := make([]float64, 1000)
 	for i := range vals {
-		vals[i] = math.Round(float64(i)*100) / 100
+		vals[i] = float64(i) / 100
 	}
 
 	b.SetBytes(int64(len(vals)) * 8) // raw input bytes encoded/sec
@@ -307,7 +306,7 @@ func BenchmarkDecimalEncode(b *testing.B) {
 func BenchmarkDecimalDecode(b *testing.B) {
 	vals := make([]float64, 1000)
 	for i := range vals {
-		vals[i] = math.Round(float64(i)*100) / 100
+		vals[i] = float64(i) / 100
 	}
 
 	enc := EncodeFloatsDecimal(nil, vals, 64)
