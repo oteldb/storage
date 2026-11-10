@@ -653,6 +653,7 @@ func (e *Engine) compactStreamWithInputs(
 
 	var newParts []*part
 	var buildScratch block.StreamBuildScratch
+	var closedBloomBytes int64
 
 	router := timebucket.Router[*partStreamWriter]{
 		Open: func(int64) (*partStreamWriter, error) {
@@ -671,11 +672,14 @@ func (e *Engine) compactStreamWithInputs(
 			}
 
 			newParts = append(newParts, p)
+			closedBloomBytes = buildbudget.Add(closedBloomBytes, p.idBloom.Load().sizeBytes())
 
 			return nil
 		},
-		Resident:      (*partStreamWriter).mergeResidentBytes,
-		Held:          func() int64 { return buildbudget.Add(held, buildScratch.SizeBytes()) },
+		Resident: (*partStreamWriter).mergeResidentBytes,
+		Held: func() int64 {
+			return buildbudget.Add(buildbudget.Add(held, buildScratch.SizeBytes()), closedBloomBytes)
+		},
 		MaxOpen:       timebucket.MaxOpenWriters,
 		ResidentLimit: budget.ResidentBytes,
 	}

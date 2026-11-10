@@ -241,7 +241,7 @@ func (p *part) lookupDiskSeries(ctx context.Context, id signal.SeriesID) (signal
 }
 
 func (p *part) diskSeriesMetadata(ctx context.Context, id signal.SeriesID) (seriesindex.Metadata, bool, error) {
-	if !p.index.mayContainID(id) {
+	if !p.mayContainDiskID(id) {
 		return seriesindex.Metadata{}, false, nil
 	}
 	ctx = p.reader.ReaderContext(ctx)
@@ -294,15 +294,26 @@ func (p *part) validateDiskSeriesIDs(ctx context.Context) error {
 	if p.diskIDsChecked {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	ids, err := p.diskSeriesIDs(ctx)
 	if err != nil {
 		return err
 	}
+	bloom := newPartIDBloom(p.index.seriesCount())
 	for ids.Next() {
+		if bloom != nil {
+			bloom.add(ids.At())
+		}
 	}
 	if err := ids.Err(); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p.idBloom.Store(bloom)
 	p.diskIDsChecked = true
 	return nil
 }
@@ -414,6 +425,17 @@ func (p *part) visitDiskMetadata(ctx context.Context, ids []signal.SeriesID, rea
 	if len(ids) == 0 {
 		return nil
 	}
+	bloom := p.idBloom.Load()
+	if bloom != nil {
+		first := 0
+		for first < len(ids) && !bloom.mayContain(ids[first]) {
+			first++
+		}
+		ids = ids[first:]
+		if len(ids) == 0 {
+			return nil
+		}
+	}
 	ctx = p.reader.ReaderContext(ctx)
 	index, err := p.seriesIndex(ctx)
 	if err != nil {
@@ -425,6 +447,9 @@ func (p *part) visitDiskMetadata(ctx context.Context, ids []signal.SeriesID, rea
 		lookup = reader.Lookup
 	}
 	for _, id := range ids {
+		if !bloom.mayContain(id) {
+			continue
+		}
 		meta, found, err := lookup(id)
 		if err != nil {
 			return err

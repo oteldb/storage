@@ -241,6 +241,15 @@ flushes: pointer-free, 16-way buckets grow in 256 hash shards and evict within a
 `SeriesCacheBytes` defaults to 512 MiB per engine, allocated as the working set grows; negative disables
 it. The limit covers retained arrays and their headers; shard growth also temporarily owns its old
 array until collection. Warm probes allocate nothing and retain no attributes or head references.
+Immutable indexed parts build a four-hash ID Bloom filter during the existing verified
+series-index/SIDX ID scan. Fresh outputs seed it from the ordered writer IDs after checking the
+output descriptor IDs; this does not mark a future on-disk validation as complete. Only a successful
+complete scan or output check publishes it; absent or unfinished
+filters always fall back to lookup, and legacy parts keep their on-demand path. Filters target
+at least ten bits per ID up to 1 MiB per part; larger parts can become less selective without
+introducing false negatives. They retire with their part handle. Negative probes skip metadata
+page reads and decompression before reader setup. `IdentityBytes` includes these filters,
+including retired pinned parts, while resident-head flush pressure excludes them.
 Historical cache misses probe parts before admission; a complete successful scan can cache positive
 membership, while unaccepted writes never advance watermarks. Load, adoption, repair, pruning and
 reset invalidate this advisory cache. Recounts hydrate active watermarks from the resulting catalog,

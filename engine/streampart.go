@@ -236,7 +236,7 @@ func (p *partStreamWriter) residentBytes() int64 {
 
 	total := p.w.ResidentBytes() + int64(cap(p.runs))*runBytes
 	if p.seriesBuilder != nil {
-		total += p.seriesBuilder.Bytes()
+		total += p.seriesBuilder.Bytes() + partIDBloomBytes(p.seriesBuilder.Count())
 		if p.buffered {
 			total += 3 * p.seriesBuilder.EncodedBound()
 		}
@@ -339,6 +339,10 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 		return nil, err
 	}
 
+	if err := p.seedPartIDBloom(ctx, part); err != nil {
+		part.closeReaders()
+		return nil, err
+	}
 	part.minTime, part.maxTime = p.minT, p.maxT
 	p.e.cacheWrittenMarks(part, p.w.Marks())
 

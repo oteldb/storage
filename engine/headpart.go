@@ -44,6 +44,7 @@ type headPartBuilder struct {
 	rows             int
 	orderWorkspace   int64
 	buildScratch     block.StreamBuildScratch
+	closedBloomBytes int64
 }
 
 func (e *Engine) flushMemoryBytes() int64 {
@@ -114,6 +115,7 @@ func (b *headPartBuilder) baseBytes() int64 {
 	n := buildbudget.Add(8<<20, buildbudget.Mul(int64(blockRows), 64))
 	n = buildbudget.Add(n, b.orderWorkspace)
 	n = buildbudget.Add(n, b.buildScratch.SizeBytes())
+	n = buildbudget.Add(n, b.closedBloomBytes)
 	return buildbudget.Add(n, memsize.Slice(b.entries)+memsize.Slice(b.partRefs))
 }
 
@@ -310,6 +312,7 @@ func (b *headPartBuilder) finish() error {
 	}
 	planFlushBlocks(p)
 	b.parts = append(b.parts, p)
+	b.closedBloomBytes = buildbudget.Add(b.closedBloomBytes, p.idBloom.Load().sizeBytes())
 	b.writer = nil
 	b.partRefs = b.partRefs[:0]
 	return nil
