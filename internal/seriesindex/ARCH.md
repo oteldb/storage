@@ -84,3 +84,23 @@ identity per output ID. Equal-ID new-format payloads must agree byte-for-byte; l
 already contain validated canonical identities. The selected descriptor is consumed into owned
 compact output state before any source cursor advances. Source hash checks and checked output
 insertion remain independent validation boundaries.
+
+Compaction can register checked identities without rebuilding their label maps. `PostingMerge`
+retains sorted source/output reference pairs and streams the source presence/name/value key spaces
+into the output table. Equal keys merge sorted references, dropping duplicates and excluded series.
+
+A source mapping every output reference supplies all memberships because source descriptors already
+agree with the checked canonical output identities. The smallest covering index alone is read.
+Otherwise broad unions use the merged path only when at most two source references map to each
+output series on average. Sparse or duplicate-heavy outputs rebuild from owned compact identities.
+
+Source-local ordinals never escape their parent index. Dense remapping windows are used only when
+at most four slots cover each selected reference; sparse mappings stay compact. Source pages,
+owned grouping keys, chunk buffers, remapping windows and sparse-fallback construction are admitted.
+Outputs selecting less than a quarter of the chosen sources' references avoid rescanning their
+postings and rebuild from compact identities instead.
+
+Reuse trusts the same posting membership semantics as query resolution. Every visited source page,
+escaped key, typed value, reference range, chunk order and name flag is checked, even for excluded
+references. Unused membership indexes need no reads; all contributing identity descriptors retain
+their independent validation. CRC-valid missing postings are not reconstructed on this path.

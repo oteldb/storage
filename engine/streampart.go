@@ -30,6 +30,7 @@ const (
 // Rows must arrive in the part's sort order; consecutive chunks of one series are coalesced.
 type partStreamWriter struct {
 	seriesBuilder *seriesindex.Builder
+	postingMerge  *seriesindex.PostingMerge
 	e             *Engine
 	w             *block.StreamWriter
 	prefix        string

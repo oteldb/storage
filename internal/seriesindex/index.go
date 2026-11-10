@@ -52,15 +52,18 @@ type valuePosting struct {
 
 // Builder owns one output part's metadata. Callers include Bytes in their build admission.
 type Builder struct {
-	registry                     *series.Index
-	records                      []record
-	names                        map[string]*namePosting
-	values                       map[string]*valuePosting
-	bytes                        int64
-	canonicalScratch             []byte
-	valueScratch, postingScratch []byte
-	parentDigest                 [32]byte
-	encodedRaw, encodedRecords   int64
+	registry                         *series.Index
+	records                          []record
+	names                            map[string]*namePosting
+	values                           map[string]*valuePosting
+	bytes                            int64
+	canonicalScratch                 []byte
+	valueScratch, postingScratch     []byte
+	parentDigest                     [32]byte
+	encodedRaw, encodedRecords       int64
+	mergedPostings                   *PostingMerge
+	fallbackBytes                    int64
+	mergeCanonicalBytes, mergeLabels int64
 }
 
 // Bytes bounds retained metadata and sorting/directory scratch during writing.
@@ -69,7 +72,7 @@ func (b *Builder) Bytes() int64 {
 	if b.registry != nil {
 		n += b.registry.SizeBytes()
 	}
-	return 3*n + 512<<10
+	return 3*n + 512<<10 + b.fallbackBytes + b.mergedPostings.Bytes()
 }
 
 // EncodedBound bounds the whole buffered output, including repeated canonical identities.
@@ -132,6 +135,44 @@ func (b *Builder) AddView(view series.View, i int, meta Metadata) error {
 		b.addLabel(ref, name, value)
 	})
 	view.EncodedAttributes(i, func(name, encoded []byte) { b.addEncodedLabel(ref, name, encoded) })
+	return nil
+}
+
+// MergePostings chooses immutable source postings for subsequent AddIdentity calls.
+func (b *Builder) MergePostings(m *PostingMerge) { b.mergedPostings = m }
+
+// AddIdentity appends a checked descriptor whose label memberships come from MergePostings.
+func (b *Builder) AddIdentity(id signal.SeriesID, s signal.Series, meta Metadata) error {
+	if b.mergedPostings == nil {
+		return errors.New("seriesindex: no merge postings")
+	}
+	if err := b.checkID(id); err != nil {
+		return err
+	}
+	if b.registry == nil {
+		b.registry = series.New()
+	}
+	canonicalBytes, ok := b.registry.AddChecked(id, s)
+	if !ok {
+		return errors.New("seriesindex: identity hash mismatch")
+	}
+	b.appendRecord(id, meta, canonicalBytes)
+	labels := len(s.Resource.Attributes) + len(s.Scope.Attributes) + len(s.Attributes)
+	if len(s.Scope.Name) > 0 {
+		labels++
+	}
+	if len(s.Scope.Version) > 0 {
+		labels++
+	}
+	// Sparse fallback reserves keys, map entries and reference growth; source table records
+	// bound distinct posting keys, while canonical bytes cover their escaped byte copies.
+	b.mergeCanonicalBytes = buildbudget.Add(b.mergeCanonicalBytes, int64(canonicalBytes))
+	b.mergeLabels = buildbudget.Add(b.mergeLabels, int64(labels))
+	keys := min(b.mergeLabels, b.mergedPostings.postingRecords)
+	postingBytes := buildbudget.Add(buildbudget.Mul(b.mergeLabels, 16), buildbudget.Mul(keys, 256))
+	b.fallbackBytes = buildbudget.Add(buildbudget.Mul(b.mergeCanonicalBytes, 4), postingBytes)
+	b.encodedRaw = buildbudget.Add(b.encodedRaw, int64(canonicalBytes)*6+int64(labels)*160)
+	b.encodedRecords = buildbudget.Add(b.encodedRecords, int64(labels)*3)
 	return nil
 }
 
@@ -201,6 +242,9 @@ func recordKey(ref uint32) []byte { return binary.BigEndian.AppendUint32([]byte{
 
 // Write emits one complete, range-readable index without taking ownership of dst.
 func (b *Builder) Write(dst io.Writer) error {
+	if err := b.prepareMergedPostings(); err != nil {
+		return err
+	}
 	w := NewTableWriter(dst)
 	w.seriesCount = uint32(len(b.records))
 	w.parentDigest = b.parentDigest
@@ -215,6 +259,11 @@ func (b *Builder) Write(dst io.Writer) error {
 		names = append(names, name)
 	}
 	slices.Sort(names)
+	if b.mergedPostings != nil {
+		if err := b.writeMergedPostings(w, 'h'); err != nil {
+			return err
+		}
+	}
 	for _, name := range names {
 		if err := postings.write(appendEscaped([]byte{'h'}, []byte(name)), b.names[name].refs); err != nil {
 			return err
@@ -233,6 +282,11 @@ func (b *Builder) Write(dst io.Writer) error {
 			return err
 		}
 	}
+	if b.mergedPostings != nil {
+		if err := b.writeMergedPostings(w, 'n'); err != nil {
+			return err
+		}
+	}
 	for _, name := range names {
 		value := byte(0)
 		if b.names[name].nonString {
@@ -247,6 +301,11 @@ func (b *Builder) Write(dst io.Writer) error {
 		values = append(values, key)
 	}
 	slices.Sort(values)
+	if b.mergedPostings != nil {
+		if err := b.writeMergedPostings(w, 'p'); err != nil {
+			return err
+		}
+	}
 	for _, key := range values {
 		if err := postings.write([]byte(key), b.values[key].refs); err != nil {
 			return err
@@ -293,10 +352,6 @@ func (b *Builder) checkID(id signal.SeriesID) error {
 }
 
 func (b *Builder) appendRecord(id signal.SeriesID, meta Metadata, canonicalBytes int) uint32 {
-	if b.names == nil {
-		b.names, b.values = make(map[string]*namePosting), make(map[string]*valuePosting)
-		b.bytes += 2 * memsize.MapBase
-	}
 	b.encodedRaw = buildbudget.Add(b.encodedRaw, int64(canonicalBytes)+184)
 	b.encodedRecords = buildbudget.Add(b.encodedRecords, 2)
 	ref := uint32(len(b.records))
@@ -406,12 +461,20 @@ func decodeRecord(data []byte) (signal.SeriesID, []byte, Metadata, error) {
 	return id, raw, meta, nil
 }
 
+func (b *Builder) initPostings() {
+	if b.names == nil {
+		b.names, b.values = make(map[string]*namePosting), make(map[string]*valuePosting)
+		b.bytes += 2 * memsize.MapBase
+	}
+}
+
 func (b *Builder) addLabel(ref uint32, name []byte, value signal.Value) {
 	b.valueScratch = signal.AppendValue(b.valueScratch[:0], value)
 	b.addEncodedLabel(ref, name, b.valueScratch)
 }
 
 func (b *Builder) addEncodedLabel(ref uint32, name, encoded []byte) {
+	b.initPostings()
 	n := b.names[string(name)]
 	if n == nil {
 		n = &namePosting{}
@@ -465,6 +528,34 @@ func (w *postingsWriter) write(prefix []byte, refs []uint32) error {
 			return err
 		}
 		refs = refs[n:]
+	}
+	return nil
+}
+
+func (b *Builder) prepareMergedPostings() error {
+	if b.mergedPostings != nil {
+		for _, source := range b.mergedPostings.sources {
+			for _, pair := range source.pairs {
+				if pair.output >= uint32(len(b.records)) {
+					return errors.New("seriesindex: output reference bounds")
+				}
+			}
+		}
+	}
+	if b.mergedPostings != nil {
+		b.mergedPostings.selectCovering(b.Count())
+	}
+	if b.mergedPostings != nil && !b.mergedPostings.dense() {
+		view := b.View()
+		for i := range b.Count() {
+			resource, scope := view.Context(i)
+			visitLabels(signal.Series{Resource: resource, Scope: scope}, func(name []byte, value signal.Value) {
+				b.addLabel(uint32(i), name, value)
+			})
+			view.EncodedAttributes(i, func(name, encoded []byte) { b.addEncodedLabel(uint32(i), name, encoded) })
+		}
+		b.mergedPostings = nil
+		b.fallbackBytes = 0
 	}
 	return nil
 }

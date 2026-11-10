@@ -2019,3 +2019,8 @@ Streaming metric flushes and merges keep separate operation-owned build scratch.
 finalization is sequential across router writers, so one workspace serves those outputs; its retained
 capacity is charged to the router's held bytes. Flush scratch is charged to the builder's base bytes.
 Published raw marks remain owned by their original writer and are never recycled with build scratch.
+
+Disk-series merges whose sources all have immutable indexes record source/output reference pairs
+alongside checked output identities. Finalization remaps and merges source postings directly; mixed
+legacy inputs retain label-based construction. Output mappings follow each time-bucket writer, so
+retention, size splitting and overlapping series preserve the output's own canonical reference order.

@@ -651,6 +651,8 @@ func (e *Engine) compactStreamWithInputs(
 	budget := mergestream.Budget{DiskBytes: capBytes, ResidentBytes: allowance}
 	held := buildbudget.Add(buildbudget.Add(inputBytes, coders.workspace()), mergeRangeBatchBytes(len(src)))
 
+	postingSources := diskMergeIndexes(metadata)
+
 	var newParts []*part
 	var buildScratch block.StreamBuildScratch
 	var closedBloomBytes int64
@@ -663,6 +665,7 @@ func (e *Engine) compactStreamWithInputs(
 			}
 			w.mergeFinish = &mergeFinishBudget{}
 			w.buildScratch = &buildScratch
+			w.initMergePostings(ctx, postingSources)
 			return w, nil
 		},
 		Finish: func(w *partStreamWriter) error {
