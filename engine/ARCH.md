@@ -61,6 +61,16 @@ come directly from the captured index entries; encoding does not binary-search e
 The 256-series identity batch retains the corresponding range matrix, charged to output scratch,
 so identity lookahead cannot move the range used for decoding. Sources are consumed oldest first.
 
+Independent raw metric chunks can concatenate encoded payloads in canonical-series/time order.
+Timestamp preflight checks alignment, strict ordering and non-overlap before writing a series.
+The value codec is walked without sample arrays to retain corruption checks and fold aggregates in
+their original timestamp order; the destination reapplies its outer compression profile.
+
+Partial retention/day cuts, overlapping timestamps, incompatible chunk caps/codecs, sampling and
+rollups use the decoded merge. Whole excluded chunks still validate their value payloads. Copied
+rows advance the same numeric cursors before later decoded series resume. Encoded reads retain a
+separate bounded frame workspace, included in merge input admission.
+
 Merge sources and rollup probes own `OpenColumnScan` handles for their scoped walks. Completion
 and failure close every opened source before its part can retire; file windows return to their
 bounded pool after writer finalization. Source admission includes the handle's retained-state hint.

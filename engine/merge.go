@@ -650,6 +650,9 @@ func (e *Engine) compactStreamWithInputs(
 	coders := newMetricMergeCoders(src, comp)
 	budget := mergestream.Budget{DiskBytes: capBytes, ResidentBytes: allowance}
 	held := buildbudget.Add(buildbudget.Add(inputBytes, coders.workspace()), mergeRangeBatchBytes(len(src)))
+	if e.cfg.MetricSeriesChunks {
+		held = buildbudget.Add(held, granulePlanBytes(len(src)))
+	}
 
 	postingSources := diskMergeIndexes(metadata)
 
@@ -695,6 +698,10 @@ func (e *Engine) compactStreamWithInputs(
 	var output rollupScratch
 	var m sampleMerge
 	var item mergeIdentityItem
+	encoded := e.newEncodedMergePlan(precision, withSF, plan.tiers)
+	reached := func(w *partStreamWriter) bool {
+		return budget.Reached(w.encodedBytes(), buildbudget.Add(held, w.mergeResidentBytes()))
+	}
 	for {
 		ok, err := item.next(ctx, e, &keys, &identities, src, metadata)
 		if err != nil {
@@ -702,6 +709,13 @@ func (e *Engine) compactStreamWithInputs(
 		}
 		if !ok {
 			break
+		}
+		copied, err := encoded.copySeries(&item, streams, &router, start, reached)
+		if err != nil {
+			return nil, err
+		}
+		if copied {
+			continue
 		}
 		if err := mergeStreamedSeries(&m, src, streams, scratch, item.ranges, start); err != nil {
 			return nil, err

@@ -29,6 +29,7 @@ type partStream struct {
 	sf       chunk.FloatDecoder // nil when the part has no scale-factor column
 	pos      int                // next undecoded row; a requested range's start must equal pos
 	decoders [3]*block.Decoder
+	copyable bool
 }
 
 // newPartStream opens forward cursors over p's ts/value(/sf) columns, each reading window bytes of
@@ -62,6 +63,7 @@ func newPartStream(ctx context.Context, p *part, window int64) (_ *partStream, e
 	}
 
 	stream.ts, stream.val, stream.sf = ts, val, sf
+	stream.copyable = stream.canCopyGranules(p)
 	return stream, nil
 }
 
