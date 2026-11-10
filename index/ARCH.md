@@ -37,8 +37,13 @@ attribute-name sequences are stored once per schema rather than repeated for eve
 
 `View` captures immutable append-only arenas for off-lock flush and pruning. `GetInto` and
 `View.At` materialize only requested identities into reusable caller buffers. The compatibility
-`Snapshot` API materializes entries; pruning uses compact views. Metrics flush and merge
-encode identities one at a time, so their snapshots do not expand the resident registry.
+`Snapshot` API materializes entries; pruning uses compact views. `View.AppendCanonical` emits the
+canonical identity from shared context and encoded point symbols without constructing attribute
+values. `EncodedAttributes` borrows those point symbols for encoders and postings builders.
+`Index.AddView` copies them into an owned registry, preserving their established canonical ID and
+remapping source symbols; source references never escape into the destination's durable data.
+Metrics flush and merge encode identities one at a time, so their snapshots do not expand the
+resident registry.
 
 ## `postings`
 
@@ -78,7 +83,10 @@ decoded identity still hashes to its id) and golden-tested.
 series before symbols and recording their locations in the existing TOC. Existing readers
 resolve sections by kind, so both orders are readable; `Encode`/`EncodeSorted` retain their
 symbols-first bytes. Streaming retains one record's scratch and the part-local symbol table,
-without materializing the full series section or final object. `symbols.Table.WriteTo` streams
+without materializing the full series section or final object. `WriteViewSorted` produces the same
+streaming bytes from compact views: typed point-value encodings are re-interned by content into
+the output symbol table, without materializing values or copying source-local symbol IDs.
+`symbols.Table.WriteTo` streams
 the exact bytes of `Table.Encode`; the destination owns buffering.
 
 ## Metering

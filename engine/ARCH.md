@@ -246,6 +246,10 @@ membership, while unaccepted writes never advance watermarks. Load, adoption, re
 reset invalidate this advisory cache. Recounts hydrate active watermarks from the resulting catalog,
 including higher timestamps introduced by another writer. Distinct-series counts come from a
 streaming union after load, repair and retention, rather than sums of overlapping parts.
+Head-to-part metadata copies and both streaming identity outputs consume immutable compact views.
+They reuse established IDs and typed point-value bytes without materializing point attributes;
+the output registry and its symbol table own their copies. Merge input descriptor decoding remains
+validated before the materialized compatibility `Builder.Add` boundary.
 
 `ResidentHeadBytes` defaults to 128 MiB and applies synchronous flush backpressure before the next
 write. It counts active/frozen identities and samples, excluding the separately bounded historical

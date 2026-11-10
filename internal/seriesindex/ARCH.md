@@ -6,6 +6,11 @@ compact interned identities and label-reference lists; callers charge `Builder.B
 admission. `EncodedBound` also prices buffered output using cumulative canonical identity bytes,
 including repeated shared attributes; one reusable serialization buffer belongs to `Bytes`.
 Legacy identity objects remain available to earlier readers.
+`Builder.AddView` copies from an immutable compact registry using its established canonical ID and
+encoded point attributes. Public `Add` still checks externally supplied identities against their
+IDs. Postings consume typed encoded bytes; descriptor and legacy identity writers read compact
+views directly, avoiding repeated materialization and rehashing. Each output registry owns its
+symbols and resource/scope context; source-local ordinals are remapped, never persisted or borrowed.
 
 ## Table framing
 

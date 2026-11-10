@@ -31,6 +31,7 @@ var cpuFixtureModes = [...]string{"idle", "user", "system", "iowait", "irq", "so
 
 type cpuFixtureOptions struct {
 	hosts, generations, points int
+	flushMemoryBytes           int64
 	disk, sync, reopen         bool
 }
 
@@ -108,9 +109,13 @@ func buildCPUFixture(b *testing.B, options cpuFixtureOptions) *cpuFixture {
 	if os.Getenv("OTELDB_BENCH_CPU_READ_CACHE") == "true" {
 		source = backend.Cached(source, 256<<20)
 	}
+	flushBytes := options.flushMemoryBytes
+	if flushBytes == 0 {
+		flushBytes = 64 << 20
+	}
 	f.engine = New(Config{Backend: source, WAL: w, Prefix: "cpu", DiskSeries: options.disk,
 		MetricSeriesChunks: true, MetricBlockRows: 1024, AggregateStats: true,
-		DecodeCacheBytes: 16 << 20, DecodeMemoryBytes: 256 << 20, FlushMemoryBytes: 64 << 20})
+		DecodeCacheBytes: 16 << 20, DecodeMemoryBytes: 256 << 20, FlushMemoryBytes: flushBytes})
 	b.Cleanup(func() {
 		if f.engine != nil {
 			_ = f.engine.Close(context.WithoutCancel(b.Context()))

@@ -85,7 +85,7 @@ func (p *partStreamWriter) writeIdentity(ctx context.Context, entries identitySn
 			return err
 		}
 		defer w.Abort()
-		if _, err := identity.WriteSorted(w, p.seriesBuilder.Count(), p.seriesBuilder.Entry); err != nil {
+		if _, err := identity.WriteViewSorted(w, p.seriesBuilder.Count(), p.seriesBuilder.View(), nil); err != nil {
 			return err
 		}
 		return w.Commit(ctx)
@@ -98,10 +98,7 @@ func (p *partStreamWriter) writeIdentity(ctx context.Context, entries identitySn
 		return errors.Wrapf(err, "create identity object %q", p.prefix)
 	}
 	defer w.Abort()
-	if _, err := identity.WriteSorted(w, len(entries.refs), func(i int, dst signal.Attributes) series.Entry {
-		ref := int(entries.refs[i])
-		return series.Entry{ID: entries.view.ID(ref), Series: entries.view.At(ref, dst)}
-	}); err != nil {
+	if _, err := identity.WriteViewSorted(w, len(entries.refs), entries.view, func(i int) int { return int(entries.refs[i]) }); err != nil {
 		return errors.Wrapf(err, "stream identity object %q", p.prefix)
 	}
 	if err := w.Commit(ctx); err != nil {
