@@ -507,6 +507,9 @@ func (sw *SegmentWriter) forget(seq int) {
 
 // prepare ensures a current segment is open and not over the size limit before a write.
 func (sw *SegmentWriter) prepare() error {
+	if sw.closed {
+		return os.ErrClosed
+	}
 	// Healing comes first: opening the next segment behind a torn one would leave the tear in the
 	// middle of the log.
 	if err := sw.heal(); err != nil {
