@@ -193,6 +193,10 @@ to fail over to: a read overlapping a want fails.
 
 ## 4. Cross-cutting invariants
 
+Engine embedders can opt into bounded resource/scope sharing through `Config.SeriesContexts`.
+Shared immutable payloads have their own caller-owned budget and lifetime; canonical identities,
+postings references, WAL ordering and admission state retain their existing ownership.
+
 - **Zero-alloc hot paths.** Append-style codec APIs (`func(dst []byte, …) []byte`), caller-owned
   buffers, pooled+`Reset` scratch, decoders returning views that alias the source where the
   lifetime is bounded. `[]byte` (not `string`) for keys/values/identity.

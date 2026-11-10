@@ -19,6 +19,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/diskguard"
 	"github.com/oteldb/storage/internal/engineguard"
 	"github.com/oteldb/storage/internal/obs"
@@ -179,6 +180,9 @@ type Config struct {
 	// SeriesCacheBytes bounds historical ID/watermark cache memory per disk-indexed engine.
 	// Zero uses 512 MiB, allocated on demand; negative disables the cache.
 	SeriesCacheBytes int64
+	// SeriesContexts shares bounded immutable resource/scope payloads across engines.
+	// The caller owns its separate memory budget; nil keeps per-engine ownership.
+	SeriesContexts *series.Contexts
 	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
 	// still has it, and says whether the part is gone from every owner. The cluster layer supplies
 	// it over its transport; a single-node store supplies one that fetches nothing and answers for
@@ -407,7 +411,7 @@ func New(cfg Config) *Engine {
 	}
 
 	e := &Engine{
-		cfg: cfg, head: newHead(), tsCodec: chunk.CodecDoDScaled, mergeReadWindow: defaultMergeReadWindow,
+		cfg: cfg, head: newHeadWithContexts(cfg.SeriesContexts), tsCodec: chunk.CodecDoDScaled, mergeReadWindow: defaultMergeReadWindow,
 		readCompressors: block.NewReadCompressors(),
 	}
 	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
@@ -1459,7 +1463,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.mu.Lock()
 	e.head.memory.release()
 	e.head.frozenMemory.release()
-	e.head = newHead()
+	e.head = newHeadWithContexts(e.cfg.SeriesContexts)
 	if e.cfg.DiskSeries {
 		e.head.disk = newDiskHeadStateWithCache(e.cfg.SeriesCacheBytes)
 	}

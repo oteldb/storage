@@ -48,6 +48,13 @@ remapping source symbols; source references never escape into the destination's 
 Metrics flush and merge encode identities one at a time, so their snapshots do not expand the
 resident registry.
 
+`series.Contexts` optionally shares immutable Resource/Scope payloads across registries. The
+64-shard pool compares canonical keys and charges retained keys and expanded payloads before
+publishing entries, including slack for mostly empty map groups. It never evicts or recycles borrowed storage; full shards use ordinary local
+interning. The caller budgets the pool separately; index sizes exclude shared attribute arrays.
+Point symbols, local references, postings, admission watermarks and canonical IDs remain local.
+An originating index can disappear while pool entries or other index views still retain payloads.
+
 ## `postings`
 
 The inverted index is keyed on interned name/typed-value symbols. `MemPostings` stores canonical

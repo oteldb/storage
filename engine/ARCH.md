@@ -18,6 +18,11 @@ do not. Tokens are process-local, never reset or reused, and become noncacheable
 
 ### Independent known-series preparation
 
+`Config.SeriesContexts` optionally shares bounded immutable resource/scope payloads across engine
+registries. Reset and disk-head compaction preserve the configured pool. It owns no membership,
+watermark or acceptance state; cache hits cannot revive removed series. The embedder budgets its
+retained memory separately from engine-local identity state. Nil retains existing local ownership.
+
 Anonymous standalone WAL engines allow contended 1,024–4,096-point batches to prepare independently
 when every identity already exists and soft-overflow routing is inactive. Transient uint32-reference
 bitmaps use 64 reservation stripes; conflicting batches roll back reservations and enter existing

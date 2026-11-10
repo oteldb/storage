@@ -12,9 +12,10 @@ import (
 
 // Index maps canonical series IDs to compact identities. Callers own synchronization.
 type Index struct {
-	byID map[signal.SeriesID]uint32
-	rows []row
-	sym  *symbols.Table
+	byID   map[signal.SeriesID]uint32
+	rows   []row
+	sym    *symbols.Table
+	shared *Contexts
 
 	resources []signal.Resource
 	scopes    []signal.Scope
@@ -52,7 +53,13 @@ type Entry struct {
 
 // New returns an empty index.
 func New() *Index {
+	return NewWithContexts(nil)
+}
+
+// NewWithContexts shares immutable context payloads; callers budget contexts separately.
+func NewWithContexts(contexts *Contexts) *Index {
 	return &Index{
+		shared:  contexts,
 		byID:    make(map[signal.SeriesID]uint32),
 		sym:     symbols.New(),
 		res:     make(map[string]uint32),
@@ -151,29 +158,49 @@ func (ix *Index) SizeBytes() int64 {
 		memsize.Slice(ix.keys) + memsize.Slice(ix.buf) + memsize.Slice(ix.kbuf) + memsize.Slice(ix.vbuf)
 }
 
+//nolint:dupl // Resource and Scope retain distinct typed ownership and canonical keys.
 func (ix *Index) internResource(r signal.Resource) uint32 {
 	ix.kbuf = r.AppendHashInput(ix.kbuf[:0])
 	if ref, ok := ix.res[string(ix.kbuf)]; ok {
 		return ref
 	}
 	ref := uint32(len(ix.resources))
-	stored := r.Intern(ix.sym.Bytes)
+	var stored signal.Resource
+	var shared bool
+	if ix.shared == nil {
+		stored = r.Intern(ix.sym.Bytes)
+	} else {
+		stored, shared = ix.shared.resource(ix.kbuf, r, func() signal.Resource { return r.Intern(ix.sym.Bytes) })
+	}
 	ix.resources = append(ix.resources, stored)
 	ix.res[string(ix.kbuf)] = ref
-	ix.bytes += memsize.MapEntry[string, uint32]() + int64(len(ix.kbuf)) + memsize.Slice(stored.Attributes)
+	ix.bytes += memsize.MapEntry[string, uint32]() + int64(len(ix.kbuf))
+	if !shared {
+		ix.bytes += memsize.Slice(stored.Attributes)
+	}
 	return ref
 }
 
+//nolint:dupl // Resource and Scope retain distinct typed ownership and canonical keys.
 func (ix *Index) internScope(s signal.Scope) uint32 {
 	ix.kbuf = s.AppendHashInput(ix.kbuf[:0])
 	if ref, ok := ix.scope[string(ix.kbuf)]; ok {
 		return ref
 	}
 	ref := uint32(len(ix.scopes))
-	stored := s.Intern(ix.sym.Bytes)
+	var stored signal.Scope
+	var shared bool
+	if ix.shared == nil {
+		stored = s.Intern(ix.sym.Bytes)
+	} else {
+		stored, shared = ix.shared.scope(ix.kbuf, s, func() signal.Scope { return s.Intern(ix.sym.Bytes) })
+	}
 	ix.scopes = append(ix.scopes, stored)
 	ix.scope[string(ix.kbuf)] = ref
-	ix.bytes += memsize.MapEntry[string, uint32]() + int64(len(ix.kbuf)) + memsize.Slice(stored.Attributes)
+	ix.bytes += memsize.MapEntry[string, uint32]() + int64(len(ix.kbuf))
+	if !shared {
+		ix.bytes += memsize.Slice(stored.Attributes)
+	}
 	return ref
 }
 
