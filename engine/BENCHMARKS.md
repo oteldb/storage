@@ -89,3 +89,9 @@ The matching binary can be retained with `-o` as above.
 The default fixture merges four parts holding 80,000 series and 16 samples per series each:
 **5,120,000 input samples**, not 80,000 samples. `series/op` and `samples/op` report these counts;
 MB/s measures logical timestamp/value bytes. Scoped profiles are separate from timing comparisons.
+
+Compaction reports output disk bytes, identity/index bytes and timestamp/value granule counts.
+For four hourly inputs at 15-second cadence, use `OTELDB_BENCH_CPU_HOSTS=1000` and
+`OTELDB_BENCH_CPU_POINTS=240`; the fixture stays bounded at 8,000 series and 7.68 million samples.
+Point counts up to 1,024 are supported. `OTELDB_BENCH_CPU_QUERY_MERGE=true` makes the query
+benchmark compact its fixture before measuring, so it can check the resulting chunk layout.

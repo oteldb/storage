@@ -19,6 +19,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	backendfile "github.com/oteldb/storage/backend/file"
+	"github.com/oteldb/storage/internal/timebucket"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
@@ -43,7 +44,7 @@ func cpuBenchOptions(b *testing.B) cpuFixtureOptions {
 	return cpuFixtureOptions{
 		hosts:       cpuBenchInt(b, "OTELDB_BENCH_CPU_HOSTS", 10000, 80000),
 		generations: cpuBenchInt(b, "OTELDB_BENCH_CPU_GENERATIONS", 4, 4),
-		points:      cpuBenchInt(b, "OTELDB_BENCH_CPU_POINTS", 16, 64),
+		points:      cpuBenchInt(b, "OTELDB_BENCH_CPU_POINTS", 16, 1024),
 		disk:        os.Getenv("OTELDB_BENCH_DISK_SERIES") == "true",
 		readCache:   os.Getenv("OTELDB_BENCH_CPU_READ_CACHE") == "true",
 		sync:        os.Getenv("OTELDB_BENCH_WAL_SYNC") != "false",
@@ -256,12 +257,46 @@ func (f *cpuFixture) countAll(ctx context.Context, _ int) error {
 	return nil
 }
 
+func (f *cpuFixture) prepareMerge(b *testing.B) int {
+	b.Helper()
+	points := f.options.generations * f.options.points
+	if int64(points)*cpuFixtureCadence < int64(time.Hour) {
+		return 1
+	}
+	// Seal older compaction buckets without adding the marker to the CPU query range.
+	last := cpuFixtureBase + int64(points-1)*cpuFixtureCadence
+	marker := signal.Series{Attributes: signal.NewAttributes(signal.KeyValue{
+		Key: []byte("__name__"), Value: signal.StringValue([]byte("benchmark_clock")),
+	})}
+	accepted, err := f.engine.Append(marker, timebucket.End(last, timebucket.Top())+1, 0)
+	if err != nil || !accepted {
+		b.Fatalf("append bucket marker: accepted=%t: %v", accepted, err)
+	}
+	if err := f.engine.Flush(b.Context()); err != nil {
+		b.Fatal(err)
+	}
+	return 2
+}
+
 // BenchmarkDiskSeriesCPUQuery uses one fixture per process mode. Select a single workload when profiling.
 // Set OTELDB_BENCH_DISK_SERIES=true for disk indexes; use a disk-backed TMPDIR for file/WAL timing.
 // OTELDB_BENCH_CPU_READ_CACHE=true enables a shared 256 MiB backend cache; read-B/op counts file reads.
 func BenchmarkDiskSeriesCPUQuery(b *testing.B) {
 	options := cpuBenchOptions(b)
+	merged := os.Getenv("OTELDB_BENCH_CPU_QUERY_MERGE") == "true"
+	if merged {
+		options.flushMemoryBytes = 2 << 30
+	}
 	f := buildCPUFixture(b, options)
+	if merged {
+		expectedParts := f.prepareMerge(b)
+		if err := f.engine.MergeWith(b.Context(), MergeOptions{Force: true}); err != nil {
+			b.Fatal(err)
+		}
+		if f.engine.PartCount() != expectedParts {
+			b.Fatalf("merged query fixture has %d parts, want %d", f.engine.PartCount(), expectedParts)
+		}
+	}
 	for _, workload := range []string{"fetch-random-host", "fetch-repeated-host", "grid-random-host", "grid-repeated-host", "count-all"} {
 		b.Run(workload, func(b *testing.B) {
 			query := f.fetchHost
