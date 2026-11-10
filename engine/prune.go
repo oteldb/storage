@@ -77,7 +77,7 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 	}
 	if !opts.Force {
 		e.mu.RLock()
-		skip := !e.identityDirty || e.head.series.Len() < pruneMinIdentities
+		skip := !e.identityDirty || (!e.cfg.DiskSeries && e.head.series.Len() < pruneMinIdentities)
 		e.mu.RUnlock()
 		if skip {
 			return 0, nil
@@ -88,6 +88,19 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 	defer e.flushMu.Unlock()
 	e.identityMu.Lock()
 	defer e.identityMu.Unlock()
+
+	if e.cfg.DiskSeries {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		before := e.head.series.Len()
+		e.compactDiskHeadLocked()
+		if err := e.rebuildDiskStateLocked(ctx); err != nil {
+			e.loadErr = err
+			return 0, err
+		}
+		e.identityDirty = false
+		return before - e.head.series.Len(), nil
+	}
 
 	e.mu.RLock()
 	// readablePartsLocked, not e.parts: the identities of an adopted part back rows this engine

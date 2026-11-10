@@ -2,6 +2,7 @@ package block
 
 import (
 	"context"
+	"crypto/sha256"
 	"slices"
 	"strconv"
 	"sync"
@@ -405,11 +406,12 @@ func DeletePart(ctx context.Context, b backend.Backend, prefix string) error {
 // columns and marks are read lazily, so a query touches only the objects it references
 // (DESIGN.md §7).
 type PartReader struct {
-	readers  *readerpool.Scope
-	b        backend.Backend
-	prefix   string
-	manifest Manifest
-	byName   map[string]int
+	readers        *readerpool.Scope
+	b              backend.Backend
+	prefix         string
+	manifest       Manifest
+	manifestDigest [32]byte
+	byName         map[string]int
 	// compsMu guards comps: Column is called concurrently (overlapping fetches prefetching the
 	// same part), and the per-algorithm compressor is created lazily on first use.
 	compsMu sync.Mutex
@@ -474,12 +476,13 @@ func OpenPart(ctx context.Context, b backend.Backend, prefix string, opts ...Rea
 
 	r := &PartReader{
 
-		b:        b,
-		prefix:   prefix,
-		manifest: m,
-		byName:   byName,
-		comps:    make(map[compress.Algorithm]*compress.Compressor),
-		level:    compress.LevelDefault,
+		b:              b,
+		prefix:         prefix,
+		manifest:       m,
+		manifestDigest: sha256.Sum256(raw),
+		byName:         byName,
+		comps:          make(map[compress.Algorithm]*compress.Compressor),
+		level:          compress.LevelDefault,
 	}
 
 	if readerpool.Supported(b) {
@@ -519,6 +522,18 @@ func NewReadCompressors() ReadOption {
 
 // Manifest returns the part's decoded manifest.
 func (r *PartReader) Manifest() Manifest { return r.manifest }
+
+// ManifestDigest returns the digest of the exact persisted manifest bytes.
+func (r *PartReader) ManifestDigest() [32]byte { return r.manifestDigest }
+
+// ManifestDigest reads a part manifest's content digest without opening its columns.
+func ManifestDigest(ctx context.Context, b backend.Backend, prefix string) ([32]byte, error) {
+	raw, err := backend.ReadView(ctx, b, manifestKey(prefix))
+	if err != nil {
+		return [32]byte{}, errors.Wrap(err, "read manifest digest")
+	}
+	return sha256.Sum256(raw), nil
+}
 
 // RowCount returns the number of rows in the part.
 func (r *PartReader) RowCount() int { return r.manifest.RowCount }

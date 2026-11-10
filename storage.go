@@ -1105,14 +1105,7 @@ func (s *Storage) recover(ctx context.Context) error {
 			return err
 		}
 
-		switch {
-		case s.opts.ReadOnly:
-			return e.LoadPartsReadOnly(ctx)
-		case s.opts.Cluster != nil:
-			return e.LoadPartsUnclaimed(ctx)
-		default:
-			return e.LoadParts(ctx)
-		}
+		return s.loadRecoveredParts(ctx, e)
 	}
 
 	metricSuffix := metricsPrefix + "/" + bucketindex.Object
@@ -1326,6 +1319,9 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		AggregateStats:     s.opts.AggregateStats,
 		MetricFloatGroups:  s.opts.MetricFloatGroups,
 		MetricSeriesChunks: s.opts.MetricSeriesChunks,
+		DiskSeries:         s.opts.MetricDiskSeries,
+		ResidentHeadBytes:  s.opts.MetricResidentHeadBytes,
+		SeriesCacheBytes:   s.opts.MetricSeriesCacheBytes,
 		// MaxPartBytes caps each flushed part; resolved from the tenant's policy, falling back to
 		// defaultMaxPartBytes when the policy leaves it unset. It is an operational/structural cap
 		// fixed at engine creation (unlike the per-write admission limits).

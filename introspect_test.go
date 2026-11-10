@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -209,4 +210,14 @@ func TestInspectWALAndMergeFields(t *testing.T) {
 	assert.Equal(t, 1, after.MergeBacklog, "one flushed part is the backlog")
 	assert.Equal(t, after.Parts, after.MergeBacklog, "backlog tracks the part count")
 	assert.False(t, after.MergeRunning)
+}
+
+func TestMetricCardinalityScope(t *testing.T) {
+	t.Parallel()
+	for _, complete := range []bool{false, true} {
+		got := metricCardinality(engine.CardinalityStat{IndexScope: "resident_head", TotalSeries: 42, TotalSeriesComplete: complete})
+		require.Equal(t, "resident_head", got.IndexScope)
+		require.EqualValues(t, 42, got.TotalSeries)
+		require.Equal(t, complete, got.TotalSeriesComplete)
+	}
 }

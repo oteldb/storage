@@ -115,18 +115,29 @@ func (e *Engine) AggregateRange(ctx context.Context, r fetch.Request) (map[signa
 // — once it holds the read lock over a sorted index no writer can be running. The caller must
 // releaseParts, unless it returned an error (the plan is released here).
 func (e *Engine) planAggregate(ctx context.Context, r fetch.Request) ([]signal.SeriesID, *enginePlan, error) {
-	e.mu.RLock()
-	for !e.head.indexSorted() {
-		e.mu.RUnlock()
-		e.mu.LockState()
-		e.head.ensureIndexSorted()
-		e.mu.UnlockState()
+	var plan *enginePlan
+	var ids []signal.SeriesID
+	if e.cfg.DiskSeries {
+		var err error
+		plan, err = e.planDiskQuery(ctx, r, true, false)
+		if err != nil {
+			return nil, nil, err
+		}
+		ids = plan.ids
+	} else {
 		e.mu.RLock()
-	}
+		for !e.head.indexSorted() {
+			e.mu.RUnlock()
+			e.mu.LockState()
+			e.head.ensureIndexSorted()
+			e.mu.UnlockState()
+			e.mu.RLock()
+		}
 
-	ids := e.head.resolve(r.Matchers)
-	plan := e.planFetch(ids, r)
-	e.mu.RUnlock()
+		ids = e.head.resolve(r.Matchers)
+		plan = e.planFetch(ids, r)
+		e.mu.RUnlock()
+	}
 
 	if err := plan.acquireDecodeBudget(ctx, r, colNeed{values: true}); err != nil {
 		plan.releaseParts()
@@ -296,7 +307,7 @@ func (e *Engine) bucketPart(ctx context.Context, plan *enginePlan, p *part, id s
 
 	// A part wholly inside one bucket contributes entirely to it — fold its sidecar, no decode.
 	if grid.bucketOf(p.minTime) == grid.bucketOf(p.maxTime) {
-		if st, ok := p.seriesStat(ctx, id); ok {
+		if st, ok := plan.seriesStat(ctx, p, id); ok {
 			grid.mergeStat(p.minTime, st)
 
 			return nil
@@ -459,7 +470,7 @@ func (e *Engine) aggViaStats(ctx context.Context, plan *enginePlan, id signal.Se
 			continue
 		}
 
-		if st, ok := p.seriesStat(ctx, id); ok {
+		if st, ok := plan.seriesStat(ctx, p, id); ok {
 			agg.merge(st)
 
 			continue
@@ -550,4 +561,17 @@ func weightAt(sf []float64, i int) float64 {
 	}
 
 	return sf[i]
+}
+
+// seriesStat keeps disk-mode aggregate metadata query-local and restricted to selected identities.
+func (p *enginePlan) seriesStat(ctx context.Context, pt *part, id signal.SeriesID) (SeriesAgg, bool) {
+	if !p.engine.cfg.DiskSeries {
+		return pt.seriesStat(ctx, id)
+	}
+	m, ok := p.diskMetadata[pt][id]
+	if !ok || !m.HasStats || pt.hasSF {
+		return SeriesAgg{}, false
+	}
+	s := m.Stats
+	return SeriesAgg{Rows: s.Count, Count: float64(s.Count), Sum: s.Sum, Min: s.Min, Max: s.Max}, true
 }

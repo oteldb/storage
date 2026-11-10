@@ -65,16 +65,23 @@ func (e *Engine) appendKnownPrepared(
 	if err := e.refuseWrite(); err != nil {
 		return AppendResult{}, true, err
 	}
-	func() {
+	admissionErr := func() error {
 		e.mu.RLock()
 		defer e.mu.RUnlock()
+		if err := e.checkDiskAdmissionLocked(); err != nil {
+			return err
+		}
 		for i := range p.snapshots {
 			s := &p.snapshots[i]
 			slot := e.head.stateRefs[s.ref]
 			s.buffer = e.head.buffers.get(slot)
 			s.newest, s.seen = e.head.slots.get(slot)
 		}
+		return nil
 	}()
+	if admissionErr != nil {
+		return AppendResult{}, true, admissionErr
+	}
 	p.warm = true
 	stageLimits := limits
 	stageLimits.MaxInFlightBytes = 0

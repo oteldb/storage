@@ -52,12 +52,16 @@ type ColumnInfo struct {
 	Bytes int64
 }
 
-// CardinalityStats summarizes a (tenant, signal) engine's label cardinality — the operator's first
-// stop for a cardinality-explosion incident. It is computed from the in-memory inverted index (which
-// spans head ∪ flushed series), so it does no backend I/O and is safe to poll. See [Storage.Cardinality].
+// CardinalityStats combines global series counts and resident label cardinality without backend I/O.
+// IndexScope identifies label coverage. See [Storage.Cardinality].
 type CardinalityStats struct {
+	// IndexScope describes label/symbol counters and TopLabelNames; TotalSeries is global.
+	// Metrics with disk series use resident_head; other engines use resident_all_series.
+	IndexScope string
 	// TotalSeries is the distinct series/streams the engine indexes (head ∪ flushed).
 	TotalSeries int64
+	// TotalSeriesComplete is false if historical metrics parts are missing or a recount failed.
+	TotalSeriesComplete bool
 	// DistinctLabelNames is the number of distinct indexed label names.
 	DistinctLabelNames int
 	// SymbolCount is the size of the engine's interned-symbol table (names + values).
@@ -331,7 +335,9 @@ func recordColumns(cs []recordengine.ColumnStat) []ColumnInfo {
 
 func metricCardinality(c engine.CardinalityStat) CardinalityStats {
 	out := CardinalityStats{
-		TotalSeries: c.TotalSeries, DistinctLabelNames: c.DistinctLabelNames, SymbolCount: c.SymbolCount,
+		IndexScope:          c.IndexScope,
+		TotalSeriesComplete: c.TotalSeriesComplete,
+		TotalSeries:         c.TotalSeries, DistinctLabelNames: c.DistinctLabelNames, SymbolCount: c.SymbolCount,
 		TopLabelNames: make([]LabelCardinality, len(c.Top)),
 	}
 	for i, l := range c.Top {
@@ -343,7 +349,9 @@ func metricCardinality(c engine.CardinalityStat) CardinalityStats {
 
 func recordCardinality(c recordengine.CardinalityStat) CardinalityStats {
 	out := CardinalityStats{
-		TotalSeries: c.TotalSeries, DistinctLabelNames: c.DistinctLabelNames, SymbolCount: c.SymbolCount,
+		IndexScope:          "resident_all_series",
+		TotalSeriesComplete: true,
+		TotalSeries:         c.TotalSeries, DistinctLabelNames: c.DistinctLabelNames, SymbolCount: c.SymbolCount,
 		TopLabelNames: make([]LabelCardinality, len(c.Top)),
 	}
 	for i, l := range c.Top {

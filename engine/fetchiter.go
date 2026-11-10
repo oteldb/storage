@@ -115,9 +115,9 @@ func (it *fetchIter) Close() error {
 
 	it.closed = true
 
-	it.plan.releaseParts()
-
 	matched := len(it.plan.ids)
+
+	it.plan.releaseParts()
 
 	it.spf.Add("parts_scanned", int64(it.partsScanned))
 	it.spf.Add("rows", int64(it.rows))

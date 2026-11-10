@@ -540,6 +540,11 @@ slack); `compress.DecodeWorkspace` rounds it to 512 KiB.
   would license re-rolling downsampled data, and failing would strand a readable part — the same trap
   as a size field whose absence two readers interpret differently. A writer that does not set it
   (the record engine) stays byte-identical, so there is no version bump.
+- **Parent binding** — disk-series metric writers append `OTBN` and a random 16-byte nonce
+  before the CRC, after any rollup marker, while the part is unpublished. A sidecar hashes these raw
+  manifest bytes, preventing another valid part with identical column descriptors from supplying
+  its coverage or aggregate stats. Older readers ignore this additive trailer; replication and
+  renames copy it unchanged. The engine catalog remains the publication boundary for all sidecars.
 - **Version 3** adds a per-column `xflags` byte after `flags`; an unknown bit is
   `ErrUnsupportedVersion`, since each gates fields a reader must parse. A writer emits version 3
   only when some column sets a bit and version 2 otherwise, so metric parts stay readable by a

@@ -47,13 +47,18 @@ type ColumnStat struct {
 	Bytes    int64  // size of the column's object; 0 for a constant-collapsed column, which has none
 }
 
-// CardinalityStat summarizes the engine's label cardinality (the head's index spans head ∪ flushed
-// series). TotalSeries and SymbolCount are exact; Top is the highest-cardinality label names.
+// CardinalityStat combines the global series count with resident label-index cardinality.
+// IndexScope identifies which series contribute to label and symbol counts.
 type CardinalityStat struct {
-	TotalSeries        int64
-	DistinctLabelNames int
-	SymbolCount        int
-	Top                []LabelCard // sorted by Series desc, then Name; truncated to the requested top-N
+	// IndexScope describes DistinctLabelNames, SymbolCount and Top. TotalSeries is global.
+	// It is resident_head with DiskSeries, otherwise resident_all_series.
+	IndexScope  string
+	TotalSeries int64
+	// TotalSeriesComplete is false while historical parts are unavailable or the last recount failed.
+	TotalSeriesComplete bool
+	DistinctLabelNames  int
+	SymbolCount         int
+	Top                 []LabelCard // sorted by Series desc, then Name; truncated to the requested top-N
 }
 
 // LabelCard is one label name's cardinality: how many series carry it and how many distinct values
@@ -178,16 +183,21 @@ func (e *Engine) WALState() (segments int, bytes int64, epoch uint64, ok bool) {
 	return e.cfg.WAL.Segments(), e.cfg.WAL.Bytes(), e.cfg.WAL.Epoch(), true
 }
 
-// Cardinality summarizes the engine's label cardinality from the head's inverted index (which spans
-// every series ever seen, flushed or not). topN bounds the returned Top slice (≤0 returns all label
-// names). It takes a read lock and does no backend I/O.
+// Cardinality reports the global series count and resident label cardinality without backend I/O.
+// topN bounds Top; a nonpositive value returns every resident indexed label name.
 func (e *Engine) Cardinality(topN int) CardinalityStat {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
 	cs := CardinalityStat{
-		TotalSeries: int64(e.head.series.Len()),
-		SymbolCount: e.head.sym.Len(),
+		TotalSeries:         e.diskSeriesCountLocked(),
+		TotalSeriesComplete: e.diskSeriesCompleteLocked(),
+		IndexScope:          "resident_all_series",
+		SymbolCount:         e.head.sym.Len(),
+	}
+
+	if e.cfg.DiskSeries {
+		cs.IndexScope = "resident_head"
 	}
 
 	e.head.post.ForEachName(func(nameID uint32, distinctValues, totalSeries int) {

@@ -25,6 +25,7 @@ var (
 // plus per-series sample buffers in arrival order (sorted on read). It is not safe for
 // concurrent use; the [Engine] holds the lock.
 type head struct {
+	disk                         *diskHeadState
 	sym                          *symbols.Table
 	series                       *series.Index
 	post                         *postings.Dense
@@ -39,6 +40,7 @@ type head struct {
 	slots                headSlots
 	buffers              headBuffers
 	memory, frozenMemory sampleArena
+	replicaTrimmedBytes  int64
 
 	bytes         int64 // active buffered sample bytes (SampleBytes each)
 	detachedBytes int64 // resident samples held by the single in-flight flush
@@ -104,12 +106,16 @@ func newHead() *head {
 	}
 }
 
-// identityBytes is the resident footprint of the head's identity state — symbols, the series
-// index, the postings lists and the per-series OOO watermarks. It is deliberately **not** part of
-// [head.bytes]: a flush drains buffered samples but not identities, so folding the two would make
-// a size-triggered flush chase a number it cannot lower. Identity is reported on its own
-// ([Stats.IdentityBytes]) because nothing else counts it, and it only grows.
+// identityBytes includes resident identity metadata and separately bounded historical caches.
 func (h *head) identityBytes() int64 {
+	n := h.residentIdentityBytes()
+	if h.disk != nil {
+		n += h.disk.bloom.sizeBytes() + h.disk.cache.sizeBytes()
+	}
+	return n
+}
+
+func (h *head) residentIdentityBytes() int64 {
 	n := h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
 		memsize.Slice(h.stateRefs) + h.slots.sizeBytes() + memsize.Slice(h.valueScratch)
 	if h.nonStringLabels != nil {
@@ -198,9 +204,20 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 
 // register records and indexes an identity known not to be present.
 func (h *head) register(id signal.SeriesID, s signal.Series) {
+	historical := h.seriesState(id)
 	h.registerIndex(id, s)
 	for len(h.stateRefs) < h.series.Len() {
 		h.stateRefs = append(h.stateRefs, h.slots.alloc())
+	}
+	if h.disk != nil {
+		if !historical.historical && h.disk.complete {
+			h.disk.count++
+			h.disk.note(id)
+		}
+		if historical.seen {
+			ref, _ := h.series.Ref(id)
+			h.slots.set(h.stateRefs[ref], historical.newest)
+		}
 	}
 }
 
@@ -318,7 +335,7 @@ func (h *head) appendByID(
 func (h *head) admitNew(
 	id signal.SeriesID, ts int64, value, sf float64, limits AppendLimits, materialize func() signal.Series,
 ) (out admitOutcome, effID signal.SeriesID, isNew bool, s signal.Series, done bool) {
-	cardinality := int64(h.series.Len())
+	cardinality := h.cardinality()
 
 	// Hard ceiling: reject a new series that would exceed MaxSeries. Existing series are never
 	// blocked, so a query keeps returning what is already admitted.
@@ -679,6 +696,7 @@ func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 
 	detached, bytes, since := h.samples, h.bytes, h.since
 	h.frozenMemory, h.memory = h.memory, sampleArena{}
+	h.replicaTrimmedBytes = 0
 	h.samples = make(map[signal.SeriesID]*sampleBuf)
 	h.buffers = headBuffers{}
 	h.bytes = 0

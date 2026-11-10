@@ -191,6 +191,11 @@ amount of retained tail capacity for far fewer allocator and GC objects.
 A process-wide bounded recycler retains at most 512 numeric pages and 128 cleared header pages
 (about 11.4 MiB); excess pages are released rather than retaining per-series capacity indefinitely.
 
+Disk replica refresh releases an empty sample arena immediately. Once cumulative trimmed bytes
+reach half the remaining head bytes, survivors move into a fresh arena and buffer map before old
+pages return to the recycler. This also runs after partial proof errors, so one retained OOO row
+cannot pin every past generation. Writer/state ownership protects the swap; read plans own copies.
+
 Pruning builds the surviving registry-to-slot mapping off-lock. Tail registrations and revived
 series retain their slots at installation; only dead slots are cleared and recycled. Updates
 made while rebuilding therefore keep their watermarks, and a reused slot inherits no old bound.
@@ -228,6 +233,36 @@ ones sharing the head, and a first sample is never late. Watermarks outlive a fl
 
 **The series index outlives a flush** — only sample buffers drain, so flushed series stay queryable
 and re-appends do not re-index.
+
+With `Config.DiskSeries`, immutable parts own historical identities and postings. Flush publication
+rebuilds resident metadata around active samples. A bounded scalable bloom filter rejects definitely
+new IDs. A separate byte-budgeted cache retains only full 128-bit IDs and newest timestamps across
+flushes: pointer-free, 16-way buckets grow in 256 hash shards and evict within a full bucket.
+`SeriesCacheBytes` defaults to 512 MiB per engine, allocated as the working set grows; negative disables
+it. The limit covers retained arrays and their headers; shard growth also temporarily owns its old
+array until collection. Warm probes allocate nothing and retain no attributes or head references.
+Historical cache misses probe parts before admission; a complete successful scan can cache positive
+membership, while unaccepted writes never advance watermarks. Load, adoption, repair, pruning and
+reset invalidate this advisory cache. Recounts hydrate active watermarks from the resulting catalog,
+including higher timestamps introduced by another writer. Distinct-series counts come from a
+streaming union after load, repair and retention, rather than sums of overlapping parts.
+
+`ResidentHeadBytes` defaults to 128 MiB and applies synchronous flush backpressure before the next
+write. It counts active/frozen identities and samples, excluding the separately bounded historical
+cache and Bloom filter; flushing cannot reclaim those. `IdentityBytes` still reports all identity
+memory. One atomic caller batch may exceed the target. This mode disables the optional recent tier.
+An oversized old WAL fails recovery without advancing epochs or changing journal bytes; increase
+this budget to recover it. All local admission and head publication wait while historical state is
+incomplete. Accepted WAL and primary replica payloads still restore into the head, preserving
+journals and checkpoints until repair. A successful recount restores historical watermarks for
+these active identities before lifting admission's fence.
+A replica without a cluster claim refreshes published primary parts under pressure; if its head
+stays full, `ErrReplicaHeadFull` asks replication to retry without publishing or checkpointing.
+Disk-mode refresh trims only samples whose timestamp, value bits and scale-factor bits match
+unambiguous persisted rows. Conflicting same-timestamp updates, rolled/unsupported layouts,
+series above 65,536 active samples and scans above 16 MiB retain their head data. Scoped immutable
+part pins and bounded block decoders protect this proof; legacy trimming is unchanged.
+`Stats.SeriesComplete=false` marks the preserved count as unavailable until recount succeeds.
 
 **`AppendBatch`** takes a precomputed `SeriesID`, columns, and a `materialize` callback used only on
 first sight. `appendByID` does one map probe: a present buffer means the series is
@@ -1313,6 +1348,15 @@ the part into a want repair can never satisfy. A failed commit rolls the in-memo
 never observable as published; its objects are orphans, swept by a later open.
 
 ### Repair — a want is discharged by committing a part
+
+Disk-index footer, binding and canonical-ID corruption joins the existing repeated-load confirmation
+before becoming a repair want. Storage startup performs those bounded confirmations on the same
+engine so it can open and request repair; I/O errors and newer index features remain fatal. Read-only
+startup records only pending wants and writes no backend state.
+
+Lazy dictionary/descriptor pages are checked when read. Their CRC failures return errors and do not
+automatically create peer-repair wants. Restoring or explicitly replacing the affected part is
+required; a catalog reload alone may not touch the corrupt page.
 
 A part this engine's index names but cannot read is recorded as a `bucketindex.Want`, carried
 across every commit alongside the removals. Repair runs at the head of each merge cycle

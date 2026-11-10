@@ -24,8 +24,10 @@ import (
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/repair"
 	"github.com/oteldb/storage/internal/retention"
+	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/pool"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/readbudget"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
 )
@@ -169,6 +171,14 @@ type Config struct {
 	MetricFloatGroups bool
 	// MetricSeriesChunks isolates each series in independently framed numeric chunks.
 	MetricSeriesChunks bool
+	// DiskSeries stores historical identities/postings in immutable per-part indexes and disables RecentWindow.
+	DiskSeries bool
+	// ResidentHeadBytes flushes disk-indexed heads under memory pressure. Zero uses 128 MiB.
+	// One atomic caller batch may exceed the target and flushes before the next write.
+	ResidentHeadBytes int64
+	// SeriesCacheBytes bounds historical ID/watermark cache memory per disk-indexed engine.
+	// Zero uses 512 MiB, allocated on demand; negative disables the cache.
+	SeriesCacheBytes int64
 	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
 	// still has it, and says whether the part is gone from every owner. The cluster layer supplies
 	// it over its transport; a single-node store supplies one that fetches nothing and answers for
@@ -383,6 +393,15 @@ var _ fetch.Fetcher = (*Engine)(nil)
 
 // New returns an engine with an empty head.
 func New(cfg Config) *Engine {
+	if cfg.DiskSeries {
+		cfg.RecentWindow = 0
+		if cfg.SeriesCacheBytes == 0 {
+			cfg.SeriesCacheBytes = defaultSeriesCacheBytes
+		}
+		if cfg.ResidentHeadBytes <= 0 {
+			cfg.ResidentHeadBytes = defaultResidentHeadBytes
+		}
+	}
 	if cfg.Obs == nil {
 		cfg.Obs = obs.NewNop()
 	}
@@ -403,6 +422,9 @@ func New(cfg Config) *Engine {
 		e.putF64(b.Values)
 	}
 
+	if cfg.DiskSeries {
+		e.head.disk = newDiskHeadStateWithCache(e.cfg.SeriesCacheBytes)
+	}
 	e.walB = newWALBatch()
 
 	if cfg.WAL != nil {
@@ -442,10 +464,19 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 		return false, err
 	}
 
+	if err := e.flushResidentHead(); err != nil {
+		return false, err
+	}
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
-
-	if e.cfg.WAL == nil {
+	if err := e.flushResidentHeadLocked(); err != nil {
+		return false, err
+	}
+	if err := e.preloadDiskSeriesLocked([]signal.SeriesID{s.Hash()}); err != nil {
+		return false, err
+	}
+	defer e.clearDiskPendingLocked()
+	if e.cfg.WAL == nil && !e.cfg.DiskSeries {
 		_, accepted, _ := e.head.append(s, ts, value, e.cfg.OOOWindow)
 
 		return accepted, nil
@@ -484,6 +515,9 @@ func (e *Engine) AppendBatch(
 		return AppendResult{}, err
 	}
 
+	if err := e.flushResidentHead(); err != nil {
+		return AppendResult{}, err
+	}
 	eligible := e.cfg.WAL != nil && (limits.Overflow == nil || limits.MaxSeriesSoft <= 0) &&
 		len(ids) >= minPreparedBatchSamples && len(ids) <= maxPreparedBatchSamples
 	if !eligible || !e.mu.TryLockWriter() {
@@ -497,7 +531,13 @@ func (e *Engine) AppendBatch(
 		e.mu.LockWriter()
 	}
 	defer e.mu.UnlockWriter()
-
+	if err := e.flushResidentHeadLocked(); err != nil {
+		return AppendResult{}, err
+	}
+	if err := e.preloadDiskSeriesLocked(ids); err != nil {
+		return AppendResult{}, err
+	}
+	defer e.clearDiskPendingLocked()
 	// One closure for the whole run (not one per point): bi selects the current sample for
 	// the lazy materializer, which fires only on a newly-seen series.
 	var bi int
@@ -506,8 +546,9 @@ func (e *Engine) AppendBatch(
 
 	var res AppendResult
 
-	if e.cfg.WAL != nil {
+	if e.cfg.WAL != nil || e.cfg.DiskSeries {
 		defer e.walB.reset()
+		limits = e.diskOverflowLimits(limits, e.walB, false)
 		err := e.mu.WithReaders(func() error {
 			var err error
 			res, err = e.stageWALBatch(ids, ts, values, sf, materialize, limits)
@@ -569,9 +610,11 @@ type Stats struct {
 	RetainFrom int64
 	// RetentionBoundBy identifies the bound behind RetainFrom.
 	RetentionBoundBy RetentionBound
-	Series           int64 // distinct series ever seen (index span: head ∪ flushed)
-	HeadSamples      int64 // samples currently buffered in the head (unflushed)
-	HeadBytes        int64 // head's buffered sample bytes (the in-flight memory measure)
+	Series           int64 // distinct retained series (head ∪ flushed).
+	// SeriesComplete is false when historical metadata prevents an exact current count.
+	SeriesComplete bool
+	HeadSamples    int64 // samples currently buffered in the head (unflushed)
+	HeadBytes      int64 // head's buffered sample bytes (the in-flight memory measure)
 	// HeadAge is how long the head has been accumulating since its last flush (0 when empty) —
 	// the flush lag, which no data-time field here reports (backfill makes sample timestamps
 	// useless as a measure of it).
@@ -617,18 +660,19 @@ func (e *Engine) Stats() Stats {
 	request := e.retentionRequest()
 	s := Stats{
 		RetainFrom: request.Cutoff, RetentionBoundBy: request.Bound,
-		Series:        int64(e.head.series.Len()),
-		OutOfSpace:    e.space.Exhausted(),
-		HeadBytes:     e.head.inFlightBytes(),
-		HeadSamples:   e.head.bytes / SampleBytes,
-		HeadAge:       e.head.age(),
-		IdentityBytes: e.head.identityBytes() + e.identityOrder.bytes.Load(),
-		Parts:         len(e.parts),
-		WantedParts:   len(e.wants) + len(e.pendingWants) + len(e.adoptedWants),
-		Holes:         len(e.holes),
-		LostParts:     e.lostParts,
-		IndexFenced:   e.loadErr != nil,
-		IndexLoadErr:  e.loadErr,
+		Series:         e.diskSeriesCountLocked(),
+		SeriesComplete: e.diskSeriesCompleteLocked(),
+		OutOfSpace:     e.space.Exhausted(),
+		HeadBytes:      e.head.inFlightBytes(),
+		HeadSamples:    e.head.bytes / SampleBytes,
+		HeadAge:        e.head.age(),
+		IdentityBytes:  e.head.identityBytes() + e.identityOrder.bytes.Load(),
+		Parts:          len(e.parts),
+		WantedParts:    len(e.wants) + len(e.pendingWants) + len(e.adoptedWants),
+		Holes:          len(e.holes),
+		LostParts:      e.lostParts,
+		IndexFenced:    e.loadErr != nil,
+		IndexLoadErr:   e.loadErr,
 
 		TenureUnestablished: e.tenureUnestablishedLocked(),
 		MaxTime:             e.head.newest,
@@ -651,14 +695,17 @@ func (e *Engine) Stats() Stats {
 // (ref-held) in-window parts still to read, plus each series' identity and its already-snapshotted head
 // and mid-flush samples. Its [enginePlan.mergeSeries] does the part reads off the lock.
 type enginePlan struct {
-	tryDecode bool
-	ids       []signal.SeriesID
-	series    []signal.Series                  // matched-series identities, parallel to ids (zero value when absent)
-	headB     map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
-	flushB    map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
-	recentB   map[signal.SeriesID]*fetch.Batch // recent-tier samples (the in-RAM flush window)
-	liveParts []*part
-	decoded   partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
+	selectionBudget *readbudget.Budget
+	selectionBytes  int64
+	diskMetadata    map[*part]map[signal.SeriesID]seriesindex.Metadata
+	tryDecode       bool
+	ids             []signal.SeriesID
+	series          []signal.Series                  // matched-series identities, parallel to ids (zero value when absent)
+	headB           map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
+	flushB          map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
+	recentB         map[signal.SeriesID]*fetch.Batch // recent-tier samples (the in-RAM flush window)
+	liveParts       []*part
+	decoded         partDecodeCache // per-fetch decode memo so each part decodes once, not once per series
 	// blockReaders streams a part's matched series straight from cached column blocks (no whole-part
 	// decodedPart); a part absent from the map (cache off, or a const/legacy-unblocked column) uses
 	// the decoded-part path instead. Built once in planFetch.
@@ -1035,6 +1082,7 @@ func (p *enginePlan) releaseSeriesPins() {
 }
 
 func (p *enginePlan) releaseParts() {
+	p.selectionBudget.Release(p.selectionBytes)
 	p.engine.budget.releaseFor(p.budgetScope, p.budgetBytes)
 
 	// Drop the block-slice readers' remaining references on the cache blocks they viewed (the scan
@@ -1080,7 +1128,16 @@ func (p *enginePlan) releaseParts() {
 
 	// The plan maps are dead now: the returned batches copied out their identity and samples. Clear
 	// and recycle the map structures so the next fetch reuses their capacity instead of re-making them.
-	p.engine.putSeriesSlice(p.series)
+	if p.selectionBudget != nil {
+		// Disk identities are query-owned; pooled slabs must not retain historical payloads.
+		clear(p.series)
+		p.series = nil
+		p.ids = nil
+		p.memActive = nil
+		p.diskMetadata = nil
+	} else {
+		p.engine.putSeriesSlice(p.series)
+	}
 	p.engine.putBatchMap(p.headB)
 	p.engine.putBatchMap(p.flushB)
 	p.engine.putBatchMap(p.recentB)
@@ -1407,6 +1464,9 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.head.memory.release()
 	e.head.frozenMemory.release()
 	e.head = newHead()
+	if e.cfg.DiskSeries {
+		e.head.disk = newDiskHeadStateWithCache(e.cfg.SeriesCacheBytes)
+	}
 	e.identityOrder.reset()
 	e.flushing = nil        // discarded with the head: Reset drops the samples, it does not flush them
 	e.identityDirty = false // nothing is left to prune
@@ -1494,12 +1554,20 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 		return nil, AppendResult{}, err
 	}
 
+	if err := e.flushResidentHead(); err != nil {
+		return nil, AppendResult{}, err
+	}
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
+	if err := e.flushResidentHeadLocked(); err != nil {
+		return nil, AppendResult{}, err
+	}
+	defer e.clearDiskPendingLocked()
 
 	// Decided into the staged batch, logged, then applied, as a durable AppendBatch is: an error leaves
 	// the head untouched (see [walBatch]).
 	defer e.walB.reset()
+	limits = e.diskOverflowLimits(limits, e.walB, true)
 
 	byID := make(map[signal.SeriesID]signal.Series)
 
@@ -1524,6 +1592,9 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 
 	if err := wal.Replay(data, wal.Handlers{
 		OnSeries: func(id signal.SeriesID, s signal.Series) error {
+			if err := e.preloadOneDiskSeriesLocked(id); err != nil {
+				return err
+			}
 			byID[id] = s
 
 			return nil
@@ -1560,9 +1631,19 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 // replicas hold identical data. A replica holds the unflushed head this way; after a flush the
 // shared object store reconciles them. Safe for concurrent use.
 func (e *Engine) ApplyReplicated(data []byte) error {
+	if err := e.flushResidentHead(); err != nil {
+		return err
+	}
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
 
+	if e.cfg.DiskSeries {
+		if err := e.flushResidentHeadLocked(); err != nil {
+			return err
+		}
+		defer e.clearDiskPendingLocked()
+		return e.applyDiskReplicatedLocked(data)
+	}
 	return wal.Replay(data, e.replayHandlers())
 }
 
@@ -1580,12 +1661,12 @@ func (e *Engine) HeadSampleCount() int {
 	return n
 }
 
-// SeriesCount returns the number of distinct series in the head.
+// SeriesCount returns distinct indexed series, including immutable parts in disk-index mode.
 func (e *Engine) SeriesCount() int {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	return e.head.series.Len()
+	return int(e.diskSeriesCountLocked())
 }
 
 func (e *Engine) observeFlush(ctx context.Context, flush func(context.Context) (int, int64, error)) error {
@@ -1650,6 +1731,12 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 		return 0, 0, err
 	}
 
+	if e.head.bytes > 0 {
+		if err := e.checkDiskAdmissionLocked(); err != nil {
+			e.mu.Unlock()
+			return 0, 0, err
+		}
+	}
 	detached, detachedBytes, detachedSince := e.head.detach()
 	if detached == nil {
 		e.mu.Unlock()
@@ -1738,6 +1825,7 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 	e.head.frozenMemory = sampleArena{}
 	e.head.detachedBytes = 0
 	e.head.detachedKnown = false
+	e.compactDiskHeadLocked()
 	if err == nil {
 		err = e.checkpointLocked(checkpointSeq)
 	}
@@ -1975,7 +2063,7 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 
 	// The recent tier short-circuit: when the query range falls inside the tier's window, the tier ∪
 	// the mid-flush buffers ∪ the head cover it entirely, so no part is acquired or decoded.
-	if !e.recentEnabled() || r.Start < e.recentMin {
+	if e.cfg.DiskSeries || !e.recentEnabled() || r.Start < e.recentMin {
 		e.acquireWindowParts(p, r.Start, r.End, true)
 	}
 
@@ -2032,7 +2120,7 @@ func (e *Engine) planExistence(ids []signal.SeriesID, r fetch.Request, withIdent
 
 	// The recent tier short-circuit, as in planFetch: a window inside the tier is fully covered by
 	// the in-memory buffers, so no part is acquired or decoded.
-	if !e.recentEnabled() || r.Start < e.recentMin {
+	if e.cfg.DiskSeries || !e.recentEnabled() || r.Start < e.recentMin {
 		e.acquireWindowParts(p, r.Start, r.End, false)
 	}
 
@@ -2075,17 +2163,30 @@ func bufHasInWindow(buf *sampleBuf, start, end int64) bool {
 // durable-restart [Engine.Replay] and the trusting [Engine.ApplyReplicated]. The caller holds e.mu.
 func (e *Engine) replayHandlers() wal.Handlers {
 	return wal.Handlers{
-		OnSeries: func(_ signal.SeriesID, s signal.Series) error {
+		OnSeries: func(id signal.SeriesID, s signal.Series) error {
+			if e.cfg.DiskSeries {
+				if err := e.replayResidentGuard(0); err != nil {
+					return err
+				}
+				e.preloadAuthoritativeSeriesLocked(id)
+			}
 			e.head.registerSeries(s)
+			e.clearDiskPendingLocked()
 
 			return nil
 		},
 		OnSamples: func(id signal.SeriesID, ts []int64, values []float64) error {
+			if err := e.replayResidentGuard(len(ts)); err != nil {
+				return err
+			}
 			e.head.replaySamples(id, ts, values)
 
 			return nil
 		},
 		OnSamplesSF: func(id signal.SeriesID, ts []int64, values, sf []float64) error {
+			if err := e.replayResidentGuard(len(ts)); err != nil {
+				return err
+			}
 			e.head.replaySamplesSF(id, ts, values, sf)
 
 			return nil

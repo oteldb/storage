@@ -64,6 +64,9 @@ func (p *partStreamWriter) appendMergeSeries(view series.View, ref uint32, found
 	id signal.SeriesID, ts []int64, values, sf []float64, covered int64,
 ) error {
 	if len(ts) > 0 && found && (len(p.runs) == 0 || p.runs[len(p.runs)-1].Value != idToU128(id)) {
+		if err := p.addDiskSeries(view, ref, id); err != nil {
+			return err
+		}
 		p.mergeFinish.add(view, ref)
 	}
 	return p.appendSeries(idToU128(id), ts, values, sf, covered)

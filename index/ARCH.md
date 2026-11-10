@@ -27,6 +27,9 @@ unrelated dictionary workloads cannot inflate the resident identity state.
 
 ## `series`
 
+[`internal/seriesindex`](../internal/seriesindex/ARCH.md) supplies optional immutable per-part
+identity/postings indexes, with bounded ranged reads and typed local-reference postings.
+
 `SeriesID ↔ Series`. Canonical hashes and durable formats use the full typed identity.
 The resident registry uses 32-byte rows: hash, value-arena offset, shared resource/scope
 context, and shared attribute-name schema. Values occupy four-byte typed-symbol references;

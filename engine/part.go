@@ -18,6 +18,7 @@ import (
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/readerpool"
+	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
@@ -60,6 +61,14 @@ type partIndex struct {
 	starts  []int32 // len == len(ids)+1; starts[0] == 0, starts[len(ids)] == total rows
 	paged   *pagedIndex
 	maxRows int
+}
+
+// mayContainID prunes probes outside the validated canonical-ID bounds without reading a page.
+func (idx partIndex) mayContainID(id signal.SeriesID) bool {
+	if p := idx.paged; p != nil {
+		return p.n > 0 && (!p.bounded || (id.Compare(p.first) >= 0 && id.Compare(p.last) <= 0))
+	}
+	return len(idx.ids) > 0 && id.Compare(idx.ids[0]) >= 0 && id.Compare(idx.ids[len(idx.ids)-1]) <= 0
 }
 
 func (idx partIndex) selectedIDRange(ids []signal.SeriesID) (first, end int) {
@@ -419,6 +428,15 @@ type part struct {
 	// head, and identityPresent whether it had one. A reloaded index reuses the handle, and the
 	// object is immutable, so the (uncached) read is not repeated per refresh.
 	identityLoaded, identityPresent bool
+	legacyIdentityKey               string
+	metadataMu                      sync.Mutex
+	metadata                        *seriesindex.Index
+	metadataChecked                 bool
+	metadataBounded                 bool
+	diskIDsMu                       sync.Mutex
+	diskIDsChecked                  bool
+	diskWatermarkMu                 sync.Mutex
+	diskWatermark                   *watermark.Reader
 }
 
 func (p *part) acquire() { p.refs.Add(1); p.reader.AcquireReaders() }

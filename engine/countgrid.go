@@ -10,6 +10,7 @@ import (
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/readbudget"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -22,6 +23,15 @@ func (e *Engine) CountGrid(ctx context.Context, r fetch.Request, grid fetch.Wind
 	defer span.End()
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if e.cfg.DiskSeries && grid.NumSteps > 0 {
+		var budget *readbudget.Budget
+		ctx, budget = diskQueryBudget(ctx)
+		n := buildbudget.Mul((int64(grid.NumSteps)-1)/64+1, 8)
+		if err := budget.Reserve(n); err != nil {
+			return nil, err
+		}
+		defer budget.Release(n)
 	}
 	presence, err := newGridPresence(grid)
 	if err != nil {
@@ -53,7 +63,10 @@ func (e *Engine) CountGrid(ctx context.Context, r fetch.Request, grid fetch.Wind
 		}
 	}
 
-	groupOf, names, groupBytes := cp.groups(groupBy, grid.NumSteps)
+	groupOf, names, groupBytes, err := cp.groups(groupBy, grid.NumSteps)
+	if err != nil {
+		return nil, err
+	}
 	estimate := buildbudget.Add(cp.workspace(presence), groupBytes)
 	raw := slices.Contains(p.memActive, false)
 	if raw {

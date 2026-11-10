@@ -207,6 +207,15 @@ type Options struct {
 	MetricFloatGroups bool
 	// MetricSeriesChunks writes independently framed chunks for each metric series.
 	MetricSeriesChunks bool
+	// MetricDiskSeries uses part-local on-disk metric identities/postings and bounded resident heads.
+	// Existing part identity objects remain readable; legacy readers retain their historical registry.
+	MetricDiskSeries bool
+	// MetricResidentHeadBytes is the disk-index mode's resident-head pressure target. Zero uses 128 MiB.
+	// One atomic append may exceed the target; pressure flushes happen before subsequent writes.
+	MetricResidentHeadBytes int64
+	// MetricSeriesCacheBytes bounds the historical ID/watermark cache per metric engine.
+	// Zero uses 512 MiB, allocated on demand; negative disables the cache.
+	MetricSeriesCacheBytes int64
 
 	// FlushInterval is the max age of unflushed head data: the cadence of the background loop that
 	// flushes each head to a part and runs compaction/retention. Zero ⇒ a sane default
@@ -522,6 +531,10 @@ func errOptionInvalid(reason string) error {
 
 // validate checks the option combination before construction.
 func (o *Options) validate() error {
+	if o.MetricResidentHeadBytes < 0 {
+		return errOptionInvalid("MetricResidentHeadBytes must not be negative")
+	}
+
 	if o.Durability == DurabilityEphemeral && o.WALDir != "" {
 		return errOptionInvalid("WALDir must be empty when Durability is Ephemeral")
 	}
@@ -619,6 +632,9 @@ func WithMetricFloatGroups() Option { return func(o *Options) { o.MetricFloatGro
 
 // WithMetricSeriesChunks enables independently readable per-series metric chunks.
 func WithMetricSeriesChunks() Option { return func(o *Options) { o.MetricSeriesChunks = true } }
+
+// WithMetricDiskSeries enables part-local disk identities/postings for metric engines.
+func WithMetricDiskSeries() Option { return func(o *Options) { o.MetricDiskSeries = true } }
 
 // WithRejectOutOfRetention enables retention-age admission for all writes.
 func WithRejectOutOfRetention() Option { return func(o *Options) { o.RejectOutOfRetention = true } }

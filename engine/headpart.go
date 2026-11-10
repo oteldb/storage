@@ -267,6 +267,9 @@ func (b *headPartBuilder) append(id chunk.U128, ref uint32, ts []int64, values, 
 			weights = sf[lo:hi]
 		}
 		if len(b.writer.runs) == 0 || b.writer.runs[len(b.writer.runs)-1].Value != id {
+			if err := b.writer.addDiskSeries(b.view, ref, u128ToID(id)); err != nil {
+				return err
+			}
 			b.partRefs = append(b.partRefs, ref)
 		}
 		if err := b.writer.appendSeries(id, ts[lo:hi], values[lo:hi], weights, ts[hi-1]); err != nil {

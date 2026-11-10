@@ -342,14 +342,13 @@ func openPagedIndex(
 
 	_, viewer := b.(backend.Viewer)
 
-	p := &pagedIndex{be: b, key: key, n: n, maxRows: maxRows, total: total, keep: !viewer}
+	p := &pagedIndex{be: b, key: key, n: n, maxRows: maxRows, total: total, keep: !viewer, offset: int64(len(data) - 4 - len(ents))}
 	if n > 0 {
 		p.first, p.last = sidxEntryID(ents, 0), sidxEntryID(ents, n-1)
 		p.bounded = true
 	}
 	if n >= indexPageEntries*2 && backend.RangesNatively(ctx, b, p.key) {
 		p.keep = false
-		p.offset = int64(len(data) - 4 - len(ents))
 		p.fences = make([]signal.SeriesID, (n+sparseIndexPageEntries-1)/sparseIndexPageEntries)
 		for i := range p.fences {
 			p.fences[i] = sidxEntryID(ents, i*sparseIndexPageEntries)

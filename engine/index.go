@@ -15,6 +15,7 @@ import (
 	"github.com/oteldb/storage/internal/indexcommit"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/repair"
+	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -187,7 +188,15 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	e.catalog = bucketindex.MergeLineage(e.catalog, ix.Catalog)
 
 	e.foreign = foreignEntries(ix.Entries, e.indexed, e.removals, e.wants)
-	e.openForeignLocked(ctx)
+	if err := e.openForeignLocked(ctx); err != nil {
+		return err
+	}
+	if e.cfg.DiskSeries {
+		if err := e.rebuildDiskStateLocked(ctx); err != nil {
+			e.loadErr = err
+			return err
+		}
+	}
 
 	return nil
 }
@@ -210,14 +219,14 @@ func mergeHoles(cur, other []bucketindex.Entry) []bucketindex.Entry {
 // that cannot be opened (a rival that merged it away between the two commits) is left out of the
 // readable set but kept in the index: the entry is what keeps the part reachable, and only its
 // writer knows whether it is still live. Caller holds e.mu.
-func (e *Engine) openForeignLocked(ctx context.Context) {
+func (e *Engine) openForeignLocked(ctx context.Context) error {
 	if len(e.foreign) == 0 {
 		for _, p := range e.foreignParts {
 			p.closeReaders()
 		}
 		e.foreignParts = nil
 
-		return
+		return nil
 	}
 
 	open := make(map[string]*part, len(e.foreign))
@@ -237,6 +246,10 @@ func (e *Engine) openForeignLocked(ctx context.Context) {
 			return err
 		})
 		if err != nil {
+			if e.cfg.DiskSeries {
+				e.loadErr = err
+				return errors.Wrap(err, "open adopted disk part")
+			}
 			zctx.From(ctx).Debug("adopted part is not readable here",
 				zap.String("prefix", ent.Prefix), zap.Error(err))
 			e.countCorrupt(ctx, err, "part", obs.CorruptTolerated)
@@ -248,11 +261,13 @@ func (e *Engine) openForeignLocked(ctx context.Context) {
 		open[ent.Prefix] = p
 		fillRollup(ent, p)
 
-		// Without its identities the part is open but unresolvable: matchers resolve through the
-		// head's identity index, so the rows would be there and nothing would name them.
-		if _, err := e.registerPartIdentities(ctx, ent.Prefix, true); err != nil {
-			zctx.From(ctx).Debug("adopted part identities are not readable here",
-				zap.String("prefix", ent.Prefix), zap.Error(err))
+		if e.cfg.DiskSeries {
+			if _, err := e.prepareDiskPart(ctx, p); err != nil {
+				e.loadErr = err
+				return errors.Wrap(err, "prepare adopted part identities")
+			}
+		} else if _, err := e.registerPartIdentities(ctx, ent.Prefix, true); err != nil {
+			zctx.From(ctx).Debug("adopted part identities are not readable here", zap.String("prefix", ent.Prefix), zap.Error(err))
 		}
 	}
 
@@ -262,6 +277,7 @@ func (e *Engine) openForeignLocked(ctx context.Context) {
 		}
 	}
 	e.foreignParts = open
+	return nil
 }
 
 // readablePartsLocked is the part set a query may read: this engine's own, plus the ones it
@@ -526,7 +542,8 @@ const (
 func (e *Engine) livePart(
 	ctx context.Context, ent *bucketindex.Entry, open map[string]*part,
 ) (*part, error) {
-	if p := open[ent.Prefix]; p != nil && p.matchesEntry(ent) {
+	if p := open[ent.Prefix]; p != nil && p.matchesEntry(ent) &&
+		(!e.cfg.DiskSeries || !errors.Is(e.loadErr, seriesindex.ErrCorrupt)) {
 		live, err := block.PartPresent(ctx, e.cfg.Backend, ent.Prefix)
 		if err != nil {
 			return nil, errors.Wrapf(err, "probe part %q", ent.Prefix)
@@ -581,6 +598,18 @@ type indexLoad struct {
 // the same bar repair sets before concluding a part is gone ([repair.HoleConfirmations]).
 const corruptLoadsBeforeWant = repair.HoleConfirmations
 
+func (e *Engine) loadReferencedPart(ctx context.Context, ent *bucketindex.Entry, open map[string]*part) (*part, error) {
+	previous := open[ent.Prefix]
+	p, err := e.livePart(ctx, ent, open)
+	if err == nil && e.cfg.DiskSeries {
+		_, err = e.prepareDiskPart(ctx, p)
+	}
+	if err != nil && p != nil && p != previous {
+		p.closeReaders()
+	}
+	return p, err
+}
+
 // readIndexLocked loads the bucket index and opens the parts it names, writing nothing on the
 // engine. A load that failed on corrupt parts also returns every part it found corrupt. Caller holds
 // e.mu.
@@ -605,6 +634,15 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 		open[p.prefix] = p
 	}
 
+	var opened []*part
+	completed := false
+	defer func() {
+		if !completed {
+			for _, p := range opened {
+				p.closeReaders()
+			}
+		}
+	}()
 	named := make(map[string]struct{}, len(ix.Entries))
 
 	var (
@@ -624,7 +662,8 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 			continue
 		}
 
-		p, err := e.livePart(ctx, ent, open)
+		previous := open[ent.Prefix]
+		p, err := e.loadReferencedPart(ctx, ent, open)
 		if err != nil {
 			switch {
 			case partGone(err):
@@ -658,6 +697,9 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 			continue
 		}
 
+		if p != previous {
+			opened = append(opened, p)
+		}
 		l.parts = append(l.parts, p)
 		// Only the parts that opened: a lost one left out is what keeps the next commit from also
 		// calling it a removal, which would restate a loss as a deliberate deletion.
@@ -683,6 +725,7 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 	}
 
 	l.dropped = len(open) > 0
+	completed = true
 
 	return l, nil, nil
 }
@@ -838,7 +881,14 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 
 	complete, err := e.loadIdentitiesLocked(ctx, l.parts)
 	if err != nil {
+		e.loadErr = err
 		return err
+	}
+	if e.cfg.DiskSeries {
+		if err := e.rebuildDiskStateLocked(ctx); err != nil {
+			e.loadErr = err
+			return err
+		}
 	}
 
 	// Identity and the next WAL epoch must be ready before the repair commit admits readers/writers.
@@ -853,7 +903,7 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 	// live that the parts do not — only identities whose data is gone. Deleting it completes the
 	// migration for a prefix written by an older build, and stops recovery from resurrecting dead
 	// identities on every restart.
-	if complete && sweep {
+	if complete && sweep && !e.cfg.DiskSeries {
 		if err := e.cfg.Backend.Delete(ctx, e.seriesKey()); err != nil && !errors.Is(err, backend.ErrNotExist) {
 			return errors.Wrap(err, "delete legacy series index")
 		}
@@ -884,6 +934,18 @@ func (e *Engine) RefreshReplica(ctx context.Context) error {
 	}
 
 	covered := make(map[signal.SeriesID]int64)
+	if e.cfg.DiskSeries {
+		if err := e.trimDiskReplicaLocked(ctx); err != nil {
+			return err
+		}
+		for id, buf := range e.head.samples {
+			if len(buf.ts) == 0 {
+				delete(e.head.samples, id)
+			}
+		}
+		e.compactDiskHeadLocked()
+		return e.rebuildDiskStateLocked(ctx)
+	}
 
 	// Each series is trimmed against its own newest flushed timestamp, not the newest in the part
 	// set: a series absent from every part keeps its whole head (a late-registered series whose
@@ -930,6 +992,10 @@ func (e *Engine) loadSeriesIndexLocked(ctx context.Context) error {
 // defensive against truncated input. Nothing writes this format any more; it is read to migrate a
 // prefix written by an older build.
 func decodeSeriesSet(data []byte, fn func(signal.Series)) error {
+	return decodeSeriesSetVisit(data, func(s signal.Series) error { fn(s); return nil })
+}
+
+func decodeSeriesSetVisit(data []byte, fn func(signal.Series) error) error {
 	count, n := binary.Uvarint(data)
 	if n <= 0 {
 		return errors.Wrap(signal.ErrMalformed, "series count")
@@ -943,12 +1009,17 @@ func decodeSeriesSet(data []byte, fn func(signal.Series)) error {
 		}
 		data = data[n:]
 
-		s, _, err := signal.DecodeSeries(data[:l])
+		s, consumed, err := signal.DecodeSeries(data[:l])
 		if err != nil {
 			return errors.Wrap(err, "decode series")
 		}
 
-		fn(s)
+		if consumed != int(l) {
+			return errors.Wrap(signal.ErrMalformed, "series trailing bytes")
+		}
+		if err := fn(s); err != nil {
+			return err
+		}
 		data = data[l:]
 	}
 
