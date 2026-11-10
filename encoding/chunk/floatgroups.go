@@ -289,11 +289,23 @@ type FloatGroupsDecoder struct {
 
 // NewFloatGroupsDecoder validates grouped framing before returning a cursor.
 func NewFloatGroupsDecoder(src []byte) (*FloatGroupsDecoder, error) {
-	rows, rest, err := floatGroupHeader(src)
-	if err != nil {
+	d := &FloatGroupsDecoder{}
+	if err := d.Reset(src); err != nil {
 		return nil, err
 	}
-	return &FloatGroupsDecoder{rest: rest, rows: rows}, nil
+	return d, nil
+}
+
+// Reset opens another grouped stream, retaining decoded fragment capacity.
+func (d *FloatGroupsDecoder) Reset(src []byte) error {
+	*d = FloatGroupsDecoder{values: d.values[:0]}
+	rows, rest, err := floatGroupHeader(src)
+	if err != nil {
+		d.failed = err
+		return err
+	}
+	d.rest, d.rows = rest, rows
+	return nil
 }
 
 // Len returns the stream's row count.

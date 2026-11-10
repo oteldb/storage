@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 
 	"github.com/go-faster/errors"
+
+	"github.com/oteldb/storage/encoding/bitstream"
 )
 
 // EncodeTimestampsAdaptive appends a regular-cadence or scaled delta-of-delta stream.
@@ -105,36 +107,33 @@ type adaptiveTimestampCursor struct {
 	next, step                    int64
 	fallback                      *scaledTsDecoder
 	fallbackBytes, fallbackHeader int
+	fallbackActive                bool
 	failed                        error
 }
 
 // NewAdaptiveTimestampCursor opens an adaptive timestamp chunk without materializing its rows.
 func NewAdaptiveTimestampCursor(src []byte) (TsCursor, error) {
-	if len(src) == 0 {
-		return nil, errors.New("adaptive timestamps: missing mode")
+	c := &adaptiveTimestampCursor{}
+	if err := c.Reset(src); err != nil {
+		return nil, err
 	}
-	switch src[0] {
-	case 0:
-		rows, first, step, err := adaptiveTimestampHeader(src[1:])
-		if err != nil {
-			return nil, err
-		}
-		return &adaptiveTimestampCursor{rows: rows, next: first, step: step}, nil
-	case 1:
-		rows, n := binary.Uvarint(src[1:])
-		if n <= 0 || rows == 0 || rows > MaxFloatGroupRows {
-			return nil, errors.New("adaptive timestamps: invalid fallback rows")
-		}
-		decoded, err := NewTsDecoder(src[1:])
-		if err != nil {
-			return nil, err
-		}
-		cur := &scaledTsDecoder{TsDecoder: *decoded}
-		return &adaptiveTimestampCursor{rows: int(rows), fallback: cur, fallbackBytes: len(src) - 1, fallbackHeader: n}, nil
+	return c, nil
+}
 
-	default:
-		return nil, errors.New("adaptive timestamps: unsupported mode")
+// Reset opens another adaptive stream, reusing fallback reader state.
+func (c *adaptiveTimestampCursor) Reset(src []byte) error {
+	fallback := c.fallback
+	if fallback != nil {
+		reader := fallback.r
+		reader.Reset(nil)
+		*fallback = scaledTsDecoder{TsDecoder: TsDecoder{r: reader}}
 	}
+	*c = adaptiveTimestampCursor{fallback: fallback}
+	if err := c.reset(src); err != nil {
+		c.failed = err
+		return err
+	}
+	return nil
 }
 
 func (c *adaptiveTimestampCursor) Len() int { return c.rows }
@@ -146,7 +145,7 @@ func (c *adaptiveTimestampCursor) Next() (int64, error) {
 	if c.pos >= c.rows {
 		return 0, errEOF
 	}
-	if c.fallback != nil {
+	if c.fallbackActive {
 		v, err := c.fallback.Next()
 		if err == nil {
 			c.pos++
@@ -163,4 +162,41 @@ func (c *adaptiveTimestampCursor) Next() (int64, error) {
 	c.next += c.step
 	c.pos++
 	return v, nil
+}
+
+func (c *adaptiveTimestampCursor) reset(src []byte) error {
+	if len(src) == 0 {
+		return errors.New("adaptive timestamps: missing mode")
+	}
+	switch src[0] {
+	case 0:
+		rows, first, step, err := adaptiveTimestampHeader(src[1:])
+		if err != nil {
+			return err
+		}
+		c.rows, c.next, c.step = rows, first, step
+		return nil
+	case 1:
+		rows, n := binary.Uvarint(src[1:])
+		if n <= 0 || rows == 0 || rows > MaxFloatGroupRows {
+			return errors.New("adaptive timestamps: invalid fallback rows")
+		}
+		if c.fallback == nil {
+			c.fallback = &scaledTsDecoder{TsDecoder: TsDecoder{r: new(bitstream.Reader)}}
+		}
+		_, consumed, err := readHeaderInto(src[1:], c.fallback.r)
+		if err != nil {
+			return err
+		}
+		if err := boundRows(int(rows), 8*(len(src)-1-consumed)); err != nil {
+			return err
+		}
+		c.rows, c.fallback.rows = int(rows), int(rows)
+		c.fallbackBytes, c.fallbackHeader = len(src)-1, n
+		c.fallbackActive = true
+		return nil
+
+	default:
+		return errors.New("adaptive timestamps: unsupported mode")
+	}
 }

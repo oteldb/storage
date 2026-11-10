@@ -54,6 +54,11 @@ Rules that matter beyond the code:
   The remap is invalidated by a generation stamp rather than a refill: a granule's row range is
   small against a whole column's entry table, so a per-call fill would dominate the encode.
 
+Grouped-float and adaptive-timestamp forward cursors support `Reset([]byte) error`. Each reset
+validates the new header and discards positions and failures; grouped-float cursors retain only decoded
+fragment capacity, and adaptive timestamps retain reusable fallback reader state across cadence changes.
+A failed reset is not readable until a successful reset. Input bytes are borrowed until the next reset.
+
 ## `compress`
 
 1-byte-flagged frame around a column/block: raw or compressed, automatically falling back to raw

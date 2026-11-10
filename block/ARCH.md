@@ -91,7 +91,9 @@ primitives the engines need:
 - `DecodeBlocksInt64/Float64` — decode a chosen *set* of blocks into a full-length slice (the
   series-skip primitive).
 - `TsCursor`/`FloatCursor` — forward streaming cursors that span block boundaries transparently,
-  so the merge reads blocked parts unchanged.
+  so the merge reads blocked parts unchanged. Grouped-float and adaptive-timestamp cursors reset
+  in place between blocks; float fragment capacity survives the reset, while validation and borrowed
+  source state belong only to the new block.
 
 Block boundaries align with marks granules, so marks already carry each block's time bounds.
 Unblocked columns keep the single-stream layout byte-for-byte. Metric parts are block-framed

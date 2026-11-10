@@ -1425,8 +1425,8 @@ type rowCursor[T any] interface {
 
 // blockedCursor is a forward cursor over a blocked column: it decodes one block at a time, opening
 // the next block when the current is exhausted, so it spans block boundaries transparently. Each
-// block is an independent codec stream (its row 0 is absolute), so crossing a boundary just starts a
-// fresh per-block decoder — no cross-block state.
+// block is an independent codec stream (its row 0 is absolute). Crossing a boundary resets the
+// per-block decoder where supported, retaining only reusable scratch.
 type blockedCursor[T any, C rowCursor[T]] struct {
 	streams blockStreams
 	codec   chunk.Codec
@@ -1468,7 +1468,11 @@ func (c *blockedCursor[T, C]) Next() (T, error) {
 			return zero, err
 		}
 
-		c.cur, err = c.open(c.codec, stream)
+		if reset, ok := any(c.cur).(interface{ Reset(src []byte) error }); ok {
+			err = reset.Reset(stream)
+		} else {
+			c.cur, err = c.open(c.codec, stream)
+		}
 		if err != nil {
 			c.opened = false
 
