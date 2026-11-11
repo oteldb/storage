@@ -104,3 +104,8 @@ Reuse trusts the same posting membership semantics as query resolution. Every vi
 escaped key, typed value, reference range, chunk order and name flag is checked, even for excluded
 references. Unused membership indexes need no reads; all contributing identity descriptors retain
 their independent validation. CRC-valid missing postings are not reconstructed on this path.
+
+Forward seeks retain the last requested key and its successful lower-bound position. Increasing
+probes inside the same absent-key gap reuse that position; `Next` and reset invalidate the proof.
+The seek-key buffer is included in the per-cursor memory bound. Page CRC/order validation remains
+unchanged when another page or a backward seek requires decoding.
