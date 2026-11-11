@@ -9,10 +9,12 @@ import (
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/seriesindex"
+	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
 
 type diskMergeSource struct {
+	covered  *watermark.Cursor
 	index    *seriesindex.Index
 	cursor   *seriesindex.SeriesCursor
 	legacy   *series.Index
@@ -22,6 +24,13 @@ type diskMergeSource struct {
 }
 
 func (e *Engine) openMetricMergeStreams(ctx context.Context, src []*part) ([]*partStream, []*diskMergeSource, error) {
+	if e.cfg.SeparateSeries {
+		for _, p := range src {
+			if p.sharedSeries == nil {
+				return nil, nil, errors.New("engine: separate series merge requires shared descriptor sources")
+			}
+		}
+	}
 	streams := make([]*partStream, len(src))
 	var metadata []*diskMergeSource
 	if e.cfg.DiskSeries {
@@ -29,7 +38,14 @@ func (e *Engine) openMetricMergeStreams(ctx context.Context, src []*part) ([]*pa
 	}
 	for i, p := range src {
 		stream, err := newPartStream(ctx, p, e.mergeReadWindow)
-		if err == nil && e.cfg.DiskSeries {
+		if err == nil && e.cfg.SeparateSeries {
+			covered, openErr := watermark.OpenReader(p.reader.ReaderContext(ctx), p.be, watermark.Key(p.prefix), p.index.seriesCount())
+			err = openErr
+			if err == nil {
+				metadata[i] = &diskMergeSource{covered: covered.Cursor(p.reader.ReaderContext(ctx))}
+			}
+		}
+		if err == nil && e.cfg.DiskSeries && !e.cfg.SeparateSeries {
 			metadata[i], err = newDiskMergeSource(ctx, p)
 		}
 		if err != nil {
@@ -58,6 +74,19 @@ type mergeIdentityItem struct {
 func (item *mergeIdentityItem) next(ctx context.Context, e *Engine, keys *seriesMerge,
 	legacy *mergeIdentityBatch, parts []*part, sources []*diskMergeSource,
 ) (bool, error) {
+	if e.cfg.SeparateSeries {
+		if !keys.Next() {
+			return false, nil
+		}
+		item.id, item.ranges, item.positions = keys.Key(), keys.ranges, keys.positions
+		var err error
+		if len(sources) > 0 {
+			item.covered, err = streamedCovered(item.id, keys.positions, sources)
+		} else {
+			item.covered, err = sourceCovered(ctx, parts, item.id)
+		}
+		return err == nil, err
+	}
 	if e.cfg.DiskSeries {
 		item.identity = signal.Series{}
 		releaseMergeIdentityScratch(sources)
@@ -83,6 +112,9 @@ func (item *mergeIdentityItem) next(ctx context.Context, e *Engine, keys *series
 }
 
 func (item *mergeIdentityItem) appendTo(w *partStreamWriter, ts []int64, values, sf []float64, covered int64) error {
+	if w.e.cfg.SeparateSeries {
+		return w.appendSeries(idToU128(item.id), ts, values, sf, covered)
+	}
 	if w.e.cfg.DiskSeries {
 		return w.appendDiskMergeSeries(item.id, item.identity, ts, values, sf, covered, item.positions)
 	}
@@ -190,6 +222,9 @@ func (p *partStreamWriter) appendDiskMergeSeries(id signal.SeriesID, identity si
 }
 
 func (p *partStreamWriter) addMergedDiskIdentity(id signal.SeriesID, identity signal.Series, positions []mergestream.Position) error {
+	if p.e.cfg.SeparateSeries {
+		return nil
+	}
 	if p.seriesBuilder == nil {
 		p.seriesBuilder = &seriesindex.Builder{}
 	}
@@ -221,7 +256,22 @@ func diskMergeIndexes(metadata []*diskMergeSource) []*seriesindex.Index {
 }
 
 func (p *partStreamWriter) initMergePostings(ctx context.Context, sources []*seriesindex.Index) {
-	if len(sources) > 0 {
+	if !p.e.cfg.SeparateSeries && len(sources) > 0 {
 		p.postingMerge = seriesindex.NewPostingMerge(ctx, sources)
 	}
+}
+
+func streamedCovered(id signal.SeriesID, positions []mergestream.Position, sources []*diskMergeSource) (int64, error) {
+	newest := minInt64
+	for _, pos := range positions {
+		ent, err := sources[pos.Source].covered.At(pos.Index)
+		if err != nil {
+			return 0, err
+		}
+		if ent.ID != id {
+			return 0, errors.Wrap(seriesindex.ErrCorrupt, "numeric coverage ordinal disagrees with SIDX")
+		}
+		newest = max(newest, ent.Max)
+	}
+	return newest, nil
 }

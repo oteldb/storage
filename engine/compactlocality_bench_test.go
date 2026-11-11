@@ -37,7 +37,7 @@ func BenchmarkSeriesLocalCompaction(b *testing.B) {
 			var bytes, series int64
 			for b.Loop() {
 				selected = selectRun()
-				parts, err := e.compactStream(b.Context(), selected, minInt64, 0,
+				parts, err := e.compactStream(b.Context(), selected, 0,
 					rollupPlan{marker: &block.Rollup{}}, MergeOptions{})
 				b.StopTimer()
 				if err != nil {

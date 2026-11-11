@@ -58,6 +58,9 @@ func (e *Engine) admitFlush(ctx context.Context) error {
 // transient queue, so a waiting writer would only convert an unbounded head into unbounded blocked
 // callers — and the error is retryable, so a caller can shed or throttle upstream.
 func (e *Engine) refuseWrite() error {
+	if err := e.validateSeparateSeries(); err != nil {
+		return err
+	}
 	err := e.space.Refuse()
 	if err == nil {
 		return nil

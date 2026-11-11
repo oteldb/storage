@@ -63,7 +63,7 @@ func (p *part) seriesIndex(ctx context.Context) (*seriesindex.Index, error) {
 }
 
 func (p *partStreamWriter) addDiskSeries(view series.View, ref uint32, id signal.SeriesID) error {
-	if !p.e.cfg.DiskSeries {
+	if !p.e.cfg.DiskSeries || p.e.cfg.SeparateSeries {
 		return nil
 	}
 	if len(p.runs) > 0 && u128ToID(p.runs[len(p.runs)-1].Value) == id {
@@ -79,7 +79,7 @@ func (p *partStreamWriter) addDiskSeries(view series.View, ref uint32, id signal
 }
 
 func (p *partStreamWriter) updateDiskSeriesMetadata() {
-	if p.seriesBuilder == nil || len(p.wmarks) == 0 {
+	if p.e.cfg.SeparateSeries || p.seriesBuilder == nil || len(p.wmarks) == 0 {
 		return
 	}
 	meta := seriesindex.Metadata{Covered: p.wmarks[len(p.wmarks)-1].Max}
@@ -89,6 +89,24 @@ func (p *partStreamWriter) updateDiskSeriesMetadata() {
 		meta.Stats = seriesindex.Stats{Count: int64(a.Count), Sum: a.Sum, Min: a.Min, Max: a.Max}
 	}
 	p.seriesBuilder.UpdateMetadata(meta)
+}
+
+func (p *partStreamWriter) seedOutputIDBloom(ctx context.Context, out *part) error {
+	if !p.e.cfg.SeparateSeries {
+		return p.seedPartIDBloom(ctx, out)
+	}
+	if out.index.seriesCount() != len(p.runs) {
+		return errors.Wrap(seriesindex.ErrCorrupt, "numeric output series count")
+	}
+	bloom := newPartIDBloom(len(p.runs))
+	for _, run := range p.runs {
+		bloom.add(u128ToID(run.Value))
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	out.idBloom.Store(bloom)
+	return nil
 }
 
 func (p *partStreamWriter) writeDiskSeries(ctx context.Context, entries identitySnapshot) error {

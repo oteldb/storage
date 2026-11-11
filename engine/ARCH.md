@@ -2050,3 +2050,26 @@ Disk-series merges whose sources all have immutable indexes record source/output
 alongside checked output identities. Finalization remaps and merges source postings directly; mixed
 legacy inputs retain label-based construction. Output mappings follow each time-bucket writer, so
 retention, size splitting and overlapping series preserve the output's own canonical reference order.
+
+## Separate series table
+
+`SeparateSeries` is an opt-in standalone, fresh-catalog mode requiring `DiskSeries` and
+`MetricSeriesChunks`. Immutable `s-<partid>` runs hold canonical descriptors and typed postings;
+numeric parts carry SIDX, coverage watermarks and aggregate statistics, with a manifest-bound
+`series-ref` marker instead of identities/postings. Numeric compaction never rebuilds descriptors.
+
+Catalog v9 names metadata roots independently of sample entries and publishes their union with
+numeric parts and the WAL checkpoint in one CAS. Runs sync before publication; failed commits
+retain pending roots through retries and reloads. A missing or invalid root fences loading.
+Part-held snapshot leases keep roots open until retired readers drain. Numeric membership, never
+metadata-run cardinality, determines active series and coverage; descriptors survive retention.
+
+Metadata roots are append-only: descriptor garbage collection and run compaction are unavailable.
+Clustered engines, replica refresh, unclaimed loading and Reset reject this mode. Existing sample
+catalogs require migration and are rejected; readers without the option reject v9 roots before
+mutating the catalog or sweeping objects. This mode does not change canonical IDs or WAL records.
+
+Strict merge coverage uses a checked SMAX cursor with one 32 KiB window per input. SIDX and
+SMAX ordinals must name identical canonical IDs; known merge positions bypass repeated ID seeks.
+Validation never substitutes sample timestamps for missing coverage. Byte-based retention counts
+numeric parts only; append-only metadata roots require separate disk-capacity monitoring.

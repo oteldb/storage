@@ -71,15 +71,12 @@ func (e *Engine) selectMergeInputsWithWatermarks(ctx context.Context, cohorts []
 			return boundedMergeSelection{}, err
 		}
 		bound.resident = buildbudget.Add(bound.resident, mergeSeriesScratchBound(parts, tiers))
-		if e.cfg.DiskSeries {
-			for _, p := range parts {
-				n, err := p.diskSeriesWorkspace(ctx, 0)
-				if err != nil {
-					return boundedMergeSelection{}, err
-				}
-				bound.resident = buildbudget.Add(bound.resident, n)
-			}
+		metadataBytes, err := e.mergeMetadataWorkspace(ctx, parts)
+		if err != nil {
+			return boundedMergeSelection{}, err
 		}
+		bound.resident = buildbudget.Add(bound.resident, metadataBytes)
+
 		floor := e.minimumMergeOutput(parts, selection.capBytes, opts, tiers)
 		if whole && !e.cfg.DiskSeries && buildbudget.Add(bound.bytes(), floor) <= limit {
 			floor = buildbudget.Add(floor, e.wholeMergeOutputBound(parts[0], selection.capBytes, opts, tiers))
@@ -166,7 +163,7 @@ func (e *Engine) partMergeInputBound(ctx context.Context, p *part, whole, fallba
 		return mergeInputBound{}, err
 	}
 	bound.include(columns)
-	if e.cfg.DiskSeries {
+	if e.cfg.DiskSeries && !e.cfg.SeparateSeries {
 		bound.resident = buildbudget.Add(bound.resident, mergeIdentityScratchBytes)
 	}
 	if e.cfg.MetricSeriesChunks {
@@ -200,8 +197,10 @@ func mergeIndexBound(ctx context.Context, p *part) (mergeInputBound, error) {
 		bytes = max(bytes, size)
 		transient = buildbudget.Mul(bytes, 2)
 	}
-	return mergeInputBound{resident: buildbudget.Add(bytes, memsize.Of[pagedIndex]()+memsize.Slice(index.fences)),
-		transient: transient}, nil
+	return mergeInputBound{
+		resident:  buildbudget.Add(bytes, memsize.Of[pagedIndex]()+memsize.Slice(index.fences)),
+		transient: transient,
+	}, nil
 }
 
 func mergeWatermarkBound(ctx context.Context, p *part) (mergeInputBound, error) {
@@ -324,4 +323,22 @@ func mergeSidecarBytes(ctx context.Context, b backend.Backend, key string, canon
 		return 0, errMergeInputMemory
 	}
 	return n, nil
+}
+
+func (e *Engine) mergeMetadataWorkspace(ctx context.Context, parts []*part) (int64, error) {
+	if e.cfg.SeparateSeries {
+		return buildbudget.Mul(int64(len(parts)), 64<<10), nil
+	}
+	if !e.cfg.DiskSeries {
+		return 0, nil
+	}
+	var bytes int64
+	for _, p := range parts {
+		n, err := p.diskSeriesWorkspace(ctx, 0)
+		if err != nil {
+			return 0, err
+		}
+		bytes = buildbudget.Add(bytes, n)
+	}
+	return bytes, nil
 }

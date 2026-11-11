@@ -417,6 +417,8 @@ type part struct {
 	// delete.
 	refs           atomic.Int32
 	readersClosing atomic.Bool
+	sharedSeries   *seriesSnapshot
+	sharedClose    sync.Once
 
 	// seriesMaxMu guards seriesMax, the per-series watermarks of [part.forEachSeriesMaxTime]. A
 	// mutex rather than a sync.Once so a failed load (a transient backend error) is retried instead
@@ -451,6 +453,7 @@ func (p *part) release() {
 		p.index.dropView()
 		if p.readersClosing.Load() {
 			_ = p.reader.Close()
+			p.releaseSharedSeries()
 		}
 	}
 }
@@ -1104,7 +1107,12 @@ func (p *part) closeReaders() {
 	p.readersClosing.Store(true)
 	if p.refs.Load() == 0 {
 		_ = p.reader.Close()
+		p.releaseSharedSeries()
 	}
+}
+
+func (p *part) releaseSharedSeries() {
+	p.sharedClose.Do(func() { p.sharedSeries.release() })
 }
 
 func (e *Engine) closePartReadersLocked() {

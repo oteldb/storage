@@ -59,7 +59,17 @@ func (e *Engine) snapshotDiskQuery(
 	if !countOnly {
 		p.diskMetadata = make(map[*part]map[signal.SeriesID]seriesindex.Metadata)
 	}
+	sharedSelection := withIdentity || !countOnly || len(r.Matchers) > 0
+	if sharedSelection {
+		if err := p.selectSharedDiskParts(ctx, r, selected, withIdentity, !countOnly); err != nil {
+			p.releaseParts()
+			return nil, err
+		}
+	}
 	for _, pt := range p.liveParts {
+		if sharedSelection && pt.sharedSeries != nil {
+			continue
+		}
 		if err := p.selectDiskPart(ctx, pt, r, selected, withIdentity, !countOnly); err != nil {
 			p.releaseParts()
 			return nil, err

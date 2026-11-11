@@ -244,6 +244,12 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	// Build (lock-free): compact the selected parts into new output part(s), reading them back. The
 	// source parts stay live (not retired) until publish, so they can't be reclaimed here.
 	var newParts []*part
+	published := false
+	defer func() {
+		if !published {
+			closePartReaders(newParts)
+		}
+	}()
 
 	var single *flushColumns
 
@@ -285,6 +291,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	if !committed {
 		return mergeResult{parts: dropped}, nil
 	}
+	published = true
 	return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, nil
 }
 
@@ -434,6 +441,12 @@ func (e *Engine) writeColumns(
 
 	ranges := chunkRanges(len(cols.ts), capRows)
 	newParts := make([]*part, 0, len(ranges))
+	completed := false
+	defer func() {
+		if !completed {
+			closePartReaders(newParts)
+		}
+	}()
 
 	for _, rg := range ranges {
 		sub := cols.slice(rg[0], rg[1])
@@ -446,6 +459,7 @@ func (e *Engine) writeColumns(
 		newParts = append(newParts, p)
 	}
 
+	completed = true
 	return newParts, nil
 }
 
@@ -557,7 +571,7 @@ func sourceCovered(ctx context.Context, src []*part, id signal.SeriesID) (int64,
 	covered := minInt64
 
 	for _, p := range src {
-		t, ok, err := p.seriesWatermark(ctx, id)
+		t, ok, err := p.mergeSeriesWatermark(ctx, id)
 		if err != nil {
 			return 0, err
 		}
@@ -621,9 +635,9 @@ var mergeResidentObserver func(peak, run, limit int64)
 // straddler's days, and a rollup whose bucket starts on the day before its samples, each land in
 // their own part. Every output part records plan's marker.
 func (e *Engine) compactStream(
-	ctx context.Context, src []*part, start, capBytes int64, plan rollupPlan, opts MergeOptions,
+	ctx context.Context, src []*part, capBytes int64, plan rollupPlan, opts MergeOptions,
 ) ([]*part, error) {
-	return e.compactStreamWithInputs(ctx, src, start, capBytes, plan, opts, 0, e.mergeBudget(capBytes).ResidentBytes)
+	return e.compactStreamWithInputs(ctx, src, minInt64, capBytes, plan, opts, 0, e.mergeBudget(capBytes).ResidentBytes)
 }
 
 func (e *Engine) compactStreamWithInputs(
@@ -657,6 +671,12 @@ func (e *Engine) compactStreamWithInputs(
 	postingSources := diskMergeIndexes(metadata)
 
 	var newParts []*part
+	completed := false
+	defer func() {
+		if !completed {
+			closePartReaders(newParts)
+		}
+	}()
 	var buildScratch block.StreamBuildScratch
 	var closedBloomBytes int64
 
@@ -756,6 +776,7 @@ func (e *Engine) compactStreamWithInputs(
 		mergeResidentObserver(peak, run, budget.ResidentBytes)
 	}
 
+	completed = true
 	return newParts, nil
 }
 
@@ -872,6 +893,8 @@ func (e *Engine) Close(ctx context.Context) (retErr error) {
 	defer func() {
 		readersDone := obs.ShutdownPhase(ctx, log, "release_part_readers")
 		e.closePartReadersLocked()
+		e.seriesTable.release()
+		e.seriesTable = nil
 		readersDone(nil)
 	}()
 
@@ -892,7 +915,11 @@ func (e *Engine) Close(ctx context.Context) (retErr error) {
 func (e *Engine) CloseWAL() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	defer e.closePartReadersLocked()
+	defer func() {
+		e.closePartReadersLocked()
+		e.seriesTable.release()
+		e.seriesTable = nil
+	}()
 
 	if e.cfg.WAL != nil {
 		return e.mu.WithReaders(e.cfg.WAL.Close)

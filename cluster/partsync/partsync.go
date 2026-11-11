@@ -488,21 +488,13 @@ func (s *Syncer) sync(ctx context.Context, enginePrefix string, peers []string, 
 
 	indexKey := enginePrefix + "/" + bucketindex.Object
 
-	addr, peerIndexRaw, peerIndex := s.newestPeer(ctx, indexKey, peers)
-	if peerIndex == nil {
-		return Stats{}, nil
+	localRaw, localIndex, err := s.localMirrorIndex(ctx, indexKey)
+	if err != nil {
+		return Stats{}, err
 	}
-
-	localRaw, err := backend.ReadView(ctx, s.local, indexKey)
-	if err != nil && !errors.Is(err, backend.ErrNotExist) {
-		return Stats{}, errors.Wrap(err, "read local index")
-	}
-
-	localIndex := &bucketindex.Index{}
-	if localRaw != nil {
-		if ix, err := bucketindex.Decode(localRaw); err == nil {
-			localIndex = ix
-		} // a corrupt local index is treated as empty and overwritten by the mirror
+	addr, peerIndexRaw, peerIndex, err := s.newestPeer(ctx, indexKey, peers)
+	if err != nil || peerIndex == nil {
+		return Stats{}, err
 	}
 
 	cmp := compareIndexes(peerIndex, localIndex)
@@ -766,16 +758,24 @@ func (s *Syncer) stateFor(enginePrefix string) *prefixState {
 
 // newestPeer fetches every peer's bucket index for indexKey and returns the newest one (by
 // part sequence, then flushed epoch). Unreachable peers and missing indexes are skipped.
-func (s *Syncer) newestPeer(ctx context.Context, indexKey string, peers []string) (addr string, raw []byte, ix *bucketindex.Index) {
+func (s *Syncer) newestPeer(
+	ctx context.Context, indexKey string, peers []string,
+) (addr string, raw []byte, ix *bucketindex.Index, retErr error) {
 	for _, p := range peers {
 		data, err := s.client.Fetch(ctx, p, indexKey)
 		if err != nil {
 			continue // unreachable or has no index: not a candidate
 		}
+		if err := rejectSeriesCatalogBytes(data); err != nil {
+			return "", nil, nil, err
+		}
 
 		cand, err := bucketindex.Decode(data)
 		if err != nil {
 			continue // corrupt copy: not a candidate
+		}
+		if err := rejectSeriesRoots(cand); err != nil {
+			return "", nil, nil, err
 		}
 
 		if ix == nil || compareIndexes(cand, ix) > 0 {
@@ -783,7 +783,7 @@ func (s *Syncer) newestPeer(ctx context.Context, indexKey string, peers []string
 		}
 	}
 
-	return addr, raw, ix
+	return addr, raw, ix, nil
 }
 
 // copyMissing fetches from addr every object under enginePrefix the local backend lacks,

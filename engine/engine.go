@@ -183,6 +183,9 @@ type Config struct {
 	// SeriesContexts shares bounded immutable resource/scope payloads across engines.
 	// The caller owns its separate memory budget; nil keeps per-engine ownership.
 	SeriesContexts *series.Contexts
+	// SeparateSeries stores immutable identity/postings deltas separately from numeric parts.
+	// Opt-in standalone disk-series mode; metadata reclamation and clustered use are unsupported.
+	SeparateSeries bool
 	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
 	// still has it, and says whether the part is gone from every owner. The cluster layer supplies
 	// it over its transport; a single-node store supplies one that fetches nothing and answers for
@@ -217,6 +220,7 @@ type Engine struct {
 	mergeRun      sync.Mutex
 	head          *head
 	parts         []*part
+	seriesTable   *seriesSnapshot
 	// tsCodec is the codec flushes and merges write the timestamp column with. It is a field, not a
 	// constant, only so a test can write the [chunk.CodecDoD] parts earlier builds wrote and check
 	// they merge.
@@ -1457,10 +1461,27 @@ func (e *Engine) Flush(ctx context.Context) error {
 // in-memory engine in tests and benchmarks,
 // letting a long-lived engine be reused across runs. Safe for concurrent use.
 func (e *Engine) Reset(ctx context.Context) error {
+	if e.cfg.SeparateSeries {
+		return errors.New("engine: reset of separate series storage is unsupported")
+	}
 	e.flushMu.Lock() // drain an in-flight flush/merge; it would otherwise publish into the empty engine
 	defer e.flushMu.Unlock()
 
 	e.mu.Lock()
+	if e.cfg.Backend != nil {
+		var ix *bucketindex.Index
+		err := e.mu.WithReaders(func() (err error) {
+			ix, _, err = bucketindex.LoadVersioned(ctx, e.cfg.Backend, e.indexKey())
+			return err
+		})
+		if err == nil {
+			err = e.validateSeriesCatalog(ix)
+		}
+		if err != nil {
+			e.mu.Unlock()
+			return err
+		}
+	}
 	e.head.memory.release()
 	e.head.frozenMemory.release()
 	e.head = newHeadWithContexts(e.cfg.SeriesContexts)
@@ -1791,6 +1812,7 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 		zap.Int("detached_series", len(detached)), zap.Int64("detached_bytes", detachedBytes))
 	newParts, rows, err := e.streamHead(ctx, detached)
 	if err != nil || rows == 0 {
+		closePartReaders(newParts)
 		return 0, 0, e.abortFlush(ctx, detached, detachedBytes, detachedSince, err)
 	}
 
@@ -1804,6 +1826,7 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 	// the head rather than into a part set the next reload would not keep.
 	if err := e.fenceLocked(); err != nil {
 		e.mu.Unlock()
+		closePartReaders(newParts)
 
 		return 0, 0, e.abortFlush(ctx, detached, detachedBytes, detachedSince, err)
 	}

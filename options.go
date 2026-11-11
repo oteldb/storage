@@ -210,6 +210,9 @@ type Options struct {
 	// MetricDiskSeries uses part-local on-disk metric identities/postings and bounded resident heads.
 	// Existing part identity objects remain readable; legacy readers retain their historical registry.
 	MetricDiskSeries bool
+	// MetricSeparateSeries stores descriptors/postings in independent immutable runs.
+	// Requires MetricDiskSeries and MetricSeriesChunks; standalone fresh catalogs only.
+	MetricSeparateSeries bool
 	// MetricResidentHeadBytes is the disk-index mode's resident-head pressure target. Zero uses 128 MiB.
 	// One atomic append may exceed the target; pressure flushes happen before subsequent writes.
 	MetricResidentHeadBytes int64
@@ -531,6 +534,9 @@ func errOptionInvalid(reason string) error {
 
 // validate checks the option combination before construction.
 func (o *Options) validate() error {
+	if o.MetricSeparateSeries && (!o.MetricDiskSeries || !o.MetricSeriesChunks || o.Cluster != nil) {
+		return errOptionInvalid("MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks without Cluster")
+	}
 	if o.MetricResidentHeadBytes < 0 {
 		return errOptionInvalid("MetricResidentHeadBytes must not be negative")
 	}
@@ -635,6 +641,9 @@ func WithMetricSeriesChunks() Option { return func(o *Options) { o.MetricSeriesC
 
 // WithMetricDiskSeries enables part-local disk identities/postings for metric engines.
 func WithMetricDiskSeries() Option { return func(o *Options) { o.MetricDiskSeries = true } }
+
+// WithMetricSeparateSeries enables independent metric descriptor runs on a fresh standalone store.
+func WithMetricSeparateSeries() Option { return func(o *Options) { o.MetricSeparateSeries = true } }
 
 // WithRejectOutOfRetention enables retention-age admission for all writes.
 func WithRejectOutOfRetention() Option { return func(o *Options) { o.RejectOutOfRetention = true } }

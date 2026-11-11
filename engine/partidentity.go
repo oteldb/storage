@@ -79,6 +79,9 @@ func writeIdentity(ctx context.Context, b backend.Backend, prefix string, entrie
 }
 
 func (p *partStreamWriter) writeIdentity(ctx context.Context, entries identitySnapshot) error {
+	if p.e.cfg.SeparateSeries {
+		return nil
+	}
 	if p.seriesBuilder != nil {
 		w, err := backend.CreateObjectDeferred(ctx, p.e.cfg.Backend, identityKey(p.prefix))
 		if err != nil {
@@ -226,6 +229,12 @@ func (e *Engine) registerPartIdentities(ctx context.Context, prefix string, admi
 
 // prepareDiskPart opens only bounded index metadata; legacy payloads remain on demand.
 func (e *Engine) prepareDiskPart(ctx context.Context, p *part) (bool, error) {
+	if e.cfg.SeparateSeries {
+		if err := e.prepareSharedPart(ctx, p); err != nil {
+			return false, err
+		}
+		return true, p.validateSharedSeriesIDs(ctx)
+	}
 	idx, err := p.seriesIndex(ctx)
 	if err != nil {
 		return false, err

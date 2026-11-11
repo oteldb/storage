@@ -68,3 +68,60 @@ func TestMetricResidentHeadBytesValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestSeparateSeriesFacadeFlushReopen(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	dir := t.TempDir()
+	open := func() *Storage {
+		t.Helper()
+		be, err := file.New(dir)
+		require.NoError(t, err)
+		s, err := Open(ctx, Options{FlushInterval: -1}, WithBackend(be), WithMetricDiskSeries(), WithMetricSeriesChunks(), WithMetricSeparateSeries())
+		require.NoError(t, err)
+		return s
+	}
+	s := open()
+	for range 2 {
+		acc, err := s.WriteMetrics(ctx, gaugeBatch("api", "one", []int64{100, 200}, []float64{1, 2}))
+		require.NoError(t, err)
+		require.EqualValues(t, 2, acc.Accepted)
+		eng, err := s.engineFor("default")
+		require.NoError(t, err)
+		require.NoError(t, eng.Flush(ctx))
+	}
+	require.NoError(t, s.Close(ctx))
+	s = open()
+	it, err := s.Fetcher("default").Fetch(ctx, fetch.Request{Start: 0, End: 1000, Matchers: []fetch.Matcher{nameMatcher("one")}})
+	require.NoError(t, err)
+	rows, err := fetch.Drain(ctx, it)
+	require.NoError(t, err)
+	require.NoError(t, it.Close())
+	require.Len(t, rows, 1)
+	require.Equal(t, []float64{1, 2}, rows[0].Values)
+	require.NoError(t, s.Close(ctx))
+}
+
+func TestMetricSeparateSeriesValidation(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name         string
+		disk, chunks bool
+		valid        bool
+	}{
+		{"neither", false, false, false},
+		{"disk only", true, false, false},
+		{"chunks only", false, true, false},
+		{"both", true, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			o := Options{MetricSeparateSeries: true, MetricDiskSeries: tc.disk, MetricSeriesChunks: tc.chunks}
+			if tc.valid {
+				require.NoError(t, o.validate())
+			} else {
+				require.Error(t, o.validate())
+			}
+		})
+	}
+}

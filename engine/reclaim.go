@@ -91,6 +91,9 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 	for _, p := range e.parts {
 		live[p.prefix] = struct{}{}
 	}
+	for _, binding := range e.seriesTable.bindings() {
+		live[binding.Prefix] = struct{}{}
+	}
 
 	// A wanted part's objects are not orphans, they are what is left of it. Deleting the readable
 	// remainder of a part repair is about to fetch destroys evidence and buys nothing: the want
@@ -119,7 +122,7 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 			continue // an engine-level object (bucket index, series index), not part of a part
 		}
 
-		id, err := partid.Parse(dir)
+		id, err := partid.Parse(strings.TrimPrefix(dir, "s-"))
 		if err != nil {
 			continue
 		}
