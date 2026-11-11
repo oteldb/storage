@@ -21,7 +21,17 @@ import (
 
 const validationBuffer = 64 << 10
 
-func (r *Run) validate(ctx context.Context, be backend.Backend, key string, desc block.ColumnDesc) error {
+func (r *Run) validate(ctx context.Context, be backend.Backend, key string, desc block.ColumnDesc) (err error) {
+	retained := r.idCache.reserve(r)
+	defer func() {
+		if err != nil {
+			r.idCache.remove(r)
+		}
+	}()
+	return r.validateContents(ctx, be, key, desc, retained)
+}
+
+func (r *Run) validateContents(ctx context.Context, be backend.Backend, key string, desc block.ColumnDesc, retained *cachedIDs) error {
 	// Descriptor materialization is bounded by one page, never by run cardinality.
 	n := 20*r.MaxPageBytes() + 4*validationBuffer
 	budget := readbudget.From(ctx)
@@ -51,7 +61,7 @@ func (r *Run) validate(ctx context.Context, be backend.Backend, key string, desc
 		if encoded[16] != 1 || id != ids.At() {
 			return errors.Wrap(ErrCorrupt, "ID column and index disagree")
 		}
-		raw, meta, found, err := rawReader.Lookup(id)
+		ref, raw, meta, found, err := rawReader.LookupRef(id)
 		if err != nil {
 			return err
 		}
@@ -66,6 +76,11 @@ func (r *Run) validate(ctx context.Context, be backend.Backend, key string, desc
 		if !bytes.Equal(raw, canonical) {
 			return errors.Wrap(ErrCorrupt, "noncanonical descriptor")
 		}
+		if ref != seen {
+			return errors.Wrap(ErrCorrupt, "noncanonical descriptor ordinal")
+		}
+
+		retained.set(seen, id)
 		seen++
 	}
 	if err := ids.Err(); err != nil {
@@ -86,6 +101,7 @@ func (r *Run) validate(ctx context.Context, be backend.Backend, key string, desc
 	if len(trailer) != 4 || binary.LittleEndian.Uint32(trailer) != crc.Sum32() {
 		return errors.Wrap(ErrCorrupt, "ID checksum")
 	}
+	r.idCache.publish(r)
 	return nil
 }
 

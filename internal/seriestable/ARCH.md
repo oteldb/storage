@@ -12,3 +12,10 @@ Readers and iterators reserve operation-local page scratch and pin retained file
 Returned descriptors are borrowed until the next cursor operation. Closing a run rejects new
 operations and closes its handles after existing operations finish; the engine must keep its
 objects reachable for the same lifetime. Write requires an unused caller-owned prefix.
+
+An optional byte-bounded ID cache retains fixed-width sorted canonical IDs from validation. Array
+position is the descriptor ordinal, checked during validation. Cache hits and exact negative probes
+bypass the generic ID-key table; descriptors retain page CRC/hash checks. Pending arrays are charged
+before allocation and published only after validation. Readers pin arrays once and binary-search without per-ID locks; pinned arrays remain charged and
+cannot be evicted during an operation. LRU eviction leaves the bounded disk fallback
+available, and run closure removes its retained IDs after active readers drain.

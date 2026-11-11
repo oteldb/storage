@@ -14,9 +14,11 @@ import (
 	"github.com/oteldb/storage/wal"
 )
 
-const defaultResidentHeadBytes = 128 << 20
-const diskHeadBloomWords = 1 << 17
-const diskHeadBloomMaxWords = 32 * diskHeadBloomWords
+const (
+	defaultResidentHeadBytes = 128 << 20
+	diskHeadBloomWords       = 1 << 17
+	diskHeadBloomMaxWords    = 32 * diskHeadBloomWords
+)
 
 // ErrReplicaHeadFull asks replication to retry after the primary publishes more parts.
 var ErrReplicaHeadFull = errors.New("engine: replica resident head is full; retry after primary part publication")
@@ -148,7 +150,7 @@ func (e *Engine) rebuildDiskStateLocked(ctx context.Context) (err error) {
 		e.head.disk.complete = false
 		return nil
 	}
-	next := newDiskHeadStateWithCache(e.cfg.SeriesCacheBytes)
+	next := newDiskHeadStateWithCache(e.diskSeriesCacheBytes())
 	headIDs := make([]signal.SeriesID, e.head.series.Len())
 	view := e.head.series.View()
 	for i := range headIDs {
@@ -509,4 +511,11 @@ func (e *Engine) diskWatermarksForHead(ctx context.Context, parts []*part, ids [
 		}
 	}
 	return bounds, nil
+}
+
+func (e *Engine) diskSeriesCacheBytes() int64 {
+	if e.cfg.SeparateSeries {
+		return e.cfg.SeriesCacheBytes - e.cfg.SeriesCacheBytes/8
+	}
+	return e.cfg.SeriesCacheBytes
 }

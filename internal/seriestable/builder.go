@@ -44,6 +44,11 @@ func (b *Builder) EncodedBound() int64 { return b.index.EncodedBound() + int64(b
 
 // Write writes and syncs an unused, caller-owned prefix; it does not publish a catalog.
 func Write(ctx context.Context, be backend.Backend, prefix string, b *Builder) (*Run, error) {
+	return WriteWithIDCache(ctx, be, prefix, b, nil)
+}
+
+// WriteWithIDCache writes a run and retains its IDs within cache's memory budget.
+func WriteWithIDCache(ctx context.Context, be backend.Backend, prefix string, b *Builder, cache *IDCache) (*Run, error) {
 	if b == nil || b.Count() == 0 {
 		return nil, errors.New("seriestable: empty run")
 	}
@@ -76,5 +81,5 @@ func Write(ctx context.Context, be backend.Backend, prefix string, b *Builder) (
 	if err := backend.SyncPrefix(ctx, be, prefix); err != nil {
 		return nil, err
 	}
-	return Open(ctx, be, prefix, digest)
+	return OpenWithIDCache(ctx, be, prefix, cache, digest)
 }

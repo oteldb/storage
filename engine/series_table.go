@@ -165,7 +165,7 @@ func (e *Engine) prepareSeriesRoots(ctx context.Context, bindings []bucketindex.
 			}
 		}
 		if found == nil {
-			run, openErr := seriestable.Open(ctx, e.cfg.Backend, binding.Prefix, binding.ManifestDigest)
+			run, openErr := seriestable.OpenWithIDCache(ctx, e.cfg.Backend, binding.Prefix, e.seriesIDs, binding.ManifestDigest)
 			if openErr != nil {
 				for _, r := range opened {
 					_ = r.Close()

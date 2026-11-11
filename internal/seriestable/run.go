@@ -22,15 +22,21 @@ var ErrClosed = errors.New("seriestable: closed run")
 
 // Run retains immutable metadata only. The engine owns catalog and object reclamation.
 type Run struct {
-	part   *block.PartReader
-	index  *seriesindex.Index
-	mu     sync.Mutex
-	refs   int
-	closed bool
+	idCache *IDCache
+	part    *block.PartReader
+	index   *seriesindex.Index
+	mu      sync.Mutex
+	refs    int
+	closed  bool
 }
 
 // Open validates a run and optionally checks its catalog-bound manifest digest.
-func Open(ctx context.Context, be backend.Backend, prefix string, expected ...[32]byte) (_ *Run, err error) {
+func Open(ctx context.Context, be backend.Backend, prefix string, expected ...[32]byte) (*Run, error) {
+	return OpenWithIDCache(ctx, be, prefix, nil, expected...)
+}
+
+// OpenWithIDCache retains validated IDs within cache's separate memory budget.
+func OpenWithIDCache(ctx context.Context, be backend.Backend, prefix string, cache *IDCache, expected ...[32]byte) (_ *Run, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -76,7 +82,7 @@ func Open(ctx context.Context, be backend.Backend, prefix string, expected ...[3
 	if uint64(idx.Count()) != uint64(m.RowCount) || idx.ParentDigest() != p.ManifestDigest() {
 		return nil, errors.Wrap(ErrCorrupt, "index manifest binding")
 	}
-	r := &Run{part: p, index: idx}
+	r := &Run{part: p, index: idx, idCache: cache}
 	if err := r.validate(ctx, be, prefix+"/c/0", c); err != nil {
 		return nil, err
 	}
@@ -123,6 +129,7 @@ func (r *Run) Close() error {
 	closePart := r.refs == 0
 	r.mu.Unlock()
 	if closePart {
+		r.idCache.remove(r)
 		return r.part.Close()
 	}
 	return nil
@@ -146,6 +153,7 @@ func (r *Run) release() {
 	closePart := r.closed && r.refs == 0
 	r.mu.Unlock()
 	if closePart {
+		r.idCache.remove(r)
 		_ = r.part.Close()
 	}
 }

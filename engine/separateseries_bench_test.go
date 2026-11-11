@@ -50,8 +50,9 @@ func benchmarkSeparateSeriesCPU(
 	profiled := false
 	for b.Loop() {
 		b.StopTimer()
-		f := newCPUFixture(b, b.Context(), options)
-		f.engine.cfg.SeparateSeries = separate
+		fixtureOptions := options
+		fixtureOptions.separate = separate
+		f := newCPUFixture(b, b.Context(), fixtureOptions)
 		// Keep fixture construction from triggering unmeasured pressure flushes.
 		f.engine.cfg.ResidentHeadBytes = math.MaxInt64
 		if err := seed.appendTo(f.engine); err != nil {

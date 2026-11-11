@@ -217,6 +217,7 @@ type Options struct {
 	// One atomic append may exceed the target; pressure flushes happen before subsequent writes.
 	MetricResidentHeadBytes int64
 	// MetricSeriesCacheBytes bounds the historical ID/watermark cache per metric engine.
+	// Separate metadata mode shares this budget with retained sorted identity IDs.
 	// Zero uses 512 MiB, allocated on demand; negative disables the cache.
 	MetricSeriesCacheBytes int64
 

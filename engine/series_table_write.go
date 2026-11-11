@@ -124,7 +124,7 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 			return err
 		}
 	}
-	run, err := seriestable.Write(ctx, e.cfg.Backend, prefix, &builder)
+	run, err := seriestable.WriteWithIDCache(ctx, e.cfg.Backend, prefix, &builder, e.seriesIDs)
 	if err != nil {
 		return errors.Wrap(err, "write shared series delta")
 	}

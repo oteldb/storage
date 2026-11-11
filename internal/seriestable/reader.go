@@ -2,6 +2,7 @@ package seriestable
 
 import (
 	"context"
+	"slices"
 
 	"github.com/go-faster/errors"
 
@@ -14,6 +15,7 @@ import (
 
 // Reader owns bounded page scratch for one operation. It is not concurrent-safe.
 type Reader struct {
+	ids    *cachedIDs
 	run    *Run
 	ctx    context.Context //nolint:containedctx // Reader owns operation-local I/O and scratch.
 	raw    *seriesindex.RawReader
@@ -35,8 +37,7 @@ func (r *Run) NewReader(ctx context.Context) (*Reader, error) {
 		budget.Release(n)
 		return nil, err
 	}
-	ctx = r.ReaderContext(ctx)
-	return &Reader{run: r, ctx: ctx, raw: r.index.RawReader(ctx), budget: budget, bytes: n}, nil
+	return &Reader{run: r, ctx: ctx, budget: budget, bytes: n, ids: r.idCache.acquire(r)}, nil
 }
 
 // LookupRaw returns a borrowed descriptor, valid until the next lookup or Close.
@@ -47,7 +48,20 @@ func (r *Reader) LookupRaw(id signal.SeriesID) ([]byte, bool, error) {
 	if err := r.ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	raw, meta, found, err := r.raw.Lookup(id)
+	var ref int
+	var found bool
+	var raw []byte
+	var meta seriesindex.Metadata
+	var err error
+	if r.ids != nil {
+		ref, found = slices.BinarySearchFunc(r.ids.ids, id, signal.SeriesID.Compare)
+		if !found {
+			return nil, false, nil
+		}
+		raw, meta, err = r.rawReader().LookupOrdinal(id, uint32(ref))
+	} else {
+		raw, meta, found, err = r.rawReader().Lookup(id)
+	}
 	if err != nil {
 		return nil, false, err
 	}
@@ -62,6 +76,8 @@ func (r *Reader) Close() error {
 	if r == nil || r.run == nil {
 		return nil
 	}
+	r.run.idCache.release(r.ids)
+	r.ids = nil
 	r.run.release()
 	r.budget.Release(r.bytes)
 	r.run, r.raw, r.ctx = nil, nil, nil
@@ -161,4 +177,12 @@ func (it *Iterator) Close() error {
 	it.budget.Release(it.bytes)
 	it.run, it.refs, it.cursor, it.raw, it.ctx = nil, nil, nil, nil, nil
 	return nil
+}
+
+func (r *Reader) rawReader() *seriesindex.RawReader {
+	if r.raw == nil {
+		r.ctx = r.run.ReaderContext(r.ctx)
+		r.raw = r.run.index.RawReader(r.ctx)
+	}
+	return r.raw
 }

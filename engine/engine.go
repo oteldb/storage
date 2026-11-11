@@ -26,6 +26,7 @@ import (
 	"github.com/oteldb/storage/internal/repair"
 	"github.com/oteldb/storage/internal/retention"
 	"github.com/oteldb/storage/internal/seriesindex"
+	"github.com/oteldb/storage/internal/seriestable"
 	"github.com/oteldb/storage/pool"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/readbudget"
@@ -178,6 +179,7 @@ type Config struct {
 	// One atomic caller batch may exceed the target and flushes before the next write.
 	ResidentHeadBytes int64
 	// SeriesCacheBytes bounds historical ID/watermark cache memory per disk-indexed engine.
+	// SeparateSeries reserves one eighth for retained sorted IDs; the rest holds watermarks.
 	// Zero uses 512 MiB, allocated on demand; negative disables the cache.
 	SeriesCacheBytes int64
 	// SeriesContexts shares bounded immutable resource/scope payloads across engines.
@@ -221,6 +223,7 @@ type Engine struct {
 	head          *head
 	parts         []*part
 	seriesTable   *seriesSnapshot
+	seriesIDs     *seriestable.IDCache
 	// tsCodec is the codec flushes and merges write the timestamp column with. It is a field, not a
 	// constant, only so a test can write the [chunk.CodecDoD] parts earlier builds wrote and check
 	// they merge.
@@ -430,8 +433,11 @@ func New(cfg Config) *Engine {
 		e.putF64(b.Values)
 	}
 
+	if cfg.SeparateSeries {
+		e.seriesIDs = seriestable.NewIDCache(cfg.SeriesCacheBytes / 8)
+	}
 	if cfg.DiskSeries {
-		e.head.disk = newDiskHeadStateWithCache(e.cfg.SeriesCacheBytes)
+		e.head.disk = newDiskHeadStateWithCache(e.diskSeriesCacheBytes())
 	}
 	e.walB = newWALBatch()
 
@@ -1486,7 +1492,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 	e.head.frozenMemory.release()
 	e.head = newHeadWithContexts(e.cfg.SeriesContexts)
 	if e.cfg.DiskSeries {
-		e.head.disk = newDiskHeadStateWithCache(e.cfg.SeriesCacheBytes)
+		e.head.disk = newDiskHeadStateWithCache(e.diskSeriesCacheBytes())
 	}
 	e.identityOrder.reset()
 	e.flushing = nil        // discarded with the head: Reset drops the samples, it does not flush them

@@ -2073,3 +2073,9 @@ Strict merge coverage uses a checked SMAX cursor with one 32 KiB window per inpu
 SMAX ordinals must name identical canonical IDs; known merge positions bypass repeated ID seeks.
 Validation never substitutes sample timestamps for missing coverage. Byte-based retention counts
 numeric parts only; append-only metadata roots require separate disk-capacity monitoring.
+
+Separate metadata reserves one eighth of `SeriesCacheBytes` for a bounded
+LRU of validated, sorted `SeriesID` arrays. Exact binary search returns a descriptor ordinal or a
+negative result without decoding prefix-coded keys. The remainder holds historical watermarks. Pending arrays count against the cache limit
+before allocation and become readable only after full run validation; eviction falls back to the
+existing bounded disk reader. Cached IDs never determine active cardinality or sample coverage.
