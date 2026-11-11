@@ -104,6 +104,9 @@ type Index struct {
 	// [MaxLineage] kept, sorted by group — see [Index.RecordLineage], which is the whole of why it
 	// outlives the entries that carried each claim. Added in format v8.
 	Catalog []Claim
+	// SeriesRoots names immutable identity-only runs, independent of sample lineage.
+	// Roots are kept sorted by prefix and carried forward until explicit metadata GC exists.
+	SeriesRoots []SeriesRoot
 }
 
 // Add inserts e, replacing any existing entry with the same prefix, keeping the index sorted.
@@ -150,6 +153,7 @@ func (ix *Index) Overlapping(start, end int64) []Entry {
 const (
 	magic0, magic1 = 'B', 'I'
 
+	// v9 appends immutable series roots. Writers without roots retain the v8 layout.
 	// v8 adds each entry's rollup layout, behind a flag bit, and appends the lineage catalog.
 	//
 	// v7 scopes every block to the ownership term that allocated it (a [Block] is a term and a
@@ -169,13 +173,17 @@ const (
 	// Reading is backward compatible; writing is not. [Decode] rejects any version above this one,
 	// so a node on pre-v5 code cannot read an index this one writes: every node that reads a given
 	// index must be upgraded together. See backend/ARCH.md for the blast radius per deployment.
-	version = 8
+	version = 9
 )
 
 // AppendBinary appends the versioned binary encoding of the index to dst (append-style for
-// buffer reuse).
+// buffer reuse). SeriesRoots must be canonical; use [Index.AddSeriesRoot] or [MergeSeriesRoots].
 func (ix *Index) AppendBinary(dst []byte) []byte {
-	dst = append(dst, magic0, magic1, version)
+	ver := byte(8)
+	if len(ix.SeriesRoots) > 0 {
+		ver = version
+	}
+	dst = append(dst, magic0, magic1, ver)
 	dst = binary.AppendUvarint(dst, uint64(len(ix.Entries)))
 	for i := range ix.Entries {
 		e := &ix.Entries[i]
@@ -237,6 +245,9 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 	for _, c := range ix.Catalog {
 		dst = appendInterval(dst, c.Blocks)
 		dst = appendInterval(dst, c.Group)
+	}
+	if ver >= 9 {
+		dst = appendSeriesRoots(dst, ix.SeriesRoots)
 	}
 
 	return dst
@@ -360,8 +371,16 @@ func decodeTail(ix *Index, buf []byte, ver uint8) error {
 		return nil
 	}
 
-	if ix.Catalog, ok = readCatalog(rest); !ok {
+	if ix.Catalog, rest, ok = readCatalog(rest); !ok {
 		return errors.Wrap(ErrCorrupt, "bad lineage catalog")
+	}
+	if ver >= 9 {
+		if ix.SeriesRoots, rest, err = decodeSeriesRoots(rest); err != nil {
+			return err
+		}
+		if len(rest) != 0 {
+			return errors.Wrap(ErrCorrupt, "trailing series roots data")
+		}
 	}
 
 	return nil
@@ -369,14 +388,14 @@ func decodeTail(ix *Index, buf []byte, ver uint8) error {
 
 // readCatalog parses the v8+ lineage catalog. It is canonical like everything else — every claim
 // valid, strictly ascending in [MergeLineage]'s order — so encode∘decode stays the identity.
-func readCatalog(buf []byte) ([]Claim, bool) {
+func readCatalog(buf []byte) ([]Claim, []byte, bool) {
 	n, buf, ok := readUvarint(buf)
 	if !ok || n > uint64(len(buf)) {
-		return nil, false
+		return nil, nil, false
 	}
 
 	if n == 0 {
-		return nil, true
+		return nil, buf, true
 	}
 
 	out := make([]Claim, 0, n)
@@ -384,11 +403,11 @@ func readCatalog(buf []byte) ([]Claim, bool) {
 		var c Claim
 
 		if c.Blocks, buf, ok = readInterval(buf, version); !ok {
-			return nil, false
+			return nil, nil, false
 		}
 
 		if c.Group, buf, ok = readInterval(buf, version); !ok || !c.Valid() {
-			return nil, false
+			return nil, nil, false
 		}
 
 		out = append(out, c)
@@ -396,11 +415,11 @@ func readCatalog(buf []byte) ([]Claim, bool) {
 
 	for i := 1; i < len(out); i++ {
 		if compareClaims(out[i-1], out[i]) >= 0 {
-			return nil, false
+			return nil, nil, false
 		}
 	}
 
-	return out, true
+	return out, buf, true
 }
 
 // decodeEntries parses the part list, bounding the count by what the buffer could hold as the
@@ -964,6 +983,9 @@ var ErrFenced = errors.New("bucketindex: commit fenced by a failed index load")
 func (ix *Index) Save(
 	ctx context.Context, b backend.Backend, key string, expected backend.Version,
 ) (backend.Version, error) {
+	if err := validateSeriesRoots(ix.SeriesRoots); err != nil {
+		return backend.VersionAbsent, err
+	}
 	version, ok, err := b.CompareAndSwap(ctx, key, expected, ix.AppendBinary(nil))
 	if err != nil {
 		return backend.VersionAbsent, errors.Wrapf(err, "commit index %q", key)

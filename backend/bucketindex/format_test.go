@@ -229,7 +229,7 @@ func TestDecodeAllVersions(t *testing.T) {
 		})
 	}
 
-	_, err := bucketindex.Decode([]byte{'B', 'I', 9, 0})
+	_, err := bucketindex.Decode([]byte{'B', 'I', 10, 0})
 	require.ErrorIs(t, err, bucketindex.ErrCorrupt, "a version this reader does not know is rejected")
 }
 
