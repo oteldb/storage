@@ -23,6 +23,7 @@ type readCacheKey struct {
 	offset     int64
 	length     int64
 	owner      uint64
+	format     string
 }
 
 func (c *cachedBackend) invalidate(key string) {
