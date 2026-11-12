@@ -881,6 +881,13 @@ allowance from the merge limiter and shared build pool described above. The pool
 requests, not actual allocations: an indivisible input may exceed its nominal share and runs alone.
 Disk floors do not set resident allowances.
 
+Merge writers reserve run, watermark, aggregate and Int128-run capacity from the largest input's
+series count as a sizing hint. One operation-local reservation spends at most 32 MiB or one eighth
+of the allowance left after input/codec charges, whichever is smaller, across all output writers.
+Allocator rounding is included conservatively; capacities remain charged by normal residency and
+writer-open run accounting. New/disjoint series still grow normally; small outputs cannot retain
+an input-sized reservation without this bound. No extra ID traversal or disk read is needed.
+
 A background merge defers when its allowance is unavailable; operator-requested work waits.
 The independent pressure worker does not wait for the merge scheduler. It can still wait for memory
 when overlap would exceed the shared allowance. Queued requests prevent later work from starving them.

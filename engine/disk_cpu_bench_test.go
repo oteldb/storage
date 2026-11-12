@@ -49,6 +49,7 @@ func cpuBenchOptions(b *testing.B) cpuFixtureOptions {
 		generations: cpuBenchInt(b, "OTELDB_BENCH_CPU_GENERATIONS", 4, 4),
 		points:      cpuBenchInt(b, "OTELDB_BENCH_CPU_POINTS", 16, 1024),
 		disk:        os.Getenv("OTELDB_BENCH_DISK_SERIES") == "true",
+		separate:    os.Getenv("OTELDB_BENCH_CPU_SEPARATE_SERIES") == "true",
 		readCache:   os.Getenv("OTELDB_BENCH_CPU_READ_CACHE") == "true",
 		sync:        os.Getenv("OTELDB_BENCH_WAL_SYNC") != "false",
 		reopen:      os.Getenv("OTELDB_BENCH_CPU_REOPEN") == "true",

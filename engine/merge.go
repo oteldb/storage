@@ -679,6 +679,7 @@ func (e *Engine) compactStreamWithInputs(
 	}()
 	var buildScratch block.StreamBuildScratch
 	var closedBloomBytes int64
+	seriesReservation := newMergeSeriesReservation(src, allowance, held)
 
 	router := timebucket.Router[*partStreamWriter]{
 		Open: func(int64) (*partStreamWriter, error) {
@@ -689,7 +690,7 @@ func (e *Engine) compactStreamWithInputs(
 			w.mergeFinish = &mergeFinishBudget{}
 			w.buildScratch = &buildScratch
 			w.initMergePostings(ctx, postingSources)
-			return w, nil
+			return w, seriesReservation.reserve(w)
 		},
 		Finish: func(w *partStreamWriter) error {
 			p, err := w.finish(ctx)
