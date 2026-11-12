@@ -2085,3 +2085,9 @@ operation-local 32-KiB window. The scratch window is reset and reused across par
 lazily after a real index hit, so absent IDs do not read irrelevant sidecars. Every ordinal verifies
 its canonical ID before returning Covered. Point APIs and legacy per-part indexes retain their
 existing paths; CRC validation and generation fencing are unchanged.
+
+Historical ingestion probes attach a reader-pool Batch to their operation context and reset it
+between numeric parts. Repeated SIDX/SMAX ranges reuse acquired handles, or remember a declined
+retention request for that part. The batch releases every lease before snapshot references drain;
+read failures and reset/close errors prevent applying the staged admission state. At most eight
+entries are retained per batch within the existing global descriptor limit.

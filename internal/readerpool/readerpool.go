@@ -462,11 +462,24 @@ func Append(ctx context.Context, namespace any, name string, dst []byte, off, n 
 	if !ok {
 		return dst, false, nil
 	}
-	e, supported, err := shared.borrowGeneration(b.scope, b.generation, namespace, name, open)
+	if batch, ok := ctx.Value(batchKey{}).(*Batch); ok {
+		return batch.append(b, namespace, name, dst, off, n, open)
+	}
+	return shared.appendGeneration(b, namespace, name, dst, off, n, open)
+}
+
+func (p *pool) appendGeneration(b binding, namespace any, name string, dst []byte, off, n int64,
+	open func() (Reader, error),
+) ([]byte, bool, error) {
+	e, supported, err := p.borrowGeneration(b.scope, b.generation, namespace, name, open)
 	if err != nil || !supported {
 		return dst, supported, err
 	}
-	defer func() { _ = shared.release(e) }()
+	defer func() { _ = p.release(e) }()
+	return appendEntry(e, dst, off, n)
+}
+
+func appendEntry(e *entry, dst []byte, off, n int64) ([]byte, bool, error) {
 	if off >= e.reader.Size() {
 		return dst, true, nil
 	}

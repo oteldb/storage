@@ -63,7 +63,19 @@ func TestImmutableReaderScopeReusesOpenedGeneration(t *testing.T) {
 
 //nolint:paralleltest // This test reserves every slot of the process-wide reader budget.
 func TestSaturatedRangeFallbackRejectsReplacement(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(strconv.FormatBool(batch), func(t *testing.T) { testSaturatedRangeFallbackRejectsReplacement(t, batch) })
+	}
+}
+
+func testSaturatedRangeFallbackRejectsReplacement(t *testing.T, batched bool) {
+	t.Helper()
 	ctx := t.Context()
+	if batched {
+		base, batch := readerpool.WithBatch(ctx)
+		ctx = base
+		defer func() { require.NoError(t, batch.Close()) }()
+	}
 	fsys := faultfs.New()
 	b := newFS(fsys)
 	fill := readerpool.NewScope()
