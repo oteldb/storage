@@ -86,7 +86,7 @@ func (p *part) mayContainDiskID(id signal.SeriesID) bool {
 }
 
 func (e *Engine) identityBytesLocked() int64 {
-	n := e.head.identityBytes() + e.identityOrder.bytes.Load()
+	n := e.head.identityBytes() + e.seriesIDs.SizeBytes() + e.identityOrder.bytes.Load()
 	for _, p := range e.parts {
 		n += p.idBloom.Load().sizeBytes()
 	}

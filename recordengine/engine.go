@@ -919,9 +919,25 @@ func (e *Engine) Flush(ctx context.Context) error {
 func (e *Engine) Reset(ctx context.Context) error {
 	e.flushMu.Lock() // drain an in-flight flush/merge; it would otherwise publish into the empty engine
 	defer e.flushMu.Unlock()
-	e.mergeFeedback.prune(nil)
 
 	e.mu.Lock()
+	if e.cfg.Backend != nil {
+		err := e.mu.WithReaders(func() error {
+			ix, err := bucketindex.Load(ctx, e.cfg.Backend, e.indexKey())
+			if err != nil {
+				return err
+			}
+			if len(ix.SeriesRoots) > 0 {
+				return errors.New("recordengine: separate series catalogs are unsupported")
+			}
+			return nil
+		})
+		if err != nil {
+			e.mu.Unlock()
+			return err
+		}
+	}
+	e.mergeFeedback.prune(nil)
 	e.head = newHead(e.cfg.Schema)
 	e.flushing = nil // discarded with the head: Reset drops the records, it does not flush them
 	e.flushingSide = nil

@@ -92,7 +92,7 @@ func (e *Engine) MergeStreamOutputForTest(ctx context.Context, opts MergeOptions
 	if err != nil {
 		return err
 	}
-	out, err := e.compactStream(ctx, src, minInt64, e.mergeCapBytes(ctx), plan, opts)
+	out, err := e.compactStream(ctx, src, e.mergeCapBytes(ctx), plan, opts)
 	if err != nil {
 		return err
 	}

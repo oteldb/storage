@@ -18,11 +18,22 @@ do not. Tokens are process-local, never reset or reused, and become noncacheable
 
 ### Independent known-series preparation
 
+`Config.SeriesContexts` optionally shares bounded immutable resource/scope payloads across engine
+registries. Reset and disk-head compaction preserve the configured pool. It owns no membership,
+watermark or acceptance state; cache hits cannot revive removed series. The embedder budgets its
+retained memory separately from engine-local identity state. Nil retains existing local ownership.
+
 Anonymous standalone WAL engines allow contended 1,024–4,096-point batches to prepare independently
 when every identity already exists and soft-overflow routing is inactive. Transient uint32-reference
 bitmaps use 64 reservation stripes; conflicting batches roll back reservations and enter existing
 ordered admission. The shared writer lease pins references and head generation until completion.
-Cluster-owned, new-identity and other batch shapes retain exclusive writer ownership.
+Cluster-owned, new-identity and other batch shapes retain ordered admission and publication.
+
+Standalone disk-series batches in the bounded preparation pool pin immutable part handles and
+resolve historical watermarks outside writer ownership. Lookup maps are private; cache and Bloom
+access stays ordered. Head/disk identity, catalog generation and readable handles are revalidated
+before admission uses current watermarks and limits. A changed snapshot falls back to one ordered
+lookup, bounding retries. Pool release clears part/head references and reuses numeric lookup scratch.
 
 Readers see only published slice lengths. A reserved series may prepare appends beyond that prefix
 in spare numeric capacity; growth uses private arrays. Existing prefix values and visible headers
@@ -869,6 +880,13 @@ producing.
 allowance from the merge limiter and shared build pool described above. The pool bounds admission
 requests, not actual allocations: an indivisible input may exceed its nominal share and runs alone.
 Disk floors do not set resident allowances.
+
+Merge writers reserve run, watermark, aggregate and Int128-run capacity from the largest input's
+series count as a sizing hint. One operation-local reservation spends at most 32 MiB or one eighth
+of the allowance left after input/codec charges, whichever is smaller, across all output writers.
+Allocator rounding is included conservatively; capacities remain charged by normal residency and
+writer-open run accounting. New/disjoint series still grow normally; small outputs cannot retain
+an input-sized reservation without this bound. No extra ID traversal or disk read is needed.
 
 A background merge defers when its allowance is unavailable; operator-requested work waits.
 The independent pressure worker does not wait for the merge scheduler. It can still wait for memory
@@ -2039,3 +2057,52 @@ Disk-series merges whose sources all have immutable indexes record source/output
 alongside checked output identities. Finalization remaps and merges source postings directly; mixed
 legacy inputs retain label-based construction. Output mappings follow each time-bucket writer, so
 retention, size splitting and overlapping series preserve the output's own canonical reference order.
+
+## Separate series table
+
+`SeparateSeries` is an opt-in standalone, fresh-catalog mode requiring `DiskSeries` and
+`MetricSeriesChunks`. Immutable `s-<partid>` runs hold canonical descriptors and typed postings;
+numeric parts carry SIDX, coverage watermarks and aggregate statistics, with a manifest-bound
+`series-ref` marker instead of identities/postings. Numeric compaction never rebuilds descriptors.
+
+Catalog v9 names metadata roots independently of sample entries and publishes their union with
+numeric parts and the WAL checkpoint in one CAS. Runs sync before publication; failed commits
+retain pending roots through retries and reloads. A missing or invalid root fences loading.
+Part-held snapshot leases keep roots open until retired readers drain. Numeric membership, never
+metadata-run cardinality, determines active series and coverage; descriptors survive retention.
+
+Metadata roots are append-only: descriptor garbage collection and run compaction are unavailable.
+Clustered engines, replica refresh, unclaimed loading and Reset reject this mode. Existing sample
+catalogs require migration and are rejected; readers without the option reject v9 roots before
+mutating the catalog or sweeping objects. This mode does not change canonical IDs or WAL records.
+
+Strict merge coverage uses a checked SMAX cursor with one 32 KiB window per input. SIDX and
+SMAX ordinals must name identical canonical IDs; known merge positions bypass repeated ID seeks.
+Validation never substitutes sample timestamps for missing coverage. Byte-based retention counts
+numeric parts only; append-only metadata roots require separate disk-capacity monitoring.
+
+Separate metadata reserves one eighth of `SeriesCacheBytes` for a bounded
+LRU of validated, sorted `SeriesID` arrays. Exact binary search returns a descriptor ordinal or a
+negative result without decoding prefix-coded keys. The remainder holds historical watermarks. Pending arrays count against the cache limit
+before allocation and become readable only after full run validation; eviction falls back to the
+existing bounded disk reader. Cached IDs never determine active cardinality or sample coverage.
+
+Shared-part ingestion metadata probes reuse the SIDX ordinal and read SMAX through an
+operation-local 32-KiB window. The scratch window is reset and reused across parts; coverage opens
+lazily after a real index hit, so absent IDs do not read irrelevant sidecars. Every ordinal verifies
+its canonical ID before returning Covered. Point APIs and legacy per-part indexes retain their
+existing paths; CRC validation and generation fencing are unchanged.
+
+Historical ingestion probes attach a reader-pool Batch to their operation context and reset it
+between numeric parts. Repeated SIDX/SMAX ranges reuse acquired handles, or remember a declined
+retention request for that part. The batch releases every lease before snapshot references drain;
+read failures and reset/close errors prevent applying the staged admission state. At most eight
+entries are retained per batch within the existing global descriptor limit.
+
+
+Ordinary sample fetches request identities without aggregate metadata. Aggregate plans explicitly
+request statistics; count-only planning remains independent. Shared numeric statistics are not
+read or materialized for sample fetches. Missing/corrupt optional stats retain the decode fallback.
+Historical sorted-ID batches hold one bounded SIDX page per part beside the coverage window,
+so adjacent probes reuse it even when backend cache admission declines. Both views expire with
+the pinned part; final-page and SIDX/SMAX ordinal validation remain unchanged.

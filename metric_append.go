@@ -21,11 +21,13 @@ type metricAppendBuffer struct {
 	values  []float64
 	refs    []metricPointRef
 	sources []metric.Source
+	arena   metric.SeriesArena
 }
 
 var metricAppendPool = sync.Pool{New: func() any { return &metricAppendBuffer{} }}
 
 func (b *metricAppendBuffer) reset() {
+	b.arena.Reset()
 	clear(b.sources)
 	b.sources = b.sources[:0]
 	b.ids, b.ts, b.values, b.refs = b.ids[:0], b.ts[:0], b.values[:0], b.refs[:0]
@@ -45,7 +47,7 @@ func (b *metricAppendBuffer) append(batch *metric.Batch) {
 
 func (b *metricAppendBuffer) series(i int) signal.Series {
 	r := b.refs[i]
-	return b.sources[r.source].Series(r.point)
+	return b.arena.Materialize(b.sources[r.source].Identity(r.point))
 }
 
 func (b *metricAppendBuffer) flush(eng *engine.Engine, limits engine.AppendLimits) (engine.AppendResult, error) {

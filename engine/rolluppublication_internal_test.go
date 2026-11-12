@@ -22,7 +22,7 @@ func rollupPublicationCandidate(t *testing.T, be backend.Backend) (*Engine, []*p
 	tiers := []DownsampleTier{{Before: 100, Interval: 10, Agg: signal.AggSum}}
 	plan, err := e.planRollup(t.Context(), src, minInt64, tiers)
 	require.NoError(t, err)
-	out, err := e.compactStream(t.Context(), src, minInt64, e.mergeCapBytes(t.Context()), plan, MergeOptions{Downsample: tiers})
+	out, err := e.compactStream(t.Context(), src, e.mergeCapBytes(t.Context()), plan, MergeOptions{Downsample: tiers})
 	require.NoError(t, err)
 	planMergeBlocks(src, out)
 	return e, src, out, plan

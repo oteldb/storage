@@ -8,8 +8,40 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/internal/buildbudget"
+	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/internal/watermark"
+	"github.com/oteldb/storage/signal"
 )
+
+func (p *part) mergeSeriesWatermark(ctx context.Context, id signal.SeriesID) (int64, bool, error) {
+	if p.sharedSeries == nil {
+		return p.seriesWatermark(ctx, id)
+	}
+	meta, found, err := p.sharedSeriesMetadata(ctx, id)
+	return meta.Covered, found, err
+}
+
+func (p *part) validateSharedMergeWatermarks(ctx context.Context) error {
+	ctx = p.reader.ReaderContext(ctx)
+	reader, err := watermark.OpenReader(ctx, p.be, watermark.Key(p.prefix), p.index.seriesCount())
+	if err != nil {
+		return err
+	}
+	cursor := reader.Cursor(ctx)
+	ids := p.diskRowIDs(ctx)
+	index := 0
+	for ids.Next() {
+		entry, err := cursor.At(index)
+		if err != nil {
+			return err
+		}
+		if entry.ID != ids.At() {
+			return errors.Wrap(seriesindex.ErrCorrupt, "numeric coverage ordinal disagrees with SIDX")
+		}
+		index++
+	}
+	return ids.Err()
+}
 
 type mergeWatermarkPreflight struct {
 	entries  map[*part][]watermark.Entry
@@ -57,6 +89,9 @@ func (e *Engine) prepareMergeWatermarks(ctx context.Context, cohorts []mergeCoho
 			return boundedMergeSelection{}, err
 		}
 		bound.resident = buildbudget.Add(bound.resident, mergeSeriesScratchBound(selection.parts, selection.tiers))
+		if e.cfg.SeparateSeries {
+			bound.resident = buildbudget.Add(bound.resident, buildbudget.Mul(int64(len(selection.parts)), 64<<10))
+		}
 		selection.inputBytes = bound.bytes()
 		return selection, nil
 	}
@@ -78,6 +113,15 @@ func (m *mergeWatermarkPreflight) read(ctx context.Context, src []*part) (change
 	for _, p := range src {
 		if err := ctx.Err(); err != nil {
 			return false, err
+		}
+		if p.sharedSeries != nil {
+			if _, validated := m.entries[p]; !validated {
+				if err := p.validateSharedMergeWatermarks(ctx); err != nil {
+					return false, err
+				}
+				m.entries[p] = nil
+			}
+			continue
 		}
 		p.seriesMaxMu.Lock()
 		cached := p.seriesMax != nil
@@ -121,6 +165,9 @@ func (m *mergeWatermarkPreflight) install(ctx context.Context, src []*part) erro
 }
 
 func (m *mergeWatermarkPreflight) installPart(ctx context.Context, p *part) error {
+	if p.sharedSeries != nil {
+		return ctx.Err()
+	}
 	p.seriesMaxMu.Lock()
 	defer p.seriesMaxMu.Unlock()
 	if err := ctx.Err(); err != nil {

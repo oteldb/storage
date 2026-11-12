@@ -19,12 +19,14 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/diskguard"
 	"github.com/oteldb/storage/internal/engineguard"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/repair"
 	"github.com/oteldb/storage/internal/retention"
 	"github.com/oteldb/storage/internal/seriesindex"
+	"github.com/oteldb/storage/internal/seriestable"
 	"github.com/oteldb/storage/pool"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/readbudget"
@@ -177,8 +179,15 @@ type Config struct {
 	// One atomic caller batch may exceed the target and flushes before the next write.
 	ResidentHeadBytes int64
 	// SeriesCacheBytes bounds historical ID/watermark cache memory per disk-indexed engine.
+	// SeparateSeries reserves one eighth for retained sorted IDs; the rest holds watermarks.
 	// Zero uses 512 MiB, allocated on demand; negative disables the cache.
 	SeriesCacheBytes int64
+	// SeriesContexts shares bounded immutable resource/scope payloads across engines.
+	// The caller owns its separate memory budget; nil keeps per-engine ownership.
+	SeriesContexts *series.Contexts
+	// SeparateSeries stores immutable identity/postings deltas separately from numeric parts.
+	// Opt-in standalone disk-series mode; metadata reclamation and clustered use are unsupported.
+	SeparateSeries bool
 	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
 	// still has it, and says whether the part is gone from every owner. The cluster layer supplies
 	// it over its transport; a single-node store supplies one that fetches nothing and answers for
@@ -213,6 +222,8 @@ type Engine struct {
 	mergeRun      sync.Mutex
 	head          *head
 	parts         []*part
+	seriesTable   *seriesSnapshot
+	seriesIDs     *seriestable.IDCache
 	// tsCodec is the codec flushes and merges write the timestamp column with. It is a field, not a
 	// constant, only so a test can write the [chunk.CodecDoD] parts earlier builds wrote and check
 	// they merge.
@@ -407,7 +418,7 @@ func New(cfg Config) *Engine {
 	}
 
 	e := &Engine{
-		cfg: cfg, head: newHead(), tsCodec: chunk.CodecDoDScaled, mergeReadWindow: defaultMergeReadWindow,
+		cfg: cfg, head: newHeadWithContexts(cfg.SeriesContexts), tsCodec: chunk.CodecDoDScaled, mergeReadWindow: defaultMergeReadWindow,
 		readCompressors: block.NewReadCompressors(),
 	}
 	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
@@ -422,8 +433,11 @@ func New(cfg Config) *Engine {
 		e.putF64(b.Values)
 	}
 
+	if cfg.SeparateSeries {
+		e.seriesIDs = seriestable.NewIDCache(cfg.SeriesCacheBytes / 8)
+	}
 	if cfg.DiskSeries {
-		e.head.disk = newDiskHeadStateWithCache(e.cfg.SeriesCacheBytes)
+		e.head.disk = newDiskHeadStateWithCache(e.diskSeriesCacheBytes())
 	}
 	e.walB = newWALBatch()
 
@@ -1453,15 +1467,32 @@ func (e *Engine) Flush(ctx context.Context) error {
 // in-memory engine in tests and benchmarks,
 // letting a long-lived engine be reused across runs. Safe for concurrent use.
 func (e *Engine) Reset(ctx context.Context) error {
+	if e.cfg.SeparateSeries {
+		return errors.New("engine: reset of separate series storage is unsupported")
+	}
 	e.flushMu.Lock() // drain an in-flight flush/merge; it would otherwise publish into the empty engine
 	defer e.flushMu.Unlock()
 
 	e.mu.Lock()
+	if e.cfg.Backend != nil {
+		var ix *bucketindex.Index
+		err := e.mu.WithReaders(func() (err error) {
+			ix, _, err = bucketindex.LoadVersioned(ctx, e.cfg.Backend, e.indexKey())
+			return err
+		})
+		if err == nil {
+			err = e.validateSeriesCatalog(ix)
+		}
+		if err != nil {
+			e.mu.Unlock()
+			return err
+		}
+	}
 	e.head.memory.release()
 	e.head.frozenMemory.release()
-	e.head = newHead()
+	e.head = newHeadWithContexts(e.cfg.SeriesContexts)
 	if e.cfg.DiskSeries {
-		e.head.disk = newDiskHeadStateWithCache(e.cfg.SeriesCacheBytes)
+		e.head.disk = newDiskHeadStateWithCache(e.diskSeriesCacheBytes())
 	}
 	e.identityOrder.reset()
 	e.flushing = nil        // discarded with the head: Reset drops the samples, it does not flush them
@@ -1787,6 +1818,7 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 		zap.Int("detached_series", len(detached)), zap.Int64("detached_bytes", detachedBytes))
 	newParts, rows, err := e.streamHead(ctx, detached)
 	if err != nil || rows == 0 {
+		closePartReaders(newParts)
 		return 0, 0, e.abortFlush(ctx, detached, detachedBytes, detachedSince, err)
 	}
 
@@ -1800,6 +1832,7 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 	// the head rather than into a part set the next reload would not keep.
 	if err := e.fenceLocked(); err != nil {
 		e.mu.Unlock()
+		closePartReaders(newParts)
 
 		return 0, 0, e.abortFlush(ctx, detached, detachedBytes, detachedSince, err)
 	}

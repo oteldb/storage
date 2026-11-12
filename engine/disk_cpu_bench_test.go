@@ -25,8 +25,10 @@ import (
 	"github.com/oteldb/storage/wal"
 )
 
-const cpuFixtureBase = int64(1_700_006_400) * int64(time.Second)
-const cpuFixtureCadence = 15 * int64(time.Second)
+const (
+	cpuFixtureBase    = int64(1_700_006_400) * int64(time.Second)
+	cpuFixtureCadence = 15 * int64(time.Second)
+)
 
 var cpuFixtureModes = [...]string{"idle", "user", "system", "iowait", "irq", "softirq", "nice", "steal"}
 
@@ -35,6 +37,7 @@ type cpuFixtureOptions struct {
 	flushMemoryBytes           int64
 	readCache                  bool
 	disk, sync, reopen         bool
+	separate                   bool
 }
 
 // Hosts defaults to 10,000 (80,000 series), capped at 80,000 (640,000 series).
@@ -46,6 +49,7 @@ func cpuBenchOptions(b *testing.B) cpuFixtureOptions {
 		generations: cpuBenchInt(b, "OTELDB_BENCH_CPU_GENERATIONS", 4, 4),
 		points:      cpuBenchInt(b, "OTELDB_BENCH_CPU_POINTS", 16, 1024),
 		disk:        os.Getenv("OTELDB_BENCH_DISK_SERIES") == "true",
+		separate:    os.Getenv("OTELDB_BENCH_CPU_SEPARATE_SERIES") == "true",
 		readCache:   os.Getenv("OTELDB_BENCH_CPU_READ_CACHE") == "true",
 		sync:        os.Getenv("OTELDB_BENCH_WAL_SYNC") != "false",
 		reopen:      os.Getenv("OTELDB_BENCH_CPU_REOPEN") == "true",
@@ -115,9 +119,11 @@ func newCPUFixture(tb testing.TB, ctx context.Context, options cpuFixtureOptions
 	if flushBytes == 0 {
 		flushBytes = 64 << 20
 	}
-	f.engine = New(Config{Backend: source, WAL: w, Prefix: "cpu", DiskSeries: options.disk,
+	f.engine = New(Config{
+		Backend: source, WAL: w, Prefix: "cpu", DiskSeries: options.disk, SeparateSeries: options.separate,
 		MetricSeriesChunks: true, MetricBlockRows: 1024, AggregateStats: true,
-		DecodeCacheBytes: 16 << 20, DecodeMemoryBytes: 256 << 20, FlushMemoryBytes: flushBytes})
+		DecodeCacheBytes: 16 << 20, DecodeMemoryBytes: 256 << 20, FlushMemoryBytes: flushBytes,
+	})
 	tb.Cleanup(func() {
 		if f.engine != nil {
 			_ = f.engine.Close(context.WithoutCancel(ctx))
@@ -189,12 +195,14 @@ func (f *cpuFixture) appendGeneration(b *testing.B, generation int) {
 func (f *cpuFixture) request(host int) fetch.Request {
 	hostEqual := &fetch.EqualMatcher{Name: "host.name", Value: cpuHost(host)}
 	nameEqual := &fetch.EqualMatcher{Name: "__name__", Value: "node_cpu_seconds_total"}
-	return fetch.Request{Start: cpuFixtureBase,
-		End: cpuFixtureBase + int64(f.options.generations*f.options.points-1)*cpuFixtureCadence, Recycle: true,
+	return fetch.Request{
+		Start: cpuFixtureBase,
+		End:   cpuFixtureBase + int64(f.options.generations*f.options.points-1)*cpuFixtureCadence, Recycle: true,
 		Matchers: []fetch.Matcher{
 			{Name: []byte(hostEqual.Name), Match: hostEqual.Predicate(), Spec: hostEqual},
 			{Name: []byte(nameEqual.Name), Match: nameEqual.Predicate(), Spec: nameEqual},
-		}}
+		},
+	}
 }
 
 func (f *cpuFixture) fetchHost(ctx context.Context, host int) error {
@@ -225,8 +233,10 @@ func (f *cpuFixture) fetchHost(ctx context.Context, host int) error {
 func (f *cpuFixture) countHost(ctx context.Context, host int) error {
 	points := f.options.generations * f.options.points
 	steps := min(points, 16)
-	grid := fetch.WindowGrid{Start: cpuFixtureBase + int64(points-steps)*cpuFixtureCadence,
-		Step: cpuFixtureCadence, Width: 300 * int64(time.Second), NumSteps: steps}
+	grid := fetch.WindowGrid{
+		Start: cpuFixtureBase + int64(points-steps)*cpuFixtureCadence,
+		Step:  cpuFixtureCadence, Width: 300 * int64(time.Second), NumSteps: steps,
+	}
 	groups, err := f.engine.CountGrid(ctx, f.request(host), grid, []byte("mode"))
 	if err != nil {
 		return err

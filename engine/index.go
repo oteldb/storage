@@ -59,6 +59,9 @@ func (e *Engine) updateIndexLocked(ctx context.Context) error {
 // so acknowledged head admissions cannot invalidate a rollup after validation. Readers proceed.
 // Unguarded publications admit ingestion during I/O. Caller holds e.mu.
 func (e *Engine) commitIndexLocked(ctx context.Context, parts []*part, epoch, stamp uint64, guard func() error) error {
+	if err := e.validateSeparateSeries(); err != nil {
+		return err
+	}
 	if e.cfg.Backend == nil {
 		return nil
 	}
@@ -159,6 +162,12 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 
 		return errors.Wrap(err, "reload bucket index")
 	}
+	if err := e.validateSeriesCatalog(ix); err != nil {
+		return err
+	}
+	if err := e.installSeriesRootsLocked(ctx, ix.SeriesRoots); err != nil {
+		return err
+	}
 
 	e.indexVersion = version
 	if ix.Generation.Compare(e.generation) > 0 {
@@ -258,6 +267,12 @@ func (e *Engine) openForeignLocked(ctx context.Context) error {
 		}
 
 		p.minTime, p.maxTime = ent.MinTime, ent.MaxTime
+		if e.cfg.SeparateSeries {
+			if err := attachSharedSeriesFrom(p, e.seriesTable); err != nil {
+				p.closeReaders()
+				return err
+			}
+		}
 		open[ent.Prefix] = p
 		fillRollup(ent, p)
 
@@ -314,6 +329,7 @@ func (e *Engine) nextIndexLocked(ctx context.Context, parts []*part, epoch uint6
 		FlushedEpoch: e.anonEpoch,
 		Epochs:       slices.Clone(e.epochs),
 		Generation:   e.generation,
+		SeriesRoots:  e.seriesTable.bindings(),
 	}
 	ix.SetWriterEpoch(e.cfg.WriterID, epoch, e.generation)
 	ix.Epochs = bucketindex.TrimWriters(ix.Epochs, e.cfg.WriterID, bucketindex.MaxWriters)
@@ -497,6 +513,9 @@ func (e *Engine) LoadParts(ctx context.Context) error {
 // backend lacks becomes a pending want, committed by the first commit this engine makes as a writer
 // rather than now. Reads over it disclaim meanwhile ([Engine.WantOverlaps]).
 func (e *Engine) LoadPartsUnclaimed(ctx context.Context) error {
+	if e.cfg.SeparateSeries {
+		return errors.New("engine: separate series does not support unclaimed loads")
+	}
 	e.identityMu.RLock()
 	defer e.identityMu.RUnlock()
 	e.mu.Lock()
@@ -540,7 +559,7 @@ const (
 // any other prefix the index names gets a fresh handle. A part whose objects are gone is left in open
 // (it counts as dropped) and reported through [partGone], which the caller turns into a repair want.
 func (e *Engine) livePart(
-	ctx context.Context, ent *bucketindex.Entry, open map[string]*part,
+	ctx context.Context, ent *bucketindex.Entry, open map[string]*part, roots *seriesSnapshot,
 ) (*part, error) {
 	if p := open[ent.Prefix]; p != nil && p.matchesEntry(ent) &&
 		(!e.cfg.DiskSeries || !errors.Is(e.loadErr, seriesindex.ErrCorrupt)) {
@@ -559,6 +578,12 @@ func (e *Engine) livePart(
 	p, err := openPart(ctx, e.cfg.Backend, ent.Prefix, e.cfg.Obs.Corruption, e.readCompressors)
 	if err != nil {
 		return nil, errors.Wrapf(err, "open part %q", ent.Prefix)
+	}
+	if e.cfg.SeparateSeries {
+		if err := attachSharedSeriesFrom(p, roots); err != nil {
+			p.closeReaders()
+			return nil, err
+		}
 	}
 
 	// The handle this one replaces names a part that is still live, so it is not a dropped one.
@@ -581,6 +606,7 @@ func (p *part) matchesEntry(ent *bucketindex.Entry) bool {
 // anywhere before [Engine.adoptLoadLocked] leaves the engine exactly as it was.
 type indexLoad struct {
 	ix      *bucketindex.Index
+	roots   *seriesSnapshot
 	version backend.Version
 	parts   []*part
 	indexed map[string]struct{}
@@ -598,16 +624,36 @@ type indexLoad struct {
 // the same bar repair sets before concluding a part is gone ([repair.HoleConfirmations]).
 const corruptLoadsBeforeWant = repair.HoleConfirmations
 
-func (e *Engine) loadReferencedPart(ctx context.Context, ent *bucketindex.Entry, open map[string]*part) (*part, error) {
+var errSharedSeriesReference = errors.New("engine: shared series reference is invalid")
+
+func (e *Engine) loadReferencedPart(
+	ctx context.Context, ent *bucketindex.Entry, open map[string]*part, roots *seriesSnapshot,
+) (*part, error) {
 	previous := open[ent.Prefix]
-	p, err := e.livePart(ctx, ent, open)
+	p, err := e.livePart(ctx, ent, open, roots)
 	if err == nil && e.cfg.DiskSeries {
 		_, err = e.prepareDiskPart(ctx, p)
+		if err != nil && e.cfg.SeparateSeries {
+			err = errors.Join(errSharedSeriesReference, err)
+		}
 	}
 	if err != nil && p != nil && p != previous {
 		p.closeReaders()
 	}
 	return p, err
+}
+
+func (e *Engine) validateSeriesCatalog(ix *bucketindex.Index) error {
+	if err := e.validateSeparateSeries(); err != nil {
+		return err
+	}
+	if len(ix.SeriesRoots) > 0 && !e.cfg.SeparateSeries {
+		return errors.New("engine: separate series catalog requires SeparateSeries")
+	}
+	if e.cfg.SeparateSeries && len(ix.SeriesRoots) == 0 && len(ix.Entries) > 0 {
+		return errors.New("engine: SeparateSeries requires a fresh sample catalog")
+	}
+	return nil
 }
 
 // readIndexLocked loads the bucket index and opens the parts it names, writing nothing on the
@@ -620,9 +666,16 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 
 		return nil, nil, errors.Wrap(err, "load bucket index")
 	}
+	if err := e.validateSeriesCatalog(ix); err != nil {
+		return nil, nil, err
+	}
+	roots, err := e.prepareSeriesRoots(ctx, ix.SeriesRoots)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	l := &indexLoad{
-		ix: ix, version: version,
+		ix: ix, version: version, roots: roots,
 		parts:   make([]*part, 0, len(ix.Entries)),
 		indexed: make(map[string]struct{}, len(ix.Entries)),
 	}
@@ -641,6 +694,7 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 			for _, p := range opened {
 				p.closeReaders()
 			}
+			l.roots.release()
 		}
 	}()
 	named := make(map[string]struct{}, len(ix.Entries))
@@ -663,9 +717,12 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 		}
 
 		previous := open[ent.Prefix]
-		p, err := e.loadReferencedPart(ctx, ent, open)
+		p, err := e.loadReferencedPart(ctx, ent, open, l.roots)
 		if err != nil {
 			switch {
+			case errors.Is(err, errSharedSeriesReference):
+				e.countCorrupt(ctx, err, "series_reference", obs.CorruptFatal)
+				return nil, nil, err
 			case partGone(err):
 				zctx.From(ctx).Error("part named by the index is gone; recording a repair",
 					zap.String("prefix", ent.Prefix), zap.Error(err))
@@ -733,6 +790,9 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 // adoptLoadLocked makes l the engine's state and lifts the commit fence. It cannot fail, which is
 // what makes a load all-or-nothing. Caller holds e.mu.
 func (e *Engine) adoptLoadLocked(l *indexLoad) {
+	oldRoots := e.seriesTable
+	e.seriesTable, l.roots = l.roots, nil
+	oldRoots.release()
 	kept := make(map[*part]struct{}, len(l.parts))
 	for _, p := range l.parts {
 		kept[p] = struct{}{}
@@ -842,6 +902,9 @@ func (e *Engine) ReloadFenced(ctx context.Context) error {
 // e.mu.
 func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 	sweep := mode != loadReplica
+	if err := e.validateSeparateSeries(); err != nil {
+		return err
+	}
 
 	if e.cfg.Backend == nil {
 		return nil
@@ -920,6 +983,9 @@ func (e *Engine) loadPartsLocked(ctx context.Context, mode loadMode) error {
 // lacks is not an error: it leaves the part set and is counted as a pending want ([Stats.WantedParts],
 // [Engine.WantOverlaps]) until a refresh finds it again or this node commits as an owner.
 func (e *Engine) RefreshReplica(ctx context.Context) error {
+	if e.cfg.SeparateSeries {
+		return errors.New("engine: separate series does not support replica refresh")
+	}
 	e.identityMu.RLock()
 	defer e.identityMu.RUnlock()
 	e.mu.Lock()

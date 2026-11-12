@@ -143,7 +143,7 @@ func TestDecodeRejectsCorrupt(t *testing.T) {
 	cases := map[string][]byte{
 		"empty":          {},
 		"bad magic":      {'X', 'Y', 1, 0},
-		"bad version":    {'B', 'I', 9, 0},
+		"bad version":    {'B', 'I', 10, 0},
 		"truncated body": {'B', 'I', 1, 5}, // claims 5 entries, none follow
 		"bad prefix len": {'B', 'I', 1, 1, 200},
 		"missing max":    {'B', 'I', 1, 1, 1, 'a', 2}, // prefix+min present, max truncated
@@ -212,6 +212,7 @@ func FuzzDecode(f *testing.F) {
 		},
 	}).AppendBinary(nil))
 	f.Add(fullIndex().AppendBinary(nil))
+	f.Add((&bucketindex.Index{SeriesRoots: []bucketindex.SeriesRoot{seriesRoot("a", 1), seriesRoot("b", 2)}}).AppendBinary(nil))
 	f.Add([]byte{
 		'B', 'I', 7, 1, 1, 'a', 2, 4, 1, 1, 1, 1, 2, 1, 2, 1, 3, 1, 5, 2, 0,
 		2, 0, 1, 6, 1, 0, 7, 0, 1, 2, 0, 4, 0, 3, 3, 4, 5, 1, 1, 'r', 6, 7, 1, 1, 'w', 8, 9, 10,
@@ -236,5 +237,6 @@ func FuzzDecode(f *testing.F) {
 		assert.Equal(t, ix.Wanted, again.Wanted)
 		assert.Equal(t, ix.AllocatedBlocks, again.AllocatedBlocks)
 		assert.Equal(t, ix.Catalog, again.Catalog)
+		assert.Equal(t, ix.SeriesRoots, again.SeriesRoots)
 	})
 }

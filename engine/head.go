@@ -98,9 +98,13 @@ func (b *sampleBuf) appendSample(ts int64, value, sf float64) {
 }
 
 func newHead() *head {
+	return newHeadWithContexts(nil)
+}
+
+func newHeadWithContexts(contexts *series.Contexts) *head {
 	return &head{
 		sym:     symbols.New(),
-		series:  series.New(),
+		series:  series.NewWithContexts(contexts),
 		post:    postings.NewDense(),
 		samples: make(map[signal.SeriesID]*sampleBuf),
 	}

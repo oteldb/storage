@@ -33,13 +33,13 @@ func diskQueryBudget(ctx context.Context) (context.Context, *readbudget.Budget) 
 }
 
 // planDiskQuery snapshots memory and pins parts together, then resolves immutable postings off-lock.
-func (e *Engine) planDiskQuery(ctx context.Context, r fetch.Request, withIdentity, countOnly bool) (*enginePlan, error) {
-	return e.snapshotDiskQuery(ctx, r, withIdentity, countOnly, nil)
+func (e *Engine) planDiskQuery(ctx context.Context, r fetch.Request, withIdentity, countOnly, needStats bool) (*enginePlan, error) {
+	return e.snapshotDiskQuery(ctx, r, withIdentity, countOnly, needStats, nil)
 }
 
 // snapshot runs under state ownership before publication can replace frozen buffers with parts.
 func (e *Engine) snapshotDiskQuery(
-	ctx context.Context, r fetch.Request, withIdentity, countOnly bool,
+	ctx context.Context, r fetch.Request, withIdentity, countOnly, needStats bool,
 	snapshot func(*enginePlan) error,
 ) (*enginePlan, error) {
 	for _, m := range r.Matchers {
@@ -56,11 +56,21 @@ func (e *Engine) snapshotDiskQuery(
 	for i, id := range p.ids {
 		selected[id] = diskSelection{head: uint32(i), identity: uint32(i)}
 	}
-	if !countOnly {
+	if needStats {
 		p.diskMetadata = make(map[*part]map[signal.SeriesID]seriesindex.Metadata)
 	}
+	sharedSelection := withIdentity || !countOnly || len(r.Matchers) > 0
+	if sharedSelection {
+		if err := p.selectSharedDiskParts(ctx, r, selected, withIdentity, needStats); err != nil {
+			p.releaseParts()
+			return nil, err
+		}
+	}
 	for _, pt := range p.liveParts {
-		if err := p.selectDiskPart(ctx, pt, r, selected, withIdentity, !countOnly); err != nil {
+		if sharedSelection && pt.sharedSeries != nil {
+			continue
+		}
+		if err := p.selectDiskPart(ctx, pt, r, selected, withIdentity, needStats); err != nil {
 			p.releaseParts()
 			return nil, err
 		}

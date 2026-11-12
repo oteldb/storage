@@ -24,9 +24,14 @@ page avoid directory I/O. Oversized records are bounded at 64 MiB and require co
 caller admission. Budgeted reads require native object sizes and ranged reads before opening.
 Unbudgeted opaque backends retain their whole-object fallback.
 Directory entries, seek keys and compressed pages use the backend's immutable-range cache when
-available, sharing its configured byte budget with data columns. Cursors copy borrowed cache
-views into owned scratch before reuse; decoded pages remain operation-local. Bare backends keep
-reusable ranged reads.
+available, sharing its configured byte budget with data columns. Validated decoded pages retain
+full keys/values
+in one immutable byte arena with uint32 offsets for binary search and ordinal iteration. Expansion
+is capped at three times the raw page size; larger prefix expansions retain validated raw bytes
+and the final key instead. Misses coalesce before decompression/validation. Cursor reset drops
+borrowed slices before any writable reuse. Seeks enable decoded-page admission; `Next` reuses
+the current page, then loads further pages through streaming scratch. One-pass scans avoid
+expanding/admitting every page. Bare backends keep reusable ranged reads.
 
 The parent digest covers raw manifest bytes, including a persistent per-part nonce, and excludes
 object paths, so part copies and renames preserve the binding. The nonce distinguishes otherwise
@@ -35,7 +40,8 @@ bindings before publishing a handle.
 Generic tables may carry a zero digest. A valid page is fully checked for strictly ordered keys
 before exposing records; writer errors and finalization are terminal.
 
-`MaxPageBytes` covers packed/raw data, current/first/last keys, directory scratch and buffer growth.
+`MaxPageBytes` covers packed/raw data, current/first/last keys, directory scratch, buffer growth
+and a pinned decoded page during a cold load, independently of cache eviction.
 Buffers grow to explicit capacities bounded by the largest raw page; cancellation joins page I/O.
 `EncodedBound` covers raw record framing, a directory first-key copy and worst-case one-page-per-record
 framing, independently of compression ratio or identity interning.
@@ -65,7 +71,7 @@ probes then avoid descriptor pages. Full identity lookups check agreement with i
 Historical append probes sort pending IDs and prune each part by its validated ID bounds. One
 operation-local ID cursor serves the whole batch; legacy values lazily add a descriptor cursor.
 Identity-free counts read selected canonical IDs from the corresponding SIDX ordinals, while
-label-bearing queries still load the selected identities. No global identity page cache is retained.
+label-bearing queries still load the selected identities. Decoded pages share the backend cache; complete materialized identities are not cached.
 
 
 The sorted prefix-key/cursor model follows VictoriaMetrics'
@@ -76,8 +82,8 @@ The backend range/admission boundary is shared with the existing recordengine la
 
 Historical admission sorts only its current batch's unknown IDs and reuses one metadata reader
 across parts. Reset drops the previous owner, cursor state and errors while retaining owned
-page scratch. Scratch follows the largest visited page and dies at batch return; no global pool
-or historical identity cache is introduced. Legacy descriptor scratch remains lazy.
+page scratch. Owned scratch follows the largest visited page and dies at batch return; shared decoded pages
+remain under the backend cache budget. Legacy descriptor scratch remains lazy.
 
 Compaction checks every contributing descriptor and combines coverage before decoding one canonical
 identity per output ID. Equal-ID new-format payloads must agree byte-for-byte; legacy registries
@@ -104,3 +110,17 @@ Reuse trusts the same posting membership semantics as query resolution. Every vi
 escaped key, typed value, reference range, chunk order and name flag is checked, even for excluded
 references. Unused membership indexes need no reads; all contributing identity descriptors retain
 their independent validation. CRC-valid missing postings are not reconstructed on this path.
+
+Forward seeks retain the last requested key and its successful lower-bound position. Increasing
+probes inside the same absent-key gap reuse that position; `Next` and reset invalidate the proof.
+The seek-key buffer is included in the per-cursor memory bound. Cold pages still undergo full CRC/order validation before cache admission. Warm expanded pages
+support backward seeks without decompression or reconstruction; compact fallback pages rewind
+through validated prefix records.
+
+
+Decoded-page misses reuse separate cursor-owned decompression and key scratch. Cache results own
+their bytes; borrowed raw/cache views never become decoder destinations. Scratch remains inside
+MaxPageBytes and is dropped when resetting to a bare backend's smaller bound. Ordered canonical
+identity checks select StreamPages, retaining raw page buffers instead of expanding each crossed
+page. Random readers retain decoded-cache seeks. Descriptor hashes and canonical-byte comparisons
+remain mandatory in both modes.

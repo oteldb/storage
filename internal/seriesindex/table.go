@@ -54,8 +54,10 @@ type TableWriter struct {
 
 // NewTableWriter constructs a streaming table writer; Finish does not close dst.
 func NewTableWriter(dst io.Writer) *TableWriter {
-	return &TableWriter{dst: dst, limit: pageSize,
-		codec: compress.NewCompressor(compress.AlgorithmLZ4, compress.LevelDefault)}
+	return &TableWriter{
+		dst: dst, limit: pageSize,
+		codec: compress.NewCompressor(compress.AlgorithmLZ4, compress.LevelDefault),
+	}
 }
 
 // Append consumes key/value before returning. Keys must be strictly increasing.
@@ -199,21 +201,28 @@ func OpenTable(ctx context.Context, b backend.Backend, key string) (*Table, erro
 		uint64(binary.BigEndian.Uint32(data[28:]))*2+1 > uint64(count) && binary.BigEndian.Uint32(data[28:]) > 0 {
 		return nil, errors.Wrap(ErrCorrupt, "directory bounds")
 	}
-	return &Table{b: b, key: key, dir: int64(dir), pages: pages, count: count, maxRaw: raw,
+	return &Table{
+		b: b, key: key, dir: int64(dir), pages: pages, count: count, maxRaw: raw,
 		seriesCount: binary.BigEndian.Uint32(data[28:]), parentDigest: [32]byte(data[32:64]),
-		codec: compress.NewCompressor(compress.AlgorithmLZ4, compress.LevelDefault)}, nil
+		codec: compress.NewCompressor(compress.AlgorithmLZ4, compress.LevelDefault),
+	}, nil
 }
 
 // Count returns the number of stored keys.
 func (t *Table) Count() uint32 { return t.count }
 
 // MaxPageBytes bounds the encoded/decoded buffers retained by one cursor.
-func (t *Table) MaxPageBytes() int64 { return int64(t.maxRaw)*8 + 1024 }
+func (t *Table) MaxPageBytes() int64 {
+	if _, ok := t.b.(backend.DecodedPageViewer); ok {
+		return int64(t.maxRaw)*13 + 2048
+	}
+	return int64(t.maxRaw)*9 + 1024
+}
 
 // Cursor returns a forward cursor with caller-owned reusable buffers.
 func (t *Table) Cursor(ctx context.Context) *Cursor { return &Cursor{table: t, ctx: ctx, page: -1} }
 
-// Cursor yields key/value views valid until its next operation.
+// Cursor yields read-only key/value views valid until its next operation.
 type Cursor struct {
 	table                                           *Table
 	ctx                                             context.Context //nolint:containedctx // The cursor owns its scoped I/O lifetime.
@@ -221,12 +230,20 @@ type Cursor struct {
 	left                                            uint32
 	off                                             int
 	key, value, packed, raw, first, directory, last []byte
+	sought                                          []byte
+	seekValid                                       bool
 	err                                             error
+	decoded                                         []byte
+	decodedIndex                                    uint32
+	decoding                                        pageInfo
+	decodeScratch, decodeKey                        []byte
+	streaming                                       bool
 }
 
 // Next advances to the next record, including the first before any seek.
 // Cancellation is checked at page I/O boundaries.
 func (c *Cursor) Next() bool {
+	c.seekValid = false
 	if c.err != nil {
 		return false
 	}
@@ -237,7 +254,7 @@ func (c *Cursor) Next() bool {
 	if i >= int64(c.table.pages) {
 		return false
 	}
-	return c.load(uint32(i))
+	return c.load(uint32(i), false)
 }
 
 // Seek positions at the first key greater than or equal to key.
@@ -245,53 +262,25 @@ func (c *Cursor) Seek(key []byte) bool {
 	if c.err != nil || c.table.pages == 0 {
 		return false
 	}
-	// The page's final key was validated at load; forward probes need no directory I/O.
-	if c.page >= 0 && bytes.Compare(c.key, key) <= 0 && bytes.Compare(key, c.last) <= 0 {
-		for bytes.Compare(c.key, key) < 0 {
-			if !c.advance() {
-				return false
-			}
-		}
+	// A previous lower bound also answers a forward probe that remains in the same gap.
+	if c.seekValid && bytes.Compare(c.sought, key) <= 0 && bytes.Compare(key, c.key) <= 0 {
+		c.sought = append(c.sought[:0], key...)
 		return true
 	}
-	lo, hi := uint32(0), c.table.pages
-	for lo < hi {
-		mid := lo + (hi-lo)/2
-		p, err := c.entry(mid)
-		if err != nil {
-			c.err = err
-			return false
-		}
-		if bytes.Compare(p.first, key) <= 0 {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
+	c.seekValid = false
+	if uint64(len(key)) > uint64(c.table.maxRaw) {
+		return c.seek(key)
 	}
-	i := uint32(0)
-	if lo > 0 {
-		i = lo - 1
-	}
-	if c.page != int64(i) || bytes.Compare(c.key, key) > 0 {
-		if !c.load(i) {
-			return false
-		}
-	}
-	if c.page < 0 {
-		return false
-	}
-	for bytes.Compare(c.key, key) < 0 {
-		if !c.Next() {
-			return false
-		}
-	}
-	return true
+	c.sought = append(c.sought[:0], key...)
+	ok := c.seek(c.sought)
+	c.seekValid = ok
+	return ok
 }
 
-// Key returns the current borrowed key.
+// Key returns the current read-only borrowed key.
 func (c *Cursor) Key() []byte { return c.key }
 
-// Value returns the current borrowed value.
+// Value returns the current read-only borrowed value.
 func (c *Cursor) Value() []byte { return c.value }
 
 // Err reports a terminal I/O or format error.
@@ -299,10 +288,18 @@ func (c *Cursor) Err() error { return c.err }
 
 // reset replaces the owner and traversal state while retaining operation-local buffers.
 func (c *Cursor) reset(ctx context.Context, table *Table) {
-	*c = Cursor{ctx: ctx, table: table, page: -1, key: c.key[:0], packed: c.packed[:0], raw: c.raw[:0],
-		first: c.first[:0], directory: c.directory[:0], last: c.last[:0]}
+	if c.decoded != nil {
+		c.key, c.raw, c.last = nil, nil, nil
+	}
+	*c = Cursor{
+		decodeScratch: c.decodeScratch[:0], decodeKey: c.decodeKey[:0], streaming: c.streaming,
+		ctx: ctx, table: table, page: -1, key: c.key[:0], packed: c.packed[:0], raw: c.raw[:0],
+		first: c.first[:0], directory: c.directory[:0], last: c.last[:0], sought: c.sought[:0],
+	}
 	if table == nil {
 		c.ctx = nil
+	} else if _, ok := table.b.(backend.DecodedPageViewer); !ok {
+		c.decodeScratch, c.decodeKey = nil, nil
 	}
 }
 
@@ -327,8 +324,10 @@ func (w *TableWriter) flush() error {
 	w.packed = w.codec.Compress(w.packed[:0], w.buf)
 	crc := crc32.Checksum(w.packed, checksumTable)
 	w.packed = binary.BigEndian.AppendUint32(w.packed, crc)
-	w.pages = append(w.pages, pageInfo{first: bytes.Clone(w.first), offset: w.offset,
-		packed: uint32(len(w.packed)), raw: uint32(len(w.buf)), count: w.count})
+	w.pages = append(w.pages, pageInfo{
+		first: bytes.Clone(w.first), offset: w.offset,
+		packed: uint32(len(w.packed)), raw: uint32(len(w.buf)), count: w.count,
+	})
 	w.maxRaw = max(w.maxRaw, uint32(len(w.buf)))
 	if err := w.write(w.packed); err != nil {
 		return err
@@ -369,11 +368,19 @@ func (c *Cursor) entry(i uint32) (pageInfo, error) {
 	return pageInfo{first: c.first, offset: int64(off), packed: packed, raw: raw, count: count}, nil
 }
 
-func (c *Cursor) load(i uint32) bool {
+func (c *Cursor) load(i uint32, indexed bool) bool {
 	p, err := c.entry(i)
 	if err != nil {
 		c.err = err
 		return false
+	}
+	if cache, ok := c.table.b.(backend.DecodedPageViewer); ok && indexed && !c.streaming {
+		return c.loadDecoded(cache, i, p)
+	}
+	if c.decoded != nil {
+		last := bytes.Clone(c.last)
+		c.key, c.value, c.raw, c.packed, c.decoded = nil, nil, nil, nil, nil
+		c.last = last
 	}
 	c.packed, err = c.readPage(cursorBuffer(c.packed, int(p.packed)), p.offset, int64(p.packed))
 	if err != nil {
@@ -432,6 +439,11 @@ func (c *Cursor) number() (uint64, bool) {
 }
 
 func (c *Cursor) advance() bool {
+	if len(c.decoded) > 0 && c.decoded[0] == decodedExpanded {
+		c.decodedIndex++
+		c.selectDecoded(c.decodedIndex)
+		return true
+	}
 	first := c.off == 0
 	prefix, ok := c.number()
 	if !ok {
@@ -483,4 +495,54 @@ func cursorBuffer(dst []byte, n int) []byte {
 		return make([]byte, 0, n)
 	}
 	return dst[:0]
+}
+
+func (c *Cursor) seek(key []byte) bool {
+	if c.err != nil || c.table.pages == 0 {
+		return false
+	}
+	if c.seekDecoded(key) {
+		return true
+	}
+	// The page's final key was validated at load; forward probes need no directory I/O.
+	if c.page >= 0 && bytes.Compare(c.key, key) <= 0 && bytes.Compare(key, c.last) <= 0 {
+		for bytes.Compare(c.key, key) < 0 {
+			if !c.advance() {
+				return false
+			}
+		}
+		return true
+	}
+	lo, hi := uint32(0), c.table.pages
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		p, err := c.entry(mid)
+		if err != nil {
+			c.err = err
+			return false
+		}
+		if bytes.Compare(p.first, key) <= 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	i := uint32(0)
+	if lo > 0 {
+		i = lo - 1
+	}
+	if c.page != int64(i) || bytes.Compare(c.key, key) > 0 {
+		if !c.load(i, true) {
+			return false
+		}
+	}
+	if c.page < 0 {
+		return false
+	}
+	for bytes.Compare(c.key, key) < 0 {
+		if !c.Next() {
+			return false
+		}
+	}
+	return true
 }

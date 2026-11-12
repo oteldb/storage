@@ -210,7 +210,7 @@ func TestDiskPlanPinsBeforeResolvingParts(t *testing.T) {
 	resume := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		p, err := e.snapshotDiskQuery(ctx, fetch.Request{Start: 0, End: 100}, true, false, func(*enginePlan) error {
+		p, err := e.snapshotDiskQuery(ctx, fetch.Request{Start: 0, End: 100}, true, false, false, func(*enginePlan) error {
 			close(captured)
 			return nil
 		})

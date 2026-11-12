@@ -119,6 +119,16 @@ func (idx partIndex) has(ctx context.Context, id signal.SeriesID) (bool, error) 
 	return ok, nil
 }
 
+// position is the stable ordinal shared by SIDX and SMAX.
+func (idx partIndex) position(ctx context.Context, id signal.SeriesID) (int, bool, error) {
+	if p := idx.paged; p != nil {
+		pos, _, found, err := p.lookupPosition(ctx, id, indexPageEntries)
+		return pos, found, err
+	}
+	pos, found := slices.BinarySearchFunc(idx.ids, id, signal.SeriesID.Compare)
+	return pos, found, nil
+}
+
 // warm resolves the paged index's entries, so subsequent [partIndex.has] probes are pure in-memory
 // binary searches. It is how the label enumeration keeps its backend I/O off the engine lock: warm
 // every part first, then probe under the read lock (the ARCH invariant that the lock is never held
@@ -417,6 +427,8 @@ type part struct {
 	// delete.
 	refs           atomic.Int32
 	readersClosing atomic.Bool
+	sharedSeries   *seriesSnapshot
+	sharedClose    sync.Once
 
 	// seriesMaxMu guards seriesMax, the per-series watermarks of [part.forEachSeriesMaxTime]. A
 	// mutex rather than a sync.Once so a failed load (a transient backend error) is retried instead
@@ -451,6 +463,7 @@ func (p *part) release() {
 		p.index.dropView()
 		if p.readersClosing.Load() {
 			_ = p.reader.Close()
+			p.releaseSharedSeries()
 		}
 	}
 }
@@ -1104,7 +1117,12 @@ func (p *part) closeReaders() {
 	p.readersClosing.Store(true)
 	if p.refs.Load() == 0 {
 		_ = p.reader.Close()
+		p.releaseSharedSeries()
 	}
+}
+
+func (p *part) releaseSharedSeries() {
+	p.sharedClose.Do(func() { p.sharedSeries.release() })
 }
 
 func (e *Engine) closePartReadersLocked() {

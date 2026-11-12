@@ -81,18 +81,9 @@ func (s *Syncer) FetchWants(
 		return out
 	}
 
-	views, firstErr := s.peerIndexes(ctx, enginePrefix, peers)
-
-	// This node's own lineage is what relates a want for a member of a group split again to a peer's
-	// successor of the outer ancestry, which the peer's index may never have recorded. Without it an
-	// answer of absence would not be evidence, so a failed read is an error for every silent want.
-	local, err := bucketindex.Load(ctx, s.local, enginePrefix+"/"+bucketindex.Object)
-	if err != nil {
-		local = &bucketindex.Index{}
-
-		if firstErr == nil {
-			firstErr = errors.Wrap(err, "load local index")
-		}
+	views, local, firstErr := s.repairIndexes(ctx, enginePrefix, peers)
+	if errors.Is(firstErr, errSeparateSeries) {
+		return failedWants(out, firstErr)
 	}
 
 	// One set of relations per peer, answering every want of the batch with the closures it has
@@ -251,10 +242,18 @@ func (s *Syncer) peerIndexes(
 				return
 			}
 
+			if err := rejectSeriesCatalogBytes(data); err != nil {
+				results[i].err = err
+				return
+			}
 			ix, err := bucketindex.Decode(data)
 			if err != nil {
 				results[i].err = errors.Wrapf(err, "decode index from %q", p)
 
+				return
+			}
+			if err := rejectSeriesRoots(ix); err != nil {
+				results[i].err = err
 				return
 			}
 
@@ -267,6 +266,9 @@ func (s *Syncer) peerIndexes(
 	views = make([]peerView, 0, len(order))
 
 	for i, r := range results {
+		if errors.Is(r.err, errSeparateSeries) {
+			return nil, r.err
+		}
 		if r.err != nil && firstErr == nil {
 			firstErr = r.err
 		}

@@ -64,12 +64,16 @@ func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sa
 	// Entry buffers never grow: a full run seals before another entry is retained.
 	b.entries = make([]headRunEntry, 0, capacity)
 	b.partRefs = make([]uint32, 0, capacity)
+	completed := false
 	defer func() {
 		if b.writer != nil {
 			b.writer.abort()
 		}
 		if b.release != nil {
 			b.release()
+		}
+		if !completed {
+			closePartReaders(b.parts)
 		}
 	}()
 
@@ -104,6 +108,7 @@ func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sa
 	if b.rows != expected {
 		return nil, 0, errors.Errorf("head has %d samples without identities", expected-b.rows)
 	}
+	completed = true
 	return b.parts, b.rows, nil
 }
 
@@ -304,6 +309,16 @@ func (b *headPartBuilder) finish() error {
 			if err := b.reserve(needed); err != nil {
 				return err
 			}
+		}
+	}
+	if b.e.cfg.SeparateSeries {
+		b.writer.reserveSeriesMetadata = func(bytes int64) error {
+			numeric := buildbudget.Add(b.baseBytes(), buildbudget.Add(b.writer.residentBytes(), b.writer.w.FinishBytes()))
+			needed := buildbudget.Add(numeric, bytes)
+			if needed > b.reserved {
+				return b.reserve(needed)
+			}
+			return nil
 		}
 	}
 	p, err := b.writer.finishWithIdentities(b.ctx, identitySnapshot{view: b.view, refs: b.partRefs})

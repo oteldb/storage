@@ -9,14 +9,18 @@ import (
 
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/index/postings"
+	"github.com/oteldb/storage/internal/readerpool"
 	"github.com/oteldb/storage/internal/seriesindex"
+	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
 )
 
-const defaultResidentHeadBytes = 128 << 20
-const diskHeadBloomWords = 1 << 17
-const diskHeadBloomMaxWords = 32 * diskHeadBloomWords
+const (
+	defaultResidentHeadBytes = 128 << 20
+	diskHeadBloomWords       = 1 << 17
+	diskHeadBloomMaxWords    = 32 * diskHeadBloomWords
+)
 
 // ErrReplicaHeadFull asks replication to retry after the primary publishes more parts.
 var ErrReplicaHeadFull = errors.New("engine: replica resident head is full; retry after primary part publication")
@@ -148,7 +152,7 @@ func (e *Engine) rebuildDiskStateLocked(ctx context.Context) (err error) {
 		e.head.disk.complete = false
 		return nil
 	}
-	next := newDiskHeadStateWithCache(e.cfg.SeriesCacheBytes)
+	next := newDiskHeadStateWithCache(e.diskSeriesCacheBytes())
 	headIDs := make([]signal.SeriesID, e.head.series.Len())
 	view := e.head.series.View()
 	for i := range headIDs {
@@ -253,22 +257,40 @@ func (e *Engine) preloadHistoricalBatch(ids []signal.SeriesID) error {
 		return nil
 	}
 	s := e.head.disk
-	var reader seriesindex.MetadataReader
-	for _, p := range e.readablePartsLocked() {
-		if err := p.visitDiskMetadata(context.Background(), ids, &reader, func(id signal.SeriesID, meta seriesindex.Metadata) {
-			entry := s.pending[id]
-			if !entry.exists || meta.Covered > entry.newest {
-				entry.newest = meta.Covered
-			}
-			entry.exists = true
-			s.pending[id] = entry
-		}); err != nil {
-			return errors.Wrap(err, "lookup historical series batch")
-		}
+	if err := lookupDiskSeries(e.readablePartsLocked(), ids, s.pending); err != nil {
+		return err
 	}
 	for _, id := range ids {
 		if entry := s.pending[id]; entry.exists {
 			s.remember(id, entry.newest)
+		}
+	}
+	return nil
+}
+
+//nolint:contextcheck,nolintlint // Append has no context; scoped reader I/O stays off state.
+func lookupDiskSeries(parts []*part, ids []signal.SeriesID, pending map[signal.SeriesID]diskHeadEntry) (err error) {
+	ctx, batch := readerpool.WithBatch(context.Background())
+	defer func() {
+		if closeErr := batch.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	var reader seriesindex.MetadataReader
+	var coverage watermark.Cursor
+	for _, p := range parts {
+		if err := batch.Reset(); err != nil {
+			return err
+		}
+		if err := p.visitDiskMetadataWindow(ctx, ids, &reader, &coverage, func(id signal.SeriesID, meta seriesindex.Metadata) {
+			entry := pending[id]
+			if !entry.exists || meta.Covered > entry.newest {
+				entry.newest = meta.Covered
+			}
+			entry.exists = true
+			pending[id] = entry
+		}); err != nil {
+			return errors.Wrap(err, "lookup historical series batch")
 		}
 	}
 	return nil
@@ -287,7 +309,7 @@ func (e *Engine) compactDiskHeadLocked() {
 	if h.disk == nil || e.flushing != nil || len(h.samples) == h.series.Len() {
 		return
 	}
-	next := newHead()
+	next := newHeadWithContexts(e.cfg.SeriesContexts)
 	view := h.series.View()
 	var attrs signal.Attributes
 	for i := range view.Len() {
@@ -501,4 +523,11 @@ func (e *Engine) diskWatermarksForHead(ctx context.Context, parts []*part, ids [
 		}
 	}
 	return bounds, nil
+}
+
+func (e *Engine) diskSeriesCacheBytes() int64 {
+	if e.cfg.SeparateSeries {
+		return e.cfg.SeriesCacheBytes - e.cfg.SeriesCacheBytes/8
+	}
+	return e.cfg.SeriesCacheBytes
 }

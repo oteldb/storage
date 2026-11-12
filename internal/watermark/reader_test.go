@@ -89,7 +89,12 @@ func FuzzReader(f *testing.F) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, e := range expected {
+		cursor := r.Cursor(t.Context())
+		for i, e := range expected {
+			got, cursorErr := cursor.At(i)
+			if cursorErr != nil || got != e {
+				t.Fatalf("cursor %d: %v, %v", i, got, cursorErr)
+			}
 			value, ok, err := r.Lookup(t.Context(), e.ID)
 			if err != nil || !ok || value != e.Max {
 				t.Fatalf("lookup %v: %d, %v, %v", e.ID, value, ok, err)

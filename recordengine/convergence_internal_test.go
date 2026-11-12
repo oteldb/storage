@@ -3,6 +3,7 @@ package recordengine
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -58,10 +59,15 @@ func TestResidentLimitedCompactionConverges(t *testing.T) {
 	rows, want := recordDigest(t, e)
 	for range 24 {
 		before := e.PartPrefixes()
+		selected := e.selectMergeParts(e.parts, MergeOptions{}, e.mergeCapBytes(t.Context()))
+		compressed := !slices.ContainsFunc(selected, e.compressionForces)
 		index, err := e.cfg.Backend.Read(t.Context(), e.indexKey())
 		require.NoError(t, err)
 		changed, err := e.MergeStep(t.Context(), MergeOptions{})
 		require.NoError(t, err)
+		if changed && compressed {
+			require.LessOrEqual(t, e.PartCount(), len(before), "ordinary compaction must not multiply already-compressed parts")
+		}
 		if !changed {
 			assert.Equal(t, before, e.PartPrefixes(), "a rejected rewrite must leave the committed inputs intact")
 			assert.Empty(t, unindexedParts(t, e), "discarded output must not leave backend objects behind")
@@ -75,7 +81,6 @@ func TestResidentLimitedCompactionConverges(t *testing.T) {
 	}
 	require.Zero(t, e.MergeShape().Candidates, "unchanged resident-limited runs must reach a fixed point")
 	require.Positive(t, e.MergeShape().NonReducingMerges)
-	require.LessOrEqual(t, e.PartCount(), 3, "ordinary compaction must not multiply already-compressed parts")
 	gotRows, got := recordDigest(t, e)
 	assert.Equal(t, rows, gotRows)
 	assert.Equal(t, want, got)

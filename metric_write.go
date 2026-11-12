@@ -102,7 +102,9 @@ func (w *metricWriter) appendSampled(b *metric.Batch, weights []float64, dropped
 	// scale factor so the embedder's count/sum/rate stays unbiased. Under budget this window the
 	// sampler returns no weights and the batch passes through unchanged (no scale-factor column).
 	ids, tss, vals, sf := b.IDs, b.Ts, b.Values, []float64(nil)
-	mat := b.Series
+	source := b.Source()
+	mat := func(i int) signal.Series { return w.buffer.arena.Materialize(source.Identity(i)) }
+	defer w.buffer.arena.Reset()
 
 	if weights != nil {
 		fids := make([]signal.SeriesID, 0, len(weights))
@@ -124,7 +126,7 @@ func (w *metricWriter) appendSampled(b *metric.Batch, weights []float64, dropped
 		}
 
 		ids, tss, vals, sf = fids, fts, fvals, fsf
-		mat = func(j int) signal.Series { return b.Series(kept[j]) }
+		mat = func(j int) signal.Series { return w.buffer.arena.Materialize(source.Identity(kept[j])) }
 		w.sampledDropped += dropped
 	}
 

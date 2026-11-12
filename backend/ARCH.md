@@ -137,6 +137,11 @@ a demonstration.
   and pages share one total byte budget and loading-cache miss coalescing. Object generations
   isolate cached ranges across writes/deletes; existing borrowed views remain valid. Ranged misses
   call the backend's native `ReadAt`, without loading or copying the whole object.
+- **`backend.ReadDecodedPage`** — optional immutable decoded-page views sharing the byte cache
+  with raw ranges and whole objects. A stable format string separates representations; object
+  invalidation tokens and operation generations separate replacements. The synchronous loader
+  collapses misses before calling the decoder; errors never populate the cache. Decoders validate
+  before returning owned bytes, bound expansion, and retain no input views or operation context.
 - **`backend.ReadAtAppend`** appends a clamped range into caller-owned capacity. `ReadAppender`
   permits direct reads into that destination; older backends fall back through their existing
   view/range path. Cached entries are copied into the destination, never exposed for mutation.

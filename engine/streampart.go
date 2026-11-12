@@ -62,8 +62,9 @@ type partStreamWriter struct {
 	mergeFinish  *mergeFinishBudget
 	buildScratch *block.StreamBuildScratch
 
-	streamIdentities    bool
-	identityWriterBytes int64
+	streamIdentities      bool
+	reserveSeriesMetadata func(int64) error
+	identityWriterBytes   int64
 }
 
 // newPartStreamWriter starts an output part. comp and precisionBits are fixed for the whole part —
@@ -126,10 +127,15 @@ func newPartStreamWriter(
 		}
 	}
 
-	identityBytes, priced := backend.WriterMemory(e.cfg.Backend, identityKey(prefix))
-	streamIdentities := priced && backend.StreamsWrites(e.cfg.Backend)
-	if !streamIdentities {
-		identityBytes = 0
+	var identityBytes int64
+	var streamIdentities bool
+	if !e.cfg.SeparateSeries {
+		var priced bool
+		identityBytes, priced = backend.WriterMemory(e.cfg.Backend, identityKey(prefix))
+		streamIdentities = priced && backend.StreamsWrites(e.cfg.Backend)
+		if !streamIdentities {
+			identityBytes = 0
+		}
 	}
 	return &partStreamWriter{
 		e: e, w: w, prefix: prefix, withSF: withSF, withStats: withStats,
@@ -241,6 +247,8 @@ func (p *partStreamWriter) residentBytes() int64 {
 		if p.buffered {
 			total += 3 * p.seriesBuilder.EncodedBound()
 		}
+	} else if p.e.cfg.SeparateSeries {
+		total += partIDBloomBytes(len(p.runs))
 	}
 	total += int64(cap(p.statsIDs))*idBytes + int64(cap(p.stats))*aggBytes
 	total += int64(cap(p.wmarks)) * wmarkBytes
@@ -285,6 +293,9 @@ func (p *partStreamWriter) weights(sf []float64, n int) []float64 {
 // counterpart of [Engine.writeMergedPart]. At least one series must have been appended: an empty
 // part would mean a burnt part id and an unreadable prefix.
 func (p *partStreamWriter) finish(ctx context.Context) (*part, error) {
+	if p.e.cfg.SeparateSeries {
+		return p.finishWithIdentities(ctx, identitySnapshot{})
+	}
 	if p.e.cfg.DiskSeries && p.seriesBuilder != nil {
 		return p.finishWithIdentities(ctx, identitySnapshot{})
 	}
@@ -303,6 +314,9 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 	}
 
 	prefix := p.prefix
+	if err := p.ensureSharedIdentities(ctx, identities); err != nil {
+		return nil, err
+	}
 
 	if err := block.WriteStreamPartWithScratch(ctx, p.e.cfg.Backend, prefix, p.w, p.buildScratch); err != nil {
 		return nil, errors.Wrapf(err, "write part %q", prefix)
@@ -315,7 +329,11 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 	if err := p.writeIdentity(ctx, identities); err != nil {
 		return nil, err
 	}
-	if p.e.cfg.DiskSeries {
+	if p.e.cfg.SeparateSeries {
+		if err := writeSeriesReference(ctx, p.e, prefix); err != nil {
+			return nil, err
+		}
+	} else if p.e.cfg.DiskSeries {
 		if err := p.writeDiskSeries(ctx, identities); err != nil {
 			return nil, err
 		}
@@ -339,8 +357,14 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 	if err != nil {
 		return nil, err
 	}
+	if p.e.cfg.SeparateSeries {
+		if err := p.e.attachSharedSeries(part); err != nil {
+			part.closeReaders()
+			return nil, err
+		}
+	}
 
-	if err := p.seedPartIDBloom(ctx, part); err != nil {
+	if err := p.seedOutputIDBloom(ctx, part); err != nil {
 		part.closeReaders()
 		return nil, err
 	}
@@ -365,4 +389,19 @@ func (p *partStreamWriter) identityEntries() identitySnapshot {
 		out.refs = append(out.refs, ref)
 	})
 	return out
+}
+
+func (p *partStreamWriter) ensureSharedIdentities(ctx context.Context, identities identitySnapshot) error {
+	if !p.e.cfg.SeparateSeries || len(identities.refs) == 0 {
+		return nil
+	}
+	if len(identities.refs) != len(p.runs) {
+		return errors.New("engine: incomplete shared series identities")
+	}
+	for i, ref := range identities.refs {
+		if identities.view.ID(int(ref)) != u128ToID(p.runs[i].Value) {
+			return errors.New("engine: shared series identity mismatch")
+		}
+	}
+	return p.e.ensureSeriesIdentities(ctx, identities, p.reserveSeriesMetadata)
 }

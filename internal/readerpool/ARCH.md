@@ -25,3 +25,15 @@ Descriptor exhaustion (`EMFILE`/`ENFILE`) permits one bounded idle-eviction retr
 current-generation handles with no actual reader lease may be evicted even while their
 part is active. Actual opened leases remain protected. If a repair races a later reopen,
 the generation fence reports a changed-object error instead of mixing metadata and bytes.
+
+An operation-local Batch retains at most eight acquired entries or declined-retention results.
+Ranged hits use the held entry under the batch's read lock, bypassing the global directory,
+reference-count and LRU mutex. Reset releases the previous part's leases; Close waits for active
+reads and makes subsequent batch reads fail. Batches retain no query context or scope owner.
+
+A declined key is not retried until reset, avoiding repeated full-pool scans while the caller uses
+its ordinary ranged fallback. Its scope generation is checked on every declined hit. Held leases
+preserve existing opened-generation semantics across mutation; new generations use distinct keys.
+Reservations still pass through the unchanged process-wide 256-handle budget. Filesystem reads and
+closes never run under the global pool mutex; simultaneous readers in one batch share a local read
+lock, while reset and cold-open setup use its local write lock.

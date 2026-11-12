@@ -30,6 +30,9 @@ func Convert(ctx context.Context, be backend.Backend, partPrefix string, scheme 
 	if err := scheme.Validate(); err != nil {
 		return nil, err
 	}
+	if err := rejectSeparateSeries(ctx, be, partPrefix); err != nil {
+		return nil, err
+	}
 
 	// Already converted? Finish any pending deletes and return the recorded sidecar.
 	if raw, err := backend.ReadView(ctx, be, MetaKey(partPrefix)); err == nil {

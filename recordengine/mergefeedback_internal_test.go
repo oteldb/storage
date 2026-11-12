@@ -89,6 +89,7 @@ func TestUsefulMergeTransformations(t *testing.T) {
 	require.True(t, changed)
 	compressed := e.parts[0]
 	assert.True(t, e.usefulMerge([]*part{raw}, []*part{compressed}), "compression can preserve part count")
+	assert.True(t, e.usefulMerge([]*part{raw}, []*part{compressed, compressed}), "required compression may split an uncompressed input")
 	assert.False(t, e.usefulMerge([]*part{compressed}, []*part{compressed}))
 	assert.True(t, e.usefulMerge([]*part{compressed, compressed}, []*part{compressed}))
 	e.cfg.MergeCompression = compress.AlgorithmNone
