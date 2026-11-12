@@ -260,6 +260,6 @@ storing something nothing can retrieve.
 Metric identity materialization stably merges sorted point labels with the five reserved labels;
 unsorted input retains the stable-sort fallback. Point labels precede reserved labels on duplicate
 keys, preserving canonical IDs. Identity.ToSeries still owns a fresh attribute slice. SeriesArena
-keeps distinct attribute slices valid through a staged append/WAL operation, clears input references
+uses stable chunks to keep distinct attribute slices valid through a staged append/WAL operation, clears input references
 on Reset and drops retained capacity above 8 MiB. It is caller-owned and sequential; input values
 remain borrowed. Ingestion resets the arena only after all staged consumers finish.

@@ -43,23 +43,50 @@ func (id Identity) AppendAttributes(dst signal.Attributes) signal.Attributes {
 
 // SeriesArena owns attribute arrays until Reset; inputs remain borrowed and immutable.
 // It is not safe for concurrent use.
-type SeriesArena struct{ attrs signal.Attributes }
+type SeriesArena struct {
+	chunks  []signal.Attributes
+	current int
+}
 
 // Materialize retains point labels for an independently addressable staged identity.
 func (a *SeriesArena) Materialize(id Identity) signal.Series {
-	start := len(a.attrs)
-	a.attrs = id.AppendAttributes(a.attrs)
+	need := len(id.Series.Attributes) + 5
+	if a.current < len(a.chunks) && cap(a.chunks[a.current])-len(a.chunks[a.current]) < need {
+		a.current++
+	}
+	if a.current == len(a.chunks) {
+		size := 64
+		if a.current > 0 {
+			size = min(4096, cap(a.chunks[a.current-1])*2)
+		}
+		a.chunks = append(a.chunks, make(signal.Attributes, 0, max(size, need)))
+	} else if cap(a.chunks[a.current]) < need {
+		a.chunks[a.current] = make(signal.Attributes, 0, need)
+	}
+	chunk := a.chunks[a.current]
+	start := len(chunk)
+	chunk = id.AppendAttributes(chunk)
+	a.chunks[a.current] = chunk
 	s := id.Series
-	s.Attributes = a.attrs[start:len(a.attrs):len(a.attrs)]
+	s.Attributes = chunk[start:len(chunk):len(chunk)]
 	return s
 }
 
 // Reset releases input references; identities returned by Materialize expire.
 func (a *SeriesArena) Reset() {
-	clear(a.attrs)
-	if memsize.Slice(a.attrs) > 8<<20 {
-		a.attrs = nil
-	} else {
-		a.attrs = a.attrs[:0]
+	retained := a.chunks[:0]
+	left := int64(8 << 20)
+	for _, chunk := range a.chunks {
+		clear(chunk)
+		if size := memsize.Slice(chunk); size <= left {
+			retained = append(retained, chunk[:0])
+			left -= size
+		}
+	}
+	clear(a.chunks[len(retained):])
+	a.chunks = retained
+	a.current = 0
+	if len(a.chunks) == 0 {
+		a.chunks = nil
 	}
 }

@@ -60,14 +60,16 @@ func TestSeriesArenaBatchLifetime(t *testing.T) {
 		require.Equal(t, want[i].Hash(), got[i].Hash())
 	}
 	arena.Reset()
-	require.Empty(t, arena.attrs)
-	require.Positive(t, cap(arena.attrs))
-	for _, kv := range arena.attrs[:cap(arena.attrs)] {
-		require.Equal(t, signal.KeyValue{}, kv, "pool must release input references")
+	require.NotEmpty(t, arena.chunks)
+	for _, chunk := range arena.chunks {
+		require.Empty(t, chunk)
+		for _, kv := range chunk[:cap(chunk)] {
+			require.Equal(t, signal.KeyValue{}, kv, "pool must release input references")
+		}
 	}
-	arena.attrs = make(signal.Attributes, (8<<20)/memsize.Of[signal.KeyValue]()+1)
+	arena.chunks = []signal.Attributes{make(signal.Attributes, (8<<20)/memsize.Of[signal.KeyValue]()+1)}
 	arena.Reset()
-	require.Nil(t, arena.attrs)
+	require.Nil(t, arena.chunks)
 }
 
 //nolint:paralleltest // AllocsPerRun changes process GOMAXPROCS.
@@ -97,4 +99,25 @@ func FuzzMetricAttributeMerge(f *testing.F) {
 			t.Fatal("canonical labels differ")
 		}
 	})
+}
+
+func TestSeriesArenaLargeBatchBound(t *testing.T) {
+	t.Parallel()
+	var arena SeriesArena
+	ids := make([]signal.SeriesID, 32768)
+	series := make([]signal.Series, 0, len(ids))
+	for i := range ids {
+		id := Identity{Name: []byte(strconv.Itoa(i)), Series: signal.Series{Attributes: signal.NewAttributes(kv("a", str("one")), kv("b", str("two")), kv("c", str("three")), kv("d", str("four")))}}
+		series = append(series, arena.Materialize(id))
+		ids[i] = legacyMetricSeries(id).Hash()
+	}
+	for i, s := range series {
+		require.Equal(t, ids[i], s.Hash())
+	}
+	arena.Reset()
+	var retained int64
+	for _, chunk := range arena.chunks {
+		retained += memsize.Slice(chunk)
+	}
+	require.LessOrEqual(t, retained, int64(8<<20))
 }
