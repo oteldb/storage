@@ -2079,3 +2079,9 @@ LRU of validated, sorted `SeriesID` arrays. Exact binary search returns a descri
 negative result without decoding prefix-coded keys. The remainder holds historical watermarks. Pending arrays count against the cache limit
 before allocation and become readable only after full run validation; eviction falls back to the
 existing bounded disk reader. Cached IDs never determine active cardinality or sample coverage.
+
+Shared-part ingestion metadata probes reuse the SIDX ordinal and read SMAX through an
+operation-local 32-KiB window. The scratch window is reset and reused across parts; coverage opens
+lazily after a real index hit, so absent IDs do not read irrelevant sidecars. Every ordinal verifies
+its canonical ID before returning Covered. Point APIs and legacy per-part indexes retain their
+existing paths; CRC validation and generation fencing are unchanged.

@@ -250,6 +250,23 @@ func (p *part) sharedSeriesMetadata(ctx context.Context, id signal.SeriesID) (se
 	if err != nil || !present {
 		return seriesindex.Metadata{}, false, err
 	}
+	r, err := p.sharedWatermarkReader(ctx)
+	if err != nil {
+		return seriesindex.Metadata{}, false, err
+	}
+
+	covered, found, err := r.Lookup(ctx, id)
+	if err != nil {
+		return seriesindex.Metadata{}, false, err
+	}
+	if !found {
+		return seriesindex.Metadata{}, false, errors.Wrap(seriesindex.ErrCorrupt, "numeric watermark missing series")
+	}
+	return seriesindex.Metadata{Covered: covered}, true, nil
+}
+
+func (p *part) sharedWatermarkReader(ctx context.Context) (*watermark.Reader, error) {
+	var err error
 	p.diskWatermarkMu.Lock()
 	r := p.diskWatermark
 	if r == nil {
@@ -260,16 +277,9 @@ func (p *part) sharedSeriesMetadata(ctx context.Context, id signal.SeriesID) (se
 	}
 	p.diskWatermarkMu.Unlock()
 	if err != nil {
-		return seriesindex.Metadata{}, false, errors.Wrap(err, "open numeric series watermark")
+		return nil, errors.Wrap(err, "open numeric series watermark")
 	}
-	covered, found, err := r.Lookup(ctx, id)
-	if err != nil {
-		return seriesindex.Metadata{}, false, err
-	}
-	if !found {
-		return seriesindex.Metadata{}, false, errors.Wrap(seriesindex.ErrCorrupt, "numeric watermark missing series")
-	}
-	return seriesindex.Metadata{Covered: covered}, true, nil
+	return r, nil
 }
 
 //nolint:nilnil,nilerr // Missing or corrupt optional statistics fall back to sample decoding.

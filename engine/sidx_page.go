@@ -19,55 +19,60 @@ func (p *pagedIndex) lookup(ctx context.Context, id signal.SeriesID) (rowRange, 
 }
 
 func (p *pagedIndex) lookupPage(ctx context.Context, id signal.SeriesID, pageEntries int) (rowRange, bool, error) {
+	_, rows, found, err := p.lookupPosition(ctx, id, pageEntries)
+	return rows, found, err
+}
+
+func (p *pagedIndex) lookupPosition(ctx context.Context, id signal.SeriesID, pageEntries int) (int, rowRange, bool, error) {
 	if p.readContext != nil {
 		ctx = p.readContext(ctx)
 	}
 	if view := p.view.Load(); view != nil {
 		k, ok := p.search(*view, id)
 		if !ok {
-			return rowRange{}, false, nil
+			return 0, rowRange{}, false, nil
 		}
-		return p.rangeAt(*view, k), true, nil
+		return k, p.rangeAt(*view, k), true, nil
 	}
 	if p.bounded && (id.Compare(p.first) < 0 || id.Compare(p.last) > 0) {
-		return rowRange{}, false, nil
+		return 0, rowRange{}, false, nil
 	}
 	if len(p.fences) == 0 {
 		entries, err := p.entries(ctx)
 		if err != nil {
-			return rowRange{}, false, err
+			return 0, rowRange{}, false, err
 		}
 		k, ok := p.search(entries, id)
 		if !ok {
-			return rowRange{}, false, nil
+			return 0, rowRange{}, false, nil
 		}
-		return p.rangeAt(entries, k), true, nil
+		return k, p.rangeAt(entries, k), true, nil
 	}
 
 	start := p.pageStart(id, pageEntries)
 	if start < 0 {
-		return rowRange{}, false, nil
+		return 0, rowRange{}, false, nil
 	}
 	n := min(pageEntries, p.n-start)
 	// One extra entry supplies the last run's end when the page is not the final one.
 	readN := min(n+1, p.n-start)
 	data, err := backend.ReadPageView(ctx, p.be, p.key, p.offset+int64(start*sidxEntryW), int64(readN*sidxEntryW))
 	if err != nil {
-		return rowRange{}, false, err
+		return 0, rowRange{}, false, err
 	}
 	if len(data) != readN*sidxEntryW {
-		return rowRange{}, false, errors.Wrap(errSidxCorrupt, "short index page")
+		return 0, rowRange{}, false, errors.Wrap(errSidxCorrupt, "short index page")
 	}
 	local := pagedIndex{n: n, total: p.total}
 	k, ok := local.search(data, id)
 	if !ok {
-		return rowRange{}, false, nil
+		return 0, rowRange{}, false, nil
 	}
 	end := p.total
 	if k+1 < readN {
 		end = sidxEntryStart(data, k+1)
 	}
-	return rowRange{start: sidxEntryStart(data, k), end: end}, true, nil
+	return start + k, rowRange{start: sidxEntryStart(data, k), end: end}, true, nil
 }
 
 func (p *pagedIndex) pageStart(id signal.SeriesID, pageEntries int) int {

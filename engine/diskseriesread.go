@@ -434,7 +434,14 @@ func (p *diskPartIDs) Err() error          { return p.err }
 
 // visitDiskMetadata probes sorted IDs with the batch's operation-local metadata reader.
 func (p *part) visitDiskMetadata(ctx context.Context, ids []signal.SeriesID, reader *seriesindex.MetadataReader,
-	visit func(signal.SeriesID, seriesindex.Metadata)) error {
+	visit func(signal.SeriesID, seriesindex.Metadata),
+) error {
+	var coverage watermark.Cursor
+	return p.visitDiskMetadataWindow(ctx, ids, reader, &coverage, visit)
+}
+
+func (p *part) visitDiskMetadataWindow(ctx context.Context, ids []signal.SeriesID, reader *seriesindex.MetadataReader,
+	coverage *watermark.Cursor, visit func(signal.SeriesID, seriesindex.Metadata)) error {
 	first, end := p.index.selectedIDRange(ids)
 	ids = ids[first:end]
 	if len(ids) == 0 {
@@ -452,6 +459,9 @@ func (p *part) visitDiskMetadata(ctx context.Context, ids []signal.SeriesID, rea
 		}
 	}
 	ctx = p.reader.ReaderContext(ctx)
+	if p.sharedSeries != nil {
+		return p.visitSharedDiskMetadata(ctx, ids, coverage, visit)
+	}
 	var index *seriesindex.Index
 	if p.sharedSeries == nil {
 		var err error
@@ -476,6 +486,42 @@ func (p *part) visitDiskMetadata(ctx context.Context, ids []signal.SeriesID, rea
 		if found {
 			visit(id, meta)
 		}
+	}
+	return nil
+}
+
+func (p *part) visitSharedDiskMetadata(ctx context.Context, ids []signal.SeriesID, cursor *watermark.Cursor,
+	visit func(signal.SeriesID, seriesindex.Metadata),
+) error {
+	bound := false
+	bloom := p.idBloom.Load()
+	for _, id := range ids {
+		if !bloom.mayContain(id) {
+			continue
+		}
+		pos, found, err := p.index.position(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		if !bound {
+			r, err := p.sharedWatermarkReader(ctx)
+			if err != nil {
+				return err
+			}
+			cursor.Reset(ctx, r)
+			bound = true
+		}
+		entry, err := cursor.At(pos)
+		if err != nil {
+			return err
+		}
+		if entry.ID != id {
+			return errors.Wrap(seriesindex.ErrCorrupt, "numeric coverage ordinal disagrees with SIDX")
+		}
+		visit(id, seriesindex.Metadata{Covered: entry.Max})
 	}
 	return nil
 }

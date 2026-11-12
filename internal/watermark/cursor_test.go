@@ -90,3 +90,28 @@ func TestCursorReadFailureInvalidatesWindow(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, entries[0], got)
 }
+
+func TestCursorResetChangesOwner(t *testing.T) {
+	t.Parallel()
+	be := backendtest.NewByteCounter(backend.Memory())
+	readers := make([]*Reader, 2)
+	for i, key := range []string{"first", "second"} {
+		require.NoError(t, be.Write(t.Context(), key, Encode(nil, []Entry{{ID: signal.SeriesID{Hi: 1}, Max: int64(i + 1)}})))
+		reader, err := OpenReader(t.Context(), be, key, 1)
+		require.NoError(t, err)
+		readers[i] = reader
+	}
+	be.Reset()
+	var cursor Cursor
+	cursor.Reset(t.Context(), readers[0])
+	first, err := cursor.At(0)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, first.Max)
+	capacity := cap(cursor.data)
+	cursor.Reset(t.Context(), readers[1])
+	second, err := cursor.At(0)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, second.Max)
+	require.Equal(t, capacity, cap(cursor.data))
+	require.EqualValues(t, 2, be.Reads())
+}

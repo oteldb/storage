@@ -119,6 +119,16 @@ func (idx partIndex) has(ctx context.Context, id signal.SeriesID) (bool, error) 
 	return ok, nil
 }
 
+// position is the stable ordinal shared by SIDX and SMAX.
+func (idx partIndex) position(ctx context.Context, id signal.SeriesID) (int, bool, error) {
+	if p := idx.paged; p != nil {
+		pos, _, found, err := p.lookupPosition(ctx, id, indexPageEntries)
+		return pos, found, err
+	}
+	pos, found := slices.BinarySearchFunc(idx.ids, id, signal.SeriesID.Compare)
+	return pos, found, nil
+}
+
 // warm resolves the paged index's entries, so subsequent [partIndex.has] probes are pure in-memory
 // binary searches. It is how the label enumeration keeps its backend I/O off the engine lock: warm
 // every part first, then probe under the read lock (the ARCH invariant that the lock is never held

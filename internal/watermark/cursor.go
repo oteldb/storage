@@ -21,7 +21,17 @@ type Cursor struct {
 }
 
 // Cursor creates an operation-local reader with at most 32 KiB of scratch.
-func (r *Reader) Cursor(ctx context.Context) *Cursor { return &Cursor{reader: r, ctx: ctx, first: -1} }
+func (r *Reader) Cursor(ctx context.Context) *Cursor {
+	c := &Cursor{}
+	c.Reset(ctx, r)
+	return c
+}
+
+// Reset rebinds an operation-local window while retaining its scratch capacity.
+func (c *Cursor) Reset(ctx context.Context, r *Reader) {
+	c.reader, c.ctx, c.first = r, ctx, -1
+	c.data = c.data[:0]
+}
 
 // At reads an ordinal, retaining its page for subsequent ordinals.
 func (c *Cursor) At(index int) (Entry, error) {

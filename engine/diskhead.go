@@ -10,6 +10,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/index/postings"
 	"github.com/oteldb/storage/internal/seriesindex"
+	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
 )
@@ -269,8 +270,9 @@ func (e *Engine) preloadHistoricalBatch(ids []signal.SeriesID) error {
 //nolint:contextcheck,nolintlint // Append has no context; scoped reader I/O stays off state.
 func lookupDiskSeries(parts []*part, ids []signal.SeriesID, pending map[signal.SeriesID]diskHeadEntry) error {
 	var reader seriesindex.MetadataReader
+	var coverage watermark.Cursor
 	for _, p := range parts {
-		if err := p.visitDiskMetadata(context.Background(), ids, &reader, func(id signal.SeriesID, meta seriesindex.Metadata) {
+		if err := p.visitDiskMetadataWindow(context.Background(), ids, &reader, &coverage, func(id signal.SeriesID, meta seriesindex.Metadata) {
 			entry := pending[id]
 			if !entry.exists || meta.Covered > entry.newest {
 				entry.newest = meta.Covered
