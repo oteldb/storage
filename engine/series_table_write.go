@@ -162,6 +162,7 @@ func checkRootIdentities(ctx context.Context, run *seriestable.Run, entries iden
 		return err
 	}
 	defer func() { _ = r.Close() }()
+	r.StreamPages()
 	var canonical []byte
 	for i, ref := range entries.refs {
 		if known[i] {

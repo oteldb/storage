@@ -2098,3 +2098,11 @@ between numeric parts. Repeated SIDX/SMAX ranges reuse acquired handles, or reme
 retention request for that part. The batch releases every lease before snapshot references drain;
 read failures and reset/close errors prevent applying the staged admission state. At most eight
 entries are retained per batch within the existing global descriptor limit.
+
+
+Ordinary sample fetches request identities without aggregate metadata. Aggregate plans explicitly
+request statistics; count-only planning remains independent. Shared numeric statistics are not
+read or materialized for sample fetches. Missing/corrupt optional stats retain the decode fallback.
+Historical sorted-ID batches hold one bounded SIDX page per part beside the coverage window,
+so adjacent probes reuse it even when backend cache admission declines. Both views expire with
+the pinned part; final-page and SIDX/SMAX ordinal validation remain unchanged.

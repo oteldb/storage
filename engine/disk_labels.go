@@ -26,7 +26,7 @@ func (e *Engine) diskLabels(ctx context.Context, r fetch.Request, name []byte, v
 		plan: &enginePlan{engine: e, selectionBudget: budget}, seen: make(map[string]struct{}), name: name, values: values,
 	}
 	if len(r.Matchers) > 0 {
-		p, err := e.planDiskQuery(ctx, r, true, true)
+		p, err := e.planDiskQuery(ctx, r, true, true, false)
 		if err != nil {
 			return nil, err
 		}

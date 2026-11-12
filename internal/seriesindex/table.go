@@ -236,6 +236,8 @@ type Cursor struct {
 	decoded                                         []byte
 	decodedIndex                                    uint32
 	decoding                                        pageInfo
+	decodeScratch, decodeKey                        []byte
+	streaming                                       bool
 }
 
 // Next advances to the next record, including the first before any seek.
@@ -290,11 +292,14 @@ func (c *Cursor) reset(ctx context.Context, table *Table) {
 		c.key, c.raw, c.last = nil, nil, nil
 	}
 	*c = Cursor{
+		decodeScratch: c.decodeScratch[:0], decodeKey: c.decodeKey[:0], streaming: c.streaming,
 		ctx: ctx, table: table, page: -1, key: c.key[:0], packed: c.packed[:0], raw: c.raw[:0],
 		first: c.first[:0], directory: c.directory[:0], last: c.last[:0], sought: c.sought[:0],
 	}
 	if table == nil {
 		c.ctx = nil
+	} else if _, ok := table.b.(backend.DecodedPageViewer); !ok {
+		c.decodeScratch, c.decodeKey = nil, nil
 	}
 }
 
@@ -369,7 +374,7 @@ func (c *Cursor) load(i uint32, indexed bool) bool {
 		c.err = err
 		return false
 	}
-	if cache, ok := c.table.b.(backend.DecodedPageViewer); ok && indexed {
+	if cache, ok := c.table.b.(backend.DecodedPageViewer); ok && indexed && !c.streaming {
 		return c.loadDecoded(cache, i, p)
 	}
 	if c.decoded != nil {

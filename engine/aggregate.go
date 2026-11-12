@@ -119,7 +119,7 @@ func (e *Engine) planAggregate(ctx context.Context, r fetch.Request) ([]signal.S
 	var ids []signal.SeriesID
 	if e.cfg.DiskSeries {
 		var err error
-		plan, err = e.planDiskQuery(ctx, r, true, false)
+		plan, err = e.planDiskQuery(ctx, r, true, false, true)
 		if err != nil {
 			return nil, nil, err
 		}

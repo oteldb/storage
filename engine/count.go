@@ -118,7 +118,7 @@ func (e *Engine) planCount(ctx context.Context, r fetch.Request, withIdentity bo
 // for the index-only [Engine.Series]). The caller must releaseParts.
 func (e *Engine) planLookup(ctx context.Context, r fetch.Request, withIdentity bool) ([]signal.SeriesID, *enginePlan, error) {
 	if e.cfg.DiskSeries {
-		p, err := e.planDiskQuery(ctx, r, withIdentity, true)
+		p, err := e.planDiskQuery(ctx, r, withIdentity, true, false)
 		if err != nil {
 			return nil, nil, err
 		}

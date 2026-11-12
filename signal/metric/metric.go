@@ -59,22 +59,9 @@ type Identity struct {
 // fetch batches. Two metrics differing only in name/unit/kind/temporality/monotonicity
 // produce distinct series (and thus distinct [signal.SeriesID]).
 func (id Identity) ToSeries() signal.Series {
-	pts := id.Series.Attributes
-	merged := make([]signal.KeyValue, 0, len(pts)+5)
-	merged = append(merged, pts...)
-	merged = append(merged,
-		signal.KeyValue{Key: LabelName, Value: signal.StringValue(id.Name)},
-		signal.KeyValue{Key: LabelUnit, Value: signal.StringValue(id.Unit)},
-		signal.KeyValue{Key: LabelKind, Value: signal.IntValue(int64(id.Kind))},
-		signal.KeyValue{Key: LabelTemporality, Value: signal.IntValue(int64(id.Temporality))},
-		signal.KeyValue{Key: LabelMonotonic, Value: signal.BoolValue(id.Monotonic)},
-	)
-
-	return signal.Series{
-		Resource:   id.Series.Resource,
-		Scope:      id.Series.Scope,
-		Attributes: signal.NewAttributes(merged...),
-	}
+	s := id.Series
+	s.Attributes = id.AppendAttributes(nil)
+	return s
 }
 
 // SeriesID is the content-addressed id of the full identity ([ToSeries] hashed).

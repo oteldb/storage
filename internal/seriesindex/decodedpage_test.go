@@ -204,3 +204,53 @@ func TestDecodedPagesRejectCorruption(t *testing.T) {
 		}
 	}
 }
+
+//nolint:paralleltest // AllocsPerRun changes process GOMAXPROCS.
+func TestDecodedPageReusesScratchWithoutAliasing(t *testing.T) {
+	be := backend.Memory()
+	require.NoError(t, be.Write(t.Context(), "index", tableData(t, 1000, 64<<10)))
+	table, err := OpenTable(t.Context(), backend.Cached(be, 1<<20), "index")
+	require.NoError(t, err)
+	c := table.Cursor(t.Context())
+	p, err := c.entry(0)
+	require.NoError(t, err)
+	c.decoding = p
+	packed, err := backend.ReadAt(t.Context(), be, "index", p.offset, int64(p.packed))
+	require.NoError(t, err)
+	first, err := c.DecodePage(packed)
+	require.NoError(t, err)
+	want := bytes.Clone(first)
+	require.LessOrEqual(t, testing.AllocsPerRun(100, func() {
+		if _, err := c.DecodePage(packed); err != nil {
+			panic(err)
+		}
+	}), float64(1))
+	require.Equal(t, want, first, "cached representation must not alias reusable scratch")
+	c.reset(t.Context(), table)
+	require.NotZero(t, cap(c.decodeScratch))
+	plain, err := OpenTable(t.Context(), be, "index")
+	require.NoError(t, err)
+	c.reset(t.Context(), plain)
+	require.Nil(t, c.decodeScratch, "bare-backend admission excludes cold decoder scratch")
+}
+
+func TestStreamingPageSeeksPreserveCache(t *testing.T) {
+	t.Parallel()
+	be := backend.Memory()
+	require.NoError(t, be.Write(t.Context(), "index", tableData(t, 4096, 1024)))
+	table, err := OpenTable(t.Context(), backend.Cached(be, 1<<20), "index")
+	require.NoError(t, err)
+	c := table.Cursor(t.Context())
+	require.True(t, c.Seek([]byte("key-00002048")))
+	require.NotNil(t, c.decoded)
+	c.streaming = true
+	for _, i := range []int{0, 1, 127, 128, 129, 4095, 2048, 2} {
+		key := fmt.Appendf(nil, "key-%08d", i)
+		require.True(t, c.Seek(key))
+		require.Nil(t, c.decoded)
+		require.Equal(t, fmt.Sprintf("value-%08d", i), string(c.Value()))
+		other := table.Cursor(t.Context())
+		require.True(t, other.Seek(key))
+		require.Equal(t, c.Value(), other.Value())
+	}
+}

@@ -74,3 +74,29 @@ func BenchmarkTablePageTraversal(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkTableOrderedPages(b *testing.B) {
+	files, err := backendfile.New(b.TempDir())
+	require.NoError(b, err)
+	require.NoError(b, files.Write(b.Context(), "index", tableData(b, 65536, 64<<10)))
+	keys := make([][]byte, 8192)
+	for i := range keys {
+		keys[i] = fmt.Appendf(nil, "key-%08d", i*8)
+	}
+	for _, mode := range []string{"expanded", "streaming"} {
+		b.Run(mode, func(b *testing.B) {
+			table, err := OpenTable(b.Context(), backend.Cached(files, 64<<10), "index")
+			require.NoError(b, err)
+			b.ReportAllocs()
+			for b.Loop() {
+				c := table.Cursor(b.Context())
+				c.streaming = mode == "streaming"
+				for _, key := range keys {
+					if !c.Seek(key) {
+						b.Fatal(c.Err())
+					}
+				}
+			}
+		})
+	}
+}

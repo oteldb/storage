@@ -60,7 +60,7 @@ func (e *Engine) fetch(ctx context.Context, r fetch.Request, try bool) (fetch.It
 	var plan *enginePlan
 	if e.cfg.DiskSeries {
 		var err error
-		plan, err = e.planDiskQuery(ctx, r, true, false)
+		plan, err = e.planDiskQuery(ctx, r, true, false, false)
 		if err != nil {
 			span.RecordError(err)
 			span.End()

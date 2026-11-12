@@ -116,3 +116,11 @@ probes inside the same absent-key gap reuse that position; `Next` and reset inva
 The seek-key buffer is included in the per-cursor memory bound. Cold pages still undergo full CRC/order validation before cache admission. Warm expanded pages
 support backward seeks without decompression or reconstruction; compact fallback pages rewind
 through validated prefix records.
+
+
+Decoded-page misses reuse separate cursor-owned decompression and key scratch. Cache results own
+their bytes; borrowed raw/cache views never become decoder destinations. Scratch remains inside
+MaxPageBytes and is dropped when resetting to a bare backend's smaller bound. Ordered canonical
+identity checks select StreamPages, retaining raw page buffers instead of expanding each crossed
+page. Random readers retain decoded-cache seeks. Descriptor hashes and canonical-byte comparisons
+remain mandatory in both modes.

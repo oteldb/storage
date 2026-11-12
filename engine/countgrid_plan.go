@@ -146,7 +146,7 @@ func (presence *gridPresence) addBuffers(ctx context.Context, r fetch.Request, b
 // snapshotDiskCountGrid captures presence spans instead of copying head timestamp/value columns.
 func (e *Engine) snapshotDiskCountGrid(ctx context.Context, r fetch.Request, presence *gridPresence, grouped bool) (*countGridPlan, error) {
 	var heads map[signal.SeriesID][]gridSpan
-	p, err := e.snapshotDiskQuery(ctx, r, grouped, true, func(p *enginePlan) error {
+	p, err := e.snapshotDiskQuery(ctx, r, grouped, true, false, func(p *enginePlan) error {
 		heads = make(map[signal.SeriesID][]gridSpan, len(p.ids))
 		for i, id := range p.ids {
 			presence.reset()

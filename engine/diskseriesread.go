@@ -494,12 +494,13 @@ func (p *part) visitSharedDiskMetadata(ctx context.Context, ids []signal.SeriesI
 	visit func(signal.SeriesID, seriesindex.Metadata),
 ) error {
 	bound := false
+	var positions sidxPositionCursor
 	bloom := p.idBloom.Load()
 	for _, id := range ids {
 		if !bloom.mayContain(id) {
 			continue
 		}
-		pos, found, err := p.index.position(ctx, id)
+		pos, found, err := positions.position(ctx, p.index, id)
 		if err != nil {
 			return err
 		}

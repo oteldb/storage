@@ -25,14 +25,15 @@ func (c *Cursor) DecodePage(packed []byte) ([]byte, error) {
 	if crc32.Checksum(packed[:len(packed)-4], checksumTable) != binary.BigEndian.Uint32(packed[len(packed)-4:]) {
 		return nil, errors.Wrap(ErrCorrupt, "page checksum")
 	}
-	raw, err := c.table.codec.DecompressLimit(nil, packed[:len(packed)-4], int(p.raw))
+	raw, err := c.table.codec.DecompressLimit(cursorBuffer(c.decodeScratch, int(p.raw)), packed[:len(packed)-4], int(p.raw))
 	if err != nil {
 		return nil, errors.Wrap(ErrCorrupt, "page decompression")
 	}
 	if len(raw) != int(p.raw) {
 		return nil, errors.Wrap(ErrCorrupt, "page length")
 	}
-	v := Cursor{table: c.table, raw: raw, left: p.count}
+	c.decodeScratch = raw
+	v := Cursor{table: c.table, raw: raw, left: p.count, key: c.decodeKey[:0]}
 	size := int64(decodedHeader) + int64(p.count)*8
 	for v.left > 0 {
 		if !v.advance() {
@@ -43,6 +44,7 @@ func (c *Cursor) DecodePage(packed []byte) ([]byte, error) {
 		}
 		size += int64(len(v.key)) + int64(len(v.value))
 	}
+	c.decodeKey = v.key[:0]
 	// Prefix expansion is bounded before allocation; pathological shared keys stay compact.
 	if size > int64(p.raw)*3+decodedHeader {
 		out := make([]byte, decodedHeader+len(v.key)+len(raw))

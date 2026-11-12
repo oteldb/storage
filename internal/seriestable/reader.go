@@ -15,12 +15,13 @@ import (
 
 // Reader owns bounded page scratch for one operation. It is not concurrent-safe.
 type Reader struct {
-	ids    *cachedIDs
-	run    *Run
-	ctx    context.Context //nolint:containedctx // Reader owns operation-local I/O and scratch.
-	raw    *seriesindex.RawReader
-	budget *readbudget.Budget
-	bytes  int64
+	ids       *cachedIDs
+	run       *Run
+	ctx       context.Context //nolint:containedctx // Reader owns operation-local I/O and scratch.
+	raw       *seriesindex.RawReader
+	budget    *readbudget.Budget
+	bytes     int64
+	streaming bool
 }
 
 // NewReader reserves scratch and pins the run until Close.
@@ -179,10 +180,21 @@ func (it *Iterator) Close() error {
 	return nil
 }
 
+// StreamPages uses operation-local page buffers for ordered descriptor access.
+func (r *Reader) StreamPages() {
+	r.streaming = true
+	if r.raw != nil {
+		r.raw.StreamPages()
+	}
+}
+
 func (r *Reader) rawReader() *seriesindex.RawReader {
 	if r.raw == nil {
 		r.ctx = r.run.ReaderContext(r.ctx)
 		r.raw = r.run.index.RawReader(r.ctx)
+		if r.streaming {
+			r.raw.StreamPages()
+		}
 	}
 	return r.raw
 }

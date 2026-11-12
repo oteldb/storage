@@ -66,3 +66,9 @@ func (r *RawReader) LookupOrdinal(id signal.SeriesID, ref uint32) ([]byte, Metad
 	}
 	return raw, meta, nil
 }
+
+// StreamPages retains writable page scratch instead of expanding pages for random seeks.
+func (r *RawReader) StreamPages() {
+	r.ids.streaming = true
+	r.records.cursor.streaming = true
+}

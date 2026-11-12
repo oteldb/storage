@@ -153,8 +153,10 @@ func TestSharedSeriesQueryResolvesPredicatesOnce(t *testing.T) {
 		name         string
 		withIdentity bool
 		countOnly    bool
+		needStats    bool
 	}{
 		{name: "fetch", withIdentity: true},
+		{name: "aggregate", withIdentity: true, needStats: true},
 		{name: "count", countOnly: true},
 		{name: "grouped count", withIdentity: true, countOnly: true},
 	} {
@@ -188,7 +190,7 @@ func TestSharedSeriesQueryResolvesPredicatesOnce(t *testing.T) {
 			e.mu.RUnlock()
 			once := calls
 			calls = 0
-			plan, err := e.planDiskQuery(t.Context(), r, tc.withIdentity, tc.countOnly)
+			plan, err := e.planDiskQuery(t.Context(), r, tc.withIdentity, tc.countOnly, tc.needStats)
 			require.NoError(t, err)
 			defer plan.releaseParts()
 			require.Positive(t, once)
@@ -197,7 +199,7 @@ func TestSharedSeriesQueryResolvesPredicatesOnce(t *testing.T) {
 			if tc.withIdentity {
 				require.True(t, plan.series[0].Equal(identity))
 			}
-			if !tc.countOnly {
+			if tc.needStats {
 				for i, pt := range e.parts {
 					meta := plan.diskMetadata[pt][identity.Hash()]
 					require.EqualValues(t, 100+i, meta.Covered)
