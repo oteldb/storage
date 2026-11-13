@@ -9,7 +9,6 @@ import (
 	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/internal/timebucket"
-	"github.com/oteldb/storage/internal/watermark"
 )
 
 type rowSkipper interface {
@@ -273,20 +272,18 @@ func (p *partStreamWriter) appendEncodedGranule(item *mergeIdentityItem, ts bloc
 	if v.Rows != ts.Rows || seen != ts.Rows {
 		return errors.Wrap(block.ErrCorrupt, "copied granule row mismatch")
 	}
-	if err := p.w.AppendU128Run(colSeriesIdx, idToU128(item.id), ts.Rows); err != nil {
+	p.runs, err = p.w.AppendU128RunView(colSeriesIdx, idToU128(item.id), ts.Rows)
+	if err != nil {
 		return err
 	}
 	if err := p.w.AppendEncodedRun(colTsIdx, colValueIdx, ts, v, v.FloatStats()); err != nil {
 		return err
 	}
 	if sameSeries {
-		p.runs[len(p.runs)-1].Count += ts.Rows
-		p.wmarks[len(p.wmarks)-1].Max = max(p.wmarks[len(p.wmarks)-1].Max, covered)
+		p.covered[len(p.covered)-1] = max(p.covered[len(p.covered)-1], covered)
 	} else {
-		p.runs = append(p.runs, chunk.U128Run{Value: idToU128(item.id), Count: ts.Rows})
-		p.wmarks = append(p.wmarks, watermark.Entry{ID: item.id, Max: covered})
+		p.covered = append(p.covered, covered)
 		if p.withStats {
-			p.statsIDs = append(p.statsIDs, idToU128(item.id))
 			p.stats = append(p.stats, agg)
 		}
 	}

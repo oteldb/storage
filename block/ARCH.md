@@ -668,3 +668,7 @@ Trusted stream writers count encoded varint bytes as granules and chunk geometry
 Finish bounds use those lengths plus fixed slack for pending chunks/frames, with the existing
 growth and compression margins. Raw directories are preallocated exactly; decoder limits and
 wire bytes are unchanged. Synthetic accumulators without counters keep the conservative bound.
+
+The stream writer exposes a read-only borrowed run view after an ID append. The view follows
+writer mutation and is not independently owned; sidecar writers refresh it after append or
+reservation and never modify it. Numeric and sidecar serialization use the same ID ordering.

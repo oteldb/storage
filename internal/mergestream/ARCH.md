@@ -76,3 +76,9 @@ An engine instantiates it by adapting its own ingest/merge/read to `Store`. The 
 (`backendtest.Counting`) counts reads per key and injects the write failure; it embeds the
 `backend.Backend` *interface*, so it implements neither `Viewer` nor `Sizer` and every read funnels
 through `Read` where it is seen.
+
+Metric output sidecars use a shared bounded checked-record writer. It preserves the existing
+magic/count/entry/CRC framing, writes at most 32 KiB per chunk, and publishes the object only after
+successful encoding. Native incremental writer memory is priced before use; other backends retain
+the whole-object fallback and its existing memory charge. SIDX validation at part reopen remains
+charged even when serialization streams.

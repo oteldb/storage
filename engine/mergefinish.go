@@ -97,5 +97,9 @@ func (p *partStreamWriter) mergeResidentBytes() int64 {
 		sidecar = max(sidecar, stats)
 	}
 	// Reader/manifest state and allocator growth around the largest encoded/read sidecar.
+	if workspace := p.sidecarWriterBytes; workspace > 0 {
+		// Reopening still validates the whole SIDX and builds sparse fences.
+		return buildbudget.Add(n, buildbudget.Add(16<<10, buildbudget.Add(workspace, buildbudget.Mul(sidx, 2))))
+	}
 	return buildbudget.Add(n, buildbudget.Add(16<<10, buildbudget.Mul(sidecar, 4)))
 }

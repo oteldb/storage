@@ -268,13 +268,19 @@ func (w *StreamWriter) AppendFloat64(i int, vals []float64) error {
 // AppendU128Run appends count copies of v to the i-th column as one run, which is how an id column
 // streams without materializing its rows. A count ≤ 0 is a no-op.
 func (w *StreamWriter) AppendU128Run(i int, v chunk.U128, count int) error {
+	_, err := w.AppendU128RunView(i, v, count)
+	return err
+}
+
+// AppendU128RunView appends a run and returns read-only runs, valid until the next column mutation.
+func (w *StreamWriter) AppendU128RunView(i int, v chunk.U128, count int) ([]chunk.U128Run, error) {
 	c, err := w.column(i, KindInt128)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if count <= 0 {
-		return nil
+		return c.runs, nil
 	}
 
 	if n := len(c.runs); n > 0 && c.runs[n-1].Value == v {
@@ -285,7 +291,16 @@ func (w *StreamWriter) AppendU128Run(i int, v chunk.U128, count int) error {
 	c.rows += count
 	c.raw += int64(count) * 16
 
-	return nil
+	return c.runs, nil
+}
+
+// U128Runs returns read-only runs, valid until the next column mutation.
+func (w *StreamWriter) U128Runs(i int) ([]chunk.U128Run, error) {
+	c, err := w.column(i, KindInt128)
+	if err != nil {
+		return nil, err
+	}
+	return c.runs, nil
 }
 
 // ReserveU128Runs reserves room for n runs in the i-th column without appending rows.

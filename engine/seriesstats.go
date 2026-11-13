@@ -114,14 +114,19 @@ var errStatsCorrupt = errors.New("engine: corrupt series-stats sidecar")
 // weight is 1 there, so Count is integral and equals Rows. A sampled part has no sidecar and takes
 // the weighted decode path, which is why weighting the aggregate needs no format change here.
 func encodeSeriesStats(ids []chunk.U128, stats []SeriesAgg) []byte {
-	const entryBytes = 16 + binary.MaxVarintLen64 + 3*8
-	buf := make([]byte, 0, 8+binary.MaxVarintLen64+len(ids)*entryBytes)
-	buf = binary.BigEndian.AppendUint32(buf, statsMagic)
-	buf = binary.AppendUvarint(buf, uint64(len(ids)))
+	return encodeSeriesStatsEntries(len(ids), func(i int) chunk.U128 { return ids[i] }, stats)
+}
 
-	for i := range ids {
-		buf = binary.BigEndian.AppendUint64(buf, ids[i].Hi)
-		buf = binary.BigEndian.AppendUint64(buf, ids[i].Lo)
+func encodeSeriesStatsEntries(count int, idAt func(int) chunk.U128, stats []SeriesAgg) []byte {
+	const entryBytes = 16 + binary.MaxVarintLen64 + 3*8
+	buf := make([]byte, 0, 8+binary.MaxVarintLen64+count*entryBytes)
+	buf = binary.BigEndian.AppendUint32(buf, statsMagic)
+	buf = binary.AppendUvarint(buf, uint64(count))
+
+	for i := range count {
+		id := idAt(i)
+		buf = binary.BigEndian.AppendUint64(buf, id.Hi)
+		buf = binary.BigEndian.AppendUint64(buf, id.Lo)
 		buf = binary.AppendVarint(buf, int64(stats[i].Count))
 		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(stats[i].Sum))
 		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(stats[i].Min))

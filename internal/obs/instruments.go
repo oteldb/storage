@@ -27,12 +27,16 @@ func (b *imb) counter(name, desc, unit string) metric.Int64Counter {
 	return c
 }
 
-func (b *imb) i64hist(name, desc, unit string) metric.Int64Histogram {
+func (b *imb) i64hist(name, desc, unit string, bounds ...float64) metric.Int64Histogram {
 	if b.err != nil {
 		return nil
 	}
 
-	h, err := b.m.Int64Histogram(name, metric.WithDescription(desc), metric.WithUnit(unit))
+	opts := []metric.Int64HistogramOption{metric.WithDescription(desc), metric.WithUnit(unit)}
+	if len(bounds) > 0 {
+		opts = append(opts, metric.WithExplicitBucketBoundaries(bounds...))
+	}
+	h, err := b.m.Int64Histogram(name, opts...)
 	b.err = err
 
 	return h
@@ -65,12 +69,26 @@ func sigAttr(sig string) metric.MeasurementOption {
 
 // Flush instruments a head→part flush.
 type Flush struct {
-	total    metric.Int64Counter
-	duration metric.Float64Histogram
-	rows     metric.Int64Histogram
-	bytes    metric.Int64Counter
-	verified metric.Int64Counter
+	total           metric.Int64Counter
+	duration        metric.Float64Histogram
+	rows            metric.Int64Histogram
+	bytes           metric.Int64Counter
+	verified        metric.Int64Counter
+	reservation     metric.Int64Histogram
+	reservationWait metric.Float64Histogram
+	outputSeries    metric.Int64Histogram
 }
+
+// Reservation records admitted flush workspace and its wait, separately from the part target.
+func (f *Flush) Reservation(ctx context.Context, phase string, reserved, target int64, wait time.Duration) {
+	phaseOpt := metric.WithAttributes(attribute.String("phase", phase))
+	f.reservation.Record(ctx, reserved, phaseOpt, metric.WithAttributes(attribute.String("component", "reserved")))
+	f.reservation.Record(ctx, target, phaseOpt, metric.WithAttributes(attribute.String("component", "target")))
+	f.reservationWait.Record(ctx, wait.Seconds(), phaseOpt)
+}
+
+// OutputSeries records distinct series in each published flush candidate.
+func (f *Flush) OutputSeries(ctx context.Context, n int64) { f.outputSeries.Record(ctx, n) }
 
 // VerificationCache records exact canonical-proof probes, independent of page caching.
 func (f *Flush) VerificationCache(ctx context.Context, hits, misses int64) {
@@ -557,11 +575,15 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 	b := &imb{m: m}
 
 	flush := &Flush{
-		verified: b.counter("storage.series.verification_cache.requests", "canonical verification cache probes", "{identity}"),
-		total:    b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
-		duration: b.f64hist("storage.flush.duration", "flush wall time"),
-		rows:     b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),
-		bytes:    b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
+		reservation: b.i64hist("storage.flush.reservation.bytes", "flush workspace reservation and part target", "By",
+			1<<20, 8<<20, 16<<20, 32<<20, 64<<20, 128<<20, 256<<20, 512<<20, 1<<30, 2<<30),
+		reservationWait: b.f64hist("storage.flush.reservation.wait", "flush workspace admission wait"),
+		outputSeries:    b.i64hist("storage.flush.output.series", "distinct series per completed flush candidate", "{series}"),
+		verified:        b.counter("storage.series.verification_cache.requests", "canonical verification cache probes", "{identity}"),
+		total:           b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
+		duration:        b.f64hist("storage.flush.duration", "flush wall time"),
+		rows:            b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),
+		bytes:           b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
 	}
 	merge := &Merge{
 		refused:   b.counter("storage.merge.admission_refused", "process-pool merge refusals by pool, across signals", "{attempt}"),

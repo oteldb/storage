@@ -643,3 +643,8 @@ background cycle and therefore defers like it.
 For independent metric chunks, `PartsDetailed.Chunks` reports the recorded chunk count;
 `GranuleSize` is their maximum row count. Decode-cache bytes include retained numeric capacity
 and entry overhead for these chunks, rather than only the number of decoded sample bytes.
+
+Flush workspace metrics distinguish the configured output target from the admitted reservation:
+`storage.flush.reservation.bytes` labels `component=reserved|target` and a bounded `phase`;
+`storage.flush.reservation.wait` records admission wait by phase. `storage.flush.output.series`
+counts distinct identities per completed candidate, including candidates not yet catalog-published.
