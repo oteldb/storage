@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"slices"
 
 	"github.com/go-faster/errors"
 
@@ -26,30 +27,27 @@ func (e *Engine) captureKnownQuery(p *enginePlan) {
 }
 
 func (p *enginePlan) resolveKnownQuery(ctx context.Context, r fetch.Request, withIdentity bool) error {
-	if p.knownSnapshot == nil {
+	if p.knownSnapshot == nil || p.knownResolved || !withIdentity && len(r.Matchers) == 0 {
 		return nil
 	}
-	workspace := p.knownSnapshot.workspace(len(r.Matchers))
+	workspace := int64(len(p.ids)) * 32 // Root readers reserve their own page workspace.
 	if err := p.selectionBudget.Reserve(workspace); err != nil {
 		return err
 	}
 	defer p.selectionBudget.Release(workspace)
-	for i, id := range p.ids {
-		if !p.knownIDs[id] {
-			continue
-		}
-		if !withIdentity && len(r.Matchers) == 0 {
-			continue
-		}
-		found, err := p.knownSnapshot.lookup(ctx, id, func(raw []byte) error { return p.resolveKnownIdentity(raw, r, i, id, withIdentity) })
-		if err != nil {
-			return err
-		}
-		if !found {
-			return errors.New("engine: known head identity missing from pinned metadata")
+	ids := make([]signal.SeriesID, 0, len(p.knownIDs))
+	for _, id := range p.ids {
+		if p.knownIDs[id] {
+			ids = append(ids, id)
 		}
 	}
-	return nil
+	return p.knownSnapshot.lookupKnownBatch(ctx, ids, func(id signal.SeriesID, raw []byte) error {
+		i, found := slices.BinarySearchFunc(p.ids, id, signal.SeriesID.Compare)
+		if !found {
+			return errors.New("engine: known query selection changed")
+		}
+		return p.resolveKnownIdentity(raw, r, i, id, withIdentity)
+	})
 }
 
 func (p *enginePlan) resolveKnownIdentity(raw []byte, r fetch.Request, i int, id signal.SeriesID, withIdentity bool) error {
@@ -70,7 +68,9 @@ func (p *enginePlan) resolveKnownIdentity(raw []byte, r fetch.Request, i int, id
 	if used != len(raw) {
 		return errors.New("engine: known identity trailing bytes")
 	}
-	p.knownIDs[id] = seriesindex.MatchesSeries(s, r.Matchers)
+	if !p.knownFiltered {
+		p.knownIDs[id] = seriesindex.MatchesSeries(s, r.Matchers)
+	}
 	if withIdentity {
 		p.series[i] = s
 	}

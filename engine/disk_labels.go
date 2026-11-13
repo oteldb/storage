@@ -208,29 +208,27 @@ func (c *diskLabelCollector) collectBroad(ctx context.Context, r fetch.Request) 
 		return err
 	}
 	if c.plan.knownSnapshot != nil {
-		workspace := c.plan.knownSnapshot.workspace(0)
+		workspace := int64(len(c.knownIDs)) * 16 // Root readers reserve their own page workspace.
 		if err := c.plan.selectionBudget.Reserve(workspace); err != nil {
 			return err
 		}
 		defer c.plan.selectionBudget.Release(workspace)
 	}
-	for _, id := range c.knownIDs {
-		_, err := c.plan.knownSnapshot.lookup(ctx, id, func(raw []byte) error {
-			n := buildbudget.Mul(int64(len(raw)), 128)
-			if err := c.plan.selectionBudget.Reserve(n); err != nil {
-				return err
-			}
-			defer c.plan.selectionBudget.Release(n)
-			s, _, err := signal.DecodeSeries(raw)
-			if err != nil {
-				return err
-			}
-			return c.projectBroad(s)
-		})
+	if err := c.plan.knownSnapshot.lookupKnownBatch(ctx, c.knownIDs, func(_ signal.SeriesID, raw []byte) error {
+		n := buildbudget.Mul(int64(len(raw)), 128)
+		if err := c.plan.selectionBudget.Reserve(n); err != nil {
+			return err
+		}
+		defer c.plan.selectionBudget.Release(n)
+		decoded, _, err := signal.DecodeSeries(raw)
 		if err != nil {
 			return err
 		}
+		return c.projectBroad(decoded)
+	}); err != nil {
+		return err
 	}
+
 	for _, pt := range c.plan.liveParts {
 		if err := c.collectPart(ctx, r, pt); err != nil {
 			return err

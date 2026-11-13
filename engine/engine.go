@@ -720,6 +720,8 @@ func (e *Engine) Stats() Stats {
 // (ref-held) in-window parts still to read, plus each series' identity and its already-snapshotted head
 // and mid-flush samples. Its [enginePlan.mergeSeries] does the part reads off the lock.
 type enginePlan struct {
+	knownFiltered   bool
+	knownResolved   bool
 	knownSnapshot   *seriesSnapshot
 	knownIDs        map[signal.SeriesID]bool
 	selectionBudget *readbudget.Budget

@@ -90,8 +90,29 @@ func (e *Engine) captureDiskHead(
 	ctx context.Context, r fetch.Request, withIdentity, countOnly bool, budget *readbudget.Budget,
 	snapshot func(*enginePlan) error,
 ) (*enginePlan, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		known, err := e.selectKnownHead(ctx, r, budget)
+		if err != nil {
+			return nil, err
+		}
+		p, retry, err := e.captureSelectedDiskHead(ctx, r, withIdentity, countOnly, budget, snapshot, known)
+		known.release()
+		if retry {
+			continue
+		}
+		return p, err
+	}
+}
+
+func (e *Engine) captureSelectedDiskHead(
+	ctx context.Context, r fetch.Request, withIdentity, countOnly bool, budget *readbudget.Budget,
+	snapshot func(*enginePlan) error, known *knownHeadSelection,
+) (*enginePlan, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	e.mu.RLock()
 	for !e.head.indexSorted() {
@@ -101,28 +122,33 @@ func (e *Engine) captureDiskHead(
 		e.mu.UnlockState()
 		e.mu.RLock()
 	}
+	if !known.valid(e.head.known) {
+		e.mu.RUnlock()
+		return nil, true, nil
+	}
 	if err := e.fenceLocked(); err != nil {
 		e.mu.RUnlock()
-		return nil, err
+		return nil, false, err
 	}
 	// Head matcher iterators and the growing result slice are transient metadata workspace.
-	workspace := buildbudget.Mul(int64(e.head.series.Len()+e.head.known.len()), buildbudget.Mul(int64(len(r.Matchers))+1, 256))
+	knownCount := 0
+	known.each(e.head.known, func(signal.SeriesID) { knownCount++ })
+	workspace := buildbudget.Mul(int64(e.head.series.Len()), buildbudget.Mul(int64(len(r.Matchers))+1, 256))
+	workspace = buildbudget.Add(workspace, buildbudget.Mul(int64(knownCount), 32))
 	if err := budget.Reserve(workspace); err != nil {
 		e.mu.RUnlock()
-		return nil, err
+		return nil, false, err
 	}
 	// Only the bounded active/frozen head is resident. Capture it and the parts in one lock interval.
 	ids := e.head.resolve(r.Matchers)
-	if e.head.known != nil {
-		for id := range e.head.known.marks {
-			ids = append(ids, id)
-		}
-	}
+	known.each(e.head.known, func(id signal.SeriesID) { ids = append(ids, id) })
+	slices.SortFunc(ids, signal.SeriesID.Compare)
 	n := e.diskHeadSelectionBytes(ids, withIdentity, countOnly)
+	n = buildbudget.Add(n, buildbudget.Mul(int64(knownCount), 2*memsize.MapEntry[signal.SeriesID, bool]()))
 	budget.Release(workspace)
 	if err := budget.Reserve(n); err != nil {
 		e.mu.RUnlock()
-		return nil, err
+		return nil, false, err
 	}
 	var p *enginePlan
 	if countOnly {
@@ -131,7 +157,11 @@ func (e *Engine) captureDiskHead(
 		p = e.planFetch(ids, r)
 	}
 	p.selectionBudget, p.selectionBytes = budget, n
-	e.captureKnownQuery(p)
+	if known == nil {
+		e.captureKnownQuery(p)
+	} else {
+		known.install(p, withIdentity)
+	}
 	var err error
 	if snapshot != nil {
 		err = snapshot(p)
@@ -139,9 +169,9 @@ func (e *Engine) captureDiskHead(
 	e.mu.RUnlock()
 	if err != nil {
 		p.releaseParts()
-		return nil, err
+		return nil, false, err
 	}
-	return p, nil
+	return p, false, nil
 }
 
 func (e *Engine) diskHeadSelectionBytes(ids []signal.SeriesID, withIdentity, countOnly bool) int64 {
