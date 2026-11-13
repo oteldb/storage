@@ -24,9 +24,21 @@ func templateSeries(host, cpu int) signal.Series {
 	)}
 }
 
+func warmTemplate(p *AttributeTemplates, s signal.Series) {
+	if p == nil {
+		return
+	}
+	ix := NewWithAttributeTemplates(nil, p)
+	for i := range 512 {
+		s.Resource.SchemaURL = []byte(strconv.Itoa(i))
+		ix.Add(s)
+	}
+}
+
 func TestAttributeTemplatesMultipleVariables(t *testing.T) {
 	t.Parallel()
 	p := NewAttributeTemplates(8<<20, []byte("instance"), []byte("cpu"))
+	warmTemplate(p, templateSeries(0, 0))
 	ix := NewWithAttributeTemplates(nil, p)
 	for host := range 50 {
 		s := templateSeries(host, host%8)
@@ -47,6 +59,7 @@ func TestAttributeTemplatesCrossIndexAndCopy(t *testing.T) {
 	t.Parallel()
 	key := []byte("instance")
 	p := NewAttributeTemplates(8<<20, key)
+	warmTemplate(p, templateSeries(0, 0))
 	key[0] = 'x'
 	source := NewWithAttributeTemplates(nil, p)
 	for i := range 3 {
@@ -74,6 +87,9 @@ func TestAttributeTemplatesOwnTypedDataAndCollisions(t *testing.T) {
 	t.Parallel()
 	p := NewAttributeTemplates(8<<20, []byte("instance"))
 	p.hash = func([]byte) signal.SeriesID { return signal.SeriesID{} }
+	for cpu := range 4 {
+		warmTemplate(p, templateSeries(0, cpu))
+	}
 	ix := NewWithAttributeTemplates(nil, p)
 	for cpu := range 4 {
 		for host := range 3 {
@@ -119,6 +135,7 @@ func TestAttributeTemplatesCheckedAndBounded(t *testing.T) {
 func TestAttributeTemplatesConcurrentViews(t *testing.T) {
 	t.Parallel()
 	p := NewAttributeTemplates(8<<20, []byte("instance"))
+	warmTemplate(p, templateSeries(0, 0))
 	ix := NewWithAttributeTemplates(nil, p)
 	for i := range 8 {
 		ix.Add(templateSeries(i, 0))
@@ -168,6 +185,9 @@ func TestAttributeTemplatesTypedValues(t *testing.T) {
 				signal.KeyValue{Key: []byte("instance"), Value: signal.StringValue([]byte(strconv.Itoa(i)))},
 				signal.KeyValue{Key: []byte("variable"), Value: variable},
 			)}
+			if i == 0 {
+				warmTemplate(p, s)
+			}
 			id := ix.Add(s)
 			require.Equal(t, flat.Add(s), id)
 			ref, _ := ix.Ref(id)
@@ -199,6 +219,7 @@ func TestAttributeTemplatesNoVariablesAndNoSharedFields(t *testing.T) {
 		}
 		pool := NewAttributeTemplates(8<<20, variable...)
 		ix := NewWithAttributeTemplates(nil, pool)
+		warmTemplate(pool, templateSeries(0, 0))
 		for i := range 20 {
 			s := templateSeries(0, 0)
 			s.Resource.SchemaURL = []byte(strconv.Itoa(i))
@@ -217,6 +238,7 @@ func TestAttributeTemplatesNoVariablesAndNoSharedFields(t *testing.T) {
 func FuzzAttributeTemplates(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 3, 4, 5})
 	f.Add([]byte("same fixed attributes across differently ordered instances"))
+	f.Add(bytes.Repeat([]byte{0, 1, 2, 3}, 256))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > 1024 {
 			return

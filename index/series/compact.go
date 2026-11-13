@@ -34,6 +34,7 @@ type Index struct {
 	templateRows    []*attributeTemplate
 	templateBuf     []byte
 	templateFields  []templateField
+	templatePolicy  templatePolicy
 }
 
 type row struct {

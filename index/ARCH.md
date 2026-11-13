@@ -56,8 +56,12 @@ Point symbols, local references, postings, admission watermarks and canonical ID
 An originating index can disappear while pool entries or other index views still retain payloads.
 
 `AttributeTemplates` optionally shares fixed point-attribute combinations across registries.
-Templates own typed encodings, fixed scalar values and preencoded canonical segments; rows retain
-only positional variable-value symbols. A bounded admission table leaves one-off combinations flat.
+Templates own preencoded canonical segments and pointer-free scalar descriptors; rows retain
+only positional variable-value symbols. Field offsets refer directly to the canonical storage.
+A bounded evidence table requires repeated new registrations before retaining a combination;
+the heuristic does not guarantee resident break-even, and earlier flat rows stay immutable.
+Low-recurrence input temporarily bypasses candidate encoding,
+with periodic retries so workload changes can restore sharing. Duplicate IDs add no evidence.
 The caller charges the pool separately; full shards fall back to ordinary local tuples. Templates
 are immutable and never recycled while views can reference them. Canonical IDs and disk bytes do
 not change; resource/scope contexts and template pools remain independent.

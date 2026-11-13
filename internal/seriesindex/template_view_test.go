@@ -25,6 +25,14 @@ func TestBuilderTemplateViewPreservesDiskBytes(t *testing.T) {
 			signal.KeyValue{Key: []byte("cpu"), Value: signal.IntValue(int64(i % 4))},
 			signal.KeyValue{Key: []byte("mode"), Value: signal.StringValue([]byte("idle"))},
 		)}
+		if i == 0 {
+			warm := series.NewWithAttributeTemplates(nil, pool)
+			for j := range 512 {
+				cloned := s
+				cloned.Resource.SchemaURL = []byte(strconv.Itoa(j))
+				warm.Add(cloned)
+			}
+		}
 		input = append(input, s)
 		registry.Add(s)
 	}

@@ -27,13 +27,12 @@ type AttributeTemplates struct {
 type templateShard struct {
 	mu        sync.Mutex
 	entries   map[string]*attributeTemplate
-	probation [128]uint64
+	probation [128]templateEvidence
 	bytes     int64
 }
 
 type attributeTemplate struct {
 	key       string
-	data      []byte
 	fields    []templateField
 	dynamic   uint32
 	canonical []byte
@@ -85,7 +84,7 @@ func (p *AttributeTemplates) isVariable(name []byte) bool {
 	return false
 }
 
-func (p *AttributeTemplates) intern(key []byte, fields []templateField, dynamic uint32) *attributeTemplate {
+func (p *AttributeTemplates) intern(key []byte, fields []templateField, dynamic uint32) (*attributeTemplate, bool) {
 	hash := signal.HashBytes(key)
 	if p.hash != nil {
 		hash = p.hash(key)
@@ -94,45 +93,42 @@ func (p *AttributeTemplates) intern(key []byte, fields []templateField, dynamic 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if t := s.entries[string(key)]; t != nil {
-		return t
+		return t, true
 	}
-	// A fingerprint is only an admission hint; identity sharing always checks the full key.
-	slot, fingerprint := (hash.Lo/64)%128, hash.Hi|1
-	next := (slot + 1) % 128
-	if s.probation[slot] != fingerprint && s.probation[next] != fingerprint {
-		s.probation[next], s.probation[slot] = s.probation[slot], fingerprint
-		return nil
-	}
-	cost := buildbudget.Add(memsize.Of[attributeTemplate](), int64(len(key))*8)
+	cost := buildbudget.Add(memsize.Of[attributeTemplate](), int64(len(key))*4)
 	cost = buildbudget.Add(cost, 2*int64(len(fields))*memsize.Of[templateField]())
 	cost = buildbudget.Add(cost, 2*int64(dynamic+1)*memsize.Of[templateSegment]())
 	cost = buildbudget.Add(cost, 8*memsize.MapEntry[string, *attributeTemplate]())
 	if s.entries == nil {
 		cost = buildbudget.Add(cost, memsize.MapBase)
 	}
-	if cost > p.limit-s.bytes || len(key) > math.MaxInt/2 {
-		return nil
+	if cost > p.limit-s.bytes {
+		return nil, false
 	}
-	data := make([]byte, 2*len(key))
-	copy(data, key)
+	uses := s.observe(hash)
+	if uses < 4 {
+		return nil, uses >= 3
+	}
 	t := &attributeTemplate{
-		key: string(key), data: data[:len(key):len(key)], fields: append([]templateField(nil), fields...), dynamic: dynamic,
-		canonical: data[len(key):len(key)], segments: make([]templateSegment, 0, dynamic+1),
+		key: string(key), fields: append([]templateField(nil), fields...), dynamic: dynamic,
+		canonical: make([]byte, 0, len(key)), segments: make([]templateSegment, 0, dynamic+1),
 	}
-	t.buildCanonical()
+	t.buildCanonical(key)
 	for i, field := range t.fields {
 		if field.slot != math.MaxUint32 {
 			continue
 		}
-		encoded := t.data[field.valueOffset : field.valueOffset+field.valueLength]
+		encoded := t.canonical[field.valueOffset : field.valueOffset+field.valueLength]
 		t.fields[i].kind = signal.ValueKind(encoded[0])
 		switch t.fields[i].kind {
+		case signal.KindEmpty, signal.KindMap, signal.KindSlice:
+			continue
 		case signal.KindBool, signal.KindInt, signal.KindDouble:
 			t.fields[i].scalar = binary.BigEndian.Uint64(encoded[1:])
 		case signal.KindStr, signal.KindBytes:
 			value, _, err := signal.DecodeValue(encoded)
 			if err != nil {
-				return nil
+				return nil, false
 			}
 			data := value.Str()
 			if value.Kind() == signal.KindBytes {
@@ -148,18 +144,20 @@ func (p *AttributeTemplates) intern(key []byte, fields []templateField, dynamic 
 	s.entries[t.key] = t
 	s.bytes += cost
 	p.bytes.Add(cost)
-	return t
+	return t, true
 }
 
-func (t *attributeTemplate) buildCanonical() {
+func (t *attributeTemplate) buildCanonical(key []byte) {
 	t.canonical = binary.AppendUvarint(t.canonical[:0], uint64(len(t.fields)))
 	start := uint32(0)
-	for _, f := range t.fields {
-		name := t.data[f.keyOffset : f.keyOffset+f.keyLength]
+	for i, f := range t.fields {
+		name := key[f.keyOffset : f.keyOffset+f.keyLength]
 		t.canonical = binary.AppendUvarint(t.canonical, uint64(len(name)))
+		t.fields[i].keyOffset = uint32(len(t.canonical))
 		t.canonical = append(t.canonical, name...)
 		if f.slot == math.MaxUint32 {
-			t.canonical = append(t.canonical, t.data[f.valueOffset:f.valueOffset+f.valueLength]...)
+			t.fields[i].valueOffset = uint32(len(t.canonical))
+			t.canonical = append(t.canonical, key[f.valueOffset:f.valueOffset+f.valueLength]...)
 		} else {
 			end := uint32(len(t.canonical))
 			t.segments = append(t.segments, templateSegment{offset: start, length: end - start})
@@ -201,15 +199,18 @@ func (ix *Index) templateField(name []byte, variable bool, slot uint32) template
 
 func (ix *Index) finishTemplate(dynamic uint32) (uint32, bool) {
 	if uint64(len(ix.templateBuf)) > math.MaxUint32 || len(ix.templateFields)-int(dynamic) < 2 {
+		ix.templatePolicy.observe(false)
 		return 0, false
 	}
 	if ref, ok := ix.templateKeys[string(ix.templateBuf)]; ok {
+		ix.templatePolicy.observe(true)
 		return ref, true
 	}
 	if uint64(len(ix.templateRows)) >= uint64(templateFlag) {
 		return 0, false
 	}
-	t := ix.templates.intern(ix.templateBuf, ix.templateFields, dynamic)
+	t, recurrent := ix.templates.intern(ix.templateBuf, ix.templateFields, dynamic)
+	ix.templatePolicy.observe(recurrent)
 	if t == nil {
 		return 0, false
 	}
@@ -239,6 +240,9 @@ func (ix *Index) storeAttributes(attrs signal.Attributes) (uint32, uint64) {
 }
 
 func (ix *Index) storeTemplateAttributes(attrs signal.Attributes) (uint32, uint64, bool) {
+	if !ix.templatePolicy.probe() {
+		return 0, 0, false
+	}
 	ix.beginTemplate(len(attrs))
 	var dynamic uint32
 	for _, attr := range attrs {
@@ -267,9 +271,9 @@ func (ix *Index) storeTemplateAttributes(attrs signal.Attributes) (uint32, uint6
 }
 
 func (v View) encodedField(r row, f templateField, t *attributeTemplate) ([]byte, []byte) {
-	name := t.data[f.keyOffset : f.keyOffset+f.keyLength]
+	name := t.canonical[f.keyOffset : f.keyOffset+f.keyLength]
 	if f.slot == math.MaxUint32 {
-		return name, t.data[f.valueOffset : f.valueOffset+f.valueLength]
+		return name, t.canonical[f.valueOffset : f.valueOffset+f.valueLength]
 	}
 	return name, v.symbols[v.values[int(r.offset)+int(f.slot)]]
 }
@@ -307,6 +311,9 @@ func (t *attributeTemplate) encodingWorkspace() int64 {
 }
 
 func (ix *Index) copyTemplateAttributes(v View, i int) (uint32, uint64, bool) {
+	if !ix.templatePolicy.probe() {
+		return 0, 0, false
+	}
 	ix.beginTemplate(v.AttributeCount(i))
 	var dynamic uint32
 	v.EncodedAttributes(i, func(name, encoded []byte) {
