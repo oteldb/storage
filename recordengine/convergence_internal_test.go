@@ -80,7 +80,10 @@ func TestResidentLimitedCompactionConverges(t *testing.T) {
 		}
 	}
 	require.Zero(t, e.MergeShape().Candidates, "unchanged resident-limited runs must reach a fixed point")
-	require.Positive(t, e.MergeShape().NonReducingMerges)
+	t.Logf("fixed_point_parts=%d non_reducing_merges=%d", e.PartCount(), e.MergeShape().NonReducingMerges)
+	if e.PartCount() > 1 {
+		require.Positive(t, e.MergeShape().NonReducingMerges, "a resident-limited fixed point must remember the rejected output")
+	}
 	gotRows, got := recordDigest(t, e)
 	assert.Equal(t, rows, gotRows)
 	assert.Equal(t, want, got)
@@ -95,4 +98,21 @@ func TestResidentLimitedCompactionConverges(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.Equal(t, 1, e.PartCount(), "more resident allowance must invalidate the old rejection")
+}
+
+func TestResidentCompactionCanConvergeWithoutRejection(t *testing.T) {
+	t.Parallel()
+	e := convergenceEngine(t)
+	e.cfg.MergeMemoryBytes = 128 << 20
+	rows, want := recordDigest(t, e)
+	for step := 0; step < 24 && e.PartCount() > 1; step++ {
+		_, err := e.MergeStep(t.Context(), MergeOptions{Force: true})
+		require.NoError(t, err)
+	}
+	require.Equal(t, 1, e.PartCount())
+	require.Zero(t, e.MergeShape().NonReducingMerges, "successful packing does not require a rejected attempt")
+	require.Zero(t, e.MergeShape().Candidates)
+	gotRows, got := recordDigest(t, e)
+	require.Equal(t, rows, gotRows)
+	require.Equal(t, want, got)
 }
