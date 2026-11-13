@@ -269,9 +269,9 @@ func TestKnownHeadWALFailureDoesNotPublish(t *testing.T) {
 
 func TestKnownHeadCatalogFailureKeepsReplay(t *testing.T) {
 	t.Parallel()
+	dir := t.TempDir()
 	be := newCleanupFaultBackend()
 	e := knownHeadEngine(t, be)
-	dir := t.TempDir()
 	w, err := wal.Create(dir, 0)
 	require.NoError(t, err)
 	e.cfg.WAL = w
@@ -351,8 +351,8 @@ func TestKnownHeadQueryBudgetReleasesPin(t *testing.T) {
 
 func TestKnownHeadPreparedBatch(t *testing.T) {
 	t.Parallel()
-	e := knownHeadEngine(t, backend.Memory())
 	dir := t.TempDir()
+	e := knownHeadEngine(t, backend.Memory())
 	w, err := wal.Create(dir, 0)
 	require.NoError(t, err)
 	e.cfg.WAL = w
