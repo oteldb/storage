@@ -228,17 +228,21 @@ func (q *querier) CountSeries(ctx context.Context, startMs, endMs int64, matcher
 		return q.countSeriesRecheck(ctx, startMs, endMs, matchers, pushed)
 	}
 
-	counter := fetch.CounterOf(q.fetcher)
-	if counter == nil {
-		return q.countSeriesRecheck(ctx, startMs, endMs, matchers, pushed)
-	}
-
 	req := fetch.Request{
 		Tenant:   q.tenant,
 		Start:    msToNsClamp(startMs, math.MinInt64),
 		End:      msToNsClamp(endMs, math.MaxInt64),
 		Matchers: pushed,
 		Scope:    q.scope,
+	}
+
+	counter := fetch.CounterOf(q.fetcher)
+	if counter == nil {
+		counts, err := q.countSingleGrid(ctx, req, nil)
+		if !errors.Is(err, fetch.ErrCountGridUnsupported) {
+			return counts[""], err
+		}
+		return q.countSeriesRecheck(ctx, startMs, endMs, matchers, pushed)
 	}
 
 	n, err := counter.Count(ctx, req)
@@ -268,17 +272,21 @@ func (q *querier) CountSeriesBy(
 	// A fetcher chain without the grouped-count capability (e.g. a multi-child fan-out) takes the
 	// exact Fetch-based grouping instead of erroring: the engine picks the pushdown operator at
 	// plan time and cannot re-plan mid-query, so this hook must always answer.
-	counter := fetch.GroupCounterOf(q.fetcher)
-	if counter == nil {
-		return q.countSeriesByRecheck(ctx, startMs, endMs, label, matchers, pushed)
-	}
-
 	req := fetch.Request{
 		Tenant:   q.tenant,
 		Start:    msToNsClamp(startMs, math.MinInt64),
 		End:      msToNsClamp(endMs, math.MaxInt64),
 		Matchers: pushed,
 		Scope:    q.scope,
+	}
+
+	counter := fetch.GroupCounterOf(q.fetcher)
+	if counter == nil {
+		counts, err := q.countSingleGrid(ctx, req, []byte(label))
+		if !errors.Is(err, fetch.ErrCountGridUnsupported) {
+			return counts, err
+		}
+		return q.countSeriesByRecheck(ctx, startMs, endMs, label, matchers, pushed)
 	}
 
 	groups, err := counter.CountBy(ctx, req, []byte(label))
