@@ -9,6 +9,8 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
+var errKnownIdentityMissing = errors.New("engine: known head identity missing from pinned metadata")
+
 // lookupKnownBatch opens one forward reader per root, sharing pages across sorted IDs.
 func (s *seriesSnapshot) lookupKnownBatch(ctx context.Context, ids []signal.SeriesID, visit func(signal.SeriesID, []byte) error) error {
 	pending := slices.Clone(ids)
@@ -27,7 +29,7 @@ func (s *seriesSnapshot) lookupKnownBatch(ctx context.Context, ids []signal.Seri
 		}
 	}
 	if len(pending) != 0 {
-		return errors.New("engine: known head identity missing from pinned metadata")
+		return errKnownIdentityMissing
 	}
 	return nil
 }

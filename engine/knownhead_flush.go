@@ -60,8 +60,11 @@ func (e *Engine) streamKnownSamples(
 		}
 	}
 	e.mu.RLock()
-	metadataWorkspace := e.head.known.snapshot.workspace(0) + e.seriesTable.workspace(0)
+	source, current := e.head.known.snapshot, e.seriesTable
+	current.acquire()
+	metadataWorkspace := source.workspace(0) + current.workspace(0) + knownCatalogCompareScratch
 	e.mu.RUnlock()
+	defer current.release()
 	workspace := int64(len(samples))*128 + sorting + metadataWorkspace + 8<<20
 	target := max(e.flushMemoryBytes(), workspace+8<<20)
 	release := func() {}
@@ -72,7 +75,7 @@ func (e *Engine) streamKnownSamples(
 		}
 	}
 	defer release()
-	if err := e.verifyKnownCatalog(ctx, ids); err != nil {
+	if err := verifyKnownSnapshots(ctx, source, current, ids); err != nil {
 		return nil, 0, err
 	}
 

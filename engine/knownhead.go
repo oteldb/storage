@@ -162,19 +162,29 @@ func (h *head) compactKnownSamples() {
 	if h.known == nil {
 		return
 	}
-	next := make(map[signal.SeriesID]int64, len(h.samples))
+	live := 0
 	for id, newest := range h.known.marks {
-		if h.samples[id] == nil {
-			h.disk.remember(id, newest)
+		if h.samples[id] != nil {
+			live++
 		} else {
+			h.disk.remember(id, newest)
+		}
+	}
+	switch live {
+	case 0:
+		h.closeKnownSamples()
+		return
+	case len(h.known.marks):
+		h.recountKnownSamples(nil)
+		return
+	}
+	next := make(map[signal.SeriesID]int64, live)
+	for id, newest := range h.known.marks {
+		if h.samples[id] != nil {
 			next[id] = newest
 		}
 	}
 	h.known.marks = next
-	if len(h.known.marks) == 0 {
-		h.closeKnownSamples()
-		return
-	}
 	h.recountKnownSamples(nil)
 }
 

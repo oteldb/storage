@@ -30,7 +30,9 @@ not restart selection. Broad identity reads share forward readers across sorted 
 counts need no descriptors. Head-only windows remain queryable without historical numeric parts.
 
 Known and unknown flush outputs use the existing part format, merge engine and one catalog/WAL checkpoint. Mixed flushes may produce
-separate outputs. Metadata-generation changes are verified before numeric publication. Failed builds
+separate outputs. Metadata-generation changes are compared exactly in batches of at most 256 IDs
+and 64 KiB of copied canonical bytes; larger identities remain borrowed during comparison. The
+priced snapshot is pinned across admission and verification. Failed builds
 reattach samples in original arrival order; WAL records remain self-contained, including first-buffer
 identities, and recovery uses the compact stage only when immutable metadata proves the identity.
 Replication entry points reject this mode. No additional frozen queue or file format is introduced.
