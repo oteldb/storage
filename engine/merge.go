@@ -904,6 +904,7 @@ func (e *Engine) Close(ctx context.Context) (retErr error) {
 	defer func() {
 		readersDone := obs.ShutdownPhase(ctx, log, "release_part_readers")
 		e.closePartReadersLocked()
+		e.head.closeKnownSamples()
 		e.seriesTable.release()
 		e.seriesTable = nil
 		e.verifiedIdentities.clear()
@@ -929,6 +930,7 @@ func (e *Engine) CloseWAL() error {
 	defer e.mu.Unlock()
 	defer func() {
 		e.closePartReadersLocked()
+		e.head.closeKnownSamples()
 		e.seriesTable.release()
 		e.seriesTable = nil
 		e.verifiedIdentities.clear()

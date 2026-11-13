@@ -134,6 +134,7 @@ func (s *headBuffers) sizeBytes() int64 {
 }
 
 type headSeriesState struct {
+	compact    bool
 	historical bool
 	buffer     *sampleBuf
 	newest     int64
@@ -143,6 +144,9 @@ type headSeriesState struct {
 }
 
 func (h *head) seriesState(id signal.SeriesID) headSeriesState {
+	if newest, ok := h.known.newest(id); ok {
+		return headSeriesState{compact: true, historical: true, buffer: h.samples[id], newest: newest, seen: true}
+	}
 	ref, ok := h.series.Ref(id)
 	if !ok {
 		if h.disk != nil {
@@ -175,6 +179,9 @@ func (h *head) bufForRef(id signal.SeriesID, ref uint32) *sampleBuf {
 }
 
 func (h *head) watermark(id signal.SeriesID) (int64, bool) {
+	if newest, ok := h.known.newest(id); ok {
+		return newest, true
+	}
 	ref, ok := h.series.Ref(id)
 	if !ok {
 		return 0, false

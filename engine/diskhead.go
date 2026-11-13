@@ -154,10 +154,15 @@ func (e *Engine) rebuildDiskStateLocked(ctx context.Context) (err error) {
 		return nil
 	}
 	next := newDiskHeadStateWithCache(e.diskSeriesCacheBytes())
-	headIDs := make([]signal.SeriesID, e.head.series.Len())
+	headIDs := make([]signal.SeriesID, e.head.series.Len(), e.head.series.Len()+e.head.known.len())
 	view := e.head.series.View()
 	for i := range headIDs {
 		headIDs[i] = view.ID(i)
+	}
+	if e.head.known != nil {
+		for id := range e.head.known.marks {
+			headIDs = append(headIDs, id)
+		}
 	}
 	slices.SortFunc(headIDs, signal.SeriesID.Compare)
 	parts := e.readablePartsLocked()
@@ -190,6 +195,10 @@ func (e *Engine) rebuildDiskStateLocked(ctx context.Context) (err error) {
 	}
 	for i, entry := range watermarks {
 		if entry.exists {
+			if e.head.known.has(headIDs[i]) {
+				e.head.known.marks[headIDs[i]] = max(e.head.known.marks[headIDs[i]], entry.newest)
+				continue
+			}
 			ref, _ := e.head.series.Ref(headIDs[i])
 			e.head.slots.set(e.head.stateRefs[ref], entry.newest)
 			e.head.newest = max(e.head.newest, entry.newest)
@@ -233,7 +242,7 @@ func (e *Engine) preloadDiskSeriesOffState(ids []signal.SeriesID) error {
 	}
 	var historical []signal.SeriesID
 	for _, id := range ids {
-		if e.head.series.Has(id) {
+		if e.head.series.Has(id) || e.head.known.has(id) {
 			continue
 		}
 		if _, ok := s.pending[id]; ok {
@@ -307,7 +316,11 @@ func (e *Engine) clearDiskPendingLocked() {
 // The caller owns writer/state; disk-mode merges retain no head references.
 func (e *Engine) compactDiskHeadLocked() {
 	h := e.head
-	if h.disk == nil || e.flushing != nil || len(h.samples) == h.series.Len() {
+	if h.disk == nil || e.flushing != nil {
+		return
+	}
+	h.compactKnownSamples()
+	if len(h.samples) == h.series.Len() {
 		return
 	}
 	next := newHeadWithContexts(e.cfg.SeriesContexts, e.cfg.SeriesTemplates)
@@ -368,7 +381,7 @@ func (e *Engine) flushResidentHeadLocked() error {
 }
 
 func (e *Engine) residentHeadOverBudgetLocked() bool {
-	return e.head.bytes > 0 && e.head.residentIdentityBytes()+e.head.inFlightBytes() >= e.cfg.ResidentHeadBytes
+	return e.head.bytes > 0 && e.residentSampleHeadBytes() >= e.cfg.ResidentHeadBytes
 }
 
 //nolint:contextcheck,nolintlint // The context analyzer consumes this intentional API boundary before reporting.
@@ -390,7 +403,7 @@ func (e *Engine) relieveResidentHeadPressure() error {
 }
 
 func (e *Engine) replayResidentGuard(samples int) error {
-	if e.cfg.DiskSeries && e.head.residentIdentityBytes()+e.head.inFlightBytes()+int64(samples)*SampleBytes > e.cfg.ResidentHeadBytes {
+	if e.cfg.DiskSeries && e.residentSampleHeadBytes()+int64(samples)*SampleBytes > e.cfg.ResidentHeadBytes {
 		return errors.New("WAL replay exceeds resident head budget; journal preserved; increase ResidentHeadBytes to recover")
 	}
 	return nil

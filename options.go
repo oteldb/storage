@@ -213,6 +213,9 @@ type Options struct {
 	// MetricSeparateSeries stores descriptors/postings in independent immutable runs.
 	// Requires MetricDiskSeries and MetricSeriesChunks; standalone fresh catalogs only.
 	MetricSeparateSeries bool
+	// MetricKnownSeriesHead avoids rebuilding known metric descriptors in the bounded head.
+	// Requires MetricSeparateSeries.
+	MetricKnownSeriesHead bool
 	// MetricResidentHeadBytes is the disk-index mode's resident-head pressure target. Zero uses 128 MiB.
 	// One atomic append may exceed the target; pressure flushes happen before subsequent writes.
 	MetricResidentHeadBytes int64
@@ -535,6 +538,9 @@ func errOptionInvalid(reason string) error {
 
 // validate checks the option combination before construction.
 func (o *Options) validate() error {
+	if o.MetricKnownSeriesHead && !o.MetricSeparateSeries {
+		return errOptionInvalid("MetricKnownSeriesHead requires MetricSeparateSeries")
+	}
 	if o.MetricSeparateSeries && (!o.MetricDiskSeries || !o.MetricSeriesChunks || o.Cluster != nil) {
 		return errOptionInvalid("MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks without Cluster")
 	}
@@ -642,6 +648,9 @@ func WithMetricSeriesChunks() Option { return func(o *Options) { o.MetricSeriesC
 
 // WithMetricDiskSeries enables part-local disk identities/postings for metric engines.
 func WithMetricDiskSeries() Option { return func(o *Options) { o.MetricDiskSeries = true } }
+
+// WithMetricKnownSeriesHead enables the bounded immutable-identity metric head.
+func WithMetricKnownSeriesHead() Option { return func(o *Options) { o.MetricKnownSeriesHead = true } }
 
 // WithMetricSeparateSeries enables independent metric descriptor runs on a fresh standalone store.
 func WithMetricSeparateSeries() Option { return func(o *Options) { o.MetricSeparateSeries = true } }

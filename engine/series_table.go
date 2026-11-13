@@ -219,6 +219,9 @@ func (e *Engine) installSeriesRootsLocked(
 }
 
 func (e *Engine) validateSeparateSeries() error {
+	if e.cfg.KnownSeriesHead && !e.cfg.SeparateSeries {
+		return errors.New("engine: known series head requires separate series")
+	}
 	if !e.cfg.SeparateSeries {
 		return nil
 	}

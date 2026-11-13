@@ -52,8 +52,15 @@ func (e *Engine) snapshotDiskQuery(
 	if err != nil {
 		return nil, err
 	}
+	if err := p.resolveKnownQuery(ctx, r, withIdentity); err != nil {
+		p.releaseParts()
+		return nil, err
+	}
 	selected := make(map[signal.SeriesID]diskSelection, len(p.ids))
 	for i, id := range p.ids {
+		if matched, known := p.knownIDs[id]; known && !matched {
+			continue
+		}
 		selected[id] = diskSelection{head: uint32(i), identity: uint32(i)}
 	}
 	if needStats {
@@ -99,13 +106,18 @@ func (e *Engine) captureDiskHead(
 		return nil, err
 	}
 	// Head matcher iterators and the growing result slice are transient metadata workspace.
-	workspace := buildbudget.Mul(int64(e.head.series.Len()), buildbudget.Mul(int64(len(r.Matchers))+1, 256))
+	workspace := buildbudget.Mul(int64(e.head.series.Len()+e.head.known.len()), buildbudget.Mul(int64(len(r.Matchers))+1, 256))
 	if err := budget.Reserve(workspace); err != nil {
 		e.mu.RUnlock()
 		return nil, err
 	}
 	// Only the bounded active/frozen head is resident. Capture it and the parts in one lock interval.
 	ids := e.head.resolve(r.Matchers)
+	if e.head.known != nil {
+		for id := range e.head.known.marks {
+			ids = append(ids, id)
+		}
+	}
 	n := e.diskHeadSelectionBytes(ids, withIdentity, countOnly)
 	budget.Release(workspace)
 	if err := budget.Reserve(n); err != nil {
@@ -119,6 +131,7 @@ func (e *Engine) captureDiskHead(
 		p = e.planFetch(ids, r)
 	}
 	p.selectionBudget, p.selectionBytes = budget, n
+	e.captureKnownQuery(p)
 	var err error
 	if snapshot != nil {
 		err = snapshot(p)

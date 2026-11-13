@@ -13,10 +13,11 @@ import (
 )
 
 type diskLabelCollector struct {
-	plan   *enginePlan
-	seen   map[string]struct{}
-	name   []byte
-	values bool
+	plan     *enginePlan
+	seen     map[string]struct{}
+	name     []byte
+	values   bool
+	knownIDs []signal.SeriesID
 }
 
 // diskLabels reads covered part dictionaries, resolving only selected identities for filtered reads.
@@ -139,6 +140,10 @@ func (e *Engine) captureDiskLabelHead(ctx context.Context, r fetch.Request, c *d
 		return err
 	}
 	e.acquireWindowParts(c.plan, r.Start, r.End, false)
+	if e.head.known != nil {
+		c.plan.knownSnapshot = e.head.known.snapshot
+		c.plan.knownSnapshot.acquire()
+	}
 	for _, buffers := range [2]map[signal.SeriesID]*sampleBuf{e.head.samples, e.flushing} {
 		for id, buf := range buffers {
 			if err := ctx.Err(); err != nil {
@@ -146,6 +151,12 @@ func (e *Engine) captureDiskLabelHead(ctx context.Context, r fetch.Request, c *d
 			}
 			if !bufHasInWindow(buf, r.Start, r.End) {
 				continue
+			}
+			if e.head.known.has(id) {
+				if err := c.plan.reserveSelection(32); err != nil {
+					return err
+				}
+				c.knownIDs = append(c.knownIDs, id)
 			}
 			if s, ok := e.head.series.Get(id); ok {
 				if err := c.projectBroad(s); err != nil {
@@ -195,6 +206,30 @@ func (c *diskLabelCollector) collectPart(ctx context.Context, r fetch.Request, p
 func (c *diskLabelCollector) collectBroad(ctx context.Context, r fetch.Request) error {
 	if err := c.plan.engine.captureDiskLabelHead(ctx, r, c); err != nil {
 		return err
+	}
+	if c.plan.knownSnapshot != nil {
+		workspace := c.plan.knownSnapshot.workspace(0)
+		if err := c.plan.selectionBudget.Reserve(workspace); err != nil {
+			return err
+		}
+		defer c.plan.selectionBudget.Release(workspace)
+	}
+	for _, id := range c.knownIDs {
+		_, err := c.plan.knownSnapshot.lookup(ctx, id, func(raw []byte) error {
+			n := buildbudget.Mul(int64(len(raw)), 128)
+			if err := c.plan.selectionBudget.Reserve(n); err != nil {
+				return err
+			}
+			defer c.plan.selectionBudget.Release(n)
+			s, _, err := signal.DecodeSeries(raw)
+			if err != nil {
+				return err
+			}
+			return c.projectBroad(s)
+		})
+		if err != nil {
+			return err
+		}
 	}
 	for _, pt := range c.plan.liveParts {
 		if err := c.collectPart(ctx, r, pt); err != nil {

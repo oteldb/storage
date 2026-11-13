@@ -1321,6 +1321,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		MetricSeriesChunks: s.opts.MetricSeriesChunks,
 		DiskSeries:         s.opts.MetricDiskSeries,
 		SeparateSeries:     s.opts.MetricSeparateSeries,
+		KnownSeriesHead:    s.opts.MetricKnownSeriesHead,
 		ResidentHeadBytes:  s.opts.MetricResidentHeadBytes,
 		SeriesCacheBytes:   s.opts.MetricSeriesCacheBytes,
 		// MaxPartBytes caps each flushed part; resolved from the tenant's policy, falling back to

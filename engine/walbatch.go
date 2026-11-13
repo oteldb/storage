@@ -24,11 +24,12 @@ const maxWALIdentityAttributes = 4096
 // starting a buffer) rather than one frame per sample, and it is reused across writes under the engine
 // lock, keeping its buffers' capacity, so a steady-state durable append allocates nothing here.
 type walBatch struct {
-	lookupErr error
-	order     []signal.SeriesID       // series in first-admitted order; order[k] ↔ accs[k]
-	pos       map[signal.SeriesID]int // id → its index in order/accs (for this write only)
-	accs      []walSeriesAcc
-	attrs     signal.Attributes
+	knownSnapshot *seriesSnapshot
+	lookupErr     error
+	order         []signal.SeriesID       // series in first-admitted order; order[k] ↔ accs[k]
+	pos           map[signal.SeriesID]int // id → its index in order/accs (for this write only)
+	accs          []walSeriesAcc
+	attrs         signal.Attributes
 
 	// samples is the admitted sample count and registered counts globally new identities; both
 	// are what [head.appendByID] would have added to the head's in-flight bytes and series count.
@@ -45,6 +46,7 @@ type walBatch struct {
 }
 
 type walSeriesAcc struct {
+	compact     bool
 	historical  bool
 	isNew       bool // the series starts a buffer, so its identity record is logged
 	register    bool // the identity is not in the head's index yet
@@ -109,7 +111,7 @@ func (b *walBatch) admit(
 		state = h.seriesState(id)
 		newest, seen = state.newest, state.seen
 	}
-	acc := walSeriesAcc{buffer: state.buffer, priorNewest: newest, hadNewest: seen,
+	acc := walSeriesAcc{compact: state.compact, buffer: state.buffer, priorNewest: newest, hadNewest: seen,
 		identityRef: state.ref, knownRef: state.known, historical: state.historical}
 	if acc.buffer != nil {
 		b.add(b.start(id, acc), ts, value, sf)
@@ -133,7 +135,7 @@ func (b *walBatch) admit(
 			b.add(k, ts, value, sf)
 		} else {
 			state := h.seriesState(oid)
-			a := walSeriesAcc{buffer: state.buffer, priorNewest: state.newest, hadNewest: state.seen,
+			a := walSeriesAcc{compact: state.compact, buffer: state.buffer, priorNewest: state.newest, hadNewest: state.seen,
 				identityRef: state.ref, knownRef: state.known, historical: state.historical}
 			a.isNew = a.buffer == nil
 			if a.isNew {
@@ -213,6 +215,9 @@ func (e *Engine) flushBatchWALLocked(b *walBatch, everySeries bool) error {
 func (e *Engine) encodeWriteBatch(b *walBatch, everySeries bool) error {
 	if b.lookupErr != nil {
 		return b.lookupErr
+	}
+	if err := e.prepareKnownSamples(b); err != nil {
+		return err
 	}
 	view := b.encodingView(e.head, everySeries)
 	if err := b.encode(view, everySeries); err != nil {
@@ -301,6 +306,10 @@ func (b *walBatch) apply(h *head) {
 	for k, id := range b.order {
 		a := &b.accs[k]
 
+		if a.compact {
+			h.applyKnownSamples(id, a, b.knownSnapshot)
+			continue
+		}
 		if a.register && !h.series.Has(id) {
 			h.register(series.Entry{ID: id, Series: a.series})
 		}
@@ -330,6 +339,8 @@ func (b *walBatch) apply(h *head) {
 }
 
 func (b *walBatch) reset() {
+	b.knownSnapshot.release()
+	b.knownSnapshot = nil
 	b.lookupErr = nil
 	clear(b.attrs[:cap(b.attrs)])
 	if cap(b.attrs) > maxWALIdentityAttributes {

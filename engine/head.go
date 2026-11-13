@@ -25,6 +25,7 @@ var (
 // plus per-series sample buffers in arrival order (sorted on read). It is not safe for
 // concurrent use; the [Engine] holds the lock.
 type head struct {
+	known                        *knownSampleHead
 	disk                         *diskHeadState
 	sym                          *symbols.Table
 	series                       *series.Index
@@ -124,7 +125,7 @@ func (h *head) identityBytes() int64 {
 }
 
 func (h *head) residentIdentityBytes() int64 {
-	n := h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
+	n := h.known.sizeBytes() + h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
 		memsize.Slice(h.stateRefs) + h.slots.sizeBytes() + memsize.Slice(h.valueScratch)
 	if h.nonStringLabels != nil {
 		n += memsize.Map(h.nonStringLabels)
@@ -475,6 +476,9 @@ func (h *head) registerSeries(s signal.Series) {
 // replaySamples appends a run of samples to an already-registered series (WAL replay; no
 // OOO rejection — logged samples are authoritative).
 func (h *head) replaySamples(id signal.SeriesID, ts []int64, values []float64) {
+	if h.replayKnownSamples(id, ts, values, nil) {
+		return
+	}
 	ref, known := h.series.Ref(id)
 	if !known {
 		return // series record missing; ignore (defensive)
@@ -504,6 +508,9 @@ func (h *head) replaySamples(id signal.SeriesID, ts []int64, values []float64) {
 // appends per sample through appendSample, which materializes the buffer's sf slice on the first
 // non-unit weight.
 func (h *head) replaySamplesSF(id signal.SeriesID, ts []int64, values, sf []float64) {
+	if h.replayKnownSamples(id, ts, values, sf) {
+		return
+	}
 	ref, known := h.series.Ref(id)
 	if !known {
 		return // series record missing; ignore (defensive)
@@ -738,6 +745,7 @@ func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, si
 
 	h.memory.abandon()
 	h.resetBuffers()
+	h.recountKnownSamples(nil)
 	if !h.detachedKnown || h.bytes > 0 && !h.bufferedKnown {
 		h.bufferedMin = minInt64
 	} else if !h.bufferedKnown || h.detachedMin < h.bufferedMin {

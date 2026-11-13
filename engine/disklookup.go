@@ -32,7 +32,7 @@ func (l *diskSeriesLookup) capture(e *Engine, ids []signal.SeriesID) {
 		l.pending = make(map[signal.SeriesID]diskHeadEntry, len(ids))
 	}
 	for _, id := range ids {
-		if e.head.series.Has(id) {
+		if e.head.series.Has(id) || e.head.known.has(id) {
 			continue
 		}
 		if _, ok := l.pending[id]; ok {

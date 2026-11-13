@@ -648,3 +648,6 @@ Flush workspace metrics distinguish the configured output target from the admitt
 `storage.flush.reservation.bytes` labels `component=reserved|target` and a bounded `phase`;
 `storage.flush.reservation.wait` records admission wait by phase. `storage.flush.output.series`
 counts distinct identities per completed candidate, including candidates not yet catalog-published.
+`Options.MetricKnownSeriesHead` is an opt-in companion to `MetricSeparateSeries`. Its memory
+pressure includes compact ID/watermark maps and retained sample capacities; `HeadBytes` continues
+to report logical samples, not physical allocation. Existing flush/merge counters keep their units.

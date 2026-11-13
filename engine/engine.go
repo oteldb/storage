@@ -192,6 +192,9 @@ type Config struct {
 	// SeparateSeries stores immutable identity/postings deltas separately from numeric parts.
 	// Opt-in standalone disk-series mode; metadata reclamation and clustered use are unsupported.
 	SeparateSeries bool
+	// KnownSeriesHead keeps only samples and watermarks for verified immutable identities.
+	// Requires SeparateSeries; the active and single frozen generation share its memory target.
+	KnownSeriesHead bool
 	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
 	// still has it, and says whether the part is gone from every owner. The cluster layer supplies
 	// it over its transport; a single-node store supplies one that fetches nothing and answers for
@@ -717,6 +720,8 @@ func (e *Engine) Stats() Stats {
 // (ref-held) in-window parts still to read, plus each series' identity and its already-snapshotted head
 // and mid-flush samples. Its [enginePlan.mergeSeries] does the part reads off the lock.
 type enginePlan struct {
+	knownSnapshot   *seriesSnapshot
+	knownIDs        map[signal.SeriesID]bool
 	selectionBudget *readbudget.Budget
 	selectionBytes  int64
 	diskMetadata    map[*part]map[signal.SeriesID]seriesindex.Metadata
@@ -1104,6 +1109,9 @@ func (p *enginePlan) releaseSeriesPins() {
 }
 
 func (p *enginePlan) releaseParts() {
+	p.knownSnapshot.release()
+	p.knownSnapshot = nil
+	p.knownIDs = nil
 	p.selectionBudget.Release(p.selectionBytes)
 	p.engine.budget.releaseFor(p.budgetScope, p.budgetBytes)
 
@@ -1589,6 +1597,9 @@ func (e *Engine) Replay(ctx context.Context, dir string) error {
 // regardless of concurrent writers. A payload that fails to decode or to log applies nothing. Safe for
 // concurrent use.
 func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte, res AppendResult, err error) {
+	if e.cfg.KnownSeriesHead {
+		return nil, AppendResult{}, errors.New("engine: known series head does not support replication")
+	}
 	if err := e.refuseWrite(); err != nil {
 		return nil, AppendResult{}, err
 	}
@@ -1670,6 +1681,9 @@ func (e *Engine) ApplyPrimary(data []byte, limits AppendLimits) (accepted []byte
 // replicas hold identical data. A replica holds the unflushed head this way; after a flush the
 // shared object store reconciles them. Safe for concurrent use.
 func (e *Engine) ApplyReplicated(data []byte) error {
+	if e.cfg.KnownSeriesHead {
+		return errors.New("engine: known series head does not support replication")
+	}
 	if err := e.flushResidentHead(); err != nil {
 		return err
 	}
@@ -1828,7 +1842,7 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 	phaseDone(nil)
 	phaseDone = obs.ShutdownPhase(ctx, log, "flush_write_parts",
 		zap.Int("detached_series", len(detached)), zap.Int64("detached_bytes", detachedBytes))
-	newParts, rows, err := e.streamHead(ctx, detached)
+	newParts, rows, err := e.streamSampleHead(ctx, detached)
 	if err != nil || rows == 0 {
 		closePartReaders(newParts)
 		return 0, 0, e.abortFlush(ctx, detached, detachedBytes, detachedSince, err)
@@ -2211,7 +2225,13 @@ func (e *Engine) replayHandlers() wal.Handlers {
 				}
 				e.preloadAuthoritativeSeriesLocked(id)
 			}
-			e.head.registerSeries(s)
+			known, err := e.replayKnownIdentity(id, s)
+			if err != nil {
+				return err
+			}
+			if !known {
+				e.head.registerSeries(s)
+			}
 			e.clearDiskPendingLocked()
 
 			return nil

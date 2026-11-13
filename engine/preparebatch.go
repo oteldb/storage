@@ -236,7 +236,7 @@ func (p *preparedBatch) admit(
 		state = p.seriesState(h, id)
 		newest, seen = state.newest, state.seen
 	}
-	acc := walSeriesAcc{buffer: state.buffer, priorNewest: newest, hadNewest: seen,
+	acc := walSeriesAcc{compact: state.compact, buffer: state.buffer, priorNewest: newest, hadNewest: seen,
 		identityRef: state.ref, knownRef: state.known, historical: state.historical}
 	if acc.buffer == nil {
 		acc.isNew = true

@@ -16,6 +16,22 @@ reset, reload, repair, flush and merge advance it through exclusive writer unloc
 publication; derived postings sorts
 do not. Tokens are process-local, never reset or reused, and become noncacheable on saturation.
 
+### Bounded immutable-identity sample head
+
+`KnownSeriesHead` requires standalone `SeparateSeries`. New buffer identities are compared exactly
+against a pinned immutable snapshot before WAL acknowledgement. Known series retain only IDs,
+watermarks and sample buffers; unknown identities use the ordinary registry/postings. The pressure
+target includes compact map entries, buffer headers and numeric slice capacities across the active
+and single frozen generation. This is a bounded stage, not a retained historical identity cache.
+
+Queries capture those samples and the metadata lease together, then resolve matchers off-lock even
+when no historical numeric part intersects the query window. Known and unknown flush outputs use
+the existing part format, merge engine and one catalog/WAL checkpoint. Mixed flushes may produce
+separate outputs. Metadata-generation changes are verified before numeric publication. Failed builds
+reattach samples in original arrival order; WAL records remain self-contained, including first-buffer
+identities, and recovery uses the compact stage only when immutable metadata proves the identity.
+Replication entry points reject this mode. No additional frozen queue or file format is introduced.
+
 ### Independent known-series preparation
 
 `Config.SeriesContexts` optionally shares bounded immutable resource/scope payloads across engine
