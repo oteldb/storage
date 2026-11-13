@@ -12,7 +12,7 @@ import (
 
 // Index maps canonical series IDs to compact identities. Callers own synchronization.
 type Index struct {
-	byID   map[signal.SeriesID]uint32
+	byID   idRefs
 	rows   []row
 	sym    *symbols.Table
 	shared *Contexts
@@ -77,7 +77,6 @@ func NewWithAttributeTemplates(contexts *Contexts, templates *AttributeTemplates
 	return &Index{
 		shared:    contexts,
 		templates: templates,
-		byID:      make(map[signal.SeriesID]uint32),
 		sym:       symbols.New(),
 		res:       make(map[string]uint32),
 		scope:     make(map[string]uint32),
@@ -98,7 +97,7 @@ func (ix *Index) Add(s signal.Series) signal.SeriesID {
 // Callers must provide entry.ID == entry.Series.Hash(); use [Index.AddChecked] for untrusted identities.
 func (ix *Index) AddEntry(entry Entry) signal.SeriesID {
 	id, s := entry.ID, entry.Series
-	if _, ok := ix.byID[id]; ok {
+	if _, ok := ix.byID.get(id, ix.rows); ok {
 		return id
 	}
 	if uint64(len(ix.rows)) > math.MaxUint32 {
@@ -116,15 +115,14 @@ func (ix *Index) AddEntry(entry Entry) signal.SeriesID {
 		ix.bytes += memsize.MapEntry[contextKey, uint32]()
 	}
 	keys, offset := ix.storeAttributes(s.Attributes)
-	ix.byID[id] = uint32(len(ix.rows))
+	ix.byID.put(id, uint32(len(ix.rows)), ix.rows)
 	ix.rows = append(ix.rows, row{id: id, offset: offset, context: context, keys: keys})
-	ix.bytes += memsize.MapEntry[signal.SeriesID, uint32]()
 	return id
 }
 
 // Ref returns the engine-local ordinal of id. References are scoped to this index.
 func (ix *Index) Ref(id signal.SeriesID) (uint32, bool) {
-	ref, ok := ix.byID[id]
+	ref, ok := ix.byID.get(id, ix.rows)
 	return ref, ok
 }
 
@@ -136,7 +134,7 @@ func (ix *Index) Get(id signal.SeriesID) (signal.Series, bool) { return ix.GetIn
 
 // GetInto materializes id, reusing dst for its point attributes.
 func (ix *Index) GetInto(id signal.SeriesID, dst signal.Attributes) (signal.Series, bool) {
-	ref, ok := ix.byID[id]
+	ref, ok := ix.byID.get(id, ix.rows)
 	if !ok {
 		return signal.Series{}, false
 	}
@@ -145,7 +143,7 @@ func (ix *Index) GetInto(id signal.SeriesID, dst signal.Attributes) (signal.Seri
 
 // Has reports whether id is registered.
 func (ix *Index) Has(id signal.SeriesID) bool {
-	_, ok := ix.byID[id]
+	_, ok := ix.byID.get(id, ix.rows)
 	return ok
 }
 
@@ -172,7 +170,7 @@ func (ix *Index) ForEach(fn func(id signal.SeriesID, s signal.Series)) {
 
 // SizeBytes reports the owned resident structures and interned payloads.
 func (ix *Index) SizeBytes() int64 {
-	return ix.bytes + ix.sym.SizeBytes() + memsize.Slice(ix.rows) + memsize.Slice(ix.values) +
+	return ix.bytes + ix.byID.sizeBytes() + ix.sym.SizeBytes() + memsize.Slice(ix.rows) + memsize.Slice(ix.values) +
 		memsize.Slice(ix.resources) + memsize.Slice(ix.scopes) + memsize.Slice(ix.contexts) +
 		memsize.Slice(ix.keys) + memsize.Slice(ix.buf) + memsize.Slice(ix.kbuf) + memsize.Slice(ix.vbuf) +
 		memsize.Slice(ix.templateRows) + memsize.Slice(ix.templateBuf) + memsize.Slice(ix.templateFields)
