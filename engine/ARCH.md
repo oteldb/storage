@@ -2110,3 +2110,8 @@ read or materialized for sample fetches. Missing/corrupt optional stats retain t
 Historical sorted-ID batches hold one bounded SIDX page per part beside the coverage window,
 so adjacent probes reuse it even when backend cache admission declines. Both views expire with
 the pinned part; final-page and SIDX/SMAX ordinal validation remain unchanged.
+
+Historical watermark cache entries choose the less occupied of two independent numeric buckets.
+This reduces premature eviction while other buckets still have capacity, without increasing the
+byte budget or retaining descriptors. Both candidates compare full canonical IDs; an eviction still
+falls back to authoritative part metadata, and successful updates preserve the maximum watermark.
