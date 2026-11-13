@@ -183,9 +183,12 @@ func (ix *Index) beginTemplate(n int) {
 	ix.templateFields = ix.templateFields[:0]
 }
 
-func (ix *Index) templateField(name []byte, variable bool, slot uint32) templateField {
+func (ix *Index) templateField(name []byte, variable bool, slot uint32) *templateField {
 	ix.templateBuf = binary.AppendUvarint(ix.templateBuf, uint64(len(name)))
-	f := templateField{keyOffset: uint32(len(ix.templateBuf)), keyLength: uint32(len(name)), slot: math.MaxUint32}
+	ix.templateFields = append(ix.templateFields, templateField{
+		keyOffset: uint32(len(ix.templateBuf)), keyLength: uint32(len(name)), slot: math.MaxUint32,
+	})
+	f := &ix.templateFields[len(ix.templateFields)-1]
 	ix.templateBuf = append(ix.templateBuf, name...)
 	if variable {
 		f.slot = slot
@@ -254,7 +257,6 @@ func (ix *Index) storeTemplateAttributes(attrs signal.Attributes) (uint32, uint6
 			ix.templateBuf = signal.AppendValue(ix.templateBuf, attr.Value)
 			f.valueLength = uint32(len(ix.templateBuf)) - f.valueOffset
 		}
-		ix.templateFields = append(ix.templateFields, f)
 	}
 	ref, ok := ix.finishTemplate(dynamic)
 	if !ok {
@@ -325,7 +327,6 @@ func (ix *Index) copyTemplateAttributes(v View, i int) (uint32, uint64, bool) {
 			ix.templateBuf = append(ix.templateBuf, encoded...)
 			f.valueLength = uint32(len(ix.templateBuf)) - f.valueOffset
 		}
-		ix.templateFields = append(ix.templateFields, f)
 	})
 	if ref, ok := ix.finishTemplate(dynamic); ok {
 		offset := uint64(len(ix.values))
