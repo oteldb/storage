@@ -142,7 +142,7 @@ func (e *Engine) PruneIdentitiesWith(ctx context.Context, opts PruneOptions) (in
 	// The expensive part — re-interning every survivor into fresh structures — runs here, off the
 	// lock, over the immutable snapshot. Ingest and queries proceed against the current index
 	// throughout.
-	rebuilt := rebuildIdentity(snap, live, stateRefs)
+	rebuilt := rebuildIdentityWithPools(snap, live, stateRefs, e.cfg.SeriesContexts, e.cfg.SeriesTemplates)
 
 	e.mu.Lock()
 	// Identities registered while the rebuild ran sit past the snapshot's end in the same

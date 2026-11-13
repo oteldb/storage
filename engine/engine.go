@@ -185,6 +185,9 @@ type Config struct {
 	// SeriesContexts shares bounded immutable resource/scope payloads across engines.
 	// The caller owns its separate memory budget; nil keeps per-engine ownership.
 	SeriesContexts *series.Contexts
+	// SeriesTemplates shares bounded fixed point attributes; the caller budgets the pool separately.
+	// Nil keeps flat local tuples. Publication and canonical identities are unchanged.
+	SeriesTemplates *series.AttributeTemplates
 	// SeparateSeries stores immutable identity/postings deltas separately from numeric parts.
 	// Opt-in standalone disk-series mode; metadata reclamation and clustered use are unsupported.
 	SeparateSeries bool
@@ -419,7 +422,10 @@ func New(cfg Config) *Engine {
 	}
 
 	e := &Engine{
-		cfg: cfg, head: newHeadWithContexts(cfg.SeriesContexts), tsCodec: chunk.CodecDoDScaled, mergeReadWindow: defaultMergeReadWindow,
+		cfg:             cfg,
+		head:            newHeadWithContexts(cfg.SeriesContexts, cfg.SeriesTemplates),
+		tsCodec:         chunk.CodecDoDScaled,
+		mergeReadWindow: defaultMergeReadWindow,
 		readCompressors: block.NewReadCompressors(),
 	}
 	e.space = diskguard.New(diskguard.Reserve{Bytes: cfg.MinFreeBytes, Inodes: cfg.MinFreeInodes})
@@ -1491,7 +1497,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 	}
 	e.head.memory.release()
 	e.head.frozenMemory.release()
-	e.head = newHeadWithContexts(e.cfg.SeriesContexts)
+	e.head = newHeadWithContexts(e.cfg.SeriesContexts, e.cfg.SeriesTemplates)
 	if e.cfg.DiskSeries {
 		e.head.disk = newDiskHeadStateWithCache(e.diskSeriesCacheBytes())
 	}

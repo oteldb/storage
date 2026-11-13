@@ -101,10 +101,14 @@ func newHead() *head {
 	return newHeadWithContexts(nil)
 }
 
-func newHeadWithContexts(contexts *series.Contexts) *head {
+func newHeadWithContexts(contexts *series.Contexts, templates ...*series.AttributeTemplates) *head {
+	var pool *series.AttributeTemplates
+	if len(templates) > 0 {
+		pool = templates[0]
+	}
 	return &head{
 		sym:     symbols.New(),
-		series:  series.NewWithContexts(contexts),
+		series:  series.NewWithAttributeTemplates(contexts, pool),
 		post:    postings.NewDense(),
 		samples: make(map[signal.SeriesID]*sampleBuf),
 	}
@@ -141,7 +145,14 @@ func (h *head) residentIdentityBytes() int64 {
 // (only a lost or truncated identity object can produce one), and inventing an entry for it would
 // be worse than leaving the postings without it.
 func rebuildIdentity(snap series.View, live map[signal.SeriesID]struct{}, slots []uint32) *head {
-	out := &head{sym: symbols.New(), series: series.New(), post: postings.NewDense()}
+	return rebuildIdentityWithPools(snap, live, slots, nil, nil)
+}
+
+func rebuildIdentityWithPools(
+	snap series.View, live map[signal.SeriesID]struct{}, slots []uint32,
+	contexts *series.Contexts, templates *series.AttributeTemplates,
+) *head {
+	out := newHeadWithContexts(contexts, templates)
 
 	var attrs signal.Attributes
 	for i := range snap.Len() {

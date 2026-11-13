@@ -309,7 +309,7 @@ func (e *Engine) compactDiskHeadLocked() {
 	if h.disk == nil || e.flushing != nil || len(h.samples) == h.series.Len() {
 		return
 	}
-	next := newHeadWithContexts(e.cfg.SeriesContexts)
+	next := newHeadWithContexts(e.cfg.SeriesContexts, e.cfg.SeriesTemplates)
 	view := h.series.View()
 	var attrs signal.Attributes
 	for i := range view.Len() {

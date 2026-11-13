@@ -23,6 +23,11 @@ registries. Reset and disk-head compaction preserve the configured pool. It owns
 watermark or acceptance state; cache hits cannot revive removed series. The embedder budgets its
 retained memory separately from engine-local identity state. Nil retains existing local ownership.
 
+`Config.SeriesTemplates` optionally shares fixed point attributes through a separately budgeted
+pool. Reset, resident-head rotation and identity pruning preserve both configured pools. Template
+references remain local; WAL and part identities keep their canonical bytes. The storage facade
+does not enable this experimental policy by default.
+
 Anonymous standalone WAL engines allow contended 1,024–4,096-point batches to prepare independently
 when every identity already exists and soft-overflow routing is inactive. Transient uint32-reference
 bitmaps use 64 reservation stripes; conflicting batches roll back reservations and enter existing
