@@ -1,8 +1,6 @@
 package series
 
 import (
-	"math"
-
 	"github.com/oteldb/storage/index/symbols"
 	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/signal"
@@ -77,22 +75,7 @@ func (v View) At(i int, dst signal.Attributes) signal.Series {
 	}
 	if r.keys&templateFlag != 0 {
 		t := v.templates[r.keys&^templateFlag]
-		if dst == nil {
-			dst = make(signal.Attributes, 0, len(t.fields))
-		}
-		dst = dst[:0]
-		for j, field := range t.fields {
-			name, encoded := v.encodedField(r, field, t)
-			value := t.scalars[j]
-			if field.slot != math.MaxUint32 || signal.ValueKind(encoded[0]) == signal.KindMap || signal.ValueKind(encoded[0]) == signal.KindSlice {
-				var err error
-				value, _, err = signal.DecodeValue(encoded)
-				if err != nil {
-					panic(err)
-				}
-			}
-			dst = append(dst, signal.KeyValue{Key: name, Value: value})
-		}
+		dst = t.attributes(v, r, dst[:0])
 		return signal.Series{Resource: c.resource, Scope: c.scope, Attributes: dst}
 	}
 	keys := v.keys[r.keys]

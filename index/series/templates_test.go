@@ -2,6 +2,7 @@ package series
 
 import (
 	"bytes"
+	"encoding/binary"
 	"math"
 	"strconv"
 	"sync"
@@ -145,6 +146,9 @@ func TestAttributeTemplatesConcurrentViews(t *testing.T) {
 
 func TestAttributeTemplatesTypedValues(t *testing.T) {
 	t.Parallel()
+	encodedBool := binary.BigEndian.AppendUint64([]byte{byte(signal.KindBool)}, 7)
+	rawBool, _, err := signal.DecodeValue(encodedBool)
+	require.NoError(t, err)
 	values := []signal.Value{
 		signal.EmptyValue(), signal.StringValue(nil), signal.StringValue([]byte("a\x00b")),
 		signal.BytesValue([]byte{0, 255}), signal.BoolValue(false), signal.BoolValue(true),
@@ -152,6 +156,7 @@ func TestAttributeTemplatesTypedValues(t *testing.T) {
 		signal.DoubleValue(math.Copysign(0, -1)), signal.DoubleValue(math.Float64frombits(0x7ff8000000001234)),
 		signal.SliceValue(), signal.MapValue(), signal.SliceValue(signal.IntValue(5), signal.StringValue([]byte("5"))),
 		signal.MapValue(signal.KeyValue{Key: []byte("x"), Value: signal.SliceValue(signal.EmptyValue(), signal.BoolValue(true))}),
+		rawBool,
 	}
 	p := NewAttributeTemplates(8<<20, []byte("instance"), []byte("variable"))
 	ix, flat := NewWithAttributeTemplates(nil, p), New()
@@ -178,6 +183,11 @@ func TestAttributeTemplatesTypedValues(t *testing.T) {
 		}
 	}
 	require.NotEmpty(t, ix.templateRows)
+}
+
+func TestTemplateFieldLayout(t *testing.T) {
+	t.Parallel()
+	require.EqualValues(t, 32, memsize.Of[templateField]())
 }
 
 func TestAttributeTemplatesNoVariablesAndNoSharedFields(t *testing.T) {

@@ -38,15 +38,16 @@ type attributeTemplate struct {
 	dynamic   uint32
 	canonical []byte
 	segments  []templateSegment
-	scalars   []signal.Value
 }
 
 type templateSegment struct{ offset, length uint32 }
 
 type templateField struct {
+	scalar                   uint64
 	keyOffset, keyLength     uint32
 	valueOffset, valueLength uint32
 	slot                     uint32
+	kind                     signal.ValueKind
 }
 
 // NewAttributeTemplates returns a bounded pool; insufficient budgets disable sharing.
@@ -105,7 +106,6 @@ func (p *AttributeTemplates) intern(key []byte, fields []templateField, dynamic 
 	cost := buildbudget.Add(memsize.Of[attributeTemplate](), int64(len(key))*8)
 	cost = buildbudget.Add(cost, 2*int64(len(fields))*memsize.Of[templateField]())
 	cost = buildbudget.Add(cost, 2*int64(dynamic+1)*memsize.Of[templateSegment]())
-	cost = buildbudget.Add(cost, 2*int64(len(fields))*memsize.Of[signal.Value]())
 	cost = buildbudget.Add(cost, 8*memsize.MapEntry[string, *attributeTemplate]())
 	if s.entries == nil {
 		cost = buildbudget.Add(cost, memsize.MapBase)
@@ -120,20 +120,27 @@ func (p *AttributeTemplates) intern(key []byte, fields []templateField, dynamic 
 		canonical: data[len(key):len(key)], segments: make([]templateSegment, 0, dynamic+1),
 	}
 	t.buildCanonical()
-	t.scalars = make([]signal.Value, len(fields))
 	for i, field := range t.fields {
 		if field.slot != math.MaxUint32 {
 			continue
 		}
 		encoded := t.data[field.valueOffset : field.valueOffset+field.valueLength]
-		if signal.ValueKind(encoded[0]) == signal.KindMap || signal.ValueKind(encoded[0]) == signal.KindSlice {
-			continue
+		t.fields[i].kind = signal.ValueKind(encoded[0])
+		switch t.fields[i].kind {
+		case signal.KindBool, signal.KindInt, signal.KindDouble:
+			t.fields[i].scalar = binary.BigEndian.Uint64(encoded[1:])
+		case signal.KindStr, signal.KindBytes:
+			value, _, err := signal.DecodeValue(encoded)
+			if err != nil {
+				return nil
+			}
+			data := value.Str()
+			if value.Kind() == signal.KindBytes {
+				data = value.Bytes()
+			}
+			offset := field.valueOffset + uint32(len(encoded)-len(data))
+			t.fields[i].scalar = uint64(offset)<<32 | uint64(uint32(len(data)))
 		}
-		value, _, err := signal.DecodeValue(encoded)
-		if err != nil {
-			return nil
-		}
-		t.scalars[i] = value
 	}
 	if s.entries == nil {
 		s.entries = make(map[string]*attributeTemplate)
