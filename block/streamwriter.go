@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"math"
+	"math/bits"
 	"slices"
 
 	"github.com/go-faster/errors"
@@ -714,15 +715,15 @@ func (c *streamColumn) trackFloat(v float64) {
 		c.sawNonFinite = true
 	}
 
-	bits := math.Float64bits(v)
+	valueBits := math.Float64bits(v)
 
 	if !c.haveStats {
-		c.minF64, c.maxF64, c.firstBits, c.haveStats = v, v, bits, true
+		c.minF64, c.maxF64, c.firstBits, c.haveStats = v, v, valueBits, true
 
 		return
 	}
 
-	if bits != c.firstBits {
+	if valueBits != c.firstBits {
 		c.allSame = false
 	}
 
@@ -887,8 +888,10 @@ func (c *streamColumn) finishBytes() (retained, transient int64) {
 
 	transient = max(c.blk.sealBytes(), c.alt.sealBytes())
 	if c.variable && c.blk != nil {
-		sizing := ColumnSizing{NumFrames: int64(c.blk.frameCount + 1), NumGranules: int64(len(c.blk.gLens) + 1)}
-		n := compactDirBound(sizing, c.timeBounds)
+		n := c.blk.finishDirectoryBytes(c.timeBounds)
+		if c.alt != nil && c.altOK {
+			n = max(n, c.alt.finishDirectoryBytes(c.timeBounds))
+		}
 		transient = max(transient, 2*n+c.blk.dirComp.CompressTransient(int(n), false)+c.blk.dirComp.EncodeWorkspace())
 	}
 	if c.codec == chunk.CodecFloatGroups {
@@ -1152,6 +1155,9 @@ type blockAccum struct {
 	inFrame                    int
 	bytes                      int // compressed bytes sealed so far, the size the codec choice compares on
 	dirLen                     int // the directory's encoded length, once finished
+	directoryTracked           bool
+	granuleWireBytes           int64
+	chunkWireBytes             int64
 
 	sink    backend.ObjectWriter
 	written int64 // bytes handed to the sink
@@ -1162,7 +1168,7 @@ func newBlockAccum(comp *compress.Compressor, compressBytes int) *blockAccum {
 		compressBytes = defaultCompressBlockBytes
 	}
 
-	return &blockAccum{comp: comp, compressBytes: compressBytes}
+	return &blockAccum{comp: comp, compressBytes: compressBytes, directoryTracked: true}
 }
 
 // streams reports whether the accumulator drains to a sink rather than retaining its frames.
@@ -1246,7 +1252,9 @@ func (a *blockAccum) addGranule(enc func([]byte) ([]byte, error)) error {
 	}
 
 	a.pending = out
-	a.gLens = append(a.gLens, len(a.pending)-before)
+	length := len(a.pending) - before
+	a.gLens = append(a.gLens, length)
+	a.granuleWireBytes += directoryUvarintBytes(uint64(length))
 	a.inFrame++
 
 	if len(a.pending) >= a.compressBytes {
@@ -1398,9 +1406,48 @@ func (a *blockAccum) finishStreamed(ctx context.Context, region, dir []byte) (in
 	return n, nil
 }
 
+func directoryUvarintBytes(value uint64) int64 {
+	return int64((bits.Len64(value|1) + 6) / 7)
+}
+
+func directoryVarintBytes(value int64) int64 {
+	encoded := uint64(value) << 1
+	if value < 0 {
+		encoded = ^encoded
+	}
+	return directoryUvarintBytes(encoded)
+}
+
+func (a *blockAccum) rawDirectoryBytes(blockRows int) int64 {
+	n := directoryUvarintBytes(uint64(len(a.gLens))) + directoryUvarintBytes(uint64(blockRows))
+	n += directoryUvarintBytes(uint64(a.frameCount)) + dirCRCBytes + int64(len(a.frameDir)) + a.granuleWireBytes
+	if a.variable {
+		n += a.chunkWireBytes
+	}
+	return n
+}
+
+func (a *blockAccum) finishDirectoryBytes(timeBounds bool) int64 {
+	if !a.directoryTracked {
+		sizing := ColumnSizing{NumFrames: int64(a.frameCount + 1), NumGranules: int64(len(a.gLens) + 1)}
+		return compactDirBound(sizing, timeBounds)
+	}
+	known := int64(len(a.frameDir)) + a.granuleWireBytes + a.chunkWireBytes
+	// Staged rows and an encoded run can add final chunks; only their unknown fields need worst-case widths.
+	pendingChunk := int64(4*binary.MaxVarintLen64 + dirCRCBytes)
+	if timeBounds {
+		pendingChunk += 2 * binary.MaxVarintLen64
+	}
+	return known + 3*binary.MaxVarintLen64 + dirCRCBytes + footerLenBytes + 2*pendingChunk
+}
+
 // encodeDir serializes the frame/granule directory, the same bytes under both layouts.
 func (a *blockAccum) encodeDir(blockRows int) []byte {
-	dir := binary.AppendUvarint(nil, uint64(len(a.gLens)))
+	var dir []byte
+	if a.directoryTracked {
+		dir = make([]byte, 0, a.rawDirectoryBytes(blockRows))
+	}
+	dir = binary.AppendUvarint(dir, uint64(len(a.gLens)))
 	dir = binary.AppendUvarint(dir, uint64(blockRows))
 	dir = binary.AppendUvarint(dir, uint64(a.frameCount))
 

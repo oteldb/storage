@@ -663,3 +663,8 @@ target compressor's transient memory. The exact metadata seal and payload CRC al
 Streaming directory serialization is priced as per-column transient workspace when the backend
 actually streams writes. A buffering ObjectWriter keeps its retained directory charge. The
 ID column remains unstreamed and its compressed object stays charged while other columns finish.
+
+Trusted stream writers count encoded varint bytes as granules and chunk geometry are appended.
+Finish bounds use those lengths plus fixed slack for pending chunks/frames, with the existing
+growth and compression margins. Raw directories are preallocated exactly; decoder limits and
+wire bytes are unchanged. Synthetic accumulators without counters keep the conservative bound.

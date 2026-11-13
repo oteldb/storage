@@ -105,15 +105,29 @@ func (c *streamColumn) sealChunk(rows int) error {
 	if !c.variable {
 		return nil
 	}
-	c.blk.chunkRows = append(c.blk.chunkRows, rows)
+	c.blk.appendChunkRows(rows)
 	if err := c.blk.seal(); err != nil {
 		return err
 	}
 	if c.alt != nil && c.altOK {
-		c.alt.chunkRows = append(c.alt.chunkRows, rows)
+		c.alt.appendChunkRows(rows)
 		return c.alt.seal()
 	}
 	return nil
+}
+
+func (a *blockAccum) appendChunkRows(rows int) {
+	a.chunkRows = append(a.chunkRows, rows)
+	a.chunkWireBytes += directoryUvarintBytes(uint64(rows))
+	if !a.timeBounds {
+		return
+	}
+	i := len(a.chunkRows) - 1
+	var previous int64
+	if i > 0 {
+		previous = a.minKeys[i-1]
+	}
+	a.chunkWireBytes += directoryVarintBytes(a.minKeys[i]-previous) + directoryVarintBytes(a.maxKeys[i]-a.minKeys[i])
 }
 
 func (c *ColumnDesc) decodeVariableRows(r *bitstream.Reader) error {
