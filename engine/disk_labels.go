@@ -158,6 +158,8 @@ func (e *Engine) captureDiskLabelHead(ctx context.Context, r fetch.Request, c *d
 }
 
 func (c *diskLabelCollector) collectPart(ctx context.Context, r fetch.Request, pt *part) error {
+	ctx, release := withPartSeriesSnapshot(ctx, pt)
+	defer release()
 	workspace, err := pt.diskSeriesWorkspace(ctx, 0)
 	if err != nil {
 		return err

@@ -35,7 +35,7 @@ func TestAttachSharedSeriesDuringSnapshotPublication(t *testing.T) {
 	previous.release()
 	e.mu.UnlockState()
 	require.NoError(t, <-done)
-	require.Same(t, next, p.sharedSeries, "attachment waits for the snapshot publication and owns its lease")
+	require.Same(t, next, p.sharedSeries.snapshot, "attachment waits for the snapshot publication and owns its lease")
 	p.releaseSharedSeries()
 	_, err = e.seriesTable.lookup(t.Context(), benchSeries(1).Hash(), func([]byte) error { return nil })
 	require.NoError(t, err, "releasing the part must preserve the catalog's run lease")
@@ -45,11 +45,12 @@ func TestPrepareAttachedSharedPartUnderWriterOwnership(t *testing.T) {
 	t.Parallel()
 	e := separateCatalogEngine(backend.Memory())
 	snapshot := newSeriesSnapshot(nil)
-	p := &part{sharedSeries: snapshot}
+	p := &part{sharedSeries: newSeriesBinding(snapshot)}
+	snapshot.release()
 	defer p.releaseSharedSeries()
 	e.mu.LockWriter()
 	err := e.attachSharedSeries(p)
 	e.mu.UnlockWriter()
 	require.NoError(t, err, "already attached parts must not reacquire state ownership")
-	require.Same(t, snapshot, p.sharedSeries)
+	require.Same(t, snapshot, p.sharedSeries.snapshot)
 }

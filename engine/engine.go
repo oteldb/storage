@@ -223,6 +223,7 @@ type Engine struct {
 	head          *head
 	parts         []*part
 	seriesTable   *seriesSnapshot
+	seriesRetired []bucketindex.SeriesRoot
 	seriesIDs     *seriestable.IDCache
 	// tsCodec is the codec flushes and merges write the timestamp column with. It is a field, not a
 	// constant, only so a test can write the [chunk.CodecDoD] parts earlier builds wrote and check

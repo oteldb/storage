@@ -50,7 +50,9 @@ func sharedReadFixture(t *testing.T, missing bool) (*part, backend.Backend, []si
 			binding: bucketindex.SeriesRoot{Prefix: prefix, ManifestDigest: run.Digest()}, run: run,
 		})
 	}
-	p.sharedSeries = newSeriesSnapshot(roots)
+	snapshot := newSeriesSnapshot(roots)
+	p.sharedSeries = newSeriesBinding(snapshot)
+	snapshot.release()
 	return p, be, identities
 }
 

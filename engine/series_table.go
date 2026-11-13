@@ -30,8 +30,9 @@ func (h *seriesRootHandle) release() {
 
 // Parts retain one snapshot lease until their last reader and owner have drained.
 type seriesSnapshot struct {
-	refs  atomic.Int32
-	roots []*seriesRootHandle
+	refs    atomic.Int32
+	roots   []*seriesRootHandle
+	retired int
 }
 
 func newSeriesSnapshot(roots []*seriesRootHandle) *seriesSnapshot {
@@ -135,7 +136,9 @@ func (s *seriesSnapshot) visit(ctx context.Context, matchers []fetch.Matcher, vi
 	return nil
 }
 
-func (e *Engine) prepareSeriesRoots(ctx context.Context, bindings []bucketindex.SeriesRoot) (*seriesSnapshot, error) {
+func (e *Engine) prepareSeriesRoots(
+	ctx context.Context, bindings []bucketindex.SeriesRoot, incomingRetired ...[]bucketindex.SeriesRoot,
+) (*seriesSnapshot, error) {
 	if len(bindings) > 0 {
 		if err := e.validateSeparateSeries(); err != nil {
 			return nil, err
@@ -144,7 +147,15 @@ func (e *Engine) prepareSeriesRoots(ctx context.Context, bindings []bucketindex.
 			return nil, errors.New("engine: separate series catalog requires opt-in")
 		}
 	}
-	merged, err := bucketindex.MergeSeriesRoots(e.seriesTable.bindings(), bindings)
+	retired := e.seriesRetired
+	if len(incomingRetired) > 0 {
+		var err error
+		retired, err = bucketindex.MergeSeriesRoots(retired, incomingRetired[0])
+		if err != nil {
+			return nil, err
+		}
+	}
+	merged, _, err := bucketindex.MergeSeriesCatalog(e.seriesTable.bindings(), retired, bindings, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -177,13 +188,25 @@ func (e *Engine) prepareSeriesRoots(ctx context.Context, bindings []bucketindex.
 		}
 		roots = append(roots, found)
 	}
-	return newSeriesSnapshot(roots), nil
+	next := newSeriesSnapshot(roots)
+	next.retired = len(retired)
+	return next, nil
 }
 
-func (e *Engine) installSeriesRootsLocked(ctx context.Context, bindings []bucketindex.SeriesRoot) error {
-	next, err := e.prepareSeriesRoots(ctx, bindings)
+func (e *Engine) installSeriesRootsLocked(
+	ctx context.Context, bindings []bucketindex.SeriesRoot, retired ...[]bucketindex.SeriesRoot,
+) error {
+	next, err := e.prepareSeriesRoots(ctx, bindings, retired...)
 	if err != nil {
 		return err
+	}
+	if len(retired) > 0 {
+		merged, err := bucketindex.MergeSeriesRoots(e.seriesRetired, retired[0])
+		if err != nil {
+			next.release()
+			return err
+		}
+		e.seriesRetired = merged
 	}
 	old := e.seriesTable
 	e.seriesTable = next

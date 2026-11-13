@@ -94,6 +94,9 @@ func (e *Engine) sweepOrphansLocked(ctx context.Context) error {
 	for _, binding := range e.seriesTable.bindings() {
 		live[binding.Prefix] = struct{}{}
 	}
+	for _, binding := range e.seriesRetired {
+		live[binding.Prefix] = struct{}{}
+	}
 
 	// A wanted part's objects are not orphans, they are what is left of it. Deleting the readable
 	// remainder of a part repair is about to fetch destroys evidence and buys nothing: the want

@@ -547,3 +547,8 @@ Descriptor exhaustion (`EMFILE`/`ENFILE`) permits one bounded idle-eviction retr
 current-generation handles with no actual reader lease may be evicted even while their
 part is active. Actual opened leases remain protected. If a repair races a later reopen,
 the generation fence reports a changed-object error instead of mixing metadata and bytes.
+
+Catalog v10 adds exact retired series-root bindings. Catalog union merges retirements first and
+filters active roots, preserving compaction across CAS retries. v9 catalogs remain readable and
+are emitted until the first retirement; pre-v10 readers reject compacted catalogs. Every reader
+and writer of a standalone SeparateSeries store must be upgraded before its first compaction.

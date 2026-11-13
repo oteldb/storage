@@ -927,7 +927,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			if len(ix.SeriesRoots) > 0 {
+			if len(ix.SeriesRoots) > 0 || len(ix.RetiredSeriesRoots) > 0 {
 				return errors.New("recordengine: separate series catalogs are unsupported")
 			}
 			return nil

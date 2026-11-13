@@ -142,6 +142,9 @@ func (e *Engine) commitOnceLocked(ctx context.Context, parts []*part, epoch uint
 	e.allocated = ix.AllocatedBlocks
 	e.catalog = ix.Catalog
 	e.pendingHoles = nil
+	if e.cfg.SeparateSeries {
+		e.rebindSeriesPartsLocked(parts, ix.SeriesRoots, len(ix.RetiredSeriesRoots))
+	}
 
 	return true, nil
 }
@@ -165,7 +168,7 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	if err := e.validateSeriesCatalog(ix); err != nil {
 		return err
 	}
-	if err := e.installSeriesRootsLocked(ctx, ix.SeriesRoots); err != nil {
+	if err := e.installSeriesRootsLocked(ctx, ix.SeriesRoots, ix.RetiredSeriesRoots); err != nil {
 		return err
 	}
 
@@ -326,10 +329,11 @@ func (e *Engine) nextIndexLocked(ctx context.Context, parts []*part, epoch uint6
 		// through untouched: they count flushes of WALs this engine has never seen, and a commit
 		// that stamped its own number over one of them would make that node replay records its
 		// parts already hold, or skip records it still holds only in memory (#397).
-		FlushedEpoch: e.anonEpoch,
-		Epochs:       slices.Clone(e.epochs),
-		Generation:   e.generation,
-		SeriesRoots:  e.seriesTable.bindings(),
+		FlushedEpoch:       e.anonEpoch,
+		Epochs:             slices.Clone(e.epochs),
+		Generation:         e.generation,
+		SeriesRoots:        e.seriesTable.bindings(),
+		RetiredSeriesRoots: slices.Clone(e.seriesRetired),
 	}
 	ix.SetWriterEpoch(e.cfg.WriterID, epoch, e.generation)
 	ix.Epochs = bucketindex.TrimWriters(ix.Epochs, e.cfg.WriterID, bucketindex.MaxWriters)
@@ -647,7 +651,7 @@ func (e *Engine) validateSeriesCatalog(ix *bucketindex.Index) error {
 	if err := e.validateSeparateSeries(); err != nil {
 		return err
 	}
-	if len(ix.SeriesRoots) > 0 && !e.cfg.SeparateSeries {
+	if (len(ix.SeriesRoots) > 0 || len(ix.RetiredSeriesRoots) > 0) && !e.cfg.SeparateSeries {
 		return errors.New("engine: separate series catalog requires SeparateSeries")
 	}
 	if e.cfg.SeparateSeries && len(ix.SeriesRoots) == 0 && len(ix.Entries) > 0 {
@@ -669,7 +673,7 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 	if err := e.validateSeriesCatalog(ix); err != nil {
 		return nil, nil, err
 	}
-	roots, err := e.prepareSeriesRoots(ctx, ix.SeriesRoots)
+	roots, err := e.prepareSeriesRoots(ctx, ix.SeriesRoots, ix.RetiredSeriesRoots)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -790,9 +794,13 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 // adoptLoadLocked makes l the engine's state and lifts the commit fence. It cannot fail, which is
 // what makes a load all-or-nothing. Caller holds e.mu.
 func (e *Engine) adoptLoadLocked(l *indexLoad) {
+	e.seriesRetired, _ = bucketindex.MergeSeriesRoots(e.seriesRetired, l.ix.RetiredSeriesRoots)
 	oldRoots := e.seriesTable
 	e.seriesTable, l.roots = l.roots, nil
 	oldRoots.release()
+	if e.cfg.SeparateSeries {
+		e.rebindSeriesPartsLocked(l.parts, l.ix.SeriesRoots, len(l.ix.RetiredSeriesRoots))
+	}
 	kept := make(map[*part]struct{}, len(l.parts))
 	for _, p := range l.parts {
 		kept[p] = struct{}{}

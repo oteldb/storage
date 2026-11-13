@@ -427,7 +427,7 @@ type part struct {
 	// delete.
 	refs           atomic.Int32
 	readersClosing atomic.Bool
-	sharedSeries   *seriesSnapshot
+	sharedSeries   *seriesBinding
 	sharedClose    sync.Once
 
 	// seriesMaxMu guards seriesMax, the per-series watermarks of [part.forEachSeriesMaxTime]. A

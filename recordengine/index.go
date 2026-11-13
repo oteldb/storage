@@ -147,7 +147,7 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 
 		return errors.Wrap(err, "reload bucket index")
 	}
-	if len(ix.SeriesRoots) > 0 {
+	if len(ix.SeriesRoots) > 0 || len(ix.RetiredSeriesRoots) > 0 {
 		return errors.New("recordengine: separate series catalogs are unsupported")
 	}
 
@@ -572,7 +572,7 @@ func (e *Engine) readIndexLocked(ctx context.Context) (*indexLoad, []string, err
 
 		return nil, nil, errors.Wrap(err, "load bucket index")
 	}
-	if len(ix.SeriesRoots) > 0 {
+	if len(ix.SeriesRoots) > 0 || len(ix.RetiredSeriesRoots) > 0 {
 		return nil, nil, errors.New("recordengine: separate series catalogs are unsupported")
 	}
 

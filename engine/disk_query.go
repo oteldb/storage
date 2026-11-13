@@ -167,6 +167,8 @@ func (p *enginePlan) selectDiskPart(
 			return err
 		}
 	}
+	ctx, release := withPartSeriesSnapshot(ctx, pt)
+	defer release()
 	workspace, err := pt.diskSeriesWorkspace(ctx, len(r.Matchers))
 	if err != nil {
 		return err

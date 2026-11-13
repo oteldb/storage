@@ -108,7 +108,8 @@ complete cluster inventory; `Owned` separately names held compaction claims.
   per engine (512 MiB default, allocated on demand); legacy resident registries remain unchanged. Sidecars share parent catalog
   publication, replication and repair. `MetricSeparateSeries` additionally separates immutable
   descriptor/postings runs from numeric parts for opted-in fresh standalone stores. Catalog v9
-  publishes both sets atomically; cluster use and metadata reclamation are unavailable. The maintenance workspace allowance is separate from head bytes.
+  publishes both sets atomically; v10 retirement bindings preserve bounded metadata-run compaction
+  across catalog retries. Cluster use and physical metadata reclamation remain unavailable. The maintenance workspace allowance is separate from head bytes.
   Catalog CAS/rebase admits ingestion, then installs a coherent read view before WAL checkpoint.
   Close cancels queued work and drains both workers. See `engine/ARCH.md` for lifetime and budgets.
 - **Read-only** — `WithReadOnly()` opens a handle that never mutates the backend: the sweep-nothing
