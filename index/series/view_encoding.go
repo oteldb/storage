@@ -13,12 +13,26 @@ func (v View) Context(i int) (signal.Resource, signal.Scope) {
 }
 
 // AttributeCount returns the number of point attributes on identity i.
-func (v View) AttributeCount(i int) int { return len(v.keys[v.rows[i].keys]) }
+func (v View) AttributeCount(i int) int {
+	r := v.rows[i]
+	if r.keys&templateFlag != 0 {
+		return len(v.templates[r.keys&^templateFlag].fields)
+	}
+	return len(v.keys[r.keys])
+}
 
 // EncodedAttributes visits identity i's point attributes in stored order.
 // The borrowed keys and type-tagged values must not be mutated.
 func (v View) EncodedAttributes(i int, visit func(key, encodedValue []byte)) {
 	r := v.rows[i]
+	if r.keys&templateFlag != 0 {
+		t := v.templates[r.keys&^templateFlag]
+		for _, f := range t.fields {
+			name, value := v.encodedField(r, f, t)
+			visit(name, value)
+		}
+		return
+	}
 	for j, key := range v.keys[r.keys] {
 		visit(v.symbols[key], v.symbols[v.values[int(r.offset)+j]])
 	}
@@ -30,6 +44,9 @@ func (v View) AppendCanonical(dst []byte, i int) []byte {
 	c := v.contexts[r.context]
 	dst = c.resource.AppendHashInput(dst)
 	dst = c.scope.AppendHashInput(dst)
+	if r.keys&templateFlag != 0 {
+		return v.appendTemplateCanonical(dst, r)
+	}
 	keys := v.keys[r.keys]
 	dst = binary.AppendUvarint(dst, uint64(len(keys)))
 	for j, key := range keys {

@@ -13,7 +13,7 @@ import (
 // The index owns its copy; the source view can be discarded afterward.
 func (ix *Index) AddView(v View, i int) signal.SeriesID {
 	r := v.rows[i]
-	if _, ok := ix.byID[r.id]; ok {
+	if _, ok := ix.byID.get(r.id, ix.rows); ok {
 		return r.id
 	}
 	if uint64(len(ix.rows)) > math.MaxUint32 {
@@ -21,21 +21,25 @@ func (ix *Index) AddView(v View, i int) signal.SeriesID {
 	}
 	c := v.contexts[r.context]
 	context := ix.internContext(c.resource, c.scope)
-	keys := uint32(0)
-	if r.keys != 0 {
-		ix.kbuf = ix.kbuf[:0]
-		for _, key := range v.keys[r.keys] {
-			ix.kbuf = binary.LittleEndian.AppendUint32(ix.kbuf, uint32(ix.sym.Intern(v.symbols[key])))
+	var keys uint32
+	var offset uint64
+	if ix.templates == nil && r.keys&templateFlag == 0 {
+		if r.keys != 0 {
+			ix.kbuf = ix.kbuf[:0]
+			for _, key := range v.keys[r.keys] {
+				ix.kbuf = binary.LittleEndian.AppendUint32(ix.kbuf, uint32(ix.sym.Intern(v.symbols[key])))
+			}
+			keys = ix.internKeyBuffer(len(v.keys[r.keys]))
 		}
-		keys = ix.internKeyBuffer(len(v.keys[r.keys]))
+		offset = uint64(len(ix.values))
+		for j := range v.keys[r.keys] {
+			ix.values = append(ix.values, ix.sym.Intern(v.symbols[v.values[int(r.offset)+j]]))
+		}
+	} else {
+		keys, offset = ix.copyAttributes(v, i)
 	}
-	offset := uint64(len(ix.values))
-	for j := range v.keys[r.keys] {
-		ix.values = append(ix.values, ix.sym.Intern(v.symbols[v.values[int(r.offset)+j]]))
-	}
-	ix.byID[r.id] = uint32(len(ix.rows))
+	ix.byID.put(r.id, uint32(len(ix.rows)), ix.rows)
 	ix.rows = append(ix.rows, row{id: r.id, offset: offset, context: context, keys: keys})
-	ix.bytes += memsize.MapEntry[signal.SeriesID, uint32]()
 	return r.id
 }
 
@@ -60,6 +64,9 @@ func (ix *Index) internKeyBuffer(n int) uint32 {
 	keys := make([]symbols.ID, n)
 	for i := range keys {
 		keys[i] = symbols.ID(binary.LittleEndian.Uint32(ix.kbuf[i*4:]))
+	}
+	if uint64(len(ix.keys)) >= uint64(templateFlag) {
+		panic("series: attribute schema reference exhausted")
 	}
 	ref := uint32(len(ix.keys))
 	ix.keys = append(ix.keys, keys)

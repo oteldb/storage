@@ -12,10 +12,13 @@ import (
 
 // Index maps canonical series IDs to compact identities. Callers own synchronization.
 type Index struct {
-	byID   map[signal.SeriesID]uint32
+	byID   idRefs
 	rows   []row
 	sym    *symbols.Table
 	shared *Contexts
+
+	// Cached empty-context references are offset by one to reserve zero for unknown.
+	emptyResource, emptyScope uint64
 
 	resources []signal.Resource
 	scopes    []signal.Scope
@@ -29,6 +32,14 @@ type Index struct {
 
 	buf, kbuf, vbuf []byte
 	bytes           int64
+	templates       *AttributeTemplates
+	templateKeys    map[string]uint32
+	templateRows    []*attributeTemplate
+	templateLast    uint32
+	templateMatch   templateMatchPolicy
+	templateBuf     []byte
+	templateFields  []templateField
+	templatePolicy  templatePolicy
 }
 
 type row struct {
@@ -58,15 +69,20 @@ func New() *Index {
 
 // NewWithContexts shares immutable context payloads; callers budget contexts separately.
 func NewWithContexts(contexts *Contexts) *Index {
+	return NewWithAttributeTemplates(contexts, nil)
+}
+
+// NewWithAttributeTemplates shares fixed point attributes and resource/scope payloads independently.
+func NewWithAttributeTemplates(contexts *Contexts, templates *AttributeTemplates) *Index {
 	return &Index{
-		shared:  contexts,
-		byID:    make(map[signal.SeriesID]uint32),
-		sym:     symbols.New(),
-		res:     make(map[string]uint32),
-		scope:   make(map[string]uint32),
-		context: make(map[contextKey]uint32),
-		keysets: make(map[string]uint32),
-		keys:    [][]symbols.ID{nil},
+		shared:    contexts,
+		templates: templates,
+		sym:       symbols.New(),
+		res:       make(map[string]uint32),
+		scope:     make(map[string]uint32),
+		context:   make(map[contextKey]uint32),
+		keysets:   make(map[string]uint32),
+		keys:      [][]symbols.ID{nil},
 	}
 }
 
@@ -74,7 +90,14 @@ func NewWithContexts(contexts *Contexts) *Index {
 func (ix *Index) Add(s signal.Series) signal.SeriesID {
 	ix.buf = s.AppendHashInput(ix.buf[:0])
 	id := signal.HashBytes(ix.buf)
-	if _, ok := ix.byID[id]; ok {
+	return ix.AddEntry(Entry{ID: id, Series: s})
+}
+
+// AddEntry registers an identity using its already computed canonical ID.
+// Callers must provide entry.ID == entry.Series.Hash(); use [Index.AddChecked] for untrusted identities.
+func (ix *Index) AddEntry(entry Entry) signal.SeriesID {
+	id, s := entry.ID, entry.Series
+	if _, ok := ix.byID.get(id, ix.rows); ok {
 		return id
 	}
 	if uint64(len(ix.rows)) > math.MaxUint32 {
@@ -91,21 +114,15 @@ func (ix *Index) Add(s signal.Series) signal.SeriesID {
 		})
 		ix.bytes += memsize.MapEntry[contextKey, uint32]()
 	}
-	keys := ix.internKeys(s.Attributes)
-	offset := uint64(len(ix.values))
-	for i := range s.Attributes {
-		ix.vbuf = signal.AppendValue(ix.vbuf[:0], s.Attributes[i].Value)
-		ix.values = append(ix.values, ix.sym.Intern(ix.vbuf))
-	}
-	ix.byID[id] = uint32(len(ix.rows))
+	keys, offset := ix.storeAttributes(s.Attributes)
+	ix.byID.put(id, uint32(len(ix.rows)), ix.rows)
 	ix.rows = append(ix.rows, row{id: id, offset: offset, context: context, keys: keys})
-	ix.bytes += memsize.MapEntry[signal.SeriesID, uint32]()
 	return id
 }
 
 // Ref returns the engine-local ordinal of id. References are scoped to this index.
 func (ix *Index) Ref(id signal.SeriesID) (uint32, bool) {
-	ref, ok := ix.byID[id]
+	ref, ok := ix.byID.get(id, ix.rows)
 	return ref, ok
 }
 
@@ -117,7 +134,7 @@ func (ix *Index) Get(id signal.SeriesID) (signal.Series, bool) { return ix.GetIn
 
 // GetInto materializes id, reusing dst for its point attributes.
 func (ix *Index) GetInto(id signal.SeriesID, dst signal.Attributes) (signal.Series, bool) {
-	ref, ok := ix.byID[id]
+	ref, ok := ix.byID.get(id, ix.rows)
 	if !ok {
 		return signal.Series{}, false
 	}
@@ -126,7 +143,7 @@ func (ix *Index) GetInto(id signal.SeriesID, dst signal.Attributes) (signal.Seri
 
 // Has reports whether id is registered.
 func (ix *Index) Has(id signal.SeriesID) bool {
-	_, ok := ix.byID[id]
+	_, ok := ix.byID.get(id, ix.rows)
 	return ok
 }
 
@@ -153,13 +170,17 @@ func (ix *Index) ForEach(fn func(id signal.SeriesID, s signal.Series)) {
 
 // SizeBytes reports the owned resident structures and interned payloads.
 func (ix *Index) SizeBytes() int64 {
-	return ix.bytes + ix.sym.SizeBytes() + memsize.Slice(ix.rows) + memsize.Slice(ix.values) +
+	return ix.bytes + ix.byID.sizeBytes() + ix.sym.SizeBytes() + memsize.Slice(ix.rows) + memsize.Slice(ix.values) +
 		memsize.Slice(ix.resources) + memsize.Slice(ix.scopes) + memsize.Slice(ix.contexts) +
-		memsize.Slice(ix.keys) + memsize.Slice(ix.buf) + memsize.Slice(ix.kbuf) + memsize.Slice(ix.vbuf)
+		memsize.Slice(ix.keys) + memsize.Slice(ix.buf) + memsize.Slice(ix.kbuf) + memsize.Slice(ix.vbuf) +
+		memsize.Slice(ix.templateRows) + memsize.Slice(ix.templateBuf) + memsize.Slice(ix.templateFields)
 }
 
-//nolint:dupl // Resource and Scope retain distinct typed ownership and canonical keys.
 func (ix *Index) internResource(r signal.Resource) uint32 {
+	empty := len(r.SchemaURL) == 0 && len(r.Attributes) == 0
+	if empty && ix.emptyResource != 0 {
+		return uint32(ix.emptyResource - 1)
+	}
 	ix.kbuf = r.AppendHashInput(ix.kbuf[:0])
 	if ref, ok := ix.res[string(ix.kbuf)]; ok {
 		return ref
@@ -178,11 +199,17 @@ func (ix *Index) internResource(r signal.Resource) uint32 {
 	if !shared {
 		ix.bytes += memsize.Slice(stored.Attributes)
 	}
+	if empty {
+		ix.emptyResource = uint64(ref) + 1
+	}
 	return ref
 }
 
-//nolint:dupl // Resource and Scope retain distinct typed ownership and canonical keys.
 func (ix *Index) internScope(s signal.Scope) uint32 {
+	empty := len(s.Name) == 0 && len(s.Version) == 0 && len(s.SchemaURL) == 0 && len(s.Attributes) == 0
+	if empty && ix.emptyScope != 0 {
+		return uint32(ix.emptyScope - 1)
+	}
 	ix.kbuf = s.AppendHashInput(ix.kbuf[:0])
 	if ref, ok := ix.scope[string(ix.kbuf)]; ok {
 		return ref
@@ -201,6 +228,9 @@ func (ix *Index) internScope(s signal.Scope) uint32 {
 	if !shared {
 		ix.bytes += memsize.Slice(stored.Attributes)
 	}
+	if empty {
+		ix.emptyScope = uint64(ref) + 1
+	}
 	return ref
 }
 
@@ -218,6 +248,9 @@ func (ix *Index) internKeys(attrs signal.Attributes) uint32 {
 	keys := make([]symbols.ID, len(attrs))
 	for i := range keys {
 		keys[i] = symbols.ID(binary.LittleEndian.Uint32(ix.kbuf[i*4:]))
+	}
+	if uint64(len(ix.keys)) >= uint64(templateFlag) {
+		panic("series: attribute schema reference exhausted")
 	}
 	ref := uint32(len(ix.keys))
 	ix.keys = append(ix.keys, keys)

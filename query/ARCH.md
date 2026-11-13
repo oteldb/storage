@@ -38,6 +38,13 @@ Optional capabilities, discovered by walking the `Unwraper` decorator chain:
   decorators expose it; fanouts require an explicit implementation. `promql.CountSeriesGrid`
   declines hidden-label predicates/grouping or an absent capability with
   `ErrCountGridUnsupported`, so the embedder retains its full-aggregate fallback.
+  `MergeDisjoint` adds sequential grid-count fanout only under an explicit caller ownership
+  proof. The proof includes effective IDs after overflow/remapping and is invalidated before
+  overlap can be published. Ordinary `Merge` never sums child counts; sample fallback still
+  deduplicates IDs, including when the proof or a child capability is unavailable.
+  Instant `CountSeries`/`CountSeriesBy` can use a single-step presence grid when ordinary
+  counters are absent. Its width is the inclusive request window; aggregate bucketing
+  still declines synthetic one-step grids.
 
 - **`Limit`/`Reverse`** — ordered top-N. Filtering runs first, the limit selects over survivors.
   The result is a deliberate **superset** (rows tying at the boundary timestamp are kept), so the

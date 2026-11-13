@@ -1,0 +1,8 @@
+{
+  "archive_sha256": "2e422647a730f94785e41d3c64eb77ae00f75081f04c5bf4b2b8ad35cfe0a89a",
+  "identities": 1658,
+  "metric_names": 227,
+  "schemas": 26,
+  "normalization": "One captured instance/revision; injected revision removed; sensitive identifier values anonymized preserving lengths/cardinality; instance replaced during fanout.",
+  "extractor": "oteldb internal/promrw.Converter followed by storage signal/metric.Project; canonical identities retained in original first-seen order"
+}

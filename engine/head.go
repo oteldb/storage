@@ -101,10 +101,14 @@ func newHead() *head {
 	return newHeadWithContexts(nil)
 }
 
-func newHeadWithContexts(contexts *series.Contexts) *head {
+func newHeadWithContexts(contexts *series.Contexts, templates ...*series.AttributeTemplates) *head {
+	var pool *series.AttributeTemplates
+	if len(templates) > 0 {
+		pool = templates[0]
+	}
 	return &head{
 		sym:     symbols.New(),
-		series:  series.NewWithContexts(contexts),
+		series:  series.NewWithAttributeTemplates(contexts, pool),
 		post:    postings.NewDense(),
 		samples: make(map[signal.SeriesID]*sampleBuf),
 	}
@@ -141,7 +145,14 @@ func (h *head) residentIdentityBytes() int64 {
 // (only a lost or truncated identity object can produce one), and inventing an entry for it would
 // be worse than leaving the postings without it.
 func rebuildIdentity(snap series.View, live map[signal.SeriesID]struct{}, slots []uint32) *head {
-	out := &head{sym: symbols.New(), series: series.New(), post: postings.NewDense()}
+	return rebuildIdentityWithPools(snap, live, slots, nil, nil)
+}
+
+func rebuildIdentityWithPools(
+	snap series.View, live map[signal.SeriesID]struct{}, slots []uint32,
+	contexts *series.Contexts, templates *series.AttributeTemplates,
+) *head {
+	out := newHeadWithContexts(contexts, templates)
 
 	var attrs signal.Attributes
 	for i := range snap.Len() {
@@ -151,7 +162,7 @@ func rebuildIdentity(snap series.View, live map[signal.SeriesID]struct{}, slots 
 
 		ident := snap.At(i, attrs)
 		attrs = ident.Attributes
-		out.registerIndex(snap.ID(i), ident)
+		out.registerIndex(series.Entry{ID: snap.ID(i), Series: ident})
 		out.stateRefs = append(out.stateRefs, slots[i])
 	}
 
@@ -182,7 +193,7 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 	for i := snap.Len(); i < tail.Len(); i++ {
 		ident := tail.At(i, attrs)
 		attrs = ident.Attributes
-		rebuilt.registerIndex(tail.ID(i), ident)
+		rebuilt.registerIndex(series.Entry{ID: tail.ID(i), Series: ident})
 		rebuilt.stateRefs = append(rebuilt.stateRefs, h.stateRefs[i])
 	}
 
@@ -191,7 +202,7 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 		if _, revived := h.samples[id]; revived {
 			ident := snap.At(int(pos), attrs)
 			attrs = ident.Attributes
-			rebuilt.registerIndex(id, ident)
+			rebuilt.registerIndex(series.Entry{ID: id, Series: ident})
 			rebuilt.stateRefs = append(rebuilt.stateRefs, h.stateRefs[int(pos)])
 
 			continue
@@ -207,9 +218,10 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 }
 
 // register records and indexes an identity known not to be present.
-func (h *head) register(id signal.SeriesID, s signal.Series) {
+func (h *head) register(entry series.Entry) {
+	id := entry.ID
 	historical := h.seriesState(id)
-	h.registerIndex(id, s)
+	h.registerIndex(entry)
 	for len(h.stateRefs) < h.series.Len() {
 		h.stateRefs = append(h.stateRefs, h.slots.alloc())
 	}
@@ -225,9 +237,9 @@ func (h *head) register(id signal.SeriesID, s signal.Series) {
 	}
 }
 
-func (h *head) registerIndex(id signal.SeriesID, s signal.Series) {
-	h.series.Add(s)
-	h.indexLabels(id, s)
+func (h *head) registerIndex(entry series.Entry) {
+	h.series.AddEntry(entry)
+	h.indexLabels(entry.ID, entry.Series)
 }
 
 // noteTS advances series id's own watermark and the head-global one after a sample is admitted.
@@ -258,7 +270,7 @@ func (h *head) append(s signal.Series, ts int64, value float64, oooWindow int64)
 	logSeries = state.buffer == nil
 	ref := state.ref
 	if !state.known {
-		h.register(id, s)
+		h.register(series.Entry{ID: id, Series: s})
 		ref, _ = h.series.Ref(id)
 	}
 	buf := h.bufForRef(id, ref)
@@ -357,7 +369,7 @@ func (h *head) admitNew(
 	}
 
 	s = materialize()
-	h.register(id, s)
+	h.register(series.Entry{ID: id, Series: s})
 
 	return admitted, id, true, s, false
 }
@@ -374,7 +386,7 @@ func (h *head) appendOverflow(ov signal.Series, ts int64, value, sf float64) (ad
 	logSeries := buf == nil
 	if buf == nil {
 		if !state.known {
-			h.register(oid, ov)
+			h.register(series.Entry{ID: oid, Series: ov})
 			ref, _ = h.series.Ref(oid)
 		}
 		buf = h.bufForRef(oid, ref)
@@ -456,7 +468,7 @@ func (h *head) bufFor(id signal.SeriesID) *sampleBuf {
 func (h *head) registerSeries(s signal.Series) {
 	id := s.Hash()
 	if !h.series.Has(id) {
-		h.register(id, s)
+		h.register(series.Entry{ID: id, Series: s})
 	}
 }
 

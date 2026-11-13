@@ -302,7 +302,7 @@ func (b *walBatch) apply(h *head) {
 		a := &b.accs[k]
 
 		if a.register && !h.series.Has(id) {
-			h.register(id, a.series)
+			h.register(series.Entry{ID: id, Series: a.series})
 		}
 
 		ref := a.identityRef

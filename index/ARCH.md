@@ -33,7 +33,12 @@ identity/postings indexes, with bounded ranged reads and typed local-reference p
 `SeriesID ↔ Series`. Canonical hashes and durable formats use the full typed identity.
 `Index.AddChecked` verifies an expected canonical hash before changing identity state and returns
 the encoded length, so checked output builders do not encode/hash the identity twice. The ordinary
-`Index.Add` ingestion path is unchanged.
+`Index.Add` computes the canonical hash; `Index.AddEntry` accepts the existing `Entry` (ID plus
+identity) from trusted projection or validated readers, avoiding that encoding and hash. It still
+owns all retained payloads. Untrusted identities use `AddChecked`.
+Resident lookup keys use the low 64 bits, then verify the high half against the stored row.
+Low-half collisions use a full-ID overflow map. Canonical IDs and durable formats remain 128-bit.
+
 The resident registry uses 32-byte rows: hash, value-arena offset, shared resource/scope
 context, and shared attribute-name schema. Values occupy four-byte typed-symbol references;
 attribute-name sequences are stored once per schema rather than repeated for every series.
@@ -53,7 +58,24 @@ resident registry.
 publishing entries, including slack for mostly empty map groups. It never evicts or recycles borrowed storage; full shards use ordinary local
 interning. The caller budgets the pool separately; index sizes exclude shared attribute arrays.
 Point symbols, local references, postings, admission watermarks and canonical IDs remain local.
+Each registry caches its empty resource/scope references, skipping canonical encoding and map
+lookups after first sight; scope name, version and schema URL still distinguish nonempty contexts.
 An originating index can disappear while pool entries or other index views still retain payloads.
+
+`AttributeTemplates` optionally shares fixed point-attribute combinations across registries.
+Templates own preencoded canonical segments and pointer-free scalar descriptors; rows retain
+only positional variable-value symbols. Field offsets refer directly to the canonical storage.
+A bounded evidence table requires repeated new registrations before retaining a combination;
+the heuristic does not guarantee resident break-even, and earlier flat rows stay immutable.
+Low-recurrence input temporarily bypasses candidate encoding,
+with periodic retries so workload changes can restore sharing. Duplicate IDs add no evidence.
+The caller charges the pool separately; full shards fall back to ordinary local tuples. Templates
+are immutable and never recycled while views can reference them. Canonical IDs and disk bytes do
+not change; resource/scope contexts and template pools remain independent.
+Registration first checks the previous local template by exact keys and typed fixed values,
+retaining only variable deltas on a match. A mismatch uses ordinary canonical-key lookup;
+signed zero, NaN payloads, raw booleans and nested values keep their exact identity encoding.
+Eight consecutive mismatches back off to one comparison per 64 registrations until locality returns.
 
 ## `postings`
 
