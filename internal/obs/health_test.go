@@ -74,6 +74,15 @@ func TestNumericMergePlanningMetrics(t *testing.T) {
 	}, seen)
 }
 
+func TestCanonicalVerificationCacheMetrics(t *testing.T) {
+	t.Parallel()
+	o, collect := newMetered(t)
+	o.Flush.VerificationCache(t.Context(), 3, 7)
+	rm := collect()
+	require.EqualValues(t, 3, counterSum(t, rm, "storage.series.verification_cache.requests", map[string]string{"result": "hit"}))
+	require.EqualValues(t, 7, counterSum(t, rm, "storage.series.verification_cache.requests", map[string]string{"result": "miss"}))
+}
+
 func TestCorruptionDetected(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

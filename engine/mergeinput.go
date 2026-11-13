@@ -240,6 +240,12 @@ func mergeWatermarkBound(ctx context.Context, p *part) (mergeInputBound, error) 
 }
 
 func mergeWatermarkBoundWithFallback(ctx context.Context, p *part, fallback bool) (mergeInputBound, error) {
+	if p.sharedSeries != nil {
+		// Shared descriptors require a validated bounded SMAX cursor; they never
+		// materialize the per-series watermark array or use timestamp fallback.
+		resident, open := watermark.MemoryBound()
+		return mergeInputBound{resident: resident, transient: open}, nil
+	}
 	p.seriesMaxMu.Lock()
 	cached := p.seriesMax != nil
 	bytes := memsize.Slice(p.seriesMax)

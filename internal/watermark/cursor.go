@@ -10,7 +10,7 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-const cursorEntries = (32 << 10) / entryWidth
+const cursorEntries = readerWindowBytes / entryWidth
 
 // Cursor reuses one bounded window of a validated immutable watermark sidecar.
 type Cursor struct {

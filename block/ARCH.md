@@ -659,3 +659,7 @@ Irregular cadence, a gap, a changed stride, the cap, a normal numeric append, `E
 flushes the pair. Logical rows are visible while staged; encoding and directory accounting happen
 once on flush. Residency and finishing bounds include owned fragments, assembled packets and the
 target compressor's transient memory. The exact metadata seal and payload CRC allocate no scratch.
+
+Streaming directory serialization is priced as per-column transient workspace when the backend
+actually streams writes. A buffering ObjectWriter keeps its retained directory charge. The
+ID column remains unstreamed and its compressed object stays charged while other columns finish.

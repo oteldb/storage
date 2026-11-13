@@ -2149,3 +2149,11 @@ Numeric fan-in is capped at 32 inputs. Memory preflight reruns the policy for ea
 fan-in instead of halving and skipping fitting runs. The input-half and output-floor memory
 checks, disk cap, rollup closure and input precedence remain mandatory. A larger ceiling
 permits wider fitting merges; it does not guarantee a 32-input merge under a small grant.
+
+Shared-series SAMPLE merges price SMAX as its checked 32-KiB reader/cursor workspace, not a
+materialized entry array. CRC/order validation still precedes use and unsupported bounded
+reads still fail; legacy watermark fallback keeps its whole-array bound. Native streaming
+column directories are transient finishing state. Buffered object writers retain their
+directory charge, and the unstreamed ID object stays charged while numeric columns finish.
+The convergence fixture verifies mostly-disjoint short-series input shrinks under the same
+grant and samples live heap during actual streamed column writes.

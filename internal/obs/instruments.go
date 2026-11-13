@@ -69,6 +69,13 @@ type Flush struct {
 	duration metric.Float64Histogram
 	rows     metric.Int64Histogram
 	bytes    metric.Int64Counter
+	verified metric.Int64Counter
+}
+
+// VerificationCache records exact canonical-proof probes, independent of page caching.
+func (f *Flush) VerificationCache(ctx context.Context, hits, misses int64) {
+	f.verified.Add(ctx, hits, metric.WithAttributes(attribute.String("result", "hit")))
+	f.verified.Add(ctx, misses, metric.WithAttributes(attribute.String("result", "miss")))
 }
 
 // Record accounts one flush: the row count and part bytes written, and the wall time dur, for the
@@ -550,6 +557,7 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 	b := &imb{m: m}
 
 	flush := &Flush{
+		verified: b.counter("storage.series.verification_cache.requests", "canonical verification cache probes", "{identity}"),
 		total:    b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
 		duration: b.f64hist("storage.flush.duration", "flush wall time"),
 		rows:     b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),

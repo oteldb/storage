@@ -362,9 +362,12 @@ func (w *StreamWriter) ResidentBytes() int64 {
 func (w *StreamWriter) FinishBytes() int64 {
 	var retained, transient int64
 	if w.independentGroups {
-		// Directory and marks serialization may retain old and grown buffers together.
+		// Buffered objects retain their directories across column finishes. Streamed
+		// directories are written and released by finish; finishBytes prices their
+		// serialization and compression as one column's transient workspace.
+		streamed := backend.StreamsWrites(w.b)
 		for _, c := range w.cols {
-			if c.blk != nil {
+			if c.blk != nil && (!streamed || !c.blk.streams()) {
 				n := int64(len(c.blk.gLens) + 1)
 				retained += 3 * (64 + n*(4+4*binary.MaxVarintLen64))
 				if c.kind == KindInt64 {
@@ -895,11 +898,13 @@ func (c *streamColumn) finishBytes() (retained, transient int64) {
 	if len(c.runs) > 0 && c.comp != nil {
 		raw := len(c.runs) * runBytes
 		transient = max(transient, int64(raw)+c.comp.CompressTransient(raw, false))
+		// The ID object remains in buildInto's objects while numeric columns finish.
+		retained = 2 * int64(c.comp.CompressBound(raw)+objectCRCBytes)
 	}
 
 	bc := c.bytes
 	if bc == nil || c.blk == nil || bc.d == nil {
-		return 0, transient
+		return retained, transient
 	}
 
 	buffered := !c.blk.streams()

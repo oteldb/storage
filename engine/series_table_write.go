@@ -82,7 +82,11 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 			return err
 		}
 	}
+	beforeVerification := e.VerifiedIdentityCacheStats()
 	known, err := snapshot.knownIdentities(ctx, entries, e.verifiedIdentities)
+	afterVerification := e.VerifiedIdentityCacheStats()
+	e.cfg.Obs.Flush.VerificationCache(ctx, int64(afterVerification.Hits-beforeVerification.Hits),
+		int64(afterVerification.Misses-beforeVerification.Misses))
 	if err != nil {
 		return err
 	}
