@@ -72,3 +72,6 @@ func (r *RawReader) StreamPages() {
 	r.ids.streaming = true
 	r.records.cursor.streaming = true
 }
+
+// StreamDescriptors bounds descriptor scratch while keeping cached ID-page seeks.
+func (r *RawReader) StreamDescriptors() { r.records.cursor.streaming = true }

@@ -15,13 +15,14 @@ import (
 
 // Reader owns bounded page scratch for one operation. It is not concurrent-safe.
 type Reader struct {
-	ids       *cachedIDs
-	run       *Run
-	ctx       context.Context //nolint:containedctx // Reader owns operation-local I/O and scratch.
-	raw       *seriesindex.RawReader
-	budget    *readbudget.Budget
-	bytes     int64
-	streaming bool
+	ids               *cachedIDs
+	run               *Run
+	ctx               context.Context //nolint:containedctx // Reader owns operation-local I/O and scratch.
+	raw               *seriesindex.RawReader
+	budget            *readbudget.Budget
+	bytes             int64
+	streaming         bool
+	streamDescriptors bool
 }
 
 // NewReader reserves scratch and pins the run until Close.
@@ -188,12 +189,22 @@ func (r *Reader) StreamPages() {
 	}
 }
 
+// StreamDescriptors keeps descriptor pages local and ID pages in the bounded backend cache.
+func (r *Reader) StreamDescriptors() {
+	r.streamDescriptors = true
+	if r.raw != nil {
+		r.raw.StreamDescriptors()
+	}
+}
+
 func (r *Reader) rawReader() *seriesindex.RawReader {
 	if r.raw == nil {
 		r.ctx = r.run.ReaderContext(r.ctx)
 		r.raw = r.run.index.RawReader(r.ctx)
 		if r.streaming {
 			r.raw.StreamPages()
+		} else if r.streamDescriptors {
+			r.raw.StreamDescriptors()
 		}
 	}
 	return r.raw

@@ -23,6 +23,10 @@ against a pinned immutable snapshot before WAL acknowledgement. Known series ret
 watermarks and sample buffers; unknown identities use the ordinary registry/postings. The pressure
 target includes compact map entries, buffer headers and numeric slice capacities across the active
 and single frozen generation. This is a bounded stage, not a retained historical identity cache.
+Append proofs reuse validated ID-page offsets through the existing byte-bounded backend cache;
+descriptor pages stay in operation-local scratch. Each reader holds only its current pages, and
+`MaxPageBytes` includes decoded-page workspace. No full ID array or additional cache budget is required.
+The benefit depends on the ID-page working set fitting the shared cache; small caches can cost more.
 
 Filtered queries resolve immutable postings off-lock, validate the pinned snapshot, then copy only
 matching current head/frozen samples with the window's parts. New IDs entering the same snapshot do

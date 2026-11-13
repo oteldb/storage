@@ -101,7 +101,8 @@ func verifyKnownRoot(root *seriesRootHandle, b *walBatch, positions []int, canon
 		return err
 	}
 	defer func() { err = errors.Join(err, r.Close()) }()
-	r.StreamPages()
+	// Sparse proofs reuse ID-page offsets without filling the cache with descriptor payloads.
+	r.StreamDescriptors()
 	for _, i := range positions {
 		raw, found, err := r.LookupRaw(b.order[i])
 		if err != nil {
