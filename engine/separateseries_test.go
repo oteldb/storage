@@ -61,7 +61,7 @@ func TestSeparateSeriesLifecycle(t *testing.T) {
 	require.NoError(t, again.Flush(t.Context()))
 	ix, err = bucketindex.Load(t.Context(), be, "separated/"+bucketindex.Object)
 	require.NoError(t, err)
-	require.Len(t, ix.SeriesRoots, 2, "descriptor reused after numeric retention")
+	require.Len(t, ix.SeriesRoots, 1, "compacted descriptors are reused after numeric retention")
 	require.NoError(t, again.Close(t.Context()))
 }
 

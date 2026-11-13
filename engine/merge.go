@@ -105,7 +105,11 @@ func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool
 		log.Debug("merge no-op (nothing to compact)", zap.String("prefix", e.cfg.Prefix))
 	}
 
-	return res.parts > 0, nil
+	seriesChanged, err := e.compactSeriesRuns(ctx, opts.Background)
+	if err != nil {
+		return res.parts > 0, err
+	}
+	return res.parts > 0 || seriesChanged, nil
 }
 
 // merge compacts a bounded, size-tiered group of the engine's parts per opts and returns the number

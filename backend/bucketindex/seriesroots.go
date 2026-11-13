@@ -114,3 +114,63 @@ func decodeSeriesRoots(buf []byte) ([]SeriesRoot, []byte, error) {
 	}
 	return roots, buf, nil
 }
+
+// MergeSeriesCatalog carries root retirements across retries without reviving replaced runs.
+func MergeSeriesCatalog(roots, retired, incoming, incomingRetired []SeriesRoot) ([]SeriesRoot, []SeriesRoot, error) {
+	active, err := MergeSeriesRoots(roots, incoming)
+	if err != nil {
+		return nil, nil, err
+	}
+	removed, err := MergeSeriesRoots(retired, incomingRetired)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := MergeSeriesRoots(active, removed); err != nil {
+		return nil, nil, err
+	}
+	out := active[:0]
+	for _, root := range active {
+		if _, found := slices.BinarySearchFunc(removed, root, compareSeriesRoot); !found {
+			out = append(out, root)
+		}
+	}
+	return out, removed, nil
+}
+
+func validateSeriesCatalog(ix *Index) error {
+	if err := validateSeriesRoots(ix.SeriesRoots); err != nil {
+		return err
+	}
+	if err := validateSeriesRoots(ix.RetiredSeriesRoots); err != nil {
+		return err
+	}
+	active, _, err := MergeSeriesCatalog(ix.SeriesRoots, ix.RetiredSeriesRoots, nil, nil)
+	if err != nil {
+		return err
+	}
+	if len(active) != len(ix.SeriesRoots) {
+		return errors.Wrap(ErrCorrupt, "active series root is retired")
+	}
+	return nil
+}
+
+func decodeSeriesCatalogTail(ix *Index, buf []byte, ver uint8) error {
+	var err error
+	ix.SeriesRoots, buf, err = decodeSeriesRoots(buf)
+	if err != nil {
+		return err
+	}
+	if ver >= 10 {
+		ix.RetiredSeriesRoots, buf, err = decodeSeriesRoots(buf)
+		if err != nil {
+			return err
+		}
+		if err := validateSeriesCatalog(ix); err != nil {
+			return err
+		}
+	}
+	if len(buf) != 0 {
+		return errors.Wrap(ErrCorrupt, "trailing series roots data")
+	}
+	return nil
+}

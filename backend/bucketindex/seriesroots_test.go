@@ -201,3 +201,42 @@ func TestSeriesRootsAreIndependentOfSamples(t *testing.T) {
 	require.Empty(t, ix.Catalog)
 	require.Empty(t, ix.Holes())
 }
+
+func TestSeriesRetirementRoundTrip(t *testing.T) {
+	t.Parallel()
+	ix := &bucketindex.Index{SeriesRoots: []bucketindex.SeriesRoot{seriesRoot("merged", 3)}, RetiredSeriesRoots: []bucketindex.SeriesRoot{seriesRoot("a", 1), seriesRoot("b", 2)}}
+	raw := ix.AppendBinary(nil)
+	require.Equal(t, byte(10), raw[2])
+	decoded, err := bucketindex.Decode(raw)
+	require.NoError(t, err)
+	require.Equal(t, ix, decoded)
+	require.Equal(t, raw, decoded.AppendBinary(nil))
+	legacy := slices.Clone(raw)
+	legacy[2] = 9
+	_, err = bucketindex.Decode(legacy)
+	require.ErrorIs(t, err, bucketindex.ErrCorrupt, "v9 must not silently ignore retirement records")
+	for n := 15; n < len(raw); n++ {
+		_, err := bucketindex.Decode(raw[:n])
+		require.ErrorIs(t, err, bucketindex.ErrCorrupt)
+	}
+}
+
+func TestSeriesRetirementRebase(t *testing.T) {
+	t.Parallel()
+	a, b, c := seriesRoot("a", 1), seriesRoot("b", 2), seriesRoot("c", 3)
+	active, retired, err := bucketindex.MergeSeriesCatalog([]bucketindex.SeriesRoot{a, b}, nil, []bucketindex.SeriesRoot{c}, []bucketindex.SeriesRoot{a, b})
+	require.NoError(t, err)
+	require.Equal(t, []bucketindex.SeriesRoot{c}, active)
+	require.Equal(t, []bucketindex.SeriesRoot{a, b}, retired)
+	active, retired, err = bucketindex.MergeSeriesCatalog(active, retired, []bucketindex.SeriesRoot{a, b}, nil)
+	require.NoError(t, err)
+	require.Equal(t, []bucketindex.SeriesRoot{c}, active)
+	require.Len(t, retired, 2)
+	_, _, err = bucketindex.MergeSeriesCatalog(nil, retired, []bucketindex.SeriesRoot{seriesRoot("a", 9)}, nil)
+	require.ErrorIs(t, err, bucketindex.ErrCorrupt)
+	invalid := &bucketindex.Index{SeriesRoots: []bucketindex.SeriesRoot{a}, RetiredSeriesRoots: []bucketindex.SeriesRoot{a}}
+	_, err = invalid.Save(t.Context(), backend.Memory(), "index", backend.VersionAbsent)
+	require.ErrorIs(t, err, bucketindex.ErrCorrupt)
+	_, err = bucketindex.Decode(invalid.AppendBinary(nil))
+	require.ErrorIs(t, err, bucketindex.ErrCorrupt)
+}

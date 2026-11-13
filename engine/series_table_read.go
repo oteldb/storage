@@ -19,7 +19,9 @@ import (
 )
 
 func (p *part) sharedSeriesWorkspace(ctx context.Context, matchers int) (int64, error) {
-	n := buildbudget.Add(p.sharedSeries.workspace(matchers), 64<<10)
+	snapshot := p.acquireSeriesSnapshot(ctx)
+	defer snapshot.release()
+	n := buildbudget.Add(snapshot.workspace(matchers), 64<<10)
 	n = buildbudget.Add(n, buildbudget.Add(memsize.MapBase,
 		buildbudget.Mul(int64(p.index.seriesCount()), 2*memsize.MapEntry[signal.SeriesID, struct{}]())))
 	stats, err := p.sharedStatsWorkspace(ctx)
@@ -54,6 +56,7 @@ func (p *enginePlan) selectSharedDiskParts(ctx context.Context, r fetch.Request,
 	if err != nil {
 		return err
 	}
+	defer snapshot.release()
 	if len(snapshot.roots) == 0 {
 		return nil
 	}
@@ -86,7 +89,13 @@ func (p *enginePlan) selectSharedDiskParts(ctx context.Context, r fetch.Request,
 }
 
 func (p *enginePlan) sharedQuerySnapshot() (*seriesSnapshot, error) {
-	snapshot := &seriesSnapshot{}
+	snapshot := newSeriesSnapshot(nil)
+	ok := false
+	defer func() {
+		if !ok {
+			snapshot.release()
+		}
+	}()
 	var roots map[bucketindex.SeriesRoot]struct{}
 	for _, pt := range p.liveParts {
 		if pt.sharedSeries == nil {
@@ -98,18 +107,23 @@ func (p *enginePlan) sharedQuerySnapshot() (*seriesSnapshot, error) {
 			}
 			roots = make(map[bucketindex.SeriesRoot]struct{})
 		}
-		for _, root := range pt.sharedSeries.roots {
+		held := pt.sharedSeries.acquire()
+		for _, root := range held.roots {
 			if _, exists := roots[root.binding]; exists {
 				continue
 			}
 			n := 2*memsize.MapEntry[bucketindex.SeriesRoot, struct{}]() + 2*memsize.Of[*seriesRootHandle]()
 			if err := p.reserveSelection(n); err != nil {
+				held.release()
 				return nil, err
 			}
+			root.acquire()
 			roots[root.binding] = struct{}{}
 			snapshot.roots = append(snapshot.roots, root)
 		}
+		held.release()
 	}
+	ok = true
 	return snapshot, nil
 }
 
@@ -172,7 +186,9 @@ func (p *part) visitSharedDiskSeries(ctx context.Context, matchers []fetch.Match
 		return err
 	}
 	seen := make(map[signal.SeriesID]struct{})
-	return p.sharedSeries.visit(ctx, matchers, func(id signal.SeriesID, raw []byte) error {
+	snapshot := p.acquireSeriesSnapshot(ctx)
+	defer snapshot.release()
+	return snapshot.visit(ctx, matchers, func(id signal.SeriesID, raw []byte) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -199,7 +215,9 @@ func (p *part) diskSeriesLookupRaw(ctx context.Context, id signal.SeriesID, visi
 		return false, err
 	}
 	if p.sharedSeries != nil {
-		found, err := p.sharedSeries.lookup(ctx, id, visit)
+		snapshot := p.acquireSeriesSnapshot(ctx)
+		defer snapshot.release()
+		found, err := snapshot.lookup(ctx, id, visit)
 		if err == nil && !found {
 			return false, errors.Wrap(seriesindex.ErrCorrupt, "shared descriptor missing numeric series")
 		}
@@ -320,7 +338,9 @@ func (p *part) validateSharedSeriesIDs(ctx context.Context) error {
 	}
 	defer budget.Release(n)
 	seen := make(map[signal.SeriesID]struct{})
-	for _, root := range p.sharedSeries.roots {
+	snapshot := p.acquireSeriesSnapshot(ctx)
+	defer snapshot.release()
+	for _, root := range snapshot.roots {
 		r, err := root.run.NewReader(ctx)
 		if err != nil {
 			return err

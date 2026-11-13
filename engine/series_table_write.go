@@ -47,8 +47,7 @@ func attachSharedSeriesFrom(p *part, s *seriesSnapshot) error {
 	if s == nil {
 		return errors.New("engine: missing shared series roots")
 	}
-	p.sharedSeries = s
-	s.acquire()
+	p.sharedSeries = newSeriesBinding(s)
 	return nil
 }
 
@@ -137,6 +136,7 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 	}
 	roots = append(roots, &seriesRootHandle{binding: binding, run: run})
 	next := newSeriesSnapshot(roots)
+	next.retired = len(e.seriesRetired)
 	old := e.seriesTable
 	e.seriesTable = next
 	old.release()

@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/signal"
@@ -87,6 +88,10 @@ func (p *part) mayContainDiskID(id signal.SeriesID) bool {
 
 func (e *Engine) identityBytesLocked() int64 {
 	n := e.head.identityBytes() + e.seriesIDs.SizeBytes() + e.identityOrder.bytes.Load()
+	n += int64(cap(e.seriesRetired)) * memsize.Of[bucketindex.SeriesRoot]()
+	for _, root := range e.seriesRetired {
+		n += int64(len(root.Prefix))
+	}
 	for _, p := range e.parts {
 		n += p.idBloom.Load().sizeBytes()
 	}

@@ -2068,10 +2068,17 @@ numeric parts carry SIDX, coverage watermarks and aggregate statistics, with a m
 Catalog v9 names metadata roots independently of sample entries and publishes their union with
 numeric parts and the WAL checkpoint in one CAS. Runs sync before publication; failed commits
 retain pending roots through retries and reloads. A missing or invalid root fences loading.
-Part-held snapshot leases keep roots open until retired readers drain. Numeric membership, never
+Part bindings acquire immutable operation snapshots under a short mutex; confirmed catalog
+publication advances bindings only across retirements; ordinary flushes retain their existing views.
+Existing operations retain old root leases, and pending numeric outputs retain their staged metadata
+leases through failed commits. Numeric membership, never
 metadata-run cardinality, determines active series and coverage; descriptors survive retention.
 
-Metadata roots are append-only: descriptor garbage collection and run compaction are unavailable.
+Metadata compaction streams at most eight roots through bounded output builders under ordinary merge
+admission. Catalog v10 carries exact retired root bindings, preventing stale-writer rebases from
+resurrecting compacted roots; uncompacted stores retain v9 encoding. Retirement records are retained
+and charged as identity metadata; compaction stops at 4096 records. Source objects are not deleted,
+so descriptor garbage collection remains unavailable.
 Clustered engines, replica refresh, unclaimed loading and Reset reject this mode. Existing sample
 catalogs require migration and are rejected; readers without the option reject v9 roots before
 mutating the catalog or sweeping objects. This mode does not change canonical IDs or WAL records.
@@ -2079,7 +2086,7 @@ mutating the catalog or sweeping objects. This mode does not change canonical ID
 Strict merge coverage uses a checked SMAX cursor with one 32 KiB window per input. SIDX and
 SMAX ordinals must name identical canonical IDs; known merge positions bypass repeated ID seeks.
 Validation never substitutes sample timestamps for missing coverage. Byte-based retention counts
-numeric parts only; append-only metadata roots require separate disk-capacity monitoring.
+numeric parts only; retained metadata source objects require separate disk-capacity monitoring.
 
 Separate metadata reserves one eighth of `SeriesCacheBytes` for a bounded
 LRU of validated, sorted `SeriesID` arrays. Exact binary search returns a descriptor ordinal or a

@@ -212,6 +212,7 @@ func FuzzDecode(f *testing.F) {
 		},
 	}).AppendBinary(nil))
 	f.Add(fullIndex().AppendBinary(nil))
+	f.Add((&bucketindex.Index{SeriesRoots: []bucketindex.SeriesRoot{seriesRoot("b", 2)}, RetiredSeriesRoots: []bucketindex.SeriesRoot{seriesRoot("a", 1)}}).AppendBinary(nil))
 	f.Add((&bucketindex.Index{SeriesRoots: []bucketindex.SeriesRoot{seriesRoot("a", 1), seriesRoot("b", 2)}}).AppendBinary(nil))
 	f.Add([]byte{
 		'B', 'I', 7, 1, 1, 'a', 2, 4, 1, 1, 1, 1, 2, 1, 2, 1, 3, 1, 5, 2, 0,
@@ -238,5 +239,6 @@ func FuzzDecode(f *testing.F) {
 		assert.Equal(t, ix.AllocatedBlocks, again.AllocatedBlocks)
 		assert.Equal(t, ix.Catalog, again.Catalog)
 		assert.Equal(t, ix.SeriesRoots, again.SeriesRoots)
+		assert.Equal(t, ix.RetiredSeriesRoots, again.RetiredSeriesRoots)
 	})
 }

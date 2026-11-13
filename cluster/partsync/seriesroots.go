@@ -19,7 +19,7 @@ func rejectSeriesCatalogBytes(raw []byte) error {
 }
 
 func rejectSeriesRoots(ix *bucketindex.Index) error {
-	if len(ix.SeriesRoots) > 0 {
+	if len(ix.SeriesRoots) > 0 || len(ix.RetiredSeriesRoots) > 0 {
 		return errSeparateSeries
 	}
 	return nil
