@@ -15,6 +15,12 @@ func (d blockDir) span(blk, rows int) (int, int) {
 	if blk < 0 {
 		return rows, rows
 	}
+	if d.chunks != nil {
+		if blk >= d.chunks.count {
+			return rows, rows
+		}
+		return int(d.chunks.row(blk)), int(d.chunks.row(blk + 1))
+	}
 	if d.rowStarts != nil {
 		if blk+1 >= len(d.rowStarts) {
 			return rows, rows
@@ -26,6 +32,9 @@ func (d blockDir) span(blk, rows int) (int, int) {
 }
 
 func (d blockDir) blockAt(row int) int {
+	if d.chunks != nil {
+		return d.chunks.blockAt(row)
+	}
 	if d.rowStarts == nil {
 		return row / d.blockRows
 	}
@@ -44,41 +53,10 @@ func readChunkRows(c *dirCursor, d *blockDir, chk dirCheck) error {
 			return errors.Wrap(ErrCorrupt, "chunks share a compression frame")
 		}
 	}
-	d.rowStarts = make([]int64, d.granules+1)
-	if chk.timeBounds {
-		d.minKeys = make([]int64, d.granules)
-		d.maxKeys = make([]int64, d.granules)
-	}
-	var sum, previous int64
-	for i := range d.granules {
-		n, err := c.uvarint("chunk rows")
-		if err != nil {
-			return err
-		}
-		if n == 0 || n > uint64(chk.maxBlockRows) || uint64(sum)+n > maxPartRows {
-			return errors.Wrap(ErrCorrupt, "invalid chunk row count")
-		}
-		sum += int64(n)
-		d.rowStarts[i+1] = sum
-		if chk.timeBounds {
-			delta, err := c.varint("chunk minimum")
-			if err != nil {
-				return err
-			}
-			span, err := c.varint("chunk maximum")
-			if err != nil {
-				return err
-			}
-			lo := previous + delta
-			hi := lo + span
-			if lo > hi {
-				return errors.Wrap(ErrCorrupt, "invalid chunk time bounds")
-			}
-			d.minKeys[i], d.maxKeys[i], previous = lo, hi, lo
-		}
-	}
-	if chk.rows > 0 && sum != int64(chk.rows) {
-		return errors.Wrap(ErrCorrupt, "chunk rows differ from manifest")
+	var err error
+	d.chunks, err = readChunkGeometry(c, d.granules, chk)
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -199,6 +177,9 @@ func (c *dirCursor) varint(field string) (int64, error) {
 // BlockTimeBounds returns independently checked int64 chunk bounds when recorded.
 func (d *Decoder) BlockTimeBounds(b int) (int64, int64, bool) {
 	directory := d.streams.dir
+	if directory.chunks != nil {
+		return directory.chunks.bounds(b)
+	}
 	if b < 0 || b >= len(directory.minKeys) {
 		return 0, 0, false
 	}

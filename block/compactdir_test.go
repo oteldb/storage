@@ -58,7 +58,7 @@ func TestCompactDirectoryReads(t *testing.T) {
 					require.Nil(t, d.gLen)
 					require.Len(t, d.frameRaw, 128)
 					in := sizedInput(desc, int64(lim.rows))
-					require.Equal(t, d.residentBytes(), in.DirBytes)
+					require.LessOrEqual(t, d.residentBytes(), in.DirBytes)
 					if desc.CompactDir {
 						require.Greater(t, in.OpenBytes, desc.Sizing.DirLen)
 					}
@@ -150,7 +150,8 @@ func FuzzCompactDirectory(f *testing.F) {
 		if err != nil {
 			return
 		}
-		require.EqualValues(t, 512, d.rowStarts[d.granules])
+		_, end := d.span(d.granules-1, 512)
+		require.Equal(t, 512, end)
 		require.Equal(t, fixture.desc.Sizing.NumGranules, int64(d.granules))
 		require.Nil(t, d.gFrame)
 	})

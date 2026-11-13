@@ -90,8 +90,14 @@ func TestBlockedCursorReusesMetricDecoders(t *testing.T) {
 			require.NoError(t, err)
 			floatBlocked, ok = floatCursor.(*blockedFloatCursor)
 			require.True(t, ok)
-			floatBlocked.streams.dir.rowStarts = append([]int64(nil), floatBlocked.streams.dir.rowStarts...)
-			floatBlocked.streams.dir.rowStarts[len(floatBlocked.streams.dir.rowStarts)-1]++
+			dir := &floatBlocked.streams.dir
+			starts := make([]int64, dir.granules+1)
+			for i := range dir.granules {
+				_, end := dir.span(i, len(values))
+				starts[i+1] = int64(end)
+			}
+			starts[len(starts)-1]++
+			dir.chunks, dir.rowStarts = nil, starts
 			for range len(values) - 16 {
 				_, err = floatCursor.Next()
 				require.NoError(t, err)

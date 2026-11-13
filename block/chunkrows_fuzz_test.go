@@ -55,8 +55,8 @@ func FuzzVariableChunkDirectory(f *testing.F) {
 		if err != nil {
 			return
 		}
-		require.Len(t, d.rowStarts, d.granules+1)
-		require.EqualValues(t, m.RowCount, d.rowStarts[d.granules])
+		_, end := d.span(d.granules-1, m.RowCount)
+		require.Equal(t, m.RowCount, end)
 		c := newColumnReader(desc, raw, compress.NewCompressor(compress.AlgorithmNone, 0), m.RowCount)
 		if timestamps {
 			_, _ = c.Int64(nil)

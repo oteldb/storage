@@ -196,6 +196,7 @@ type blockDir struct {
 	blockRows        int
 	rowStarts        []int64
 	minKeys, maxKeys []int64
+	chunks           *chunkGeometry
 	granules         int
 	frameOff         []int32  // cumulative byte offsets into data; len == nFrames+1
 	frameCRC         []uint32 // per frame: CRC32C over its compressed bytes; nil when unchecked
@@ -273,7 +274,11 @@ func (d blockDir) decompress(comp *compress.Compressor, dst []byte, f int, raw [
 
 // residentBytes is what the parsed directory holds.
 func (d blockDir) residentBytes() int64 {
-	return 4*int64(len(d.frameOff)+len(d.frameCRC)+len(d.frameRaw)) +
+	var chunks int64
+	if d.chunks != nil {
+		chunks = d.chunks.bytes()
+	}
+	return chunks + 4*int64(len(d.frameOff)+len(d.frameCRC)+len(d.frameRaw)) +
 		4*int64(len(d.gFrame)+len(d.gOff)+len(d.gLen)) + 8*int64(len(d.rowStarts)+len(d.minKeys)+len(d.maxKeys))
 }
 
@@ -308,6 +313,8 @@ const footerLenBytes = 4
 type dirCheck struct {
 	rows, maxBlockRows int
 	timeBounds         bool
+	timeRange          bool
+	minTime, maxTime   int64
 	compactDir         bool
 	dirComp            *compress.Compressor
 	checked            bool
@@ -323,6 +330,7 @@ func newDirCheck(desc ColumnDesc, lim decodeLimits) dirCheck {
 	chk := dirCheck{
 		checked: desc.Checked, rawMax: lim.frames, rawPerGranule: lim.framesPerGranule,
 		rows: lim.rows, maxBlockRows: desc.MaxBlockRows, timeBounds: desc.TimeBounds, compactDir: desc.CompactDir,
+		timeRange: desc.TimeBounds, minTime: desc.MinInt64, maxTime: desc.MaxInt64,
 	}
 	if desc.HasSizing {
 		sz := desc.Sizing
@@ -1495,7 +1503,8 @@ func (c *blockedCursor[T, C]) Next() (T, error) {
 			return zero, errors.Wrapf(err, "block %d", c.blk)
 		}
 
-		if (c.codec == chunk.CodecFloatGroups || c.streams.dir.rowStarts != nil) && c.cur.Len() != blockRowsAt(c.streams.dir, c.rows, c.blk) {
+		variable := c.streams.dir.rowStarts != nil || c.streams.dir.chunks != nil
+		if (c.codec == chunk.CodecFloatGroups || variable) && c.cur.Len() != blockRowsAt(c.streams.dir, c.rows, c.blk) {
 			return zero, errors.New("block: grouped cursor row mismatch")
 		}
 		c.opened = true

@@ -53,7 +53,7 @@ func (d *Decoder) VisitEncodedGranule(blk int, visit func(float64)) (EncodedGran
 	if blk < 0 || blk >= d.NumBlocks() {
 		return EncodedGranule{}, errors.New("block: encoded granule out of range")
 	}
-	if d.streams.dir.rowStarts == nil || d.streams.dir.frameCRC == nil ||
+	if (d.streams.dir.rowStarts == nil && d.streams.dir.chunks == nil) || d.streams.dir.frameCRC == nil ||
 		(d.kind != KindInt64 || d.codec != chunk.CodecAdaptiveTimestamps) &&
 			(d.kind != KindFloat64 || d.codec != chunk.CodecFloatGroups) {
 		return EncodedGranule{}, errors.New("block: unsupported encoded granule")

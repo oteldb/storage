@@ -613,8 +613,11 @@ cursor reads use the same geometry. Decoded counts, frame ownership and manifest
 older readers reject the unknown extension bits rather than interpreting a different row layout.
 
 Timestamp chunk directories carry pruning bounds and use adaptive cadence encoding. Variable parts return an empty legacy `Marks`
-index; callers use `Decoder.BlockTimeBounds`. The directory's row and bounds arrays are included
-in input, scan, clone and finishing memory estimates.
+index; callers use `Decoder.BlockTimeBounds`. Parsed row starts and time bounds use fixed-width
+packed bytes with constant-time access; uniform row counts and constant bounds need no arrays.
+Widths follow manifest row/time bounds, which are checked while parsing. Rows wider than uint32
+and timestamps spanning int64 retain their full range. Clones share immutable owned geometry;
+input and scan estimates include its arrays and header without retaining encoded directory bytes.
 
 The variable descriptor stores the row cap after sizing fields. After the existing directory's
 stream lengths, each chunk stores its row count and, for `TimeBounds`, signed delta minimum and
