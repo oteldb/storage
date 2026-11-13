@@ -41,6 +41,8 @@ func (h *knownSampleHead) sizeBytes() int64 {
 }
 
 // prepareKnownSamples verifies canonical bytes before WAL acknowledgement, without retaining labels.
+//
+//nolint:contextcheck,nolintlint // Append has no context; writer ownership pins this bounded metadata operation.
 func (e *Engine) prepareKnownSamples(b *walBatch) error {
 	if !e.cfg.KnownSeriesHead {
 		return nil

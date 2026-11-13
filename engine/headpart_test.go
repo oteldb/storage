@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"context"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -81,7 +82,9 @@ func TestHeadPartWorkspaceSplitsIdentityRuns(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, e.Flush(t.Context()))
 	assert.Greater(t, e.PartCount(), 1, "identity workspace, not just rows, seals bounded output parts")
-	assert.Equal(t, []int64{workspace}, reservations, "normal runs fit the fixed workspace independent of head cardinality")
+	require.NotEmpty(t, reservations)
+	assert.Equal(t, int64(workspace), reservations[0])
+	assert.Greater(t, slices.Max(reservations), int64(workspace), "closed readers are additional to the unchanged per-part target")
 	assert.Len(t, fetchAll(t, e, fetch.Request{Start: 0, End: 1 << 62}), len(ids))
 }
 
@@ -136,12 +139,13 @@ func TestDuplicateTimestampStableAcrossFlush(t *testing.T) {
 func TestHeadPartOversizedAdmissionFailure(t *testing.T) {
 	t.Parallel()
 	const workspace = 9 << 20
-	var releases int
+	var releases, grants int
 	e := engine.New(engine.Config{Backend: backend.Memory(), Prefix: "metrics", FlushMemoryBytes: workspace,
 		FlushAdmission: func(_ context.Context, bytes int64) (func(), error) {
 			if bytes > workspace {
 				return nil, errWriteFailed
 			}
+			grants++
 			return func() { releases++ }, nil
 		}})
 	small := mkSeries("job", "small")
@@ -152,7 +156,8 @@ func TestHeadPartOversizedAdmissionFailure(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.Error(t, e.Flush(t.Context()))
-	assert.Equal(t, 1, releases, "the original reservation is released before the failed upgrade")
+	assert.Positive(t, grants)
+	assert.Equal(t, grants, releases, "all phase reservations are released before the failed upgrade")
 	assert.Equal(t, 2, e.HeadSampleCount())
 	assert.Zero(t, e.PartCount(), "a completed private run must not publish on a later admission failure")
 }

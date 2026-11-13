@@ -77,7 +77,11 @@ func TestKnownHeadSelectiveCopies(t *testing.T) {
 	entered, resume := make(chan struct{}), make(chan struct{})
 	var release sync.Once
 	defer release.Do(func() { close(resume) })
-	e.cfg.FlushAdmission = func(context.Context, int64) (func(), error) { close(entered); <-resume; return func() {}, nil }
+	var admissionOnce sync.Once
+	e.cfg.FlushAdmission = func(context.Context, int64) (func(), error) {
+		admissionOnce.Do(func() { close(entered); <-resume })
+		return func() {}, nil
+	}
 	flushed := make(chan error, 1)
 	go func() { flushed <- e.Flush(t.Context()) }()
 	<-entered

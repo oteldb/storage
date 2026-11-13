@@ -22,7 +22,9 @@ func (b *headPartBuilder) reserveHeadShape(ctx context.Context, samples map[sign
 			return nil
 		}
 		n = buildbudget.Add(n, buildbudget.Add(512, buildbudget.Mul(order.view.EncodingBytes(int(ref)), 4)))
-		sorting = max(sorting, buildbudget.Mul(int64(len(buf.ts)), 48))
+		if !ascendingInt64(buf.ts) {
+			sorting = max(sorting, buildbudget.Mul(int64(len(buf.ts)), 48))
+		}
 		return nil
 	})
 	if err != nil {

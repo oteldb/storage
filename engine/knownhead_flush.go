@@ -4,9 +4,9 @@ import (
 	"context"
 	"slices"
 
-	"github.com/go-faster/errors"
-
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/block"
+	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -18,6 +18,13 @@ func (e *Engine) streamSampleHead(ctx context.Context, samples map[signal.Series
 		e.mu.RUnlock()
 		return e.streamHead(ctx, samples)
 	}
+	e.mu.RUnlock()
+	lease := &flushLease{ctx: ctx, e: e, held: buildbudget.Add(64<<10, buildbudget.Mul(int64(len(samples)), 128))}
+	if err := lease.reserve(0, "partition"); err != nil {
+		return nil, 0, err
+	}
+	defer lease.close()
+	e.mu.RLock()
 	ids := make([]signal.SeriesID, 0, len(samples))
 	unknown := make(map[signal.SeriesID]*sampleBuf)
 	for id, buf := range samples {
@@ -32,12 +39,15 @@ func (e *Engine) streamSampleHead(ctx context.Context, samples map[signal.Series
 	var rows int
 	var err error
 	if len(unknown) > 0 {
-		parts, rows, err = e.streamHead(ctx, unknown)
+		parts, rows, err = e.streamHeadWithLease(ctx, unknown, lease)
 	}
 	if err != nil {
 		return nil, 0, err
 	}
-	next, n, err := e.streamKnownSamples(ctx, ids, samples)
+	for _, p := range parts {
+		lease.held = buildbudget.Add(lease.held, privatePartBytes(p))
+	}
+	next, n, err := e.streamKnownSamples(ctx, ids, samples, lease)
 	if err != nil {
 		closePartReaders(parts)
 		return nil, 0, err
@@ -46,7 +56,7 @@ func (e *Engine) streamSampleHead(ctx context.Context, samples map[signal.Series
 }
 
 func (e *Engine) streamKnownSamples(
-	ctx context.Context, ids []signal.SeriesID, samples map[signal.SeriesID]*sampleBuf,
+	ctx context.Context, ids []signal.SeriesID, samples map[signal.SeriesID]*sampleBuf, lease *flushLease,
 ) (_ []*part, _ int, err error) {
 	if len(ids) == 0 {
 		return nil, 0, nil
@@ -65,21 +75,20 @@ func (e *Engine) streamKnownSamples(
 	metadataWorkspace := source.workspace(0) + current.workspace(0) + knownCatalogCompareScratch
 	e.mu.RUnlock()
 	defer current.release()
-	workspace := int64(len(samples))*128 + sorting + metadataWorkspace + 8<<20
-	target := max(e.flushMemoryBytes(), workspace+8<<20)
-	release := func() {}
-	if e.cfg.FlushAdmission != nil {
-		release, err = e.cfg.FlushAdmission(ctx, target)
-		if err != nil {
-			return nil, 0, err
-		}
+	workspace := sorting + metadataWorkspace + 8<<20
+	target := max(e.flushMemoryBytes()-lease.held, workspace+4<<20)
+	reserved := target
+	if backend.StreamsWrites(e.cfg.Backend) {
+		reserved = min(target, buildbudget.Add(workspace, buildbudget.Add(8<<20, buildbudget.Mul(int64(len(ids)), 768))))
 	}
-	defer release()
+	if err := lease.reserve(reserved, "known"); err != nil {
+		return nil, 0, err
+	}
 	if err := verifyKnownSnapshots(ctx, source, current, ids); err != nil {
 		return nil, 0, err
 	}
 
-	b := knownPartBuilder{e: e, workspace: workspace, target: target}
+	b := knownPartBuilder{e: e, workspace: workspace, target: target, reserved: reserved, lease: lease}
 	defer func() {
 		if b.writer != nil {
 			b.writer.abort()
@@ -108,6 +117,8 @@ type knownPartBuilder struct {
 	scratch                        block.StreamBuildScratch
 	parts                          []*part
 	workspace, target, closedBytes int64
+	reserved                       int64
+	lease                          *flushLease
 	rows                           int
 }
 
@@ -121,12 +132,10 @@ func (b *knownPartBuilder) finish(ctx context.Context) error {
 	}
 	planFlushBlocks(p)
 	b.parts = append(b.parts, p)
-	b.closedBytes += p.idBloom.Load().sizeBytes() + 64<<10
+	b.closedBytes = buildbudget.Add(b.closedBytes, privatePartBytes(p))
+	b.e.cfg.Obs.Flush.OutputSeries(ctx, int64(p.index.seriesCount()))
 	b.writer = nil
-	if b.workspace+b.closedBytes >= b.target {
-		return errors.New("engine: known output metadata exceeds flush workspace")
-	}
-	return nil
+	return b.lease.reserve(buildbudget.Add(b.workspace+b.scratch.SizeBytes(), b.closedBytes), "known_outputs")
 }
 
 func (b *knownPartBuilder) add(ctx context.Context, id signal.SeriesID, buf *sampleBuf) error {
@@ -141,6 +150,11 @@ func (b *knownPartBuilder) add(ctx context.Context, id signal.SeriesID, buf *sam
 	rowLimit := maxRowsPerPart(b.e.cfg.MaxPartBytes)
 	for lo := 0; lo < len(ts); {
 		if b.writer == nil {
+			b.target = max(b.e.flushMemoryBytes()-b.lease.held-b.closedBytes, b.workspace+4<<20)
+			b.reserved = min(b.reserved, b.target)
+			if err := b.lease.reserve(b.reserved+b.closedBytes, "known"); err != nil {
+				return err
+			}
 			w, err := newPartStreamWriter(ctx, b.e, compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
 			if err != nil {
 				return err
@@ -162,8 +176,14 @@ func (b *knownPartBuilder) add(ctx context.Context, id signal.SeriesID, buf *sam
 		}
 		b.rows += hi - lo
 		lo = hi
-		held := b.workspace + b.closedBytes + b.scratch.SizeBytes() + b.writer.mergeResidentBytes()
-		if held >= b.target || rowLimit > 0 && b.writer.rows >= rowLimit {
+		held := b.workspace + b.scratch.SizeBytes() + b.writer.mergeResidentBytes()
+		if held >= b.reserved && held < b.target {
+			b.reserved = min(b.target, max(held, b.reserved+b.reserved/2))
+			if err := b.lease.reserve(buildbudget.Add(b.reserved, b.closedBytes), "known_growth"); err != nil {
+				return err
+			}
+		}
+		if held >= b.reserved || rowLimit > 0 && b.writer.rows >= rowLimit {
 			if err := b.finish(ctx); err != nil {
 				return err
 			}

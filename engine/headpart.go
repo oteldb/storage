@@ -36,17 +36,18 @@ type headPartBuilder struct {
 	sorting      int64
 	runRows      int64
 
-	target, reserved int64
-	reservationFloor int64
-	release          func()
-	writer           *partStreamWriter
-	writerRows       int
-	partRefs         []uint32
-	parts            []*part
-	rows             int
-	orderWorkspace   int64
-	buildScratch     block.StreamBuildScratch
-	closedBloomBytes int64
+	target, reserved  int64
+	reservationFloor  int64
+	lease             *flushLease
+	release           func()
+	writer            *partStreamWriter
+	writerRows        int
+	partRefs          []uint32
+	parts             []*part
+	rows              int
+	orderWorkspace    int64
+	buildScratch      block.StreamBuildScratch
+	closedOutputBytes int64
 }
 
 func (e *Engine) flushMemoryBytes() int64 {
@@ -57,7 +58,11 @@ func (e *Engine) flushMemoryBytes() int64 {
 }
 
 func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sampleBuf) ([]*part, int, error) {
-	b := headPartBuilder{ctx: ctx, e: e, target: e.flushMemoryBytes()}
+	return e.streamHeadWithLease(ctx, samples, nil)
+}
+
+func (e *Engine) streamHeadWithLease(ctx context.Context, samples map[signal.SeriesID]*sampleBuf, lease *flushLease) ([]*part, int, error) {
+	b := headPartBuilder{ctx: ctx, e: e, target: e.flushMemoryBytes(), lease: lease}
 	capacity := min(len(samples), max(1, int(b.target/1024)))
 	buffers := buildbudget.Mul(int64(capacity), memsize.Of[headRunEntry]()+memsize.Of[uint32]())
 	b.reservationFloor = b.target
@@ -129,7 +134,6 @@ func (b *headPartBuilder) baseBytes() int64 {
 	n := buildbudget.Add(8<<20, buildbudget.Mul(int64(blockRows), 64))
 	n = buildbudget.Add(n, b.orderWorkspace)
 	n = buildbudget.Add(n, b.buildScratch.SizeBytes())
-	n = buildbudget.Add(n, b.closedBloomBytes)
 	return buildbudget.Add(n, memsize.Slice(b.entries)+memsize.Slice(b.partRefs))
 }
 
@@ -154,6 +158,14 @@ func (b *headPartBuilder) reservePhase(bytes int64, phase string) error {
 	if phase == "metadata" && bytes > b.reserved {
 		bytes = max(bytes, b.reserved+max(b.reserved/2, 1<<20))
 	}
+	wanted := buildbudget.Add(bytes, b.closedOutputBytes)
+	if b.lease != nil {
+		if err := b.lease.reserve(wanted, phase); err != nil {
+			return err
+		}
+		b.reserved = bytes
+		return nil
+	}
 	if b.release != nil {
 		b.release()
 		b.release = nil
@@ -163,11 +175,11 @@ func (b *headPartBuilder) reservePhase(bytes int64, phase string) error {
 	} else {
 		var err error
 		start := time.Now()
-		b.release, err = b.e.cfg.FlushAdmission(b.ctx, bytes)
+		b.release, err = b.e.cfg.FlushAdmission(b.ctx, wanted)
 		if err != nil {
 			return err
 		}
-		b.e.cfg.Obs.Flush.Reservation(b.ctx, phase, bytes, b.target, time.Since(start))
+		b.e.cfg.Obs.Flush.Reservation(b.ctx, phase, wanted, b.target, time.Since(start))
 	}
 	b.reserved = bytes
 	return nil
@@ -244,6 +256,9 @@ func (b *headPartBuilder) flushRun() error {
 	if len(b.entries) == 0 {
 		return nil
 	}
+	if err := b.reservePhase(b.estimate(0, 0, 0, 0), "numeric"); err != nil {
+		return err
+	}
 	for _, entry := range b.entries {
 		buf := entry.buf
 		ts, values, sf := buf.ts, buf.values, buf.sf
@@ -274,16 +289,9 @@ func (b *headPartBuilder) append(id chunk.U128, ref uint32, ts []int64, values, 
 	}
 	for lo := 0; lo < len(ts); {
 		if b.writer == nil {
-			var err error
-			b.writer, err = newPartStreamWriter(b.ctx, b.e, compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
-			if err != nil {
+			if err := b.startWriter(); err != nil {
 				return err
 			}
-			b.writer.buildScratch = &b.buildScratch
-			if err := b.writer.reserveSeries(len(b.entries)); err != nil {
-				return err
-			}
-			b.writerRows = b.partRows()
 		}
 		limit := b.writerRows
 		hi := min(lo+chunkRows, len(ts))
@@ -294,24 +302,63 @@ func (b *headPartBuilder) append(id chunk.U128, ref uint32, ts []int64, values, 
 		if sf != nil {
 			weights = sf[lo:hi]
 		}
-		if len(b.writer.runs) == 0 || b.writer.runs[len(b.writer.runs)-1].Value != id {
-			if err := b.writer.addDiskSeries(b.view, ref, u128ToID(id)); err != nil {
-				return err
-			}
-			b.partRefs = append(b.partRefs, ref)
-		}
-		if err := b.writer.appendSeries(id, ts[lo:hi], values[lo:hi], weights, ts[hi-1]); err != nil {
+		if err := b.appendChunk(id, ref, ts[lo:hi], values[lo:hi], weights); err != nil {
 			return err
 		}
 		b.rows += hi - lo
 		lo = hi
-		if limit > 0 && b.writer.rows == limit || b.writer.residentBytes()+b.writer.w.FinishBytes() >= b.reserved {
+		full, err := b.writerReached()
+		if err != nil {
+			return err
+		}
+		if full {
 			if err := b.finish(); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func (b *headPartBuilder) appendChunk(id chunk.U128, ref uint32, ts []int64, values, sf []float64) error {
+	if len(b.writer.runs) == 0 || b.writer.runs[len(b.writer.runs)-1].Value != id {
+		if err := b.writer.addDiskSeries(b.view, ref, u128ToID(id)); err != nil {
+			return err
+		}
+		b.partRefs = append(b.partRefs, ref)
+	}
+	return b.writer.appendSeries(id, ts, values, sf, ts[len(ts)-1])
+}
+
+func (b *headPartBuilder) startWriter() error {
+	if err := b.reservePhase(b.estimate(0, 0, 0, 0), "numeric"); err != nil {
+		return err
+	}
+	var err error
+	b.writer, err = newPartStreamWriter(b.ctx, b.e, compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
+	if err != nil {
+		return err
+	}
+	b.writer.buildScratch = &b.buildScratch
+	if err := b.writer.reserveSeries(len(b.entries)); err != nil {
+		return err
+	}
+	b.writerRows = b.partRows()
+	return nil
+}
+
+func (b *headPartBuilder) writerReached() (bool, error) {
+	needed := b.writer.residentBytes() + b.writer.w.FinishBytes()
+	if needed >= b.reserved {
+		next := max(needed, b.reserved+b.reserved/2)
+		if needed <= b.target {
+			next = min(next, b.target)
+		}
+		if err := b.reservePhase(next, "numeric_growth"); err != nil {
+			return false, err
+		}
+	}
+	return b.writerRows > 0 && b.writer.rows == b.writerRows || needed >= b.target, nil
 }
 
 func (b *headPartBuilder) finish() error {
@@ -346,8 +393,9 @@ func (b *headPartBuilder) finish() error {
 	planFlushBlocks(p)
 	b.e.cfg.Obs.Flush.OutputSeries(b.ctx, int64(p.index.seriesCount()))
 	b.parts = append(b.parts, p)
-	b.closedBloomBytes = buildbudget.Add(b.closedBloomBytes, p.idBloom.Load().sizeBytes())
+	b.closedOutputBytes = buildbudget.Add(b.closedOutputBytes, privatePartBytes(p))
 	b.writer = nil
 	b.partRefs = b.partRefs[:0]
-	return nil
+	retained := buildbudget.Add(b.baseBytes(), buildbudget.Add(b.identities.Bytes(), b.sorting))
+	return b.reservePhase(retained, "retained_outputs")
 }

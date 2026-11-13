@@ -2190,3 +2190,15 @@ bounded native object writer. The unstreamed ID column still owns its run list a
 object; reopening still reads and validates SIDX. Those remaining lifetimes are charged separately
 from the eliminated whole-sidecar encoding buffers. CRCs, canonical order and sidecar bytes match
 the buffered path.
+
+Mixed known/unknown flushes use one admission lease: partition scratch and completed unknown
+readers stay charged through the known phase. Native known outputs reserve their estimated
+per-series state independently of the part target; growth retains normal split/oversized rules.
+Completed candidates include reader, index and bloom state, not only numeric buffers. Known
+sample slices remain independently owned so capacity accounting does not hide arena-page slack.
+
+Completed output readers consume admission separately from the next numeric writer's target.
+When a writer closes, its numeric work is released while the input/order estimates and private
+readers remain charged. This preserves the flush relief share while background merges run.
+The callback's resize protocol releases the old estimate before waiting for its replacement;
+these estimates bound admitted work, not process RSS during overlapping queued resizes.
