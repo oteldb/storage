@@ -35,6 +35,24 @@ func TestSmallNativeFlushDoesNotReservePartTarget(t *testing.T) {
 	}
 }
 
+func TestColdMetadataAdmissionGrowsGeometrically(t *testing.T) {
+	t.Parallel()
+	file, err := backendfile.New(t.TempDir())
+	require.NoError(t, err)
+	requests := 0
+	e := New(Config{Backend: file, Prefix: "cold-growth", DiskSeries: true, SeparateSeries: true, MetricSeriesChunks: true,
+		FlushMemoryBytes: 448 << 20, ResidentHeadBytes: 1 << 30,
+		FlushAdmission: func(context.Context, int64) (func(), error) { requests++; return func() {}, nil }})
+	t.Cleanup(func() { require.NoError(t, e.CloseWAL()) })
+	for i := range 8192 {
+		_, err := e.Append(benchSeries(i), 100, 1)
+		require.NoError(t, err)
+	}
+	require.NoError(t, e.Flush(t.Context()))
+	require.Equal(t, 1, e.PartCount())
+	require.Less(t, requests, 32, "cold metadata must not resize admission for each descriptor")
+}
+
 func TestNativeFlushInitialReservationsAllowPeers(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {

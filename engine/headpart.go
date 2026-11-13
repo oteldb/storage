@@ -151,6 +151,9 @@ func (b *headPartBuilder) reserve(bytes int64) error {
 }
 
 func (b *headPartBuilder) reservePhase(bytes int64, phase string) error {
+	if phase == "metadata" && bytes > b.reserved {
+		bytes = max(bytes, b.reserved+max(b.reserved/2, 1<<20))
+	}
 	if b.release != nil {
 		b.release()
 		b.release = nil
