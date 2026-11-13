@@ -17,6 +17,9 @@ type Index struct {
 	sym    *symbols.Table
 	shared *Contexts
 
+	// Cached empty-context references are offset by one to reserve zero for unknown.
+	emptyResource, emptyScope uint64
+
 	resources []signal.Resource
 	scopes    []signal.Scope
 	contexts  []identityContext
@@ -166,8 +169,11 @@ func (ix *Index) SizeBytes() int64 {
 		memsize.Slice(ix.templateRows) + memsize.Slice(ix.templateBuf) + memsize.Slice(ix.templateFields)
 }
 
-//nolint:dupl // Resource and Scope retain distinct typed ownership and canonical keys.
 func (ix *Index) internResource(r signal.Resource) uint32 {
+	empty := len(r.SchemaURL) == 0 && len(r.Attributes) == 0
+	if empty && ix.emptyResource != 0 {
+		return uint32(ix.emptyResource - 1)
+	}
 	ix.kbuf = r.AppendHashInput(ix.kbuf[:0])
 	if ref, ok := ix.res[string(ix.kbuf)]; ok {
 		return ref
@@ -186,11 +192,17 @@ func (ix *Index) internResource(r signal.Resource) uint32 {
 	if !shared {
 		ix.bytes += memsize.Slice(stored.Attributes)
 	}
+	if empty {
+		ix.emptyResource = uint64(ref) + 1
+	}
 	return ref
 }
 
-//nolint:dupl // Resource and Scope retain distinct typed ownership and canonical keys.
 func (ix *Index) internScope(s signal.Scope) uint32 {
+	empty := len(s.Name) == 0 && len(s.Version) == 0 && len(s.SchemaURL) == 0 && len(s.Attributes) == 0
+	if empty && ix.emptyScope != 0 {
+		return uint32(ix.emptyScope - 1)
+	}
 	ix.kbuf = s.AppendHashInput(ix.kbuf[:0])
 	if ref, ok := ix.scope[string(ix.kbuf)]; ok {
 		return ref
@@ -208,6 +220,9 @@ func (ix *Index) internScope(s signal.Scope) uint32 {
 	ix.bytes += memsize.MapEntry[string, uint32]() + int64(len(ix.kbuf))
 	if !shared {
 		ix.bytes += memsize.Slice(stored.Attributes)
+	}
+	if empty {
+		ix.emptyScope = uint64(ref) + 1
 	}
 	return ref
 }

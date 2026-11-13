@@ -53,6 +53,8 @@ resident registry.
 publishing entries, including slack for mostly empty map groups. It never evicts or recycles borrowed storage; full shards use ordinary local
 interning. The caller budgets the pool separately; index sizes exclude shared attribute arrays.
 Point symbols, local references, postings, admission watermarks and canonical IDs remain local.
+Each registry caches its empty resource/scope references, skipping canonical encoding and map
+lookups after first sight; scope name, version and schema URL still distinguish nonempty contexts.
 An originating index can disappear while pool entries or other index views still retain payloads.
 
 `AttributeTemplates` optionally shares fixed point-attribute combinations across registries.
