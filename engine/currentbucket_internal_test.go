@@ -43,8 +43,8 @@ func TestCurrentBucketSelectionBounds(t *testing.T) {
 		cap  int64
 		want int
 	}{
-		{name: "unlimited bytes retains count cap", cap: 0, want: 16},
-		{name: "roomy disk retains count cap", cap: 1 << 30, want: 16},
+		{name: "unlimited bytes retains count cap", cap: 0, want: maxMergeParts},
+		{name: "roomy disk retains count cap", cap: 1 << 30, want: maxMergeParts},
 		{name: "disk bounds group", cap: 16 << 10, want: 4},
 		{name: "disk bounds pair", cap: 8 << 10, want: 2},
 		{name: "sealed parts excluded", cap: 4 << 10, want: 0},

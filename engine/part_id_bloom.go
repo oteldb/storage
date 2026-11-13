@@ -88,6 +88,7 @@ func (p *part) mayContainDiskID(id signal.SeriesID) bool {
 
 func (e *Engine) identityBytesLocked() int64 {
 	n := e.head.identityBytes() + e.seriesIDs.SizeBytes() + e.identityOrder.bytes.Load()
+	n += e.verifiedIdentities.sizeBytes()
 	n += int64(cap(e.seriesRetired)) * memsize.Of[bucketindex.SeriesRoot]()
 	for _, root := range e.seriesRetired {
 		n += int64(len(root.Prefix))

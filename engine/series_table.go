@@ -30,13 +30,17 @@ func (h *seriesRootHandle) release() {
 
 // Parts retain one snapshot lease until their last reader and owner have drained.
 type seriesSnapshot struct {
-	refs    atomic.Int32
-	roots   []*seriesRootHandle
-	retired int
+	generation uint64
+	refs       atomic.Int32
+	roots      []*seriesRootHandle
+	retired    int
 }
+
+var seriesSnapshotGeneration atomic.Uint64
 
 func newSeriesSnapshot(roots []*seriesRootHandle) *seriesSnapshot {
 	s := &seriesSnapshot{roots: slices.Clone(roots)}
+	s.generation = seriesSnapshotGeneration.Add(1)
 	slices.SortFunc(s.roots, func(a, b *seriesRootHandle) int { return strings.Compare(a.binding.Prefix, b.binding.Prefix) })
 	s.refs.Store(1)
 	for _, h := range s.roots {

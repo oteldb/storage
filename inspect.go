@@ -96,6 +96,10 @@ type SignalStats struct {
 	// MergeCapBytes is the last measured stored-byte seal threshold, independent of resident memory.
 	// It reads zero before the first merge or when disk sealing is disabled.
 	MergeCapBytes int64
+	// MergePlan is the last numeric selection, workspace estimate and admission outcome.
+	MergePlan engine.MergePlan
+	// VerifiedIdentities reports descriptor verification, independent of page caching.
+	VerifiedIdentities engine.VerifiedIdentityStats
 	// WAL is true when this engine has a write-ahead log (false for the ephemeral in-memory engine);
 	// the WAL* fields below are meaningful only when it is true.
 	WAL bool
@@ -291,7 +295,9 @@ func (s *Storage) Inspect() StoreStats {
 			SealedParts:   sh.Sealed, MergeBacklog: sh.Backlog, MergeCandidates: sh.Candidates,
 			MergeForceCandidates: sh.ForceCandidates, MergeCandidatesStale: !current,
 			MergeCapBytes: sh.CapBytes, OutOfSpace: es.OutOfSpace,
-			WAL: hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
+			MergePlan:          eng.LastMergePlan(),
+			VerifiedIdentities: eng.VerifiedIdentityCacheStats(),
+			WAL:                hasWAL, WALSegments: segs, WALBytes: walBytes, WALEpoch: epoch,
 			WantedParts: es.WantedParts, Holes: es.Holes, LostParts: es.LostParts,
 			IndexFenced: es.IndexFenced, IndexLoadError: errText(es.IndexLoadErr),
 			TenureUnestablished: es.TenureUnestablished,

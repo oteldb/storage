@@ -98,6 +98,44 @@ type Merge struct {
 	deferred    metric.Int64Counter
 	over        metric.Int64Counter
 	nonReducing metric.Int64Counter
+	plans       metric.Int64Counter
+	planParts   metric.Int64Histogram
+	planBytes   metric.Int64Histogram
+	outputs     metric.Int64Histogram
+	refused     metric.Int64Counter
+}
+
+// Plan separates memory selection from process-pool admission for numeric merges.
+func (m *Merge) Plan(ctx context.Context, sig, outcome string,
+	candidates, selected, resident, open, scratch, metadata, floor, allowance int64,
+) {
+	opts := metric.WithAttributes(attribute.String("signal", sig), attribute.String("outcome", outcome))
+	m.plans.Add(ctx, 1, opts)
+	for _, component := range []struct {
+		name  string
+		value int64
+	}{{"candidates", candidates}, {"selected", selected}} {
+		m.planParts.Record(ctx, component.value, opts, metric.WithAttributes(attribute.String("component", component.name)))
+	}
+	for _, component := range []struct {
+		name  string
+		value int64
+	}{
+		{"input_resident", resident}, {"open_transient", open}, {"series_scratch", scratch},
+		{"metadata", metadata}, {"output_floor", floor}, {"allowance", allowance},
+	} {
+		m.planBytes.Record(ctx, component.value, opts, metric.WithAttributes(attribute.String("component", component.name)))
+	}
+}
+
+// Outputs records parts published by a numeric merge, separately from source parts.
+func (m *Merge) Outputs(ctx context.Context, sig string, parts int64) {
+	m.outputs.Record(ctx, parts, sigAttr(sig))
+}
+
+// AdmissionRefused identifies the process pool that refused a reservation.
+func (m *Merge) AdmissionRefused(ctx context.Context, pool string) {
+	m.refused.Add(ctx, 1, metric.WithAttributes(attribute.String("pool", pool)))
 }
 
 // Record accounts one merge that compacted partsIn source parts of bytesIn bytes into bytesOut
@@ -518,11 +556,16 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 		bytes:    b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
 	}
 	merge := &Merge{
-		total:    b.counter("storage.merge.total", "background merges", "{merge}"),
-		duration: b.f64hist("storage.merge.duration", "merge wall time"),
-		parts:    b.i64hist("storage.merge.parts_in", "source parts compacted per merge", "{part}"),
-		bytesIn:  b.counter("storage.merge.bytes_in", "part bytes read by merges", "By"),
-		bytesOut: b.counter("storage.merge.bytes_out", "part bytes written by merges", "By"),
+		refused:   b.counter("storage.merge.admission_refused", "process-pool merge refusals by pool, across signals", "{attempt}"),
+		plans:     b.counter("storage.merge.plans", "numeric merge planning outcomes and process-pool refusals", "{attempt}"),
+		planParts: b.i64hist("storage.merge.plan.parts", "numeric merge structural and memory-bounded inputs", "{part}"),
+		planBytes: b.i64hist("storage.merge.plan.bytes", "numeric merge estimated workspace by component", "By"),
+		outputs:   b.i64hist("storage.merge.parts_out", "parts published per numeric merge", "{part}"),
+		total:     b.counter("storage.merge.total", "background merges", "{merge}"),
+		duration:  b.f64hist("storage.merge.duration", "merge wall time"),
+		parts:     b.i64hist("storage.merge.parts_in", "source parts compacted per merge", "{part}"),
+		bytesIn:   b.counter("storage.merge.bytes_in", "part bytes read by merges", "By"),
+		bytesOut:  b.counter("storage.merge.bytes_out", "part bytes written by merges", "By"),
 		deferred: b.counter("storage.merge.deferred",
 			"merges that selected parts but could not claim the process merge memory budget", "{merge}"),
 		nonReducing: b.counter("storage.merge.non_reducing", "ordinary merges discarded without useful output reduction", "{merge}"),

@@ -2092,6 +2092,7 @@ func (s *Storage) admitMerge(ctx context.Context, bytes int64, wait bool) (func(
 		var ok bool
 		releaseMerge, ok = s.mergePool.TryAcquire(bytes)
 		if !ok {
+			s.obs.Merge.AdmissionRefused(ctx, "merge")
 			return nil, false, nil
 		}
 	} else {
@@ -2106,6 +2107,7 @@ func (s *Storage) admitMerge(ctx context.Context, bytes int64, wait bool) (func(
 		var ok bool
 		releaseBuild, ok = s.buildPool.TryAcquire(bytes)
 		if !ok {
+			s.obs.Merge.AdmissionRefused(ctx, "build")
 			releaseMerge()
 			return nil, false, nil
 		}

@@ -169,7 +169,7 @@ func TestRollupClosureReducesMoreThanMaxPartsUnderTinyCap(t *testing.T) {
 			require.Equal(t, 1, e.PartCount())
 			ts, values := rollupSamples(t, e)
 			require.Equal(t, []int64{0}, ts)
-			require.Equal(t, []float64{153}, values)
+			require.Equal(t, []float64{float64((maxMergeParts + 1) * (maxMergeParts + 2) / 2)}, values)
 		})
 	}
 }

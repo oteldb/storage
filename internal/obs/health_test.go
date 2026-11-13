@@ -39,6 +39,41 @@ func TestNonReducingMerges(t *testing.T) {
 	assert.Equal(t, int64(1), counterSum(t, rm, "storage.merge.non_reducing", map[string]string{"signal": "exemplar"}))
 }
 
+func TestNumericMergePlanningMetrics(t *testing.T) {
+	t.Parallel()
+	o, collect := newMetered(t)
+	o.Merge.Plan(t.Context(), "metric", "pool_busy", 32, 7, 100, 20, 30, 40, 50, 400)
+	o.Merge.AdmissionRefused(t.Context(), "merge")
+	o.Merge.AdmissionRefused(t.Context(), "build")
+	o.Merge.Outputs(t.Context(), "metric", 2)
+	rm := collect()
+	require.EqualValues(t, 1, counterSum(t, rm, "storage.merge.plans", map[string]string{"signal": "metric", "outcome": "pool_busy"}))
+	for _, pool := range []string{"merge", "build"} {
+		require.EqualValues(t, 1, counterSum(t, rm, "storage.merge.admission_refused", map[string]string{"pool": pool}))
+	}
+	seen := make(map[string]int64)
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != "storage.merge.plan.bytes" && m.Name != "storage.merge.plan.parts" && m.Name != "storage.merge.parts_out" {
+				continue
+			}
+			h, ok := m.Data.(metricdata.Histogram[int64])
+			require.True(t, ok)
+			for _, point := range h.DataPoints {
+				component, _ := point.Attributes.Value("component")
+				seen[m.Name+"/"+component.AsString()] = point.Sum
+			}
+		}
+	}
+	require.Equal(t, map[string]int64{
+		"storage.merge.plan.parts/candidates": 32, "storage.merge.plan.parts/selected": 7,
+		"storage.merge.plan.bytes/input_resident": 100, "storage.merge.plan.bytes/open_transient": 20,
+		"storage.merge.plan.bytes/series_scratch": 30, "storage.merge.plan.bytes/metadata": 40,
+		"storage.merge.plan.bytes/output_floor": 50, "storage.merge.plan.bytes/allowance": 400,
+		"storage.merge.parts_out/": 2,
+	}, seen)
+}
+
 func TestCorruptionDetected(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

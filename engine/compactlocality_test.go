@@ -107,8 +107,8 @@ func TestPreferSeriesLocalRun(t *testing.T) {
 
 func TestLocalMergeKeepsSourceOrder(t *testing.T) {
 	t.Parallel()
-	parts := make([]*part, 0, 32)
-	for i := range 32 {
+	parts := make([]*part, 0, 2*maxMergeParts)
+	for i := range 2 * maxMergeParts {
 		p := localityPart(uint64(i%2*100), uint64(i%2*100+9), 1<<20)
 		p.prefix = strconv.Itoa(i)
 		parts = append(parts, p)
@@ -176,11 +176,11 @@ func TestSeriesLocalCompactionFileWALReopen(t *testing.T) {
 	for _, p := range selected {
 		require.NoError(t, p.index.forEachID(t.Context(), func(id signal.SeriesID) { unique[id] = struct{}{} }))
 	}
-	require.LessOrEqual(t, len(unique), 3*perRange, "selection combines repeated ranges across flushes")
+	require.LessOrEqual(t, len(unique), (maxMergeParts/8+1)*perRange, "selection combines repeated ranges across flushes")
 	changed, err := e.MergeStep(t.Context(), MergeOptions{})
 	require.NoError(t, err)
 	require.True(t, changed)
-	require.Len(t, e.parts, 49)
+	require.Len(t, e.parts, 64-maxMergeParts+1)
 	assertRows := func(e *Engine) {
 		it, err := e.Fetch(t.Context(), fetch.Request{Start: 0, End: 1000})
 		require.NoError(t, err)
