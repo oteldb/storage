@@ -206,6 +206,7 @@ func (ix *Index) finishTemplate(dynamic uint32) (uint32, bool) {
 		return 0, false
 	}
 	if ref, ok := ix.templateKeys[string(ix.templateBuf)]; ok {
+		ix.templateLast = ref + 1
 		ix.templatePolicy.observe(true)
 		return ref, true
 	}
@@ -223,6 +224,7 @@ func (ix *Index) finishTemplate(dynamic uint32) (uint32, bool) {
 	}
 	ix.templateKeys[t.key] = ref
 	ix.templateRows = append(ix.templateRows, t)
+	ix.templateLast = ref + 1
 	ix.bytes += memsize.MapEntry[string, uint32]()
 	return ref, true
 }
@@ -243,6 +245,15 @@ func (ix *Index) storeAttributes(attrs signal.Attributes) (uint32, uint64) {
 }
 
 func (ix *Index) storeTemplateAttributes(attrs signal.Attributes) (uint32, uint64, bool) {
+	if ix.templateLast != 0 && ix.templateMatch.probe() {
+		ref := ix.templateLast - 1
+		matched := ix.matchesTemplate(attrs, ix.templateRows[ref])
+		ix.templateMatch.observe(matched)
+		if matched {
+			ix.templatePolicy.observe(true)
+			return ix.storeTemplateValues(attrs, ref)
+		}
+	}
 	if !ix.templatePolicy.probe() {
 		return 0, 0, false
 	}
@@ -262,6 +273,10 @@ func (ix *Index) storeTemplateAttributes(attrs signal.Attributes) (uint32, uint6
 	if !ok {
 		return 0, 0, false
 	}
+	return ix.storeTemplateValues(attrs, ref)
+}
+
+func (ix *Index) storeTemplateValues(attrs signal.Attributes, ref uint32) (uint32, uint64, bool) {
 	offset := uint64(len(ix.values))
 	for i, field := range ix.templateRows[ref].fields {
 		if field.slot != math.MaxUint32 {

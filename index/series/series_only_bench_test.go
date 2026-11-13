@@ -24,7 +24,7 @@ func BenchmarkExporterSeriesOnly(b *testing.B) {
 		hosts = n
 	}
 	for _, mode := range []string{"flat", "instance", "dimensions"} {
-		for _, phase := range []string{"register", "existing"} {
+		for _, phase := range []string{"register", "register-identified", "existing", "existing-identified"} {
 			b.Run("hosts="+strconv.Itoa(hosts)+"/"+phase+"/"+mode, func(b *testing.B) {
 				fixtureCtx := pprof.WithLabels(b.Context(), pprof.Labels("phase", "fixture", "workload", phase, "policy", mode))
 				ingestCtx := pprof.WithLabels(b.Context(), pprof.Labels("phase", "ingest", "workload", phase, "policy", mode))
@@ -32,23 +32,34 @@ func BenchmarkExporterSeriesOnly(b *testing.B) {
 				defer pprof.SetGoroutineLabels(b.Context())
 				pprof.SetGoroutineLabels(fixtureCtx)
 				f := newSeriesOnlyFixture(b, hosts)
+				identified := strings.HasSuffix(phase, "-identified")
+				existing := strings.HasPrefix(phase, "existing")
+				entries := make([]Entry, 0, seriesOnlyBatchSize)
+				hashBuf := make([]byte, 0, 4096)
 				var last *Index
 				var pool *AttributeTemplates
-				if phase == "existing" {
+				if existing {
 					pool = exporterPool(mode, "cold")
 					last = NewWithAttributeTemplates(nil, pool)
 					for offset := 0; offset < f.count(); offset += seriesOnlyBatchSize {
 						pprof.SetGoroutineLabels(fixtureCtx)
 						batch := f.prepareSeriesBatch(offset)
+						if identified {
+							entries, hashBuf = prepareSeriesOnlyEntries(entries[:0], batch, hashBuf)
+						}
 						pprof.SetGoroutineLabels(warmCtx)
-						registerSeriesOnlyBatch(last, batch)
+						if identified {
+							registerSeriesOnlyEntries(last, entries)
+						} else {
+							registerSeriesOnlyBatch(last, batch)
+						}
 					}
 				}
 				snapshotStarted := false
 				b.ReportAllocs()
 				for b.Loop() {
 					b.StopTimer()
-					if phase == "register" {
+					if !existing {
 						runtime.GC()
 						pool = exporterPool(mode, "cold")
 						last = NewWithAttributeTemplates(nil, pool)
@@ -60,9 +71,16 @@ func BenchmarkExporterSeriesOnly(b *testing.B) {
 					for offset := 0; offset < f.count(); offset += seriesOnlyBatchSize {
 						pprof.SetGoroutineLabels(fixtureCtx)
 						batch := f.prepareSeriesBatch(offset)
+						if identified {
+							entries, hashBuf = prepareSeriesOnlyEntries(entries[:0], batch, hashBuf)
+						}
 						pprof.SetGoroutineLabels(ingestCtx)
 						b.StartTimer()
-						registerSeriesOnlyBatch(last, batch)
+						if identified {
+							registerSeriesOnlyEntries(last, entries)
+						} else {
+							registerSeriesOnlyBatch(last, batch)
+						}
 						b.StopTimer()
 					}
 					pprof.SetGoroutineLabels(fixtureCtx)
@@ -109,5 +127,20 @@ func writeSeriesOnlyAllocs(b *testing.B, stage string) {
 	}
 	if err := f.Close(); err != nil {
 		b.Fatal(err)
+	}
+}
+
+func prepareSeriesOnlyEntries(dst []Entry, batch []signal.Series, buf []byte) ([]Entry, []byte) {
+	for i := range batch {
+		s := &batch[i]
+		buf = s.AppendHashInput(buf[:0])
+		dst = append(dst, Entry{ID: signal.HashBytes(buf), Series: *s})
+	}
+	return dst, buf
+}
+
+func registerSeriesOnlyEntries(ix *Index, entries []Entry) {
+	for i := range entries {
+		ix.AddEntry(entries[i])
 	}
 }

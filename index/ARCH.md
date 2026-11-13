@@ -33,7 +33,9 @@ identity/postings indexes, with bounded ranged reads and typed local-reference p
 `SeriesID ↔ Series`. Canonical hashes and durable formats use the full typed identity.
 `Index.AddChecked` verifies an expected canonical hash before changing identity state and returns
 the encoded length, so checked output builders do not encode/hash the identity twice. The ordinary
-`Index.Add` ingestion path is unchanged.
+`Index.Add` computes the canonical hash; `Index.AddEntry` accepts the existing `Entry` (ID plus
+identity) from trusted projection or validated readers, avoiding that encoding and hash. It still
+owns all retained payloads. Untrusted identities use `AddChecked`.
 The resident registry uses 32-byte rows: hash, value-arena offset, shared resource/scope
 context, and shared attribute-name schema. Values occupy four-byte typed-symbol references;
 attribute-name sequences are stored once per schema rather than repeated for every series.
@@ -67,6 +69,10 @@ with periodic retries so workload changes can restore sharing. Duplicate IDs add
 The caller charges the pool separately; full shards fall back to ordinary local tuples. Templates
 are immutable and never recycled while views can reference them. Canonical IDs and disk bytes do
 not change; resource/scope contexts and template pools remain independent.
+Registration first checks the previous local template by exact keys and typed fixed values,
+retaining only variable deltas on a match. A mismatch uses ordinary canonical-key lookup;
+signed zero, NaN payloads, raw booleans and nested values keep their exact identity encoding.
+Eight consecutive mismatches back off to one comparison per 64 registrations until locality returns.
 
 ## `postings`
 

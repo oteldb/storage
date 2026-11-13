@@ -9,6 +9,7 @@ import (
 
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/index/postings"
+	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/readerpool"
 	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/internal/watermark"
@@ -323,7 +324,7 @@ func (e *Engine) compactDiskHeadLocked() {
 		}
 		ident := view.At(i, attrs)
 		attrs = ident.Attributes
-		next.register(id, ident)
+		next.register(series.Entry{ID: id, Series: ident})
 		if seen {
 			ref, _ := next.series.Ref(id)
 			next.slots.set(next.stateRefs[ref], newest)

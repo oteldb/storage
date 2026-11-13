@@ -35,6 +35,8 @@ type Index struct {
 	templates       *AttributeTemplates
 	templateKeys    map[string]uint32
 	templateRows    []*attributeTemplate
+	templateLast    uint32
+	templateMatch   templateMatchPolicy
 	templateBuf     []byte
 	templateFields  []templateField
 	templatePolicy  templatePolicy
@@ -89,6 +91,13 @@ func NewWithAttributeTemplates(contexts *Contexts, templates *AttributeTemplates
 func (ix *Index) Add(s signal.Series) signal.SeriesID {
 	ix.buf = s.AppendHashInput(ix.buf[:0])
 	id := signal.HashBytes(ix.buf)
+	return ix.AddEntry(Entry{ID: id, Series: s})
+}
+
+// AddEntry registers an identity using its already computed canonical ID.
+// Callers must provide entry.ID == entry.Series.Hash(); use [Index.AddChecked] for untrusted identities.
+func (ix *Index) AddEntry(entry Entry) signal.SeriesID {
+	id, s := entry.ID, entry.Series
 	if _, ok := ix.byID[id]; ok {
 		return id
 	}

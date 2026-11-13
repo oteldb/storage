@@ -2127,3 +2127,6 @@ Historical watermark cache entries choose the less occupied of two independent n
 This reduces premature eviction while other buckets still have capacity, without increasing the
 byte budget or retaining descriptors. Both candidates compare full canonical IDs; an eviction still
 falls back to authoritative part metadata, and successful updates preserve the maximum watermark.
+
+Head registration carries `series.Entry` (computed ID plus identity) into the resident registry;
+projection and validated replay establish IDs, while untrusted descriptor readers retain hash checks.

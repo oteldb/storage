@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -18,7 +19,7 @@ func addStringPostingSeries(h *head, index int, value *signal.Value) signal.Seri
 	}
 	s := signal.Series{Attributes: signal.NewAttributes(attrs...)}
 	id := s.Hash()
-	h.register(id, s)
+	h.register(series.Entry{ID: id, Series: s})
 	return id
 }
 

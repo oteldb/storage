@@ -522,7 +522,8 @@ func (e *Engine) Append(s signal.Series, ts int64, value float64) (bool, error) 
 // AppendBatch ingests a run of samples whose content ids are already computed (by the
 // projection layer, on a reused buffer). ids[i], ts[i], values[i] describe sample i;
 // materialize(i) returns sample i's full identity and is called only when its series is new
-// (first sight), so a repeat series costs just a map probe and a buffer append, with no
+// (first sight). Its canonical hash must equal ids[i]; registration reuses that computed ID.
+// A repeat series costs just a map probe and a buffer append, with no
 // per-point [signal.Series] construction or hashing. Preparation can overlap other writers;
 // admission, logging and publication remain ordered. limits caps cardinality and in-flight memory
 // (0 fields ⇒ unlimited). It returns an
