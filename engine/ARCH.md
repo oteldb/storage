@@ -2021,6 +2021,10 @@ prune through inline timestamp bounds without loading or permanently retaining v
 Chunk readers pin immutable directory prototypes in fixed column slots for geometry checks, even on
 warm numeric hits. Mutable decoder and frame-read state are cloned only when a numeric block misses;
 metadata eviction cannot invalidate a pinned directory, and each clone uses the current read context.
+Directory loads coalesce by part and column; completion transfers one pin per waiting caller, even
+when the result exceeds the cache budget. Waiters cancel independently and retry canceled leaders.
+Directory entries use a distinct LRU protected up to half the existing decoded-cache budget. They
+may borrow idle capacity; sample insertions reclaim that excess before evicting sample blocks.
 
 Each cache shard indexes part prefixes once, with compact (column, block) keys in each part map.
 Entries carry their own LRU links; prefix eviction visits the same index used by lookups. Numeric

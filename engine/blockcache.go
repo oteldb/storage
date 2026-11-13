@@ -31,29 +31,34 @@ import (
 // budget-neutral — it never enlarges the resident set (the freelist is small and bounded), it only
 // stops the churn.
 type blockCache struct {
-	maxBytes     int64
-	hits, misses atomic.Int64
-	inflight     atomic.Int64
-	bytes        atomic.Int64 // Linked entries and in-flight insertion reservations.
-	marksBytes   atomic.Int64
-	seed         maphash.Seed
-	shards       []blockCacheShard
-	trimMu       sync.Mutex
-	trimming     atomic.Bool
-	trimNext     int
-	i64Free      bufFreeList[int64]
-	f64Free      bufFreeList[float64]
+	maxBytes      int64
+	hits, misses  atomic.Int64
+	inflight      atomic.Int64
+	bytes         atomic.Int64 // Linked entries and in-flight insertion reservations.
+	marksBytes    atomic.Int64
+	metadataBytes atomic.Int64
+	seed          maphash.Seed
+	shards        []blockCacheShard
+	trimMu        sync.Mutex
+	trimming      atomic.Bool
+	trimNext      int
+	i64Free       bufFreeList[int64]
+	f64Free       bufFreeList[float64]
 }
 
 type blockCacheShard struct {
-	mu        sync.Mutex
-	ll, marks blockLRU
-	items     map[string]map[blockIndex]*blockEntry
+	mu                  sync.Mutex
+	ll, marks, metadata blockLRU
+	items               map[string]map[blockIndex]*blockEntry
+	loads               map[blockKey]*metadataLoad
 }
 
 func (s *blockCacheShard) lru(key blockKey) *blockLRU {
 	if key.col == colMarksID {
 		return &s.marks
+	}
+	if key.blk == -1 {
+		return &s.metadata
 	}
 	return &s.ll
 }
@@ -171,6 +176,8 @@ func (c *blockCache) insert(e *blockEntry) *blockEntry {
 	shard.lru(e.key).PushFront(e)
 	if e.key.col == colMarksID {
 		c.marksBytes.Add(e.bytes)
+	} else if e.key.blk == -1 {
+		c.metadataBytes.Add(e.bytes)
 	}
 	entries := shard.items[e.key.prefix]
 	if entries == nil {
@@ -226,22 +233,38 @@ func (c *blockCache) tryReserveAvailable(n int64) bool {
 }
 
 func (c *blockCache) evictOldestShardEntry(required int64) bool {
-	for range c.shards {
-		shard := &c.shards[c.trimNext]
-		c.trimNext = (c.trimNext + 1) % len(c.shards)
-		shard.mu.Lock()
-		back := shard.ll.Back()
-		if c.marksBytes.Load() > c.maxBytes/marksCacheFraction || required > c.maxBytes-c.maxBytes/marksCacheFraction {
-			if mark := shard.marks.Back(); mark != nil {
-				back = mark
+	for pass := range 3 {
+		for range c.shards {
+			shard := &c.shards[c.trimNext]
+			c.trimNext = (c.trimNext + 1) % len(c.shards)
+			shard.mu.Lock()
+			var back *blockEntry
+			switch pass {
+			case 0:
+				if c.metadataBytes.Load() > c.maxBytes/2 {
+					back = shard.metadata.Back()
+				}
+				if c.marksBytes.Load() > c.maxBytes/marksCacheFraction || required > c.maxBytes-c.maxBytes/marksCacheFraction {
+					if mark := shard.marks.Back(); mark != nil {
+						back = mark
+					}
+				}
+			case 1:
+				back = shard.ll.Back()
+			case 2:
+				// Protected metadata cannot prevent a larger sample insertion.
+				back = shard.metadata.Back()
+				if back == nil {
+					back = shard.marks.Back()
+				}
 			}
-		}
-		if back != nil {
-			c.removeElem(shard, back)
+			if back != nil {
+				c.removeElem(shard, back)
+				shard.mu.Unlock()
+				return true
+			}
 			shard.mu.Unlock()
-			return true
 		}
-		shard.mu.Unlock()
 	}
 	return false
 }
@@ -303,6 +326,8 @@ func (c *blockCache) removeElem(shard *blockCacheShard, e *blockEntry) {
 	c.bytes.Add(-e.bytes)
 	if e.key.col == colMarksID {
 		c.marksBytes.Add(-e.bytes)
+	} else if e.key.blk == -1 {
+		c.metadataBytes.Add(-e.bytes)
 	}
 	shard.lru(e.key).Remove(e)
 	e.evicted = true

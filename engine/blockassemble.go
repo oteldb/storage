@@ -179,17 +179,13 @@ func (e *Engine) partBlockDecoder(ctx context.Context, p *part, name string, cid
 }
 
 func (e *Engine) partBlockMetadata(ctx context.Context, p *part, name string, cid colID) (*blockEntry, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
 	key := blockKey{prefix: p.prefix, col: cid, blk: -1}
-	if entry, ok := e.blockCache.get(key); ok {
-		return entry, nil
-	}
-	decoder, err := p.reader.ColumnBlocks(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	prototype := decoder.Clone(context.Background()) //nolint:contextcheck // Cached metadata must not retain request contexts or values.
-	return e.blockCache.insert(&blockEntry{key: key, decoder: prototype, bytes: prototype.MetadataBytes()}), nil
+	return e.blockCache.metadata(ctx, key, func() (*blockEntry, error) {
+		decoder, err := p.reader.ColumnBlocks(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		prototype := decoder.Clone(context.Background()) //nolint:contextcheck // Cached metadata must not retain request contexts or values.
+		return e.blockCache.insert(&blockEntry{key: key, decoder: prototype, bytes: prototype.MetadataBytes()}), nil
+	})
 }
