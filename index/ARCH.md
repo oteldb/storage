@@ -55,6 +55,13 @@ interning. The caller budgets the pool separately; index sizes exclude shared at
 Point symbols, local references, postings, admission watermarks and canonical IDs remain local.
 An originating index can disappear while pool entries or other index views still retain payloads.
 
+`AttributeTemplates` optionally shares fixed point-attribute combinations across registries.
+Templates own typed encodings, fixed scalar values and preencoded canonical segments; rows retain
+only positional variable-value symbols. A bounded admission table leaves one-off combinations flat.
+The caller charges the pool separately; full shards fall back to ordinary local tuples. Templates
+are immutable and never recycled while views can reference them. Canonical IDs and disk bytes do
+not change; resource/scope contexts and template pools remain independent.
+
 ## `postings`
 
 The inverted index is keyed on interned name/typed-value symbols. `MemPostings` stores canonical

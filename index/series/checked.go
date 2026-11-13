@@ -32,12 +32,7 @@ func (ix *Index) AddChecked(expected signal.SeriesID, s signal.Series) (int, boo
 		})
 		ix.bytes += memsize.MapEntry[contextKey, uint32]()
 	}
-	keys := ix.internKeys(s.Attributes)
-	offset := uint64(len(ix.values))
-	for i := range s.Attributes {
-		ix.vbuf = signal.AppendValue(ix.vbuf[:0], s.Attributes[i].Value)
-		ix.values = append(ix.values, ix.sym.Intern(ix.vbuf))
-	}
+	keys, offset := ix.storeAttributes(s.Attributes)
 	ix.byID[id] = uint32(len(ix.rows))
 	ix.rows = append(ix.rows, row{id: id, offset: offset, context: context, keys: keys})
 	ix.bytes += memsize.MapEntry[signal.SeriesID, uint32]()

@@ -29,6 +29,11 @@ type Index struct {
 
 	buf, kbuf, vbuf []byte
 	bytes           int64
+	templates       *AttributeTemplates
+	templateKeys    map[string]uint32
+	templateRows    []*attributeTemplate
+	templateBuf     []byte
+	templateFields  []templateField
 }
 
 type row struct {
@@ -58,15 +63,21 @@ func New() *Index {
 
 // NewWithContexts shares immutable context payloads; callers budget contexts separately.
 func NewWithContexts(contexts *Contexts) *Index {
+	return NewWithAttributeTemplates(contexts, nil)
+}
+
+// NewWithAttributeTemplates shares fixed point attributes and resource/scope payloads independently.
+func NewWithAttributeTemplates(contexts *Contexts, templates *AttributeTemplates) *Index {
 	return &Index{
-		shared:  contexts,
-		byID:    make(map[signal.SeriesID]uint32),
-		sym:     symbols.New(),
-		res:     make(map[string]uint32),
-		scope:   make(map[string]uint32),
-		context: make(map[contextKey]uint32),
-		keysets: make(map[string]uint32),
-		keys:    [][]symbols.ID{nil},
+		shared:    contexts,
+		templates: templates,
+		byID:      make(map[signal.SeriesID]uint32),
+		sym:       symbols.New(),
+		res:       make(map[string]uint32),
+		scope:     make(map[string]uint32),
+		context:   make(map[contextKey]uint32),
+		keysets:   make(map[string]uint32),
+		keys:      [][]symbols.ID{nil},
 	}
 }
 
@@ -91,12 +102,7 @@ func (ix *Index) Add(s signal.Series) signal.SeriesID {
 		})
 		ix.bytes += memsize.MapEntry[contextKey, uint32]()
 	}
-	keys := ix.internKeys(s.Attributes)
-	offset := uint64(len(ix.values))
-	for i := range s.Attributes {
-		ix.vbuf = signal.AppendValue(ix.vbuf[:0], s.Attributes[i].Value)
-		ix.values = append(ix.values, ix.sym.Intern(ix.vbuf))
-	}
+	keys, offset := ix.storeAttributes(s.Attributes)
 	ix.byID[id] = uint32(len(ix.rows))
 	ix.rows = append(ix.rows, row{id: id, offset: offset, context: context, keys: keys})
 	ix.bytes += memsize.MapEntry[signal.SeriesID, uint32]()
@@ -155,7 +161,8 @@ func (ix *Index) ForEach(fn func(id signal.SeriesID, s signal.Series)) {
 func (ix *Index) SizeBytes() int64 {
 	return ix.bytes + ix.sym.SizeBytes() + memsize.Slice(ix.rows) + memsize.Slice(ix.values) +
 		memsize.Slice(ix.resources) + memsize.Slice(ix.scopes) + memsize.Slice(ix.contexts) +
-		memsize.Slice(ix.keys) + memsize.Slice(ix.buf) + memsize.Slice(ix.kbuf) + memsize.Slice(ix.vbuf)
+		memsize.Slice(ix.keys) + memsize.Slice(ix.buf) + memsize.Slice(ix.kbuf) + memsize.Slice(ix.vbuf) +
+		memsize.Slice(ix.templateRows) + memsize.Slice(ix.templateBuf) + memsize.Slice(ix.templateFields)
 }
 
 //nolint:dupl // Resource and Scope retain distinct typed ownership and canonical keys.
@@ -218,6 +225,9 @@ func (ix *Index) internKeys(attrs signal.Attributes) uint32 {
 	keys := make([]symbols.ID, len(attrs))
 	for i := range keys {
 		keys[i] = symbols.ID(binary.LittleEndian.Uint32(ix.kbuf[i*4:]))
+	}
+	if uint64(len(ix.keys)) >= uint64(templateFlag) {
+		panic("series: attribute schema reference exhausted")
 	}
 	ref := uint32(len(ix.keys))
 	ix.keys = append(ix.keys, keys)

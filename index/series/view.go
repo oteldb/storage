@@ -1,6 +1,8 @@
 package series
 
 import (
+	"math"
+
 	"github.com/oteldb/storage/index/symbols"
 	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/signal"
@@ -8,16 +10,17 @@ import (
 
 // View is an immutable snapshot, safe to read while its index receives additions.
 type View struct {
-	rows     []row
-	contexts []identityContext
-	keys     [][]symbols.ID
-	values   []symbols.ID
-	symbols  [][]byte
+	rows      []row
+	contexts  []identityContext
+	keys      [][]symbols.ID
+	values    []symbols.ID
+	symbols   [][]byte
+	templates []*attributeTemplate
 }
 
 // View captures the append-only arenas without materializing identities.
 func (ix *Index) View() View {
-	return View{rows: ix.rows, contexts: ix.contexts, keys: ix.keys, values: ix.values, symbols: ix.sym.Snapshot()}
+	return View{rows: ix.rows, contexts: ix.contexts, keys: ix.keys, values: ix.values, symbols: ix.sym.Snapshot(), templates: ix.templateRows}
 }
 
 // Len returns the number of identities captured by v.
@@ -31,9 +34,7 @@ func (v View) EncodingBytes(i int) int64 {
 	r := v.rows[i]
 	c := v.contexts[r.context]
 	attrs := len(c.resource.Attributes) + len(c.scope.Attributes)
-	if r.keys != 0 {
-		attrs += len(v.keys[r.keys])
-	}
+	attrs += v.AttributeCount(i)
 	// A symbol ID is uint32 (at most five varint bytes); every attribute stores two IDs.
 	return buildbudget.Add(80, buildbudget.Mul(int64(attrs), 10))
 }
@@ -43,6 +44,9 @@ func (v View) EncodingWorkspace() int64 {
 	var n int64
 	for _, data := range v.symbols {
 		n = buildbudget.Add(n, buildbudget.Add(128, buildbudget.Mul(int64(len(data)), 4)))
+	}
+	for _, t := range v.templates {
+		n = buildbudget.Add(n, t.encodingWorkspace())
 	}
 	// Resource/scope values are interned in memory but get type-tagged encodings on disk.
 	for i := range v.contexts {
@@ -55,17 +59,12 @@ func (v View) EncodingWorkspace() int64 {
 
 // MaterializationBytes bounds a decoded point-attribute slice, including nested values.
 func (v View) MaterializationBytes(i int) int64 {
-	r := v.rows[i]
-	if r.keys == 0 {
-		return 0
-	}
-	n := buildbudget.Mul(int64(len(v.keys[r.keys])), 160)
-	for j := range v.keys[r.keys] {
-		data := v.symbols[v.values[int(r.offset)+j]]
+	n := buildbudget.Mul(int64(v.AttributeCount(i)), 160)
+	v.EncodedAttributes(i, func(_, data []byte) {
 		if len(data) > 0 && (signal.ValueKind(data[0]) == signal.KindSlice || signal.ValueKind(data[0]) == signal.KindMap) {
 			n = buildbudget.Add(n, buildbudget.Mul(int64(len(data)), 128))
 		}
-	}
+	})
 	return n
 }
 
@@ -75,6 +74,26 @@ func (v View) At(i int, dst signal.Attributes) signal.Series {
 	c := v.contexts[r.context]
 	if r.keys == 0 {
 		return signal.Series{Resource: c.resource, Scope: c.scope}
+	}
+	if r.keys&templateFlag != 0 {
+		t := v.templates[r.keys&^templateFlag]
+		if dst == nil {
+			dst = make(signal.Attributes, 0, len(t.fields))
+		}
+		dst = dst[:0]
+		for j, field := range t.fields {
+			name, encoded := v.encodedField(r, field, t)
+			value := t.scalars[j]
+			if field.slot != math.MaxUint32 || signal.ValueKind(encoded[0]) == signal.KindMap || signal.ValueKind(encoded[0]) == signal.KindSlice {
+				var err error
+				value, _, err = signal.DecodeValue(encoded)
+				if err != nil {
+					panic(err)
+				}
+			}
+			dst = append(dst, signal.KeyValue{Key: name, Value: value})
+		}
+		return signal.Series{Resource: c.resource, Scope: c.scope, Attributes: dst}
 	}
 	keys := v.keys[r.keys]
 	if dst == nil {
