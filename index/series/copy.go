@@ -13,7 +13,7 @@ import (
 // The index owns its copy; the source view can be discarded afterward.
 func (ix *Index) AddView(v View, i int) signal.SeriesID {
 	r := v.rows[i]
-	if _, ok := ix.byID[r.id]; ok {
+	if _, ok := ix.byID.get(r.id, ix.rows); ok {
 		return r.id
 	}
 	if uint64(len(ix.rows)) > math.MaxUint32 {
@@ -38,9 +38,8 @@ func (ix *Index) AddView(v View, i int) signal.SeriesID {
 	} else {
 		keys, offset = ix.copyAttributes(v, i)
 	}
-	ix.byID[r.id] = uint32(len(ix.rows))
+	ix.byID.put(r.id, uint32(len(ix.rows)), ix.rows)
 	ix.rows = append(ix.rows, row{id: r.id, offset: offset, context: context, keys: keys})
-	ix.bytes += memsize.MapEntry[signal.SeriesID, uint32]()
 	return r.id
 }
 

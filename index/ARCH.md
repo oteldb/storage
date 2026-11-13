@@ -36,6 +36,9 @@ the encoded length, so checked output builders do not encode/hash the identity t
 `Index.Add` computes the canonical hash; `Index.AddEntry` accepts the existing `Entry` (ID plus
 identity) from trusted projection or validated readers, avoiding that encoding and hash. It still
 owns all retained payloads. Untrusted identities use `AddChecked`.
+Resident lookup keys use the low 64 bits, then verify the high half against the stored row.
+Low-half collisions use a full-ID overflow map. Canonical IDs and durable formats remain 128-bit.
+
 The resident registry uses 32-byte rows: hash, value-arena offset, shared resource/scope
 context, and shared attribute-name schema. Values occupy four-byte typed-symbol references;
 attribute-name sequences are stored once per schema rather than repeated for every series.
