@@ -1807,6 +1807,9 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 		return 0, 0, nil
 	}
 
+	if e.cfg.DiskSeries {
+		e.head.freezeIdentity(e.cfg.SeriesContexts, e.cfg.SeriesTemplates)
+	}
 	// Checked after the detach so an empty head flushes as a no-op even while fenced, and before any
 	// I/O so a writer without its tenure writes no part it could not commit.
 	err = e.fenceLocked()
@@ -1858,6 +1861,12 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 	}
 
 	phaseDone(nil)
+	phaseDone = obs.ShutdownPhase(ctx, log, "flush_cache_watermarks")
+	if err := e.rememberFrozenWatermarks(ctx); err != nil {
+		closePartReaders(newParts)
+		return 0, 0, e.abortFlush(ctx, detached, detachedBytes, detachedSince, err)
+	}
+	phaseDone(nil)
 	phaseDone = obs.ShutdownPhase(ctx, log, "flush_publish_checkpoint")
 	// Commit the candidate while the frozen head stays readable, then install both sides of the swap.
 	// A WAL checkpoint follows only a confirmed catalog commit.
@@ -1889,7 +1898,12 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 	e.head.frozenMemory = sampleArena{}
 	e.head.detachedBytes = 0
 	e.head.detachedKnown = false
-	e.compactDiskHeadLocked()
+	if e.head.frozen != nil {
+		e.head.frozen = nil
+		e.identityOrder.reset()
+	} else {
+		e.compactDiskHeadLocked()
+	}
 	if err == nil {
 		err = e.checkpointLocked(checkpointSeq)
 	}
@@ -2132,7 +2146,7 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 	}
 
 	for i, id := range ids {
-		if s, ok := e.head.series.Get(id); ok {
+		if s, ok := e.head.getIdentity(id); ok {
 			p.series[i] = s
 		}
 
@@ -2192,7 +2206,7 @@ func (e *Engine) planExistence(ids []signal.SeriesID, r fetch.Request, withIdent
 
 	for i, id := range ids {
 		if withIdentity {
-			if s, ok := e.head.series.Get(id); ok {
+			if s, ok := e.head.getIdentity(id); ok {
 				p.series[i] = s
 			}
 		}

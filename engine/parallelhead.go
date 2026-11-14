@@ -15,14 +15,15 @@ import (
 const maxParallelHeadWork = 32 << 20
 
 type parallelHeadHooks struct {
-	capturing     func()
-	ordered       func([]signal.SeriesID)
-	owned         func()
-	prepared      func()
-	beforeWAL     func()
-	beforePublish func()
-	queued        func()
-	fallback      func()
+	afterFrozenCacheBatch func()
+	capturing             func()
+	ordered               func([]signal.SeriesID)
+	owned                 func()
+	prepared              func()
+	beforeWAL             func()
+	beforePublish         func()
+	queued                func()
+	fallback              func()
 }
 
 type parallelHead struct {
@@ -161,7 +162,7 @@ func (e *Engine) parallelSnapshots(p *preparedBatch, lookupErr error) (series.Vi
 		e.mu.LockState()
 		for _, id := range p.lookup.historical {
 			if entry := p.lookup.pending[id]; entry.exists {
-				e.head.disk.remember(id, entry.newest)
+				e.head.rememberHistorical(id, entry.newest)
 			}
 		}
 		e.mu.UnlockState()
@@ -179,6 +180,8 @@ func (e *Engine) parallelSnapshots(p *preparedBatch, lookupErr error) (series.Vi
 			slot := e.head.stateRefs[ref]
 			state.buffer = e.head.buffers.get(slot)
 			state.newest, state.seen = e.head.slots.get(slot)
+		} else if entry, ok := e.head.frozenState(id); ok {
+			state = entry
 		} else if e.cfg.DiskSeries {
 			entry := p.lookup.pending[id]
 			state.historical, state.seen, state.newest = entry.exists, entry.exists, entry.newest

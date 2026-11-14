@@ -147,7 +147,7 @@ func (e *Engine) captureDiskLabelHead(ctx context.Context, r fetch.Request, c *d
 			if !bufHasInWindow(buf, r.Start, r.End) {
 				continue
 			}
-			if s, ok := e.head.series.Get(id); ok {
+			if s, ok := e.head.getIdentity(id); ok {
 				if err := c.projectBroad(s); err != nil {
 					return err
 				}

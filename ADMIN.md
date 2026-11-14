@@ -105,7 +105,12 @@ admission, while one atomic batch may exceed the target. `MetricSeriesCacheBytes
 the historical ID/watermark cache per engine (512 MiB default, allocated on demand; negative disables).
 `IdentityBytes` includes its retained bytes and the Bloom filter, but head pressure excludes them
 because flushing cannot reclaim them. Catalog lifecycle changes invalidate the cache; ordinary
-flushes preserve it. The optional recent tier is disabled.
+flushes preserve it. Flushes cache accepted frozen watermarks in bounded 256-series batches before
+catalog publication; delayed lookups preserve newer active/frozen watermarks. Shutdown logs isolate
+this pass as `flush_cache_watermarks`.
+Active and frozen identity owners are both charged to resident pressure until publication;
+retiring the frozen owner preserves the active registry without rebuilding it. A failed flush
+reattaches its frozen ownership and keeps the WAL replayable. The optional recent tier is disabled.
 `MetricAsyncPressureFlush` optionally starts standalone WAL-backed disk-head rotation at half this
 target and waits at the full aggregate target. This overlaps ingestion with one frozen builder
 without multiplying resident/cache targets. It is off by default; cluster, read-only and ephemeral

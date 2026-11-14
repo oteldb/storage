@@ -9,14 +9,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/backend"
 	backendfile "github.com/oteldb/storage/backend/file"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
 
 func TestDiskHeadIdentityGenerationOwnership(t *testing.T) {
-	reproduce.Unfixed(t, 661, "flush shares and rebuilds the active identity index under writer ownership")
 	t.Parallel()
 	for _, abort := range []bool{false, true} {
 		name := "publish"
@@ -24,6 +23,7 @@ func TestDiskHeadIdentityGenerationOwnership(t *testing.T) {
 			name = "abort and retry"
 		}
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			synctest.Test(t, func(t *testing.T) {
 				e, fsys := newFaultWALEngine(t, 10)
 				files, err := backendfile.New(t.TempDir())
@@ -43,6 +43,7 @@ func TestDiskHeadIdentityGenerationOwnership(t *testing.T) {
 					func(i int) signal.Series { return input.series[i] }, AppendLimits{MaxSeries: 17})
 				require.NoError(t, err)
 				require.Equal(t, 16, accepted.Accepted)
+				originalCardinality := e.Cardinality(0)
 				frozenIndex := e.head.series
 				identityBytes := e.head.residentIdentityBytes()
 				ctx, cancel := context.WithCancel(t.Context())
@@ -50,9 +51,10 @@ func TestDiskHeadIdentityGenerationOwnership(t *testing.T) {
 				done := make(chan error, 1)
 				go func() { done <- e.Flush(ctx) }()
 				<-gate.entered
+				require.Equal(t, originalCardinality, e.Cardinality(0), "frozen resident cardinality remains visible")
 				e.mu.RLock()
 				activeIndex := e.head.series
-				assert.True(t, frozenIndex != activeIndex, "active and frozen registries must differ")
+				assert.NotSame(t, frozenIndex, activeIndex, "active and frozen registries must differ")
 				assert.Zero(t, activeIndex.Len(), "the new active generation begins empty")
 				assert.GreaterOrEqual(t, e.head.residentIdentityBytes(), identityBytes, "frozen identities remain charged")
 				e.mu.RUnlock()
@@ -71,6 +73,14 @@ func TestDiskHeadIdentityGenerationOwnership(t *testing.T) {
 				assert.Equal(t, 2, activeIndex.Len())
 				assert.GreaterOrEqual(t, e.head.residentIdentityBytes(), identityBytes+activeIndex.SizeBytes())
 				e.mu.RUnlock()
+				expected := New(Config{})
+				for _, s := range input.series {
+					_, err := expected.Append(s, 100, 1)
+					require.NoError(t, err)
+				}
+				cardinality := expected.Cardinality(0)
+				cardinality.IndexScope = "resident_head"
+				require.Equal(t, cardinality, e.Cardinality(0), "overlapping identities and symbols count once")
 				checkGenerationQueries(t, e)
 				if abort {
 					cancel()
@@ -86,7 +96,7 @@ func TestDiskHeadIdentityGenerationOwnership(t *testing.T) {
 					require.NoError(t, e.Flush(t.Context()))
 				} else {
 					require.NoError(t, err)
-					assert.True(t, activeIndex == e.head.series, "publication must not rebuild active identities")
+					assert.Same(t, activeIndex, e.head.series, "publication must not rebuild active identities")
 					require.Equal(t, 2, e.head.series.Len())
 					require.Equal(t, 2, e.HeadSampleCount())
 					require.Len(t, replayedHead(t, fsys).samples, 2, "checkpoint preserves concurrent writes")
@@ -134,4 +144,145 @@ func checkGenerationQueries(t *testing.T, e *Engine) {
 	values, err := e.LabelValues(t.Context(), r, []byte("instance"))
 	require.NoError(t, err)
 	require.Equal(t, []string{"node-00000:9100", "node-00001:9100", "node-00002:9100"}, values)
+}
+
+func TestDiskGenerationWithoutWALPreservesKnownSeriesLimits(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		files, err := backendfile.New(t.TempDir())
+		require.NoError(t, err)
+		gate := &parallelPartGate{File: files, entered: make(chan struct{}), other: make(chan struct{}), resume: make(chan struct{})}
+		resume := sync.OnceFunc(func() { close(gate.resume) })
+		defer resume()
+		e := New(Config{Backend: gate, Prefix: "no-wal-generations", DiskSeries: true, SeriesCacheBytes: -1,
+			OOOWindow: 10, ResidentHeadBytes: 1 << 30, MetricSeriesChunks: true})
+		input := nodeExporterInputBatch(4, 0)
+		for _, i := range []int{0, 1} {
+			_, err := e.Append(input.series[i], -100, float64(i))
+			require.NoError(t, err)
+		}
+		// A recovered series record may precede its first sample.
+		e.head.registerSeries(input.series[2])
+		done := make(chan error, 1)
+		go func() { done <- e.Flush(t.Context()) }()
+		<-gate.entered
+		for _, point := range []struct {
+			series int
+			ts     int64
+		}{{series: 0, ts: -90}, {series: 2, ts: -500}} {
+			r, err := e.AppendBatch(input.ids[point.series:point.series+1], []int64{point.ts}, []float64{1}, nil,
+				func(int) signal.Series { return input.series[point.series] }, AppendLimits{MaxSeries: 3})
+			require.NoError(t, err)
+			require.Equal(t, 1, r.Accepted)
+		}
+		rejected, err := e.AppendBatch(input.ids[3:4], []int64{0}, []float64{1}, nil,
+			func(int) signal.Series { t.Error("cardinality reject materialized"); return input.series[3] }, AppendLimits{MaxSeries: 3})
+		require.NoError(t, err)
+		require.Equal(t, 1, rejected.RejectedCardinality)
+		require.Equal(t, 3, e.SeriesCount())
+		resume()
+		synctest.Wait()
+		require.NoError(t, <-done)
+		require.NoError(t, e.Flush(t.Context()))
+		count, err := e.Count(t.Context(), fetch.Request{Start: -1000, End: 0})
+		require.NoError(t, err)
+		require.Equal(t, 3, count)
+		require.NoError(t, e.Close(t.Context()))
+	})
+}
+
+func TestRetiredGenerationRejectsStaleLookupAfterCacheEviction(t *testing.T) {
+	t.Parallel()
+	e, _, _ := newDiskLookupEngine(t)
+	input := []signal.SeriesID{benchSeries(0).Hash()}
+	p := preparedFor(input)
+	defer p.memory.release()
+	p.prepareOwnership()
+	require.NoError(t, e.captureParallelDiskSeries(input, p))
+	_, err := e.Append(benchSeries(0), 200, 2)
+	require.NoError(t, err)
+	e.mu.LockWriter()
+	e.head.disk.cache.clear()
+	e.mu.UnlockWriter()
+	e.mu.RLockWriter()
+	_, valid, err := e.parallelSnapshots(p, nil)
+	e.mu.RUnlockWriter()
+	require.NoError(t, err)
+	require.True(t, valid)
+	entry, hit := e.head.disk.cache.get(input[0])
+	require.True(t, hit)
+	require.EqualValues(t, 200, entry.newest)
+	require.NoError(t, e.Flush(t.Context()))
+	r, err := e.AppendBatch(input, []int64{150}, []float64{1}, nil,
+		func(int) signal.Series { t.Error("late identity materialized"); return benchSeries(0) }, AppendLimits{})
+	require.NoError(t, err)
+	require.Equal(t, 1, r.RejectedOOO)
+}
+
+func TestFrozenWatermarkBatchesReleaseWriterOwnership(t *testing.T) {
+	t.Parallel()
+	for _, abort := range []bool{false, true} {
+		name := "publish"
+		if abort {
+			name = "cancel cache pass"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				e, fs := newFaultWALEngine(t, 10)
+				e.cfg.Backend, e.cfg.Prefix, e.cfg.DiskSeries = backend.Memory(), "cache-batch", true
+				e.cfg.ResidentHeadBytes = 1 << 30
+				e.head.disk = newDiskHeadStateWithCache(1 << 20)
+				for i := range 512 {
+					_, err := e.Append(benchSeries(i), 100, float64(i))
+					require.NoError(t, err)
+				}
+				ready, proceed := make(chan struct{}), make(chan struct{})
+				resume := sync.OnceFunc(func() { close(proceed) })
+				defer resume()
+				var once sync.Once
+				e.parallel.hooks = &parallelHeadHooks{afterFrozenCacheBatch: func() {
+					once.Do(func() { close(ready); <-proceed })
+				}}
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				done := make(chan error, 1)
+				go func() { done <- e.Flush(ctx) }()
+				<-ready
+				appended := make(chan error, 1)
+				go func() { _, err := e.Append(benchSeries(0), 200, 2); appended <- err }()
+				synctest.Wait()
+				progressed := false
+				select {
+				case err := <-appended:
+					require.NoError(t, err)
+					progressed = true
+				default:
+				}
+				if abort {
+					cancel()
+				}
+				resume()
+				synctest.Wait()
+				err := <-done
+				if !progressed {
+					require.NoError(t, <-appended)
+				}
+				require.True(t, progressed, "cache maintenance must release ownership between batches")
+				if abort {
+					require.ErrorIs(t, err, context.Canceled)
+					require.Equal(t, 513, e.HeadSampleCount())
+					require.Len(t, replayedHead(t, fs).samples, 512)
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, 1, e.HeadSampleCount())
+					require.Len(t, replayedHead(t, fs).samples, 1)
+				}
+				e.parallel.hooks = nil
+				require.NoError(t, e.Flush(t.Context()))
+				require.Equal(t, 512, e.SeriesCount())
+				require.NoError(t, e.CloseWAL())
+			})
+		})
+	}
 }

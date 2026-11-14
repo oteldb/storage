@@ -62,6 +62,24 @@ the flush slot, avoiding empty/tiny work after a manual flush wins. Close drains
 CloseWAL cancels/drains it without checkpointing failed work. This mode changes part granularity
 and needs workload qualification; it is off by default and rejects cluster/read-only/ephemeral use.
 
+Disk-series flush detach transfers symbols, registry, postings and watermark slots to one frozen
+identity owner and installs an empty active owner. New registrations use only the active registry;
+queries resolve both owners and deduplicate canonical IDs. Registry pointer changes invalidate
+in-flight lookup snapshots. Frozen descriptors supply flush encoding without active-index growth.
+Combined resident pressure charges both identity owners plus active/frozen samples and pending
+preparations; shared historical caches retain their independent budget. Target and queue depth stay
+unchanged. Before catalog publication, accepted frozen watermarks populate the historical cache in
+256-series state-lock windows, allowing unrelated writers between batches. Delayed historical reads
+cannot replace a newer active/frozen watermark. No per-sample cache write or active-registry rebuild
+is required; disabled caches skip this pass.
+
+Installing candidate parts retires the frozen registry and preserves the active registry's
+references. Failure before candidate installation merges active identities/watermarks into the
+frozen owner and reattaches samples, preserving original WAL ownership. This exceptional rollback may rebuild
+index entries under writer ownership; successful publication does not. Catalog adoption counts
+both owners and hydrates their watermarks under state exclusion. Non-disk mode retains its shared
+historical registry. No WAL or part format changes are required.
+
 Per-write fsync combines ready independent batches in a bounded caller-owned queue, without a timer
 or background worker. Combined frames use at most eight reusable 4 MiB buffers globally; page-cache
 writes retain their existing physical writer path. WAL failure publishes none of the grouped batches.
