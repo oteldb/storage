@@ -14,6 +14,7 @@ import (
 const maxParallelHeadWork = 32 << 20
 
 type parallelHeadHooks struct {
+	capturing     func()
 	ordered       func([]signal.SeriesID)
 	owned         func()
 	beforeWAL     func()
@@ -114,6 +115,9 @@ func (e *Engine) appendKnownPrepared(
 func (e *Engine) captureParallelDiskSeries(ids []signal.SeriesID, p *preparedBatch) error {
 	if !e.cfg.DiskSeries {
 		return nil
+	}
+	if hooks := e.parallel.hooks; hooks != nil && hooks.capturing != nil {
+		hooks.capturing()
 	}
 	e.mu.RLock()
 	if err := e.checkDiskAdmissionLocked(); err != nil {
