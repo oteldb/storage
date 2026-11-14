@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/oteldb/storage/internal/mergestream"
-	"github.com/oteldb/storage/internal/mergestream/mergestreamtest"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -31,18 +30,4 @@ func BenchmarkKeys(b *testing.B) {
 	}
 
 	_ = last
-}
-
-// BenchmarkUnionNaive is the map-then-sort form the engines used to build per merge, kept as the
-// baseline [BenchmarkKeys] is measured against.
-func BenchmarkUnionNaive(b *testing.B) {
-	src := ascendingSources(benchSources, benchPerSource)
-
-	b.ReportAllocs()
-	b.SetBytes(int64(benchSources * benchPerSource * 16))
-	b.ResetTimer()
-
-	for b.Loop() {
-		_ = mergestreamtest.Union(src)
-	}
 }

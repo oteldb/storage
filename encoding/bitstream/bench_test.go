@@ -1,8 +1,6 @@
 package bitstream
 
 import (
-	"encoding/binary"
-	"io"
 	"testing"
 )
 
@@ -118,39 +116,4 @@ func BenchmarkVarintRead(b *testing.B) {
 			_, _ = r.ReadVarint()
 		}
 	}
-}
-
-// BenchmarkStdlibVarintRead is a baseline: binary.ReadVarint over a bytes.Reader.
-func BenchmarkStdlibVarintRead(b *testing.B) {
-	buf := make([]byte, binary.MaxVarintLen64)
-	n := binary.PutVarint(buf, 1<<63-1)
-	data := make([]byte, 0, n*1024)
-	for range 1024 {
-		data = append(data, buf[:n]...)
-	}
-	b.SetBytes(int64(n))
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		br := bytesReader{data: data}
-		for range 1024 {
-			_, _ = binary.ReadVarint(&br)
-		}
-	}
-}
-
-// bytesReader is a minimal io.ByteReader to drive binary.ReadVarint without the
-// bytes.Reader method-set overhead skewing the baseline.
-type bytesReader struct {
-	data []byte
-	off  int
-}
-
-func (r *bytesReader) ReadByte() (byte, error) {
-	if r.off >= len(r.data) {
-		return 0, io.EOF
-	}
-	b := r.data[r.off]
-	r.off++
-	return b, nil
 }
