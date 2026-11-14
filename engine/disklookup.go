@@ -61,8 +61,13 @@ func (l *diskSeriesLookup) capture(e *Engine, ids []signal.SeriesID) {
 }
 
 func (l *diskSeriesLookup) valid(e *Engine) bool {
-	if l.head != e.head || l.disk != e.head.disk || l.generation != e.generation ||
-		len(l.parts) != len(e.parts)+len(e.foreignParts) || l.ownParts != len(e.parts) {
+	if l.head != e.head || l.disk != e.head.disk || l.generation != e.generation {
+		return false
+	}
+	if len(l.historical) == 0 {
+		return true
+	}
+	if len(l.parts) != len(e.parts)+len(e.foreignParts) || l.ownParts != len(e.parts) {
 		return false
 	}
 	if !slices.Equal(l.parts[:l.ownParts], e.parts) {

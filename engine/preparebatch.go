@@ -43,7 +43,6 @@ func (p *batchPreparations) acquireWaiting() *preparedBatch {
 }
 
 func (p *batchPreparations) take() *preparedBatch {
-
 	select {
 	case b := <-p.free:
 		return b
@@ -155,24 +154,7 @@ func (e *Engine) appendPrepared(
 		if res, handled, err := e.appendKnownPrepared(ids, ts, values, sf, materialize, limits, p); handled {
 			return res, err
 		}
-		var cached map[signal.SeriesID]signal.Series
-		for group, i := range p.materializeAt {
-			if i >= 0 {
-				if cached == nil {
-					cached = make(map[signal.SeriesID]signal.Series)
-				}
-				cached[ids[i]] = p.batch.accs[p.groups[group].staged].series
-			}
-		}
-		if len(cached) > 0 {
-			original := materialize
-			materialize = func(i int) signal.Series {
-				if s, ok := cached[ids[i]]; ok {
-					return s
-				}
-				return original(i)
-			}
-		}
+		materialize = p.reuseMaterialization(ids, materialize)
 		p.batch.reset()
 		p.warm = false
 		clear(p.next)
@@ -185,6 +167,28 @@ func (e *Engine) appendPrepared(
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
 	return e.appendPreparedLocked(ids, ts, values, sf, materialize, limits, p)
+}
+
+func (p *preparedBatch) reuseMaterialization(ids []signal.SeriesID, original func(int) signal.Series) func(int) signal.Series {
+	var cached map[signal.SeriesID]signal.Series
+	for group, i := range p.materializeAt {
+		if i < 0 {
+			continue
+		}
+		if cached == nil {
+			cached = make(map[signal.SeriesID]signal.Series)
+		}
+		cached[ids[i]] = p.batch.accs[p.groups[group].staged].series
+	}
+	if len(cached) == 0 {
+		return original
+	}
+	return func(i int) signal.Series {
+		if s, ok := cached[ids[i]]; ok {
+			return s
+		}
+		return original(i)
+	}
 }
 
 func (e *Engine) appendPreparedLocked(

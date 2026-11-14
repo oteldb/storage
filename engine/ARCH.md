@@ -52,7 +52,7 @@ work falls back with memoized lazy identities. Pool exhaustion waits without tak
 `Config.AsyncPressureFlush` / `Options.MetricAsyncPressureFlush` opt in to standalone WAL-backed
 disk-head pipelining. Rotation starts at half the resident target; the other half permits active
 progress while one frozen generation builds. Active/frozen state and pending sample bytes trigger
-backpressure at the original full target, with the existing allowance for one atomic batch and
+backpressure at the original full target, with bounded overshoot from already admitted atomic batches and
 separately bounded preparation scratch. The target is not multiplied per worker. One worker and one
 frozen slot preserve publication/checkpoint order. A queued job rechecks pressure after acquiring
 the flush slot, avoiding empty/tiny work after a manual flush wins. Close drains the owned job;

@@ -84,7 +84,6 @@ func FuzzPublicationReservations(f *testing.F) {
 					t.Fatal("missing owned identity")
 				}
 			}
-
 		}
 	})
 }

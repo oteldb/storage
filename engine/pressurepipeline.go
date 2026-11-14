@@ -36,27 +36,10 @@ func (e *Engine) pipelineResidentPressure() error {
 		if !active || used < e.cfg.ResidentHeadBytes/2 {
 			return nil
 		}
-		e.pressure.mu.Lock()
-		if e.pressure.closed.Load() {
-			e.pressure.mu.Unlock()
+		job := e.startPressureJob()
+		if job == nil {
 			return os.ErrClosed
 		}
-		job := e.pressure.job
-		if job == nil {
-			ctx, cancel := context.WithCancel(context.Background())
-			job = &pressureJob{done: make(chan struct{}), cancel: cancel}
-			e.pressure.job = job
-			go func() {
-				err := e.observeFlush(ctx, e.buildPressureGeneration)
-				cancel()
-				e.pressure.mu.Lock()
-				job.err = err
-				e.pressure.job = nil
-				close(job.done)
-				e.pressure.mu.Unlock()
-			}()
-		}
-		e.pressure.mu.Unlock()
 		if used < e.cfg.ResidentHeadBytes {
 			return nil
 		}
@@ -65,6 +48,44 @@ func (e *Engine) pipelineResidentPressure() error {
 			return job.err
 		}
 	}
+}
+
+func (e *Engine) schedulePressureFlush() {
+	if !e.pressurePipelineEnabled() {
+		return
+	}
+	e.mu.RLock()
+	needed := e.head.bytes > 0 &&
+		e.head.residentIdentityBytes()+e.head.inFlightBytes()+e.parallel.pending.Load() >= e.cfg.ResidentHeadBytes/2
+	e.mu.RUnlock()
+	if needed {
+		e.startPressureJob()
+	}
+}
+
+//nolint:contextcheck,nolintlint // Append has no caller context; Close owns cancellation and drain.
+func (e *Engine) startPressureJob() *pressureJob {
+	e.pressure.mu.Lock()
+	defer e.pressure.mu.Unlock()
+	if e.pressure.closed.Load() {
+		return nil
+	}
+	if job := e.pressure.job; job != nil {
+		return job
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	job := &pressureJob{done: make(chan struct{}), cancel: cancel}
+	e.pressure.job = job
+	go func() {
+		err := e.observeFlush(ctx, e.buildPressureGeneration)
+		cancel()
+		e.pressure.mu.Lock()
+		job.err = err
+		e.pressure.job = nil
+		close(job.done)
+		e.pressure.mu.Unlock()
+	}()
+	return job
 }
 
 func (e *Engine) buildPressureGeneration(ctx context.Context) (int, int64, error) {

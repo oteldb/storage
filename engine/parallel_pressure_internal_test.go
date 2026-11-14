@@ -18,6 +18,7 @@ import (
 
 type pressureGateBackend struct {
 	backend.Backend
+
 	entered, resume chan struct{}
 	once            sync.Once
 }
@@ -99,7 +100,7 @@ func TestCloseWALCancelsPressureBuildWithoutCheckpoint(t *testing.T) {
 		require.NoError(t, <-done)
 		require.Equal(t, 64, e.HeadSampleCount(), "aborted generation must remain replayable")
 		recovered := replayedHead(t, fs)
-		require.Equal(t, 64, len(recovered.samples))
+		require.Len(t, recovered.samples, 64)
 		s := stagedTestSeries("after-close")
 		r := appendColdTest(e, s, 300, AppendLimits{}, func() signal.Series { t.Error("closed engine materialized identity"); return s })
 		require.ErrorIs(t, r.err, os.ErrClosed)

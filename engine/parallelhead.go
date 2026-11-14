@@ -37,6 +37,7 @@ func (e *Engine) appendKnownPrepared(
 	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(int) signal.Series,
 	limits AppendLimits, p *preparedBatch,
 ) (AppendResult, bool, error) {
+	lookupErr := e.captureParallelDiskSeries(ids, p)
 	e.mu.RLockWriter()
 	defer e.mu.RUnlockWriter()
 	ph := e.parallel
@@ -54,12 +55,18 @@ func (e *Engine) appendKnownPrepared(
 		return AppendResult{}, true, err
 	}
 
-	view, err := e.parallelSnapshots(ids, p)
-	if err != nil {
-		return AppendResult{}, true, err
+	view, valid, err := e.parallelSnapshots(p, lookupErr)
+	if !valid || err != nil {
+		return AppendResult{}, valid, err
 	}
 	ph.admission.Lock()
 	e.mu.RLock()
+	if e.cfg.DiskSeries && e.head.bytes > 0 &&
+		e.head.residentIdentityBytes()+e.head.inFlightBytes()+ph.pending.Load() >= e.cfg.ResidentHeadBytes {
+		e.mu.RUnlock()
+		ph.admission.Unlock()
+		return AppendResult{}, false, nil
+	}
 	p.otherPendingBytes, p.otherPendingSeries = ph.pending.Load(), ph.pendingSeries.Load()
 	p.warm = true
 	res := e.stagePreparedRows(ids, ts, values, sf, func(i int) signal.Series {
@@ -104,29 +111,54 @@ func (e *Engine) appendKnownPrepared(
 	return res, true, nil
 }
 
-func (e *Engine) parallelSnapshots(ids []signal.SeriesID, p *preparedBatch) (series.View, error) {
+func (e *Engine) captureParallelDiskSeries(ids []signal.SeriesID, p *preparedBatch) error {
+	if !e.cfg.DiskSeries {
+		return nil
+	}
 	e.mu.RLock()
 	if err := e.checkDiskAdmissionLocked(); err != nil {
 		e.mu.RUnlock()
-		return series.View{}, err
+		return err
 	}
-	if e.cfg.DiskSeries {
-		p.lookup.capture(e, ids)
-	}
+	p.lookup.capture(e, ids)
 	e.mu.RUnlock()
-	if e.cfg.DiskSeries {
-		defer func() {
-			for _, part := range p.lookup.parts {
-				part.release()
-			}
-		}()
-		slices.SortFunc(p.lookup.historical, signal.SeriesID.Compare)
-		if err := lookupDiskSeries(p.lookup.parts, p.lookup.historical, p.lookup.pending); err != nil {
-			return series.View{}, err
+	if len(p.lookup.historical) == 0 {
+		return nil
+	}
+	defer func() {
+		for _, part := range p.lookup.parts {
+			part.release()
 		}
+	}()
+	slices.SortFunc(p.lookup.historical, signal.SeriesID.Compare)
+	return lookupDiskSeries(p.lookup.parts, p.lookup.historical, p.lookup.pending)
+}
+
+func (e *Engine) parallelSnapshots(p *preparedBatch, lookupErr error) (series.View, bool, error) {
+	e.mu.RLock()
+	valid := !e.cfg.DiskSeries || p.lookup.valid(e)
+	e.mu.RUnlock()
+	if !valid {
+		return series.View{}, false, nil
+	}
+	if lookupErr != nil {
+		return series.View{}, true, lookupErr
+	}
+	if len(p.lookup.historical) > 0 {
+		// A successful lookup remains useful even if this batch's WAL later fails.
+		e.mu.LockState()
+		for _, id := range p.lookup.historical {
+			if entry := p.lookup.pending[id]; entry.exists {
+				e.head.disk.remember(id, entry.newest)
+			}
+		}
+		e.mu.UnlockState()
 	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+	if err := e.checkDiskAdmissionLocked(); err != nil {
+		return series.View{}, true, err
+	}
 	p.snapshots = resize(p.snapshots, len(p.groups))
 	for i, id := range p.ownedIDs {
 		ref, known := e.head.series.Ref(id)
@@ -141,7 +173,7 @@ func (e *Engine) parallelSnapshots(ids []signal.SeriesID, p *preparedBatch) (ser
 		}
 		p.snapshots[i] = state
 	}
-	return e.head.series.View(), nil
+	return e.head.series.View(), true, nil
 }
 
 func (p *preparedBatch) parallelWorkFits(view series.View) bool {
@@ -166,7 +198,8 @@ func (p *preparedBatch) parallelWorkFits(view series.View) bool {
 			n := buildbudget.Attributes(a.series.Attributes)
 			n = buildbudget.Add(n, buildbudget.Attributes(a.series.Resource.Attributes))
 			n = buildbudget.Add(n, buildbudget.Attributes(a.series.Scope.Attributes))
-			n = buildbudget.Add(n, int64(len(a.series.Resource.SchemaURL)+len(a.series.Scope.Name)+len(a.series.Scope.Version)+len(a.series.Scope.SchemaURL)))
+			n = buildbudget.Add(n, int64(len(a.series.Resource.SchemaURL)+len(a.series.Scope.SchemaURL)))
+			n = buildbudget.Add(n, int64(len(a.series.Scope.Name)+len(a.series.Scope.Version)))
 			work = buildbudget.Add(work, buildbudget.Mul(n, 8))
 		} else if a.isNew {
 			work = buildbudget.Add(work, view.IdentityWorkspace(int(a.identityRef)))
@@ -185,6 +218,25 @@ func (p *preparedBatch) prepareTails() {
 	p.next = resize(p.next, n)
 	p.created = resize(p.created, n)
 	clear(p.created)
+	var freshHeaders, freshSamples int
+	for i := range p.batch.order {
+		a := &p.batch.accs[i]
+		if a.buffer == nil {
+			freshHeaders++
+		}
+		if a.buffer == nil || cap(a.buffer.ts) == 0 && cap(a.buffer.values) == 0 {
+			freshSamples += len(a.ts)
+		}
+	}
+	var compactHeaders []sampleBuf
+	if freshHeaders < sampleHeaderPageSize {
+		compactHeaders = make([]sampleBuf, freshHeaders)
+	}
+	var compactTS []int64
+	var compactValues []float64
+	if freshSamples < sampleNumericPageSize {
+		compactTS, compactValues = make([]int64, freshSamples), make([]float64, freshSamples)
+	}
 	for i := range p.batch.order {
 		a := &p.batch.accs[i]
 		next := sampleBuf{}
@@ -192,7 +244,13 @@ func (p *preparedBatch) prepareTails() {
 			next = *a.buffer
 		}
 		prior := len(next.ts)
-		p.memory.initColumns(&next, prior+len(a.ts))
+		if cap(next.ts) == 0 && cap(next.values) == 0 && compactTS != nil {
+			count := len(a.ts)
+			next.ts, next.values = compactTS[:0:count], compactValues[:0:count]
+			compactTS, compactValues = compactTS[count:], compactValues[count:]
+		} else {
+			p.memory.initColumns(&next, prior+len(a.ts))
+		}
 		next.ts = append(next.ts, a.ts...)
 		next.values = append(next.values, a.values...)
 		if next.sf != nil {
@@ -206,7 +264,11 @@ func (p *preparedBatch) prepareTails() {
 		}
 		p.next[i] = next
 		if a.buffer == nil {
-			p.created[i] = p.memory.buffer()
+			if len(compactHeaders) > 0 {
+				p.created[i], compactHeaders = &compactHeaders[0], compactHeaders[1:]
+			} else {
+				p.created[i] = p.memory.buffer()
+			}
 			*p.created[i] = next
 		}
 	}

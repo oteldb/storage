@@ -23,7 +23,7 @@ func (p *preparedBatch) prepareOwnership() {
 		offsets[id.Lo%64]++
 	}
 	var total int
-	for i, count := range offsets {
+	for i, count := range &offsets {
 		offsets[i], total = total, total+count
 	}
 	p.ownerOrder = resize(p.ownerOrder, len(p.ownedIDs))
