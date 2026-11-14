@@ -554,6 +554,9 @@ func (e *Engine) AppendBatch(
 				return e.appendPrepared(ids, ts, values, sf, materialize, limits, p)
 			}
 		}
+		if e.parallel != nil && e.parallel.hooks != nil && e.parallel.hooks.ordered != nil {
+			e.parallel.hooks.ordered(ids)
+		}
 		e.mu.LockWriter()
 	}
 	defer e.mu.UnlockWriter()

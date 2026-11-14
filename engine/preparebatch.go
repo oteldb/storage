@@ -137,6 +137,9 @@ func (e *Engine) appendPrepared(
 		clear(p.created)
 		p.prepare(ids)
 	}
+	if e.parallel != nil && e.parallel.hooks != nil && e.parallel.hooks.ordered != nil {
+		e.parallel.hooks.ordered(ids)
+	}
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
 	return e.appendPreparedLocked(ids, ts, values, sf, materialize, limits, p)

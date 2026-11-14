@@ -14,6 +14,7 @@ import (
 const maxParallelHeadWork = 32 << 20
 
 type parallelHeadHooks struct {
+	ordered       func([]signal.SeriesID)
 	owned         func()
 	beforeWAL     func()
 	beforePublish func()
