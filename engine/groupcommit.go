@@ -114,6 +114,7 @@ func (e *Engine) writePreparedGroup(group []*preparedBatch, size int) error {
 		for _, p := range group {
 			p.publishTails(e.head)
 			e.parallel.pending.Add(-int64(p.batch.samples) * SampleBytes)
+			e.parallel.pendingSeries.Add(-int64(p.batch.registered))
 		}
 	})
 	return nil

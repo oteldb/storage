@@ -879,6 +879,9 @@ func mergeStreamedSeries(
 // Close flushes any buffered samples to a part and closes the WAL. It does not stop a background
 // loop — the owner ([storage.Storage]) does that before calling Close.
 func (e *Engine) Close(ctx context.Context) (retErr error) {
+	if err := e.stopPressurePipeline(ctx, false); err != nil {
+		return err
+	}
 	ctx = obs.WithShutdown(ctx)
 	log := e.cfg.Obs.Logger(ctx).With(zap.String("prefix", e.cfg.Prefix), zap.String("signal", "metric"))
 	done := obs.ShutdownPhase(ctx, log, "engine_close")
@@ -925,6 +928,9 @@ func (e *Engine) Close(ctx context.Context) (retErr error) {
 // CloseWAL releases WAL and part-reader ownership without flushing or checkpointing.
 // WAL segments remain for replay; active fetches keep their readers until release.
 func (e *Engine) CloseWAL() error {
+	if err := e.stopPressurePipeline(context.Background(), true); err != nil {
+		return err
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	defer func() {

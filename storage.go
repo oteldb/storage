@@ -1320,6 +1320,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		MetricFloatGroups:  s.opts.MetricFloatGroups,
 		MetricSeriesChunks: s.opts.MetricSeriesChunks,
 		DiskSeries:         s.opts.MetricDiskSeries,
+		AsyncPressureFlush: s.opts.MetricAsyncPressureFlush,
 		SeparateSeries:     s.opts.MetricSeparateSeries,
 		ResidentHeadBytes:  s.opts.MetricResidentHeadBytes,
 		SeriesCacheBytes:   s.opts.MetricSeriesCacheBytes,

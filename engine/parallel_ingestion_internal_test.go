@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/oteldb/storage/internal/reproduce"
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -17,8 +17,80 @@ func appendColdTest(e *Engine, s signal.Series, ts int64, limits AppendLimits, m
 	return parallelAppendResult{result: res, err: err}
 }
 
+func TestColdParallelWALFailureReleasesAdmission(t *testing.T) {
+	t.Parallel()
+	e, fs := newFaultWALEngine(t, 10)
+	s := stagedTestSeries("failed-cold")
+	failNextWALWrite(fs)
+	r := appendColdTest(e, s, 100, AppendLimits{MaxSeries: 1, MaxInFlightBytes: SampleBytes}, func() signal.Series { return s })
+	require.ErrorIs(t, r.err, errInjectedWAL)
+	require.Equal(t, AppendResult{}, r.result)
+	require.Zero(t, e.HeadSampleCount())
+	require.False(t, e.head.series.Has(s.Hash()))
+	require.Zero(t, e.parallel.pending.Load())
+	require.Zero(t, e.parallel.pendingSeries.Load())
+	r = appendColdTest(e, s, 100, AppendLimits{MaxSeries: 1, MaxInFlightBytes: SampleBytes}, func() signal.Series { return s })
+	require.NoError(t, r.err)
+	require.Equal(t, 1, r.result.Accepted)
+	require.Equal(t, []int64{100}, headTS(replayedHead(t, fs), s))
+}
+
+func TestColdBatchPublishesHeadersAtomically(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		e, _ := newFaultWALEngine(t, 0)
+		a, b := stagedTestSeries("atomic-a"), stagedTestSeries("atomic-b")
+		ready, gate := make(chan struct{}), make(chan struct{})
+		resume := sync.OnceFunc(func() { close(gate) })
+		defer resume()
+		e.parallel.hooks = &parallelHeadHooks{beforePublish: func() { close(ready); <-gate }}
+		done := make(chan parallelAppendResult, 1)
+		go func() {
+			res, err := e.AppendBatch([]signal.SeriesID{a.Hash(), b.Hash()}, []int64{1, 2}, []float64{10, 20},
+				[]float64{2, 1}, func(i int) signal.Series { return []signal.Series{a, b}[i] }, AppendLimits{})
+			done <- parallelAppendResult{result: res, err: err}
+		}()
+		<-ready
+		require.Zero(t, e.HeadSampleCount())
+		require.Zero(t, e.SeriesCount())
+		resume()
+		synctest.Wait()
+		r := <-done
+		require.NoError(t, r.err)
+		require.Equal(t, 2, r.result.Accepted)
+		require.Equal(t, []float64{2}, e.head.samples[a.Hash()].sf)
+		require.Nil(t, e.head.samples[b.Hash()].sf)
+	})
+}
+
+func TestHistoricalParallelAdmissionPreservesWatermarksAndCardinality(t *testing.T) {
+	t.Parallel()
+	e, fs := newFaultWALEngine(t, 10)
+	e.cfg.Backend, e.cfg.Prefix = backend.Memory(), "historical-parallel"
+	e.cfg.DiskSeries, e.cfg.MetricSeriesChunks = true, true
+	e.cfg.SeriesCacheBytes = -1
+	e.cfg.ResidentHeadBytes = 1 << 30
+	e.head.disk = newDiskHeadStateWithCache(-1)
+	a, b := stagedTestSeries("historical-a"), stagedTestSeries("historical-b")
+	for _, s := range []signal.Series{a, b} {
+		r := appendColdTest(e, s, 100, AppendLimits{}, func() signal.Series { return s })
+		require.NoError(t, r.err)
+	}
+	require.NoError(t, e.Flush(t.Context()))
+	require.Zero(t, e.head.series.Len())
+	for _, s := range []signal.Series{a, b} {
+		r := appendColdTest(e, s, 80, AppendLimits{MaxSeries: 2}, func() signal.Series { t.Error("OOO identity materialized"); return s })
+		require.NoError(t, r.err)
+		require.Equal(t, AppendResult{RejectedOOO: 1}, r.result)
+		r = appendColdTest(e, s, 200, AppendLimits{MaxSeries: 2}, func() signal.Series { return s })
+		require.NoError(t, r.err)
+		require.Equal(t, 1, r.result.Accepted)
+	}
+	require.Equal(t, 2, e.SeriesCount(), "rehydrating historical identities must not consume cardinality twice")
+	require.Equal(t, []int64{200}, headTS(replayedHead(t, fs), a))
+}
+
 func TestColdWritesPrepareAndPublishIndependently(t *testing.T) {
-	reproduce.Unfixed(t, 661, "a cold identity's private preparation serializes unrelated ingestion")
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		e, fs := newFaultWALEngine(t, 10)
@@ -67,7 +139,6 @@ func TestColdWritesPrepareAndPublishIndependently(t *testing.T) {
 }
 
 func TestSameSeriesWaitDoesNotBlockOtherSeries(t *testing.T) {
-	reproduce.Unfixed(t, 661, "a conflicting request queues unrelated series behind writer ownership")
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		e, _ := newFaultWALEngine(t, 10)
@@ -114,7 +185,6 @@ func TestSameSeriesWaitDoesNotBlockOtherSeries(t *testing.T) {
 }
 
 func TestPendingColdIdentityReservesCardinality(t *testing.T) {
-	reproduce.Unfixed(t, 661, "cardinality admission is inseparable from a cold writer's encoding")
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		e, _ := newFaultWALEngine(t, 0)

@@ -106,6 +106,10 @@ the historical ID/watermark cache per engine (512 MiB default, allocated on dema
 `IdentityBytes` includes its retained bytes and the Bloom filter, but head pressure excludes them
 because flushing cannot reclaim them. Catalog lifecycle changes invalidate the cache; ordinary
 flushes preserve it. The optional recent tier is disabled.
+`MetricAsyncPressureFlush` optionally starts standalone WAL-backed disk-head rotation at half this
+target and waits at the full aggregate target. This overlaps ingestion with one frozen builder
+without multiplying resident/cache targets. It is off by default; cluster, read-only and ephemeral
+modes reject it. Head/flush/queue metrics must qualify the changed batching before capacity claims.
 `engine.Stats.SeriesComplete` is false while historical metadata is unavailable; `Series` then
 preserves the last complete count. All live local admission and head publication wait for repair;
 accepted WAL and replica payloads still restore into the head, with checkpoints unchanged.

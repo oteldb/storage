@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	minPreparedBatchSamples = 1024
+	minPreparedBatchSamples = 1
 	maxPreparedBatchSamples = 4096
 	maxPreparedBatches      = 8
 	maxPreparedFrameBytes   = 4 << 20
@@ -34,6 +34,15 @@ func (p *batchPreparations) acquire() *preparedBatch {
 	default:
 		return nil
 	}
+	return p.take()
+}
+
+func (p *batchPreparations) acquireWaiting() *preparedBatch {
+	p.active <- struct{}{}
+	return p.take()
+}
+
+func (p *batchPreparations) take() *preparedBatch {
 
 	select {
 	case b := <-p.free:
@@ -42,6 +51,13 @@ func (p *batchPreparations) acquire() *preparedBatch {
 		b := &preparedBatch{batch: newWALBatch()}
 		return b
 	}
+}
+
+func (e *Engine) preparationPool() *batchPreparations {
+	if e.parallel != nil && e.parallel.preparations != nil {
+		return e.parallel.preparations
+	}
+	return metricBatchPreparations
 }
 
 func (p *batchPreparations) release(b *preparedBatch) {
@@ -71,34 +87,37 @@ type preparedGroup struct {
 }
 
 type preparedBatch struct {
-	memory    sampleArena
-	batch     *walBatch
-	positions []int
-	groups    []preparedGroup
-	ts        []int64
-	values    []float64
-	sf        []float64
-	current   int
-	warm      bool
-	snapshots []headSeriesState
-	next      []sampleBuf
-	created   []*sampleBuf
-	refs      []uint32
-	masks     []reservationMask
-	maskOrder []uint32
-	commit    preparedCommit
-	lookup    diskSeriesLookup
+	memory                                sampleArena
+	batch                                 *walBatch
+	positions                             []int
+	groups                                []preparedGroup
+	ts                                    []int64
+	values                                []float64
+	sf                                    []float64
+	current                               int
+	warm                                  bool
+	snapshots                             []headSeriesState
+	next                                  []sampleBuf
+	created                               []*sampleBuf
+	commit                                preparedCommit
+	lookup                                diskSeriesLookup
+	ownedIDs                              []signal.SeriesID
+	ownerOrder                            []uint32
+	materializeAt                         []int
+	otherPendingBytes, otherPendingSeries int64
 }
 
 func (p *preparedBatch) prepare(ids []signal.SeriesID) {
 	p.positions = resize(p.positions, len(ids))
 	p.groups = p.groups[:0]
+	p.ownedIDs = p.ownedIDs[:0]
 	for i, id := range ids {
 		k, ok := p.batch.pos[id]
 		if !ok {
 			k = len(p.groups)
 			p.batch.pos[id] = k
 			p.groups = append(p.groups, preparedGroup{staged: -1})
+			p.ownedIDs = append(p.ownedIDs, id)
 		}
 		p.positions[i] = k
 		p.groups[k].count++
@@ -114,6 +133,11 @@ func (p *preparedBatch) prepare(ids []signal.SeriesID) {
 	p.batch.order = resize(p.batch.order, len(p.groups))[:0]
 	p.batch.accs = resize(p.batch.accs, len(p.groups))
 	p.batch.frames.Grow(len(ids)*32 + len(p.groups)*64)
+	p.materializeAt = resize(p.materializeAt, len(p.groups))
+	for i := range p.materializeAt {
+		p.materializeAt[i] = -1
+	}
+	p.otherPendingBytes, p.otherPendingSeries = 0, 0
 }
 
 func resize[T any](s []T, n int) []T {
@@ -130,6 +154,24 @@ func (e *Engine) appendPrepared(
 	if e.parallel != nil {
 		if res, handled, err := e.appendKnownPrepared(ids, ts, values, sf, materialize, limits, p); handled {
 			return res, err
+		}
+		var cached map[signal.SeriesID]signal.Series
+		for group, i := range p.materializeAt {
+			if i >= 0 {
+				if cached == nil {
+					cached = make(map[signal.SeriesID]signal.Series)
+				}
+				cached[ids[i]] = p.batch.accs[p.groups[group].staged].series
+			}
+		}
+		if len(cached) > 0 {
+			original := materialize
+			materialize = func(i int) signal.Series {
+				if s, ok := cached[ids[i]]; ok {
+					return s
+				}
+				return original(i)
+			}
 		}
 		p.batch.reset()
 		p.warm = false
@@ -228,7 +270,7 @@ func (p *preparedBatch) admit(
 			return rejectOOO
 		}
 	}
-	if limits.MaxInFlightBytes > 0 && h.inFlightBytes()+int64(b.samples)*SampleBytes >= limits.MaxInFlightBytes {
+	if limits.MaxInFlightBytes > 0 && h.inFlightBytes()+p.otherPendingBytes+int64(b.samples)*SampleBytes >= limits.MaxInFlightBytes {
 		return rejectBytes
 	}
 	if k >= 0 {
@@ -244,7 +286,7 @@ func (p *preparedBatch) admit(
 	if acc.buffer == nil {
 		acc.isNew = true
 		if !acc.knownRef {
-			if !state.historical && limits.MaxSeries > 0 && h.cardinality()+int64(b.registered) >= limits.MaxSeries {
+			if !state.historical && limits.MaxSeries > 0 && h.cardinality()+p.otherPendingSeries+int64(b.registered) >= limits.MaxSeries {
 				return rejectCardinality
 			}
 			acc.register, acc.series = true, materialize()

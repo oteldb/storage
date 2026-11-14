@@ -127,6 +127,8 @@ type Config struct {
 	// separately in HeadBytes. Zero uses a bounded default. A single oversized identity or
 	// unordered series can require a larger exclusive reservation.
 	FlushMemoryBytes int64
+	// AsyncPressureFlush rotates standalone disk heads in the background within one resident budget.
+	AsyncPressureFlush bool
 
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each part,
 	// so [Engine.AggregateRange] answers a range-covering aggregate from it without decoding the
@@ -285,6 +287,7 @@ type Engine struct {
 	// walB stages a logged write before it is applied (reused under e.mu). See [walBatch].
 	walB     *walBatch
 	parallel *parallelHead
+	pressure pressurePipeline
 	// flushedEpoch is the WAL flush watermark: the generation of the most recently flushed head
 	// (persisted in the bucket index, under this writer's [Config.WriterID] slot). Current head
 	// records are written to the WAL at flushedEpoch+1,
@@ -546,6 +549,13 @@ func (e *Engine) AppendBatch(
 	}
 	eligible := e.cfg.WAL != nil && (limits.Overflow == nil || limits.MaxSeriesSoft <= 0) &&
 		len(ids) >= minPreparedBatchSamples && len(ids) <= maxPreparedBatchSamples
+	if eligible && e.parallel != nil {
+		pool := e.preparationPool()
+		p := pool.acquireWaiting()
+		defer pool.release(p)
+		p.prepare(ids)
+		return e.appendPrepared(ids, ts, values, sf, materialize, limits, p)
+	}
 	if !eligible || !e.mu.TryLockWriter() {
 		if eligible {
 			if p := metricBatchPreparations.acquire(); p != nil {

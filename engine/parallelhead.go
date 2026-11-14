@@ -23,11 +23,14 @@ type parallelHeadHooks struct {
 }
 
 type parallelHead struct {
-	reservations publicationReservations
-	commits      commitQueue
-	walMu        sync.Mutex
-	pending      atomic.Int64
-	hooks        *parallelHeadHooks
+	ownership     seriesOwnership
+	admission     sync.Mutex
+	pendingSeries atomic.Int64
+	commits       commitQueue
+	walMu         sync.Mutex
+	pending       atomic.Int64
+	preparations  *batchPreparations
+	hooks         *parallelHeadHooks
 }
 
 func (e *Engine) appendKnownPrepared(
@@ -36,80 +39,62 @@ func (e *Engine) appendKnownPrepared(
 ) (AppendResult, bool, error) {
 	e.mu.RLockWriter()
 	defer e.mu.RUnlockWriter()
-	p.snapshots = resize(p.snapshots, len(p.groups))
-	clear(p.snapshots)
-	p.refs = p.refs[:0]
-	for i, id := range ids {
-		group := p.positions[i]
-		if p.snapshots[group].known {
-			continue
-		}
-		ref, known := e.head.series.Ref(id)
-		if !known {
-			return AppendResult{}, false, nil
-		}
-		p.snapshots[group] = headSeriesState{ref: ref, known: true}
-		p.refs = append(p.refs, ref)
-	}
-	p.prepareReservation()
 	ph := e.parallel
-	if !ph.reservations.acquire(p) {
-		if ph.hooks != nil && ph.hooks.fallback != nil {
-			ph.hooks.fallback()
-		}
-		return AppendResult{}, false, nil
+	p.prepareOwnership()
+	var conflict func()
+	if ph.hooks != nil {
+		conflict = ph.hooks.fallback
 	}
-	defer ph.reservations.release(p, len(p.masks))
+	ph.ownership.acquire(p, conflict)
+	defer ph.ownership.release(p)
 	if ph.hooks != nil && ph.hooks.owned != nil {
 		ph.hooks.owned()
 	}
 	if err := e.refuseWrite(); err != nil {
 		return AppendResult{}, true, err
 	}
-	admissionErr := func() error {
-		e.mu.RLock()
-		defer e.mu.RUnlock()
-		if err := e.checkDiskAdmissionLocked(); err != nil {
-			return err
-		}
-		for i := range p.snapshots {
-			s := &p.snapshots[i]
-			slot := e.head.stateRefs[s.ref]
-			s.buffer = e.head.buffers.get(slot)
-			s.newest, s.seen = e.head.slots.get(slot)
-		}
-		return nil
-	}()
-	if admissionErr != nil {
-		return AppendResult{}, true, admissionErr
+
+	view, err := e.parallelSnapshots(ids, p)
+	if err != nil {
+		return AppendResult{}, true, err
 	}
+	ph.admission.Lock()
+	e.mu.RLock()
+	p.otherPendingBytes, p.otherPendingSeries = ph.pending.Load(), ph.pendingSeries.Load()
 	p.warm = true
-	stageLimits := limits
-	stageLimits.MaxInFlightBytes = 0
-	res := e.stagePreparedRows(ids, ts, values, sf, materialize, stageLimits, p)
+	res := e.stagePreparedRows(ids, ts, values, sf, func(i int) signal.Series {
+		p.materializeAt[p.positions[i]] = i
+		return signal.Series{}
+	}, limits, p)
+	bytes := int64(p.batch.samples) * SampleBytes
+	registered := int64(p.batch.registered)
+	ph.pending.Add(bytes)
+	ph.pendingSeries.Add(registered)
+	e.mu.RUnlock()
+	ph.admission.Unlock()
+	if res.RejectedBytes > 0 && ph.hooks != nil && ph.hooks.fallback != nil {
+		ph.hooks.fallback()
+	}
 	if p.batch.empty() {
 		return res, true, nil
 	}
-	view := e.head.series.View()
-	if !p.parallelWorkFits(view) {
-		return AppendResult{}, false, nil
-	}
-	bytes := int64(p.batch.samples) * SampleBytes
-	reserved := e.reserveParallelBytes(bytes, limits.MaxInFlightBytes)
-	if !reserved {
-		if ph.hooks != nil && ph.hooks.fallback != nil {
-			ph.hooks.fallback()
-		}
-		return AppendResult{}, false, nil
-	}
+	reserved := true
 	defer func() {
 		if reserved {
 			ph.pending.Add(-bytes)
+			ph.pendingSeries.Add(-registered)
 		}
 	}()
-
+	for group, i := range p.materializeAt {
+		if i >= 0 {
+			p.batch.accs[p.groups[group].staged].series = materialize(i)
+		}
+	}
+	if !p.parallelWorkFits(view) {
+		return AppendResult{}, false, nil
+	}
 	p.prepareTails()
-	if err := p.batch.encode(p.batch.encodingView(e.head, false), false); err != nil {
+	if err := p.batch.encode(view, false); err != nil {
 		return AppendResult{}, true, err
 	}
 	if err := e.commitPrepared(p); err != nil {
@@ -117,6 +102,46 @@ func (e *Engine) appendKnownPrepared(
 	}
 	reserved = false
 	return res, true, nil
+}
+
+func (e *Engine) parallelSnapshots(ids []signal.SeriesID, p *preparedBatch) (series.View, error) {
+	e.mu.RLock()
+	if err := e.checkDiskAdmissionLocked(); err != nil {
+		e.mu.RUnlock()
+		return series.View{}, err
+	}
+	if e.cfg.DiskSeries {
+		p.lookup.capture(e, ids)
+	}
+	e.mu.RUnlock()
+	if e.cfg.DiskSeries {
+		defer func() {
+			for _, part := range p.lookup.parts {
+				part.release()
+			}
+		}()
+		slices.SortFunc(p.lookup.historical, signal.SeriesID.Compare)
+		if err := lookupDiskSeries(p.lookup.parts, p.lookup.historical, p.lookup.pending); err != nil {
+			return series.View{}, err
+		}
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	p.snapshots = resize(p.snapshots, len(p.groups))
+	for i, id := range p.ownedIDs {
+		ref, known := e.head.series.Ref(id)
+		state := headSeriesState{ref: ref, known: known}
+		if known {
+			slot := e.head.stateRefs[ref]
+			state.buffer = e.head.buffers.get(slot)
+			state.newest, state.seen = e.head.slots.get(slot)
+		} else if e.cfg.DiskSeries {
+			entry := p.lookup.pending[id]
+			state.historical, state.seen, state.newest = entry.exists, entry.exists, entry.newest
+		}
+		p.snapshots[i] = state
+	}
+	return e.head.series.View(), nil
 }
 
 func (p *preparedBatch) parallelWorkFits(view series.View) bool {
@@ -137,7 +162,13 @@ func (p *preparedBatch) parallelWorkFits(view series.View) bool {
 		if (old.sf != nil || a.sampled) && needed > cap(old.sf) {
 			work = buildbudget.Add(work, buildbudget.Mul(int64(needed), 16))
 		}
-		if a.isNew {
+		if a.register {
+			n := buildbudget.Attributes(a.series.Attributes)
+			n = buildbudget.Add(n, buildbudget.Attributes(a.series.Resource.Attributes))
+			n = buildbudget.Add(n, buildbudget.Attributes(a.series.Scope.Attributes))
+			n = buildbudget.Add(n, int64(len(a.series.Resource.SchemaURL)+len(a.series.Scope.Name)+len(a.series.Scope.Version)+len(a.series.Scope.SchemaURL)))
+			work = buildbudget.Add(work, buildbudget.Mul(n, 8))
+		} else if a.isNew {
 			work = buildbudget.Add(work, view.IdentityWorkspace(int(a.identityRef)))
 			work = buildbudget.Add(work, view.MaterializationBytes(int(a.identityRef)))
 			work = buildbudget.Add(work, view.EncodingBytes(int(a.identityRef)))
@@ -182,10 +213,21 @@ func (p *preparedBatch) prepareTails() {
 }
 
 func (p *preparedBatch) publishTails(h *head) {
+	if h.disk != nil {
+		prior := h.disk.pending
+		h.disk.pending = p.lookup.pending
+		defer func() { h.disk.pending = prior }()
+	}
 	h.memory.adopt(&p.memory)
 	minTS := int64(math.MaxInt64)
 	for i, id := range p.batch.order {
 		a := &p.batch.accs[i]
+		if a.register && !h.series.Has(id) {
+			h.register(series.Entry{ID: id, Series: a.series})
+		}
+		if !a.knownRef {
+			a.identityRef, a.knownRef = h.series.Ref(id)
+		}
 		if a.buffer == nil {
 			h.setBuffer(id, a.identityRef, p.created[i])
 		} else {
@@ -201,20 +243,5 @@ func (p *preparedBatch) publishTails(h *head) {
 	h.grow(int64(p.batch.samples) * SampleBytes)
 	if h.since.IsZero() || p.batch.first.Before(h.since) {
 		h.since = p.batch.first
-	}
-}
-
-func (e *Engine) reserveParallelBytes(bytes, limit int64) bool {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	used := e.head.inFlightBytes()
-	for {
-		pending := e.parallel.pending.Load()
-		if limit > 0 && (used >= limit || pending > limit-used || bytes > limit-used-pending) {
-			return false
-		}
-		if e.parallel.pending.CompareAndSwap(pending, pending+bytes) {
-			return true
-		}
 	}
 }
