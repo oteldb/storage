@@ -27,6 +27,7 @@ type headRunEntry struct {
 type headPartBuilder struct {
 	plan                           *headPartPlan
 	fixedLimit, fixedIdentityBytes int64
+	checkedPrivate, trackedPrivate int64
 	ctx                            context.Context //nolint:containedctx // The builder and its streaming writes share one flush lifetime.
 	e                              *Engine
 	view                           series.View
@@ -150,14 +151,18 @@ func (b *headPartBuilder) baseBytes() int64 {
 	n := buildbudget.Add(8<<20, buildbudget.Mul(int64(blockRows), 64))
 	n = buildbudget.Add(n, b.orderWorkspace)
 	n = buildbudget.Add(n, b.buildScratch.SizeBytes())
-	n = buildbudget.Add(n, b.closedBloomBytes)
+	if b.fixedLimit == 0 {
+		n = buildbudget.Add(n, b.closedBloomBytes)
+	}
 	if b.writer != nil {
 		n = buildbudget.Add(n, max(b.writer.identityWriterBytes, b.writer.sidecarWriterBytes))
 	}
 	if b.fixedLimit == 0 {
 		n = buildbudget.Add(n, memsize.Slice(b.entries))
 	}
-	n = buildbudget.Add(n, buildbudget.Mul(memsize.Slice(b.parts), 2))
+	if b.fixedLimit == 0 {
+		n = buildbudget.Add(n, buildbudget.Mul(memsize.Slice(b.parts), 2))
+	}
 	return buildbudget.Add(n, memsize.Slice(b.partRefs))
 }
 
@@ -197,6 +202,7 @@ func (b *headPartBuilder) reserve(bytes int64) error {
 
 func (b *headPartBuilder) reservePhase(bytes int64, phase string) error {
 	if b.fixedLimit > 0 {
+		b.checkedPrivate = max(b.checkedPrivate, bytes)
 		if bytes > b.fixedLimit {
 			return errHeadJobBudget
 		}
@@ -372,9 +378,17 @@ func (b *headPartBuilder) append(id chunk.U128, ref uint32, ts []int64, values, 
 		if err := b.writer.appendSeries(id, ts[lo:hi], values[lo:hi], weights, ts[hi-1]); err != nil {
 			return err
 		}
+		resident := buildbudget.Add(b.writer.residentBytes(), b.writer.w.FinishBytes())
+		if b.fixedLimit > 0 {
+			tracked := buildbudget.Add(b.baseBytes(), resident)
+			b.trackedPrivate = max(b.trackedPrivate, tracked)
+			if err := b.reserve(max(tracked, b.estimate(len(b.entries), 0, 0, 0, 0))); err != nil {
+				return err
+			}
+		}
 		b.rows += hi - lo
 		lo = hi
-		if limit > 0 && b.writer.rows == limit || b.writer.residentBytes()+b.writer.w.FinishBytes() >= b.reserved {
+		if limit > 0 && b.writer.rows == limit || resident >= b.reserved {
 			if err := b.finish(); err != nil {
 				return err
 			}
@@ -390,9 +404,9 @@ func (b *headPartBuilder) finish() error {
 	if err := b.ctx.Err(); err != nil {
 		return err
 	}
-	if b.writer.streamIdentities {
+	if b.writer.streamIdentities || b.fixedLimit > 0 {
 		needed := b.estimate(len(b.entries), 0, 0, 0, 0)
-		if needed > b.reserved {
+		if b.fixedLimit > 0 || needed > b.reserved {
 			if err := b.reserve(needed); err != nil {
 				return err
 			}

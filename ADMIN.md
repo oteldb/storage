@@ -654,6 +654,12 @@ Flush workspace metrics distinguish the configured output target from the admitt
 counts distinct identities per completed candidate, including candidates not yet catalog-published.
 `storage.flush.build.workers` and `.jobs` record admitted concurrency and planned jobs per attempt;
 zero jobs identifies legacy sequential planning. `.fallbacks{reason=plan|workspace}` counts retries
-through that planner. Two workers require an additional nonblocking grant from the same pool;
+through that planner. Two workers reuse the planner grant and request only a nonblocking aggregate shortfall;
 one admitted worker with several jobs means those jobs run sequentially. These count admission,
 not active CPU utilization or successful publication; failed attempts remain observable.
+`storage.flush.build.memory.bytes{component}` records shared-plan, retained-output, per-job, held
+and additional claims, plus checked-private and structurally tracked-private high-water estimates.
+Held bytes include unused planner credit until the stage ends; job claims exclude discarded planner
+buffers. Tracked values exclude allocator/GC overhead and transient codec allocations. These are
+not heap/RSS measurements. The total pool, merge allowance and part targets are independent of
+this accounting experiment and remain configured as before.

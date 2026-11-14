@@ -80,6 +80,12 @@ type Flush struct {
 	buildWorkers    metric.Int64Histogram
 	buildJobs       metric.Int64Histogram
 	buildFallbacks  metric.Int64Counter
+	buildMemory     metric.Int64Histogram
+}
+
+// BuildMemory records shared, retained, job, held and checked structural workspace by component.
+func (f *Flush) BuildMemory(ctx context.Context, component string, bytes int64) {
+	f.buildMemory.Record(ctx, bytes, metric.WithAttributes(attribute.String("component", component)))
 }
 
 // BuildPlan records admitted worker concurrency and queued jobs for a flush attempt.
@@ -597,11 +603,13 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 		buildJobs: b.i64hist("storage.flush.build.jobs", "planned jobs per flush attempt, zero for legacy planning", "{job}",
 			0, 1, 2, 4, 8, 16, 32, 64),
 		buildFallbacks: b.counter("storage.flush.build.fallbacks", "parallel plans retried sequentially", "{attempt}"),
-		verified:       b.counter("storage.series.verification_cache.requests", "canonical verification cache probes", "{identity}"),
-		total:          b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
-		duration:       b.f64hist("storage.flush.duration", "flush wall time"),
-		rows:           b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),
-		bytes:          b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
+		buildMemory: b.i64hist("storage.flush.build.memory.bytes", "planned and checked flush working sets", "By",
+			1<<20, 8<<20, 16<<20, 32<<20, 64<<20, 128<<20, 256<<20, 512<<20, 1<<30),
+		verified: b.counter("storage.series.verification_cache.requests", "canonical verification cache probes", "{identity}"),
+		total:    b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
+		duration: b.f64hist("storage.flush.duration", "flush wall time"),
+		rows:     b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),
+		bytes:    b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
 	}
 	merge := &Merge{
 		refused:   b.counter("storage.merge.admission_refused", "process-pool merge refusals by pool, across signals", "{attempt}"),

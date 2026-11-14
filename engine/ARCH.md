@@ -170,13 +170,20 @@ whole build pool and runs alone; nil `FlushAdmission` retains serialized per-eng
 Streamed metric flushes can plan up to 64 ordered run jobs against one frozen view. If the embedder
 also supplies `TryFlushAdmission` from that pool, at most two builders own independent writers,
 codec/index scratch and result lists. The facade supplies this callback automatically. Shared plan
-storage is charged once; the second builder needs a nonblocking additional grant. Otherwise jobs
-run sequentially at the same part target. Jobs cannot queue for more bytes held by their siblings.
+storage is charged once. At build time, each job is priced without discarded planner buffers;
+worker scratch/reference retention and completed-output state remain charged. The existing planner
+grant supplies aggregate credit, and a nonblocking request covers only any shortfall. Its unused
+credit stays reserved through the stage. The largest job runs on the larger worker allowance;
+the second worker consumes only remaining jobs that fit its bound. Otherwise jobs run sequentially
+at the same part target. Jobs cannot queue for more bytes held by their siblings.
 Oversized plans or changed working-set estimates retry through the sequential planner.
 
 Any job failure cancels siblings and joins all builders before closing candidate readers or
 releasing grants. Outputs are collected in planned order; the whole stage keeps one catalog
 publication and WAL checkpoint. Separate-series and nonstreaming modes retain the sequential path.
+Private working-set checks and output-retention checks fail back to that path if the structural
+model is exceeded; they are estimated capacity checks, not allocator/RSS accounting. The encoded
+part target and numerical output-sealing threshold are independent of worker-private claims.
 
 Metric flushes reserve additional workspace against `FlushMemoryBytes` (64 MiB when unset):
 bounded identity runs, codec buffers, sidecars, serialized identities and selected symbol workspace.

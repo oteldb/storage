@@ -111,13 +111,14 @@ func TestFlushBuildMetrics(t *testing.T) {
 	t.Parallel()
 	o, collect := newMetered(t)
 	o.Flush.BuildPlan(t.Context(), 2, 4)
+	o.Flush.BuildMemory(t.Context(), "shared", 1<<20)
 	o.Flush.BuildFallback(t.Context(), "workspace")
 	rm := collect()
 	require.EqualValues(t, 1, counterSum(t, rm, "storage.flush.build.fallbacks", map[string]string{"reason": "workspace"}))
 	values := make(map[string]int64)
 	for _, scope := range rm.ScopeMetrics {
 		for _, m := range scope.Metrics {
-			if m.Name != "storage.flush.build.workers" && m.Name != "storage.flush.build.jobs" {
+			if m.Name != "storage.flush.build.workers" && m.Name != "storage.flush.build.jobs" && m.Name != "storage.flush.build.memory.bytes" {
 				continue
 			}
 			h, ok := m.Data.(metricdata.Histogram[int64])
@@ -127,7 +128,9 @@ func TestFlushBuildMetrics(t *testing.T) {
 			}
 		}
 	}
-	require.Equal(t, map[string]int64{"storage.flush.build.workers": 2, "storage.flush.build.jobs": 4}, values)
+	require.Equal(t, map[string]int64{
+		"storage.flush.build.workers": 2, "storage.flush.build.jobs": 4, "storage.flush.build.memory.bytes": 1 << 20,
+	}, values)
 }
 
 func TestCorruptionDetected(t *testing.T) {

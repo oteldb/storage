@@ -10,12 +10,10 @@ import (
 
 	backendfile "github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/internal/memlimit"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/signal"
 )
 
 func TestHeadJobsUseAggregateReservation(t *testing.T) {
-	reproduce.Unfixed(t, 661, "each builder requests the entire planner high-water reservation")
 	t.Parallel()
 	const mib = 1 << 20
 	for _, tc := range []struct {
