@@ -2157,3 +2157,15 @@ column directories are transient finishing state. Buffered object writers retain
 directory charge, and the unstreamed ID object stays charged while numeric columns finish.
 The convergence fixture verifies mostly-disjoint short-series input shrinks under the same
 grant and samples live heap during actual streamed column writes.
+
+Native streamed flushes reserve their frozen-head workspace estimate separately from the
+output-part target. Small heads do not reserve a fixed fraction of process memory; identity,
+ordering and metadata work can still grow admission when needed. The buffered-backend limit
+remains a bound on retained encoded objects. The block writer owns output ID runs; SIDX,
+watermarks and statistics borrow that order and retain no parallel ID arrays.
+
+SIDX, SMAX and aggregate statistics serialize through 32-KiB pooled scratch on backends with a
+bounded native object writer. The unstreamed ID column still owns its run list and compressed
+object; reopening still reads and validates SIDX. Those remaining lifetimes are charged separately
+from the eliminated whole-sidecar encoding buffers. CRCs, canonical order and sidecar bytes match
+the buffered path.

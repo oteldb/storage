@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"time"
 
 	"github.com/go-faster/errors"
 
@@ -36,6 +37,7 @@ type headPartBuilder struct {
 	runRows      int64
 
 	target, reserved int64
+	reservationFloor int64
 	release          func()
 	writer           *partStreamWriter
 	writerRows       int
@@ -58,7 +60,11 @@ func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sa
 	b := headPartBuilder{ctx: ctx, e: e, target: e.flushMemoryBytes()}
 	capacity := min(len(samples), max(1, int(b.target/1024)))
 	buffers := buildbudget.Mul(int64(capacity), memsize.Of[headRunEntry]()+memsize.Of[uint32]())
-	if err := b.reserve(max(b.target, buildbudget.Add(b.baseBytes(), buffers))); err != nil {
+	b.reservationFloor = b.target
+	if backend.StreamsWrites(e.cfg.Backend) {
+		b.reservationFloor = min(b.target, buildbudget.Add(b.baseBytes(), buffers))
+	}
+	if err := b.reservePhase(max(b.reservationFloor, buildbudget.Add(b.baseBytes(), buffers)), "initial"); err != nil {
 		return nil, 0, err
 	}
 	// Entry buffers never grow: a full run seals before another entry is retained.
@@ -82,8 +88,8 @@ func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sa
 		expected += len(buf.ts)
 	}
 	reserveOrder := func(bytes int64) error {
-		if needed := max(b.target, buildbudget.Add(b.baseBytes(), bytes)); needed > b.reserved {
-			return b.reserve(needed)
+		if needed := max(b.reservationFloor, buildbudget.Add(b.baseBytes(), bytes)); needed > b.reserved {
+			return b.reservePhase(needed, "order")
 		}
 		return nil
 	}
@@ -91,6 +97,9 @@ func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sa
 	if err == nil {
 		b.orderWorkspace = order.workspace
 		b.view = order.view
+		if err := b.reserveHeadShape(ctx, samples, order); err != nil {
+			return nil, 0, err
+		}
 		err = walkIdentityOrder(ctx, order.view, order.runs, func(id signal.SeriesID, ref uint32) error {
 			buf := samples[id]
 			if buf == nil || len(buf.ts) == 0 {
@@ -138,6 +147,13 @@ func (b *headPartBuilder) partRows() int {
 }
 
 func (b *headPartBuilder) reserve(bytes int64) error {
+	return b.reservePhase(bytes, "numeric")
+}
+
+func (b *headPartBuilder) reservePhase(bytes int64, phase string) error {
+	if phase == "metadata" && bytes > b.reserved {
+		bytes = max(bytes, b.reserved+max(b.reserved/2, 1<<20))
+	}
 	if b.release != nil {
 		b.release()
 		b.release = nil
@@ -146,10 +162,12 @@ func (b *headPartBuilder) reserve(bytes int64) error {
 		b.release = func() {}
 	} else {
 		var err error
+		start := time.Now()
 		b.release, err = b.e.cfg.FlushAdmission(b.ctx, bytes)
 		if err != nil {
 			return err
 		}
+		b.e.cfg.Obs.Flush.Reservation(b.ctx, phase, bytes, b.target, time.Since(start))
 	}
 	b.reserved = bytes
 	return nil
@@ -243,7 +261,7 @@ func (b *headPartBuilder) flushRun() error {
 	b.entries = b.entries[:0]
 	b.identities.Reset()
 	b.encoded, b.materialized, b.sorting, b.runRows = 0, 0, 0, 0
-	if next := max(b.target, buildbudget.Add(b.baseBytes(), b.identities.Bytes())); b.reserved > next {
+	if next := max(b.reservationFloor, buildbudget.Add(b.baseBytes(), b.identities.Bytes())); b.reserved > next {
 		return b.reserve(next)
 	}
 	return nil
@@ -316,7 +334,7 @@ func (b *headPartBuilder) finish() error {
 			numeric := buildbudget.Add(b.baseBytes(), buildbudget.Add(b.writer.residentBytes(), b.writer.w.FinishBytes()))
 			needed := buildbudget.Add(numeric, bytes)
 			if needed > b.reserved {
-				return b.reserve(needed)
+				return b.reservePhase(needed, "metadata")
 			}
 			return nil
 		}
@@ -326,6 +344,7 @@ func (b *headPartBuilder) finish() error {
 		return err
 	}
 	planFlushBlocks(p)
+	b.e.cfg.Obs.Flush.OutputSeries(b.ctx, int64(p.index.seriesCount()))
 	b.parts = append(b.parts, p)
 	b.closedBloomBytes = buildbudget.Add(b.closedBloomBytes, p.idBloom.Load().sizeBytes())
 	b.writer = nil

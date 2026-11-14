@@ -11,7 +11,6 @@ import (
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/seriesindex"
-	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -39,11 +38,10 @@ type partStreamWriter struct {
 	// and the series-index sidecar.
 	runs []chunk.U128Run
 
-	statsIDs []chunk.U128
-	stats    []SeriesAgg
+	stats []SeriesAgg
 
-	// wmarks is the part's per-series durability watermark sidecar, accumulated with the runs.
-	wmarks []watermark.Entry
+	// covered is aligned with the writer-owned runs.
+	covered []int64
 
 	withSF       bool
 	withStats    bool
@@ -65,6 +63,7 @@ type partStreamWriter struct {
 	streamIdentities      bool
 	reserveSeriesMetadata func(int64) error
 	identityWriterBytes   int64
+	sidecarWriterBytes    int64
 }
 
 // newPartStreamWriter starts an output part. comp and precisionBits are fixed for the whole part —
@@ -137,13 +136,15 @@ func newPartStreamWriter(
 			identityBytes = 0
 		}
 	}
-	return &partStreamWriter{
+	out := &partStreamWriter{
 		e: e, w: w, prefix: prefix, withSF: withSF, withStats: withStats,
 		buffered:         !backend.StreamsWrites(e.cfg.Backend),
 		floatGroups:      grouped,
 		seriesChunks:     e.cfg.MetricSeriesChunks,
 		streamIdentities: streamIdentities, identityWriterBytes: identityBytes,
-	}, nil
+	}
+	out.sidecarWriterBytes, _ = out.sidecarWorkspace()
+	return out, nil
 }
 
 // appendSeries appends one series' samples; a nil sf means every weight is 1. covered is the newest
@@ -160,7 +161,9 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 		}
 	}
 
-	if err := p.w.AppendU128Run(colSeriesIdx, id, len(ts)); err != nil {
+	var err error
+	p.runs, err = p.w.AppendU128RunView(colSeriesIdx, id, len(ts))
+	if err != nil {
 		return err
 	}
 
@@ -185,13 +188,10 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 	}
 
 	if sameSeries {
-		p.runs[len(p.runs)-1].Count += len(ts)
-		p.wmarks[len(p.wmarks)-1].Max = max(p.wmarks[len(p.wmarks)-1].Max, covered)
+		p.covered[len(p.covered)-1] = max(p.covered[len(p.covered)-1], covered)
 	} else {
-		p.runs = append(p.runs, chunk.U128Run{Value: id, Count: len(ts)})
-		p.wmarks = append(p.wmarks, watermark.Entry{ID: u128ToID(id), Max: covered})
+		p.covered = append(p.covered, covered)
 		if p.withStats {
-			p.statsIDs = append(p.statsIDs, id)
 			p.stats = append(p.stats, SeriesAgg{})
 		}
 	}
@@ -220,13 +220,16 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 func (p *partStreamWriter) encodedBytes() int64 { return p.w.EncodedBytes() }
 
 func (p *partStreamWriter) reserveSeries(n int) error {
-	p.runs = slices.Grow(p.runs, max(n-len(p.runs), 0))
-	p.wmarks = slices.Grow(p.wmarks, max(n-len(p.wmarks), 0))
+	p.covered = slices.Grow(p.covered, max(n-len(p.covered), 0))
 	if p.withStats {
-		p.statsIDs = slices.Grow(p.statsIDs, max(n-len(p.statsIDs), 0))
 		p.stats = slices.Grow(p.stats, max(n-len(p.stats), 0))
 	}
-	return p.w.ReserveU128Runs(colSeriesIdx, n)
+	if err := p.w.ReserveU128Runs(colSeriesIdx, n); err != nil {
+		return err
+	}
+	var err error
+	p.runs, err = p.w.U128Runs(colSeriesIdx)
+	return err
 }
 
 // residentBytes is what the part holds in RAM: the block writer's buffers plus the sidecars this
@@ -235,13 +238,10 @@ func (p *partStreamWriter) reserveSeries(n int) error {
 // encoded byte than a merge of long ones, so they are the term worth sealing on.
 func (p *partStreamWriter) residentBytes() int64 {
 	const (
-		runBytes   = 24 // chunk.U128Run
-		idBytes    = 16 // chunk.U128
-		aggBytes   = 40 // SeriesAgg
-		wmarkBytes = 24 // watermark.Entry
+		aggBytes = 40 // SeriesAgg
 	)
 
-	total := p.w.ResidentBytes() + int64(cap(p.runs))*runBytes
+	total := p.w.ResidentBytes()
 	if p.seriesBuilder != nil {
 		total += p.seriesBuilder.Bytes() + partIDBloomBytes(p.seriesBuilder.Count())
 		if p.buffered {
@@ -250,8 +250,8 @@ func (p *partStreamWriter) residentBytes() int64 {
 	} else if p.e.cfg.SeparateSeries {
 		total += partIDBloomBytes(len(p.runs))
 	}
-	total += int64(cap(p.statsIDs))*idBytes + int64(cap(p.stats))*aggBytes
-	total += int64(cap(p.wmarks)) * wmarkBytes
+	total += int64(cap(p.stats)) * aggBytes
+	total += int64(cap(p.covered)) * 8
 	total += int64(cap(p.ones)) * 8
 
 	if p.buffered {
@@ -322,8 +322,8 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 		return nil, errors.Wrapf(err, "write part %q", prefix)
 	}
 
-	if err := backend.WriteDeferred(ctx, p.e.cfg.Backend, sidxKey(prefix), encodeSeriesIndexRuns(p.runs)); err != nil {
-		return nil, errors.Wrapf(err, "write series-index sidecar %q", prefix)
+	if err := p.writeSeriesSidecars(ctx); err != nil {
+		return nil, errors.Wrapf(err, "write series sidecars %q", prefix)
 	}
 
 	if err := p.writeIdentity(ctx, identities); err != nil {
@@ -336,16 +336,6 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 	} else if p.e.cfg.DiskSeries {
 		if err := p.writeDiskSeries(ctx, identities); err != nil {
 			return nil, err
-		}
-	}
-
-	if err := backend.WriteDeferred(ctx, p.e.cfg.Backend, watermark.Key(prefix), watermark.Encode(nil, p.wmarks)); err != nil {
-		return nil, errors.Wrapf(err, "write watermark sidecar %q", prefix)
-	}
-
-	if p.withStats && !p.sampled {
-		if err := backend.WriteDeferred(ctx, p.e.cfg.Backend, statsKey(prefix), encodeSeriesStats(p.statsIDs, p.stats)); err != nil {
-			return nil, errors.Wrapf(err, "write stats sidecar %q", prefix)
 		}
 	}
 

@@ -3,6 +3,7 @@ package obs_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -81,6 +82,29 @@ func TestCanonicalVerificationCacheMetrics(t *testing.T) {
 	rm := collect()
 	require.EqualValues(t, 3, counterSum(t, rm, "storage.series.verification_cache.requests", map[string]string{"result": "hit"}))
 	require.EqualValues(t, 7, counterSum(t, rm, "storage.series.verification_cache.requests", map[string]string{"result": "miss"}))
+}
+
+func TestFlushReservationMetrics(t *testing.T) {
+	t.Parallel()
+	o, collect := newMetered(t)
+	o.Flush.Reservation(t.Context(), "shape", 16<<20, 448<<20, time.Millisecond)
+	o.Flush.OutputSeries(t.Context(), 8192)
+	rm := collect()
+	values := make(map[string]int64)
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != "storage.flush.reservation.bytes" && m.Name != "storage.flush.output.series" {
+				continue
+			}
+			h, ok := m.Data.(metricdata.Histogram[int64])
+			require.True(t, ok)
+			for _, p := range h.DataPoints {
+				component, _ := p.Attributes.Value("component")
+				values[m.Name+"/"+component.AsString()] = p.Sum
+			}
+		}
+	}
+	require.Equal(t, map[string]int64{"storage.flush.reservation.bytes/reserved": 16 << 20, "storage.flush.reservation.bytes/target": 448 << 20, "storage.flush.output.series/": 8192}, values)
 }
 
 func TestCorruptionDetected(t *testing.T) {

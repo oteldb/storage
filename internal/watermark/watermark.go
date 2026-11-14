@@ -41,12 +41,18 @@ func Key(prefix string) string { return prefix + "/smax" }
 // [u64 id.Hi][u64 id.Lo][i64 max], all big-endian, with a trailing CRC32C. Encode appends, and the
 // checksum covers only the bytes it appended — whatever dst already held is not part of the record.
 func Encode(dst []byte, entries []Entry) []byte {
-	start := len(dst)
-	dst = slices.Grow(dst, 8+binary.MaxVarintLen64+entryWidth*len(entries))
-	dst = binary.BigEndian.AppendUint32(dst, magic)
-	dst = binary.AppendUvarint(dst, uint64(len(entries)))
+	return EncodeEntries(dst, len(entries), func(i int) Entry { return entries[i] })
+}
 
-	for _, e := range entries {
+// EncodeEntries appends a sidecar without materializing a parallel entry slice.
+func EncodeEntries(dst []byte, count int, entry func(int) Entry) []byte {
+	start := len(dst)
+	dst = slices.Grow(dst, 8+binary.MaxVarintLen64+entryWidth*count)
+	dst = binary.BigEndian.AppendUint32(dst, magic)
+	dst = binary.AppendUvarint(dst, uint64(count))
+
+	for i := range count {
+		e := entry(i)
 		dst = binary.BigEndian.AppendUint64(dst, e.ID.Hi)
 		dst = binary.BigEndian.AppendUint64(dst, e.ID.Lo)
 		dst = binary.BigEndian.AppendUint64(dst, uint64(e.Max))

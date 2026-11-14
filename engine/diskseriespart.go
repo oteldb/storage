@@ -79,10 +79,10 @@ func (p *partStreamWriter) addDiskSeries(view series.View, ref uint32, id signal
 }
 
 func (p *partStreamWriter) updateDiskSeriesMetadata() {
-	if p.e.cfg.SeparateSeries || p.seriesBuilder == nil || len(p.wmarks) == 0 {
+	if p.e.cfg.SeparateSeries || p.seriesBuilder == nil || len(p.covered) == 0 {
 		return
 	}
-	meta := seriesindex.Metadata{Covered: p.wmarks[len(p.wmarks)-1].Max}
+	meta := seriesindex.Metadata{Covered: p.covered[len(p.covered)-1]}
 	if p.withStats && !p.sampled {
 		a := p.stats[len(p.stats)-1]
 		meta.HasStats = true
@@ -114,10 +114,10 @@ func (p *partStreamWriter) writeDiskSeries(ctx context.Context, entries identity
 		p.seriesBuilder = &seriesindex.Builder{}
 		for i, ref := range entries.refs {
 			id := entries.view.ID(int(ref))
-			if i >= len(p.wmarks) || p.wmarks[i].ID != id {
+			if i >= len(p.covered) || u128ToID(p.runs[i].Value) != id {
 				return errors.New("engine: incomplete series-index identities")
 			}
-			if err := p.seriesBuilder.AddView(entries.view, int(ref), seriesindex.Metadata{Covered: p.wmarks[i].Max}); err != nil {
+			if err := p.seriesBuilder.AddView(entries.view, int(ref), seriesindex.Metadata{Covered: p.covered[i]}); err != nil {
 				return err
 			}
 		}
