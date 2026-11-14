@@ -31,7 +31,8 @@ func testPreparedGroupCommit(t *testing.T, failure string, cold bool) {
 	e, fs := newFaultWALEngine(t, 0)
 	e.cfg.WAL.SetSync(true)
 	identities := []signal.Series{stagedTestSeries("a"), stagedTestSeries("b"), stagedTestSeries("c")}
-	for i, s := range identities {
+	for i := range identities {
+		s := identities[i]
 		if i > 0 {
 			if !cold {
 				e.head.registerSeries(s)
@@ -103,7 +104,8 @@ func testPreparedGroupCommit(t *testing.T, failure string, cold bool) {
 	require.Equal(t, []int64{0, 1}, headTS(e.head, identities[0]))
 	if fail {
 		require.Equal(t, 2, failures)
-		for _, s := range identities[1:] {
+		for i := range identities[1:] {
+			s := identities[i+1]
 			require.Nil(t, headTS(e.head, s))
 			if cold {
 				require.False(t, e.head.series.Has(s.Hash()), "failed group must not publish cold identities")
@@ -130,12 +132,14 @@ func testPreparedGroupCommit(t *testing.T, failure string, cold bool) {
 	}
 	recovered := fs.Crash()
 	replayed := replayedHead(t, recovered)
-	for _, s := range identities {
+	for i := range identities {
+		s := identities[i]
 		require.Equal(t, headTS(e.head, s), headTS(replayed, s))
 	}
 	e.parallel.hooks = nil
 	if fail {
-		for _, s := range identities[1:] {
+		for i := range identities[1:] {
+			s := identities[i+1]
 			_, err := e.Append(s, 1, 1)
 			require.NoError(t, err)
 		}

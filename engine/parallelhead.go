@@ -116,16 +116,19 @@ func (e *Engine) captureParallelDiskSeries(ids []signal.SeriesID, p *preparedBat
 	if !e.cfg.DiskSeries {
 		return nil
 	}
+	e.mu.RLockWriter()
 	if hooks := e.parallel.hooks; hooks != nil && hooks.capturing != nil {
 		hooks.capturing()
 	}
 	e.mu.RLock()
 	if err := e.checkDiskAdmissionLocked(); err != nil {
 		e.mu.RUnlock()
+		e.mu.RUnlockWriter()
 		return err
 	}
 	p.lookup.capture(e, ids)
 	e.mu.RUnlock()
+	e.mu.RUnlockWriter()
 	if len(p.lookup.historical) == 0 {
 		return nil
 	}

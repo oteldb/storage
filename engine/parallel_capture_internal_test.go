@@ -42,6 +42,7 @@ func TestParallelCaptureAndOrderedCacheGrowth(t *testing.T) {
 	e.head.disk.note(id)
 	e.head.disk.remember(id, 100)
 	started, done := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { <-done })
 	go func() {
 		defer close(done)
 		e.mu.LockWriter()
