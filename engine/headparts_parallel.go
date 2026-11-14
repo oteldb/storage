@@ -2,15 +2,16 @@ package engine
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-faster/errors"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/internal/memsize"
+	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -191,7 +192,8 @@ func (p *headPartPlan) build(ctx context.Context, planner *headPartBuilder) ([]*
 			workers[i] = headPartBuilder{}
 		}
 	}()
-	g, workCtx := errgroup.WithContext(ctx)
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	var next atomic.Uint32
 	for i := range workers {
 		b := &workers[i]
@@ -200,10 +202,19 @@ func (p *headPartPlan) build(ctx context.Context, planner *headPartBuilder) ([]*
 		if i == 0 {
 			b.orderWorkspace = p.shared
 		}
-		g.Go(func() error { return p.runJobs(workCtx, b, &next, results) })
 	}
-	if err := g.Wait(); err != nil {
-		return nil, 0, err
+	var failed sync.Once
+	var buildErr error
+	parallel.ForEach(count, count, func(i int) {
+		if err := p.runJobs(workCtx, &workers[i], &next, results); err != nil {
+			failed.Do(func() {
+				buildErr = err
+				cancel()
+			})
+		}
+	})
+	if buildErr != nil {
+		return nil, 0, buildErr
 	}
 	var parts []*part
 	var rows int
