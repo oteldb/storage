@@ -2097,7 +2097,7 @@ func (s *Storage) admitMerge(ctx context.Context, bytes int64, wait bool) (func(
 		}
 	} else {
 		var err error
-		releaseMerge, err = s.mergePool.Acquire(ctx, bytes)
+		releaseMerge, err = s.mergePool.AcquireObserved(ctx, bytes, s.obs.Memory.Merge)
 		if err != nil {
 			return nil, false, err
 		}
@@ -2113,7 +2113,7 @@ func (s *Storage) admitMerge(ctx context.Context, bytes int64, wait bool) (func(
 		}
 	} else {
 		var err error
-		releaseBuild, err = s.buildPool.Acquire(ctx, bytes)
+		releaseBuild, err = s.buildPool.AcquireObserved(ctx, bytes, s.obs.Memory.BuildMerge)
 		if err != nil {
 			releaseMerge()
 			return nil, false, err

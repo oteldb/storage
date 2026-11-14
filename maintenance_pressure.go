@@ -24,7 +24,9 @@ func (s *Storage) flushAdmission() func(context.Context, int64) (func(), error) 
 	if s.buildPool == nil {
 		return nil
 	}
-	return s.buildPool.Acquire
+	return func(ctx context.Context, bytes int64) (func(), error) {
+		return s.buildPool.AcquireObserved(ctx, bytes, s.obs.Memory.BuildFlush)
+	}
 }
 
 // runPressureFlush owns one bounded pressure pass independently of the merge scheduler.

@@ -310,6 +310,9 @@ Metric instruments (all prefixed `storage.`):
 | `ingest.accepted` / `ingest.rejected` | `signal`(, `reason`) | reasons: `out_of_retention`, `out_of_order`, `rate_limit`, `max_series`, `max_in_flight_bytes`, `reserved_tenant` (the `Tenant` callback derived an id in the reserved `wal` namespace; not counted in `AdmissionStats`, since no such tenant exists) |
 | `ingest.sampled_dropped` / `ingest.overflowed` | `signal` | budgeted sampling / overflow routing |
 | `flush.total` / `flush.duration` / `flush.rows` / `flush.bytes` | `signal` | head flushes; `flush.bytes` is stored part-column bytes for records (decoded bytes in older versions), the denominator of write amplification |
+| `memory.admission.waiters` / `memory.admission.waiting_bytes` | `pool`, `operation` | live contended admissions and their effective reservation bytes, including requests that have not returned; raw requests above a build/merge pool's total are clamped for accounting |
+| `memory.admission.slow_waiters` / `memory.admission.slow_waits` | `pool`, `operation` | live admissions older than one second, and cumulative threshold crossings, respectively |
+| `memory.admission.wait.duration` | `pool`, `operation`, `outcome` | seconds for completed contended acquisitions, including canceled/failed waits and forced decode admissions; uncontended acquisitions are excluded |
 | `merge.total` / `merge.duration` / `merge.parts_in` / `merge.bytes_in` / `merge.bytes_out` | `signal` | background merges; record byte counters sum stored column bytes, matching the selection unit (older versions counted decoded bytes). `bytes_out` against `flush.bytes` is how many times the engine rewrites what it ingests, `bytes_out`/`bytes_in` what one cycle gains |
 | `merge.deferred` | `signal` | merges that selected parts and could not claim the process merge memory budget, so compacted nothing and left the work for the next cycle. Any sustained rate says compaction is bounded by `MergeMemoryBytes` — raise `MergeMemoryBytes` if part counts climb with it. Raising `MaintenanceConcurrency` does not help: a deferral only happens when the budget already admits fewer merges than the fan-out |
 | `merge.non_reducing` | `signal` | record compaction trials discarded because they neither reduced part count nor applied a required transformation. The selector remembers the exact run under its resource settings and tries other work; rejected bytes are not included in the committed-merge byte counters |
@@ -346,6 +349,32 @@ Metric instruments (all prefixed `storage.`):
 Tracing emits coarse spans (`engine.flush`, `engine.merge`, `engine.fetch`, backend ops, cluster
 RPCs) with W3C trace-context propagation across the cluster transport. Logs are context-plumbed via
 `go-faster/sdk/zctx` (trace-correlated); admission shed events log at Warn only when rejections occur.
+
+**Long memory waits.** Pools are `build`, `merge` and `decode`; operations are `flush`, `merge`
+and `query`. These labels contain no tenant, series, object key or request ID. A wait older than
+one second emits `memory admission wait is slow` while still blocked. The warning includes raw
+requested and effective reserved bytes, pool limit/usage/free bytes, queue depth and head size, elapsed time and
+any context deadline. Completion or cancellation emits `memory admission wait finished` with its
+outcome. Each message is limited to one per 30 seconds per pool/operation; metrics and spans still
+record every wait. Values describe reservation accounting, not measured process RSS. Wait gauges
+count budget reservations, not other requests queued behind an engine's flush or writer locks.
+
+`storage.memory.wait` OTel child spans carry pool, operation, requested/reserved bytes, initial
+pool state, a slow event and final outcome (`admitted`, `canceled`, `forced`, `failed`). Go execution
+traces contain a region of the same name and a pool/operation annotation. Goroutine profiles carry
+`storage.memory.pool` and `storage.memory.operation` pprof labels during the wait. CPU profiles do
+not sample parked time; use a goroutine profile or execution trace to see an ongoing wait. Block
+profiles depend on embedder configuration and completed blocking intervals. The library does not
+enable global CPU/block profiling or change admission deadlines, FIFO order or decode force policy.
+Regions require tracing to be active when the wait begins; labeled goroutine snapshots also expose
+waits that started before a trace window.
+
+For Prometheus, `sum by (pool, operation) (storage_memory_admission_slow_waiters) > 0` detects
+currently long waits; `storage_memory_admission_waiters` and
+`storage_memory_admission_waiting_bytes` show their live backlog. Duration histograms alone cannot
+reveal a request that never returns. Missing series mean no observed contention; use `or vector(0)`
+when a dashboard needs an explicit zero. Per-query hard memory limits reject instead of queueing,
+so they do not produce wait diagnostics.
 
 **Disk pressure (a full disk or an exhausted inode table).** Before each flush an engine asks its
 backend for free bytes *and* free inodes and compares them against the pending part plus

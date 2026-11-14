@@ -170,11 +170,16 @@ estimate.
 ### Observability (`internal/obs`, `query/profile`)
 
 **Injected, never owned.** `Options.{Logger, TracerProvider, MeterProvider}` (OTel **API**
-only) build one `*obs.Obs` threaded into every layer; each unset pillar is no-op, so an
-unconfigured store costs nothing. Telemetry fires at **operation granularity** (flush, merge,
+only) build one `*obs.Obs` threaded into every layer; each unset pillar uses its no-op
+implementation. Telemetry fires at **operation granularity** (flush, merge,
 fetch, RPC, WAL) — never per sample or row. Logging is context-plumbed via `go-faster/sdk/zctx`,
 so lines carry the active span. `query/profile` is opt-in EXPLAIN ANALYZE: a per-query timing
 tree that grafts a peer's subtree across the cluster read RPC.
+
+Contended memory admission invokes observers outside pool locks. Live waiter metrics, rate-limited
+slow warnings, OTel child spans, Go trace regions and goroutine labels cover build/merge and decode
+queues, including canceled and forced admissions. Uncontended acquisitions bypass the observers;
+diagnostics preserve existing accounting and admission policy. See [`ADMIN.md`](ADMIN.md).
 
 ### Transport reliability (`internal/retry`, `reliability`)
 

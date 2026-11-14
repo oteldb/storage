@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/query/fetch"
 )
 
@@ -81,6 +82,10 @@ func NewDecodeBudget(maxBytes int64) *DecodeBudget {
 // It returns forced when the wait was cut short for liveness (see [DecodeBudget]); on error nothing
 // is reserved.
 func (b *DecodeBudget) acquire(ctx context.Context, n int64) (forced bool, _ error) {
+	return b.acquireObserved(ctx, n, nil)
+}
+
+func (b *DecodeBudget) acquireObserved(ctx context.Context, n int64, observe memlimit.WaitObserver) (forced bool, _ error) {
 	if b == nil || b.maxBytes <= 0 || n <= 0 {
 		return false, nil
 	}
@@ -111,6 +116,25 @@ func (b *DecodeBudget) acquire(ctx context.Context, n int64) (forced bool, _ err
 	seen := b.releases
 	b.mu.Unlock()
 
+	if observe != nil {
+		return observe(ctx, memlimit.Wait{RequestedBytes: n, ReservedBytes: n, State: b.state}, func() (bool, error) {
+			return b.wait(ctx, w, seen)
+		})
+	}
+	return b.wait(ctx, w, seen)
+}
+
+func (b *DecodeBudget) state() memlimit.State {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := memlimit.State{LimitBytes: b.maxBytes, UsedBytes: b.used, Waiters: len(b.waiters)}
+	if len(b.waiters) > 0 {
+		state.HeadBytes = b.waiters[0].n
+	}
+	return state
+}
+
+func (b *DecodeBudget) wait(ctx context.Context, w *budgetWaiter, seen uint64) (bool, error) {
 	t := time.NewTimer(b.forceAfter)
 	defer t.Stop()
 
@@ -223,12 +247,18 @@ func (b *DecodeBudget) wakeLocked() {
 // query holds it. The accounting stays exact — only the waiting is skipped — so such a query may
 // overshoot the ceiling by its own later estimates, the latitude a single over-budget read has.
 func (b *DecodeBudget) acquireFor(ctx context.Context, s *fetch.Scope, n int64) (forced bool, _ error) {
+	return b.acquireForObserved(ctx, s, n, nil)
+}
+
+func (b *DecodeBudget) acquireForObserved(
+	ctx context.Context, s *fetch.Scope, n int64, observe memlimit.WaitObserver,
+) (forced bool, _ error) {
 	if b == nil || b.maxBytes <= 0 || n <= 0 {
 		return false, nil
 	}
 
 	if !s.Enter() {
-		forced, err := b.acquire(ctx, n)
+		forced, err := b.acquireObserved(ctx, n, observe)
 		if err != nil {
 			s.Abort()
 
