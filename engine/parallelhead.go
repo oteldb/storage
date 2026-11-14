@@ -17,6 +17,7 @@ type parallelHeadHooks struct {
 	capturing     func()
 	ordered       func([]signal.SeriesID)
 	owned         func()
+	prepared      func()
 	beforeWAL     func()
 	beforePublish func()
 	queued        func()
@@ -104,6 +105,9 @@ func (e *Engine) appendKnownPrepared(
 	p.prepareTails()
 	if err := p.batch.encode(view, false); err != nil {
 		return AppendResult{}, true, err
+	}
+	if ph.hooks != nil && ph.hooks.prepared != nil {
+		ph.hooks.prepared()
 	}
 	if err := e.commitPrepared(p); err != nil {
 		return AppendResult{}, true, err
