@@ -4,7 +4,8 @@
 // As a library, oteldb/storage never owns a global logger, tracer, or meter: the embedder supplies
 // them through [Config] (via storage.Options). Every handle is **no-op by default** — an unset
 // logger becomes [zap.Nop], an unset provider becomes the OTel noop provider — so an unconfigured
-// store spans, logs, and counts nothing and pays no overhead. The library imports only the OTel
+// store emits no OTel telemetry or logs. Queued memory admission retains runtime profile annotations.
+// The library imports only the OTel
 // API (never an SDK or exporter); the embedder owns the SDK, sampling, and pipelines.
 package obs
 
@@ -42,6 +43,7 @@ type Obs struct {
 	Retention  *Retention
 	Parts      *Parts
 	Fetch      *Fetch
+	Memory     *Memory
 	Backend    *Backend
 	WAL        *WAL
 	RPC        *RPC
@@ -70,6 +72,11 @@ func New(cfg Config) (*Obs, error) {
 	}
 
 	meter := mp.Meter(scope)
+	tracer := tp.Tracer(scope)
+	memory, err := newMemory(meter, log, tracer)
+	if err != nil {
+		return nil, err
+	}
 
 	adm, err := newAdmission(meter)
 	if err != nil {
@@ -133,7 +140,8 @@ func New(cfg Config) (*Obs, error) {
 
 	return &Obs{
 		Log:        log,
-		Tracer:     tp.Tracer(scope),
+		Tracer:     tracer,
+		Memory:     memory,
 		Admission:  adm,
 		Head:       head,
 		Flush:      flush,

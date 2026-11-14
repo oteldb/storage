@@ -962,7 +962,7 @@ func (p *enginePlan) reserveDecodeBudget(ctx context.Context, r fetch.Request, e
 	if p.tryDecode {
 		err = p.engine.budget.tryAcquireFor(ctx, scope, p.budgetBytes)
 	} else {
-		forced, err = p.engine.budget.acquireFor(ctx, scope, p.budgetBytes)
+		forced, err = p.engine.budget.acquireForObserved(ctx, scope, p.budgetBytes, p.engine.cfg.Obs.Memory.Decode)
 	}
 	if err != nil {
 		// Nothing was reserved; make releaseParts a no-op on the budget rather than a double release.
