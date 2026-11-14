@@ -82,7 +82,11 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 			return err
 		}
 	}
-	known, err := snapshot.knownIdentities(ctx, entries)
+	beforeVerification := e.VerifiedIdentityCacheStats()
+	known, err := snapshot.knownIdentities(ctx, entries, e.verifiedIdentities)
+	afterVerification := e.VerifiedIdentityCacheStats()
+	e.cfg.Obs.Flush.VerificationCache(ctx, int64(afterVerification.Hits-beforeVerification.Hits),
+		int64(afterVerification.Misses-beforeVerification.Misses))
 	if err != nil {
 		return err
 	}
@@ -129,7 +133,6 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 	}
 	binding := bucketindex.SeriesRoot{Prefix: prefix, ManifestDigest: run.Digest()}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	roots := make([]*seriesRootHandle, 0)
 	if e.seriesTable != nil {
 		roots = append(roots, e.seriesTable.roots...)
@@ -140,48 +143,95 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 	old := e.seriesTable
 	e.seriesTable = next
 	old.release()
+	e.mu.Unlock()
+	var canonical []byte
+	for i, ref := range entries.refs {
+		if !e.verifiedIdentities.canAdmit(next.generation) {
+			break
+		}
+		if !known[i] {
+			canonical = entries.view.AppendCanonical(canonical[:0], int(ref))
+			e.verifiedIdentities.put(next.generation, entries.view.ID(int(ref)), canonical)
+		}
+	}
 	return nil
 }
 
-func (s *seriesSnapshot) knownIdentities(ctx context.Context, entries identitySnapshot) ([]bool, error) {
+func (s *seriesSnapshot) knownIdentities(ctx context.Context, entries identitySnapshot, caches ...*verifiedIdentityCache) ([]bool, error) {
 	known := make([]bool, len(entries.refs))
 	if s == nil {
 		return known, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var cache *verifiedIdentityCache
+	if len(caches) > 0 {
+		cache = caches[0]
+	}
+	hits, err := cache.match(s.generation, entries, known)
+	if err != nil {
+		return nil, err
+	}
+	remaining := len(known) - hits
 	for _, h := range s.roots {
-		if err := checkRootIdentities(ctx, h.run, entries, known); err != nil {
+		if remaining == 0 {
+			break
+		}
+		found, err := checkRootIdentitiesCached(ctx, h.run, entries, known, cache, s.generation)
+		if err != nil {
 			return nil, err
 		}
+		remaining -= found
 	}
 	return known, nil
 }
 
-func checkRootIdentities(ctx context.Context, run *seriestable.Run, entries identitySnapshot, known []bool) error {
-	r, err := run.NewReader(ctx)
-	if err != nil {
-		return err
+func checkRootIdentitiesCached(ctx context.Context, run *seriestable.Run, entries identitySnapshot,
+	known []bool, cache *verifiedIdentityCache, generation uint64,
+) (found int, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
-	defer func() { _ = r.Close() }()
-	r.StreamPages()
+	var r *seriestable.Reader
+	defer func() {
+		if r != nil {
+			_ = r.Close()
+		}
+	}()
 	var canonical []byte
+	remember := cache.canAdmit(generation)
 	for i, ref := range entries.refs {
 		if known[i] {
 			continue
 		}
-		raw, ok, err := r.LookupRaw(entries.view.ID(int(ref)))
+		if r == nil {
+			var err error
+			r, err = run.NewReader(ctx)
+			if err != nil {
+				return 0, err
+			}
+			r.StreamPages()
+		}
+		id := entries.view.ID(int(ref))
+		raw, ok, err := r.LookupRaw(id)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if !ok {
 			continue
 		}
 		canonical = entries.view.AppendCanonical(canonical[:0], int(ref))
 		if !bytes.Equal(raw, canonical) {
-			return errors.New("engine: shared series canonical identity conflict")
+			return 0, errors.New("engine: shared series canonical identity conflict")
 		}
 		known[i] = true
+		found++
+		if remember {
+			remember = cache.put(generation, id, raw)
+		}
 	}
-	return nil
+	return found, nil
 }
 
 func encodeSeriesReference(digest [32]byte) []byte {

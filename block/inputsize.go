@@ -19,7 +19,7 @@ type ColumnInputSize struct {
 	MaxFrameBytes int64
 	MaxFrameRaw   int64
 	MaxGranuleRaw int64
-	// DirBytes is the parsed directory.
+	// DirBytes bounds the parsed directory; constant geometry can use less.
 	DirBytes int64
 	// OpenBytes bounds transient bytes held while the column opens, including directory decompression.
 	OpenBytes int64
@@ -104,9 +104,8 @@ func sizedInput(desc ColumnDesc, rows int64) ColumnInputSize {
 	}
 	in.DirBytes = satAdd(satAdd(4, satMul(perFrame, s.NumFrames)), satMul(perGranule, s.NumGranules))
 	if desc.MaxBlockRows > 0 {
-		in.DirBytes = satAdd(in.DirBytes, satMul(8, s.NumGranules+1))
-	}
-	if desc.TimeBounds {
+		in.DirBytes = satAdd(in.DirBytes, chunkGeometryBound(desc, rows))
+	} else if desc.TimeBounds {
 		in.DirBytes = satAdd(in.DirBytes, satMul(16, s.NumGranules))
 	}
 

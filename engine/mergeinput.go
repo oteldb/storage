@@ -22,6 +22,11 @@ type mergeInputBound struct {
 	resident, transient int64
 }
 
+type mergeInputKey struct {
+	part            *part
+	whole, fallback bool
+}
+
 func (b *mergeInputBound) bytes() int64 { return buildbudget.Add(b.resident, b.transient) }
 
 type boundedMergeSelection struct {
@@ -30,6 +35,7 @@ type boundedMergeSelection struct {
 	inputBytes         int64
 	allowance          int64
 	capBytes           int64
+	plan               MergePlan
 }
 
 func (e *Engine) selectBoundedMerge(ctx context.Context, cohorts []mergeCohort, readable []*part,
@@ -48,6 +54,8 @@ func (e *Engine) selectMergeInputsWithWatermarks(ctx context.Context, cohorts []
 	opts MergeOptions, capBytes int64, idle int, turn uint64, limit int64, fallback map[*part]bool,
 ) (boundedMergeSelection, error) {
 	maxInputs := maxMergeParts
+	prices := make(map[mergeInputKey]mergeInputBound)
+	var candidates, attempts int
 	start := minInt64
 	if opts.RetainFrom > 0 {
 		start = opts.RetainFrom
@@ -56,6 +64,9 @@ func (e *Engine) selectMergeInputsWithWatermarks(ctx context.Context, cohorts []
 		selection := cohortRunPlanLimited(cohorts, readable, opts, capBytes, idle, turn, maxInputs)
 		selection.allowance = limit
 		parts, tiers := selection.parts, selection.tiers
+		candidates = max(candidates, len(parts))
+		attempts++
+		selection.plan = MergePlan{Candidates: candidates, Selected: len(parts), Attempts: attempts, AllowanceBytes: limit}
 		if len(parts) == 0 {
 			if maxInputs < maxMergeParts {
 				return boundedMergeSelection{}, errMergeInputMemory
@@ -66,30 +77,37 @@ func (e *Engine) selectMergeInputsWithWatermarks(ctx context.Context, cohorts []
 			return selection, nil
 		}
 		whole := len(parts) == 1 && !splitsOutput(parts, start)
-		bound, err := e.mergeInputBoundWithWatermarks(ctx, parts, whole, fallback)
+		bound, err := e.mergeInputBoundCached(ctx, parts, whole, fallback, prices)
 		if err != nil {
 			return boundedMergeSelection{}, err
 		}
-		bound.resident = buildbudget.Add(bound.resident, mergeSeriesScratchBound(parts, tiers))
+		selection.plan.InputResidentBytes, selection.plan.OpenBytes = bound.resident, bound.transient
+		selection.plan.ScratchBytes = mergeSeriesScratchBound(parts, tiers)
+		bound.resident = buildbudget.Add(bound.resident, selection.plan.ScratchBytes)
 		metadataBytes, err := e.mergeMetadataWorkspace(ctx, parts)
 		if err != nil {
 			return boundedMergeSelection{}, err
 		}
 		bound.resident = buildbudget.Add(bound.resident, metadataBytes)
+		selection.plan.MetadataBytes = metadataBytes
 
 		floor := e.minimumMergeOutput(parts, selection.capBytes, opts, tiers)
 		if whole && !e.cfg.DiskSeries && buildbudget.Add(bound.bytes(), floor) <= limit {
 			floor = buildbudget.Add(floor, e.wholeMergeOutputBound(parts[0], selection.capBytes, opts, tiers))
 		}
+		selection.plan.OutputFloorBytes = floor
 		if buildbudget.Add(bound.bytes(), floor) <= limit && (len(parts) <= minMergeParts || bound.bytes() <= limit/2) {
 			selection.inputBytes = bound.bytes()
 			return selection, nil
 		}
 		if len(parts) <= minMergeParts {
+			e.recordMergePlan(ctx, selection.plan, "input_memory")
 			return boundedMergeSelection{}, errors.Wrapf(errMergeInputMemory,
 				"%d inputs need %d bytes plus %d output bytes; limit %d", len(parts), bound.bytes(), floor, limit)
 		}
-		maxInputs = max(minMergeParts, len(parts)/2)
+		// Halving skips affordable runs between two powers of two (e.g. seven inputs
+		// when eight fail and four fit). Rerun the policy for each smaller fan-in.
+		maxInputs = len(parts) - 1
 	}
 }
 
@@ -134,11 +152,25 @@ func (e *Engine) mergeInputBound(ctx context.Context, src []*part, whole bool) (
 func (e *Engine) mergeInputBoundWithWatermarks(
 	ctx context.Context, src []*part, whole bool, fallback map[*part]bool,
 ) (mergeInputBound, error) {
+	return e.mergeInputBoundCached(ctx, src, whole, fallback, nil)
+}
+
+func (e *Engine) mergeInputBoundCached(ctx context.Context, src []*part, whole bool,
+	fallback map[*part]bool, prices map[mergeInputKey]mergeInputBound,
+) (mergeInputBound, error) {
 	var bound mergeInputBound
 	for _, p := range src {
-		one, err := e.partMergeInputBound(ctx, p, whole, fallback[p])
-		if err != nil {
-			return mergeInputBound{}, errors.Wrapf(err, "price merge input %q", p.prefix)
+		key := mergeInputKey{part: p, whole: whole, fallback: fallback[p]}
+		one, ok := prices[key]
+		if !ok {
+			var err error
+			one, err = e.partMergeInputBound(ctx, p, whole, key.fallback)
+			if err != nil {
+				return mergeInputBound{}, errors.Wrapf(err, "price merge input %q", p.prefix)
+			}
+			if prices != nil {
+				prices[key] = one
+			}
 		}
 		bound.resident = buildbudget.Add(bound.resident, one.resident)
 		bound.transient = max(bound.transient, one.transient)
@@ -208,6 +240,12 @@ func mergeWatermarkBound(ctx context.Context, p *part) (mergeInputBound, error) 
 }
 
 func mergeWatermarkBoundWithFallback(ctx context.Context, p *part, fallback bool) (mergeInputBound, error) {
+	if p.sharedSeries != nil {
+		// Shared descriptors require a validated bounded SMAX cursor; they never
+		// materialize the per-series watermark array or use timestamp fallback.
+		resident, open := watermark.MemoryBound()
+		return mergeInputBound{resident: resident, transient: open}, nil
+	}
 	p.seriesMaxMu.Lock()
 	cached := p.seriesMax != nil
 	bytes := memsize.Slice(p.seriesMax)

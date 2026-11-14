@@ -51,7 +51,7 @@ func OpenReader(ctx context.Context, b backend.Backend, key string, count int) (
 	var data []byte
 	var prior signal.SeriesID
 	for pos := 0; pos < count; {
-		batch := min((32<<10)/entryWidth, count-pos)
+		batch := min(readerWindowBytes/entryWidth, count-pos)
 		data, err = backend.ReadAtAppend(ctx, b, data[:0], key, int64(offset+pos*entryWidth), int64(batch*entryWidth))
 		if err != nil {
 			return nil, err

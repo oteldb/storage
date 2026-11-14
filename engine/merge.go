@@ -169,6 +169,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{parts: dropped}, err
 	}
 	selected := selection.parts
+	e.recordMergePlan(ctx, selection.plan, "selected")
 
 	if len(selected) == 0 {
 		if dropped == 0 {
@@ -202,6 +203,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	}
 
 	if !admitted {
+		e.recordMergePlan(ctx, selection.plan, "pool_busy")
 		// Remembered so the facade can order this engine first next cycle. Without it the task
 		// order — by head bytes, which the highest-ingest engines keep winning — would hand the
 		// budget to the same engines every cycle and a quiet tenant's part count would grow without
@@ -224,6 +226,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{parts: dropped}, err
 	}
 	selected = selection.parts
+	e.recordMergePlan(ctx, selection.plan, "admitted")
 	opts.Downsample = selection.tiers
 	capBytes = selection.capBytes
 	if len(selection.conflicting) > 0 && e.conflictWarned.CompareAndSwap(false, true) {
@@ -296,6 +299,9 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{parts: dropped}, nil
 	}
 	published = true
+	selection.plan.OutputParts = len(newParts)
+	e.recordMergePlan(ctx, selection.plan, "completed")
+	e.cfg.Obs.Merge.Outputs(ctx, metricSignal, int64(len(newParts)))
 	return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, nil
 }
 
@@ -900,6 +906,7 @@ func (e *Engine) Close(ctx context.Context) (retErr error) {
 		e.closePartReadersLocked()
 		e.seriesTable.release()
 		e.seriesTable = nil
+		e.verifiedIdentities.clear()
 		readersDone(nil)
 	}()
 
@@ -924,6 +931,7 @@ func (e *Engine) CloseWAL() error {
 		e.closePartReadersLocked()
 		e.seriesTable.release()
 		e.seriesTable = nil
+		e.verifiedIdentities.clear()
 	}()
 
 	if e.cfg.WAL != nil {

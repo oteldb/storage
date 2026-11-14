@@ -48,7 +48,7 @@ const (
 	minMergeParts = 2
 	// maxMergeParts keeps one merge bounded in inputs (and wall-clock) however large the byte budget
 	// grows; the rest are picked up next cycle. VictoriaMetrics bounds by parts as well as bytes too.
-	maxMergeParts = 16
+	maxMergeParts = 32
 	// minMergeMultiplier is the least output-to-largest-input ratio a run must reach to be worth
 	// merging, the write-amplification guard: folding a 1 MiB part into a 1 GiB one rewrites a
 	// gigabyte to remove one part. VictoriaMetrics uses the same constant and name
@@ -195,12 +195,14 @@ func scanRunsLimited(bySize []*part, capBytes int64, maxInputs int) (best, fallb
 	bestM := 0.0
 
 	for n := minMergeParts; n <= min(maxInputs, len(bySize)); n++ {
+		var total int64
+		for _, p := range bySize[:n] {
+			total += p.sizeBytes()
+		}
 		for i := 0; i+n <= len(bySize); i++ {
 			run := bySize[i : i+n]
-
-			var total int64
-			for _, p := range run {
-				total += p.sizeBytes()
+			if i > 0 {
+				total += run[n-1].sizeBytes() - bySize[i-1].sizeBytes()
 			}
 
 			if capBytes > 0 && total > capBytes {

@@ -179,7 +179,8 @@ type Config struct {
 	// One atomic caller batch may exceed the target and flushes before the next write.
 	ResidentHeadBytes int64
 	// SeriesCacheBytes bounds historical ID/watermark cache memory per disk-indexed engine.
-	// SeparateSeries reserves one eighth for retained sorted IDs; the rest holds watermarks.
+	// SeparateSeries reserves one eighth each for sorted IDs and verified canonical bytes;
+	// the rest holds watermarks.
 	// Zero uses 512 MiB, allocated on demand; negative disables the cache.
 	SeriesCacheBytes int64
 	// SeriesContexts shares bounded immutable resource/scope payloads across engines.
@@ -217,17 +218,19 @@ type Engine struct {
 	mu             engineguard.Mutex
 	// The build barrier excludes reset, prune and repair; admitted flush/merge builds take read slots.
 	// Identity lifecycle precedes catalog -> writer -> reader-visible state (see ARCH.md).
-	flushMu       sync.RWMutex
-	identityMu    sync.RWMutex
-	identityOrder identityOrder
-	activeBuilds  atomic.Int32
-	flushRun      sync.Mutex
-	mergeRun      sync.Mutex
-	head          *head
-	parts         []*part
-	seriesTable   *seriesSnapshot
-	seriesRetired []bucketindex.SeriesRoot
-	seriesIDs     *seriestable.IDCache
+	flushMu            sync.RWMutex
+	identityMu         sync.RWMutex
+	identityOrder      identityOrder
+	activeBuilds       atomic.Int32
+	flushRun           sync.Mutex
+	mergeRun           sync.Mutex
+	head               *head
+	parts              []*part
+	seriesTable        *seriesSnapshot
+	seriesRetired      []bucketindex.SeriesRoot
+	seriesIDs          *seriestable.IDCache
+	verifiedIdentities *verifiedIdentityCache
+	lastMergePlan      atomic.Pointer[MergePlan]
 	// tsCodec is the codec flushes and merges write the timestamp column with. It is a field, not a
 	// constant, only so a test can write the [chunk.CodecDoD] parts earlier builds wrote and check
 	// they merge.
@@ -442,6 +445,7 @@ func New(cfg Config) *Engine {
 
 	if cfg.SeparateSeries {
 		e.seriesIDs = seriestable.NewIDCache(cfg.SeriesCacheBytes / 8)
+		e.verifiedIdentities = newVerifiedIdentityCache(cfg.SeriesCacheBytes / 8)
 	}
 	if cfg.DiskSeries {
 		e.head.disk = newDiskHeadStateWithCache(e.diskSeriesCacheBytes())

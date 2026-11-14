@@ -82,9 +82,8 @@ func (r *PartReader) ScanBound(ctx context.Context, name string, window int64) (
 	}
 	if desc.MaxBlockRows > 0 {
 		n -= 12 * sz.NumGranules
-		n += 8 * (sz.NumGranules + 1)
-	}
-	if desc.TimeBounds {
+		n += chunkGeometryBound(desc, int64(r.manifest.RowCount))
+	} else if desc.TimeBounds {
 		n += 16 * sz.NumGranules
 	}
 

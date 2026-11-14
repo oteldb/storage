@@ -528,7 +528,7 @@ func (e *Engine) diskWatermarksForHead(ctx context.Context, parts []*part, ids [
 
 func (e *Engine) diskSeriesCacheBytes() int64 {
 	if e.cfg.SeparateSeries {
-		return e.cfg.SeriesCacheBytes - e.cfg.SeriesCacheBytes/8
+		return e.cfg.SeriesCacheBytes - 2*(e.cfg.SeriesCacheBytes/8)
 	}
 	return e.cfg.SeriesCacheBytes
 }

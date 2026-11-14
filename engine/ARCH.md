@@ -2099,7 +2099,12 @@ numeric parts only; retained metadata source objects require separate disk-capac
 
 Separate metadata reserves one eighth of `SeriesCacheBytes` for a bounded
 LRU of validated, sorted `SeriesID` arrays. Exact binary search returns a descriptor ordinal or a
-negative result without decoding prefix-coded keys. The remainder holds historical watermarks. Pending arrays count against the cache limit
+negative result without decoding prefix-coded keys. A second eighth holds exact canonical byte
+proofs for one immutable catalog generation; the remaining three quarters hold historical
+watermarks. Proofs are checked once per input identity before walking metadata roots. Catalog
+changes force fresh verification, and a full proof cache stops admitting entries rather than
+churning allocations for every miss. `VerifiedIdentityCacheStats` reports actual hit/miss counts;
+a fitting component benchmark does not establish that the whole host workload fits. Pending arrays count against the cache limit
 before allocation and become readable only after full run validation; eviction falls back to the
 existing bounded disk reader. Cached IDs never determine active cardinality or sample coverage.
 
@@ -2130,3 +2135,25 @@ falls back to authoritative part metadata, and successful updates preserve the m
 
 Head registration carries `series.Entry` (computed ID plus identity) into the resident registry;
 projection and validated replay establish IDs, while untrusted descriptor readers retain hash checks.
+
+### Numeric merge planning diagnostics
+
+`LastMergePlan` and `SignalStats.MergePlan` expose structural candidates, the memory-bounded
+selection, attempt count, input resident/open workspace, per-series scratch, metadata scratch,
+minimum output workspace, the granted allowance and final input/output part counts.
+`storage.merge.plan.{parts,bytes}` histograms retain outcomes;
+`storage.merge.admission_refused{pool=merge|build}` identifies process-pool refusals separately
+from intrinsic input-memory failures. Numeric and metadata compaction remain distinct operations.
+
+Numeric fan-in is capped at 32 inputs. Memory preflight reruns the policy for each smaller
+fan-in instead of halving and skipping fitting runs. The input-half and output-floor memory
+checks, disk cap, rollup closure and input precedence remain mandatory. A larger ceiling
+permits wider fitting merges; it does not guarantee a 32-input merge under a small grant.
+
+Shared-series SAMPLE merges price SMAX as its checked 32-KiB reader/cursor workspace, not a
+materialized entry array. CRC/order validation still precedes use and unsupported bounded
+reads still fail; legacy watermark fallback keeps its whole-array bound. Native streaming
+column directories are transient finishing state. Buffered object writers retain their
+directory charge, and the unstreamed ID object stays charged while numeric columns finish.
+The convergence fixture verifies mostly-disjoint short-series input shrinks under the same
+grant and samples live heap during actual streamed column writes.

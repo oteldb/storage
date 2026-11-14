@@ -613,8 +613,11 @@ cursor reads use the same geometry. Decoded counts, frame ownership and manifest
 older readers reject the unknown extension bits rather than interpreting a different row layout.
 
 Timestamp chunk directories carry pruning bounds and use adaptive cadence encoding. Variable parts return an empty legacy `Marks`
-index; callers use `Decoder.BlockTimeBounds`. The directory's row and bounds arrays are included
-in input, scan, clone and finishing memory estimates.
+index; callers use `Decoder.BlockTimeBounds`. Parsed row starts and time bounds use fixed-width
+packed bytes with constant-time access; uniform row counts and constant bounds need no arrays.
+Widths follow manifest row/time bounds, which are checked while parsing. Rows wider than uint32
+and timestamps spanning int64 retain their full range. Clones share immutable owned geometry;
+input and scan estimates include its arrays and header without retaining encoded directory bytes.
 
 The variable descriptor stores the row cap after sizing fields. After the existing directory's
 stream lengths, each chunk stores its row count and, for `TimeBounds`, signed delta minimum and
@@ -656,3 +659,12 @@ Irregular cadence, a gap, a changed stride, the cap, a normal numeric append, `E
 flushes the pair. Logical rows are visible while staged; encoding and directory accounting happen
 once on flush. Residency and finishing bounds include owned fragments, assembled packets and the
 target compressor's transient memory. The exact metadata seal and payload CRC allocate no scratch.
+
+Streaming directory serialization is priced as per-column transient workspace when the backend
+actually streams writes. A buffering ObjectWriter keeps its retained directory charge. The
+ID column remains unstreamed and its compressed object stays charged while other columns finish.
+
+Trusted stream writers count encoded varint bytes as granules and chunk geometry are appended.
+Finish bounds use those lengths plus fixed slack for pending chunks/frames, with the existing
+growth and compression margins. Raw directories are preallocated exactly; decoder limits and
+wire bytes are unchanged. Synthetic accumulators without counters keep the conservative bound.
