@@ -339,6 +339,9 @@ func (e *Engine) compactDiskHeadLocked() {
 }
 
 func (e *Engine) flushResidentHead() error {
+	if e.pressurePipelineEnabled() {
+		return e.pipelineResidentPressure()
+	}
 	if !e.cfg.DiskSeries {
 		return nil
 	}
@@ -358,7 +361,12 @@ func (e *Engine) flushResidentHeadLocked() error {
 	}
 	for e.residentHeadOverBudgetLocked() {
 		e.mu.UnlockWriter()
-		err := e.relieveResidentHeadPressure()
+		var err error
+		if e.pressurePipelineEnabled() {
+			err = e.pipelineResidentPressure()
+		} else {
+			err = e.relieveResidentHeadPressure()
+		}
 		e.mu.LockWriter()
 		if err != nil {
 			return err

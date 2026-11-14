@@ -28,30 +28,39 @@ pool. Reset, resident-head rotation and identity pruning preserve both configure
 references remain local; WAL and part identities keep their canonical bytes. The storage facade
 does not enable this experimental policy by default.
 
-Anonymous standalone WAL engines allow contended 1,024–4,096-point batches to prepare independently
-when every identity already exists and soft-overflow routing is inactive. Transient uint32-reference
-bitmaps use 64 reservation stripes; conflicting batches roll back reservations and enter existing
-ordered admission. The shared writer lease pins references and head generation until completion.
-Cluster-owned, new-identity and other batch shapes retain ordered admission and publication.
+Anonymous standalone WAL engines prepare 1–4,096-point batches independently when soft-overflow
+routing is inactive. Canonical 128-bit IDs have bounded striped ownership; conflicting requests
+wait on ownership changes without joining the exclusive writer gate. A lifecycle read lease pins
+head/part generations while unrelated requests register and publish under the short state barrier.
+Captured series views are immutable across additions. Cluster-owned and overflow writes retain the
+ordered path; this does not add distributed lane routing or new WAL/catalog formats.
 
-Standalone disk-series batches in the bounded preparation pool pin immutable part handles and
-resolve historical watermarks outside writer ownership. Lookup maps are private; cache and Bloom
-access stays ordered. Head/disk identity, catalog generation and readable handles are revalidated
-before admission uses current watermarks and limits. A changed snapshot falls back to one ordered
-lookup, bounding retries. Pool release clears part/head references and reuses numeric lookup scratch.
+Disk-series lookup captures cache/Bloom state and pinned parts under state ownership, then resolves
+historical watermarks into private maps off state. Publication temporarily supplies the batch's
+historical membership to registration, including when the advisory cache is disabled, so a known
+disk identity does not consume cardinality twice. Snapshot and catalog replacement drain shared
+writer leases before invalidating this state.
 
-Readers see only published slice lengths. A reserved series may prepare appends beyond that prefix
-in spare numeric capacity; growth uses private arrays. Existing prefix values and visible headers
-remain unchanged. Rejected or failed-WAL updates discard their private headers. Materialization,
-frame encoding and column growth are conservatively priced against 32 MiB of extra work per batch;
-larger work falls back. The existing eight-slot preparation pool bounds active private batches.
+A short admission section stages the accepted subset and reserves pending sample/cardinality
+counts. Identity materialization, numeric copying and WAL framing then use request-owned scratch;
+queries see only the old slice headers until the journal succeeds. WAL ownership spans grouped
+atomic header/metadata publication. Failed writes return their reservations and publish no staged
+identities or rows. Scoped limits preserve pointwise partial rejections, including pending writes.
+Prepared scratch and 32-MiB private-work estimates use the process-wide eight-slot pool; oversized
+work falls back with memoized lazy identities. Pool exhaustion waits without taking writer ownership.
+The estimate charges materialized identities and canonical WAL bytes, including payload/frame
+buffer growth. WAL framing does not construct the part encoder's symbol dictionaries; charging
+that workspace here would send ordinary full node-exporter batches back to exclusive ingestion.
 
-Accepted sample bytes reserve head admission capacity through an atomic pending counter read
-alongside head bytes under the state read lock. A batch that cannot reserve its complete accepted
-set falls back to existing pointwise admission, preserving partial-success classifications.
-Numeric copies and frame encoding run off state. WAL ownership spans complete header/metadata
-publication; pending bytes become visible head bytes under that lock. Sync, seal, reset, repair
-and pruning drain shared writer leases, retaining WAL and checkpoint ordering.
+`Config.AsyncPressureFlush` / `Options.MetricAsyncPressureFlush` opt in to standalone WAL-backed
+disk-head pipelining. Rotation starts at half the resident target; the other half permits active
+progress while one frozen generation builds. Active/frozen state and pending sample bytes trigger
+backpressure at the original full target, with bounded overshoot from already admitted atomic batches and
+separately bounded preparation scratch. The target is not multiplied per worker. One worker and one
+frozen slot preserve publication/checkpoint order. A queued job rechecks pressure after acquiring
+the flush slot, avoiding empty/tiny work after a manual flush wins. Close drains the owned job;
+CloseWAL cancels/drains it without checkpointing failed work. This mode changes part granularity
+and needs workload qualification; it is off by default and rejects cluster/read-only/ephemeral use.
 
 Per-write fsync combines ready independent batches in a bounded caller-owned queue, without a timer
 or background worker. Combined frames use at most eight reusable 4 MiB buffers globally; page-cache

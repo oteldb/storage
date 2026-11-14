@@ -57,7 +57,14 @@ func TestReadersDuringWALEncoding(t *testing.T) {
 				}
 				unblock := sync.OnceFunc(func() { close(gate.release) })
 				t.Cleanup(unblock)
-				e.walB.fw = wal.NewWriter(gate)
+				if op == "batch" {
+					p := &preparedBatch{batch: newWALBatch()}
+					gate.dst = &p.batch.frames
+					p.batch.fw = wal.NewWriter(gate)
+					e.preparationPool().free <- p
+				} else {
+					e.walB.fw = wal.NewWriter(gate)
+				}
 				written := make(chan error, 1)
 				go func() {
 					var err error

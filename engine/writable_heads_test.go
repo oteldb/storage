@@ -148,6 +148,8 @@ func (f *writableHeads) close() error {
 }
 
 // resetFixture discards measured writes and restores the fixed immutable seed, outside timing.
+//
+//nolint:contextcheck // The fixture aborts without flushing and drains its owned workers.
 func (f *writableHeads) resetFixture(ctx context.Context) error {
 	if err := f.close(); err != nil {
 		return err

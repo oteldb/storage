@@ -116,11 +116,14 @@ func TestSampleArenaFailedPreparedWriteDoesNotPublishMemory(t *testing.T) {
 	require.ErrorIs(t, err, errInjectedWAL)
 	require.Empty(t, e.head.samples)
 	require.Nil(t, e.head.memory.headers)
-	require.NotNil(t, p.memory.headers)
+	require.Len(t, p.created, 1)
+	require.NotNil(t, p.created[0])
+	require.Equal(t, []int64{1}, p.created[0].ts)
 	pool.release(p)
 	p = pool.acquire()
 	require.Nil(t, p.memory.headers)
 	require.Nil(t, p.memory.numeric)
+	require.Empty(t, p.created[0], "released scratch cannot retain a private compact header")
 }
 
 //nolint:paralleltest // Temporarily replaces the process-wide recyclers.
