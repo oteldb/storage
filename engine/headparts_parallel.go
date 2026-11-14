@@ -25,6 +25,7 @@ var (
 type headPartJob struct {
 	entries                                             []headRunEntry
 	encoded, materialized, sorting, rows, identityBytes int64
+	privateBytes, retainedBytes                         int64
 }
 
 type headPartResult struct {
@@ -33,10 +34,11 @@ type headPartResult struct {
 }
 
 type headPartPlan struct {
-	entries []headRunEntry
-	jobs    []headPartJob
-	shared  int64
-	parts   int
+	entries  []headRunEntry
+	jobs     []headPartJob
+	shared   int64
+	parts    int
+	retained int64
 }
 
 // reservePlan retains every grant while the planner still owns its buffers.
