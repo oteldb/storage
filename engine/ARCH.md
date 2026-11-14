@@ -48,6 +48,9 @@ atomic header/metadata publication. Failed writes return their reservations and 
 identities or rows. Scoped limits preserve pointwise partial rejections, including pending writes.
 Prepared scratch and 32-MiB private-work estimates use the process-wide eight-slot pool; oversized
 work falls back with memoized lazy identities. Pool exhaustion waits without taking writer ownership.
+The estimate charges materialized identities and canonical WAL bytes, including payload/frame
+buffer growth. WAL framing does not construct the part encoder's symbol dictionaries; charging
+that workspace here would send ordinary full node-exporter batches back to exclusive ingestion.
 
 `Config.AsyncPressureFlush` / `Options.MetricAsyncPressureFlush` opt in to standalone WAL-backed
 disk-head pipelining. Rotation starts at half the resident target; the other half permits active

@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"bytes"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
-	"github.com/oteldb/storage/internal/reproduce"
+	"github.com/oteldb/storage/internal/vfs/faultfs"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/signal/metric"
 	"github.com/oteldb/storage/wal"
@@ -50,7 +52,6 @@ func (in nodeExporterInput) append(e *Engine) parallelAppendResult {
 }
 
 func TestNodeExporterBatchesPrepareIndependently(t *testing.T) {
-	reproduce.Unfixed(t, 661, "4096 node-exporter identities exceed the inflated private-work estimate")
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		e, fs := newFaultWALEngine(t, 0)
@@ -100,6 +101,73 @@ func TestNodeExporterBatchesPrepareIndependently(t *testing.T) {
 		require.Zero(t, e.parallel.pending.Load())
 		require.Zero(t, e.parallel.pendingSeries.Load())
 	})
+}
+
+func TestNodeExporterPreparationWorkBound(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"cold", "relog", "oversized identity"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			in := nodeExporterInputBatch(4096, 0)
+			if mode == "oversized identity" {
+				in = nodeExporterInputBatch(1, 0)
+				in.series[0].Scope.SchemaURL = bytes.Repeat([]byte("x"), maxParallelHeadWork/4)
+			}
+			h := newHead()
+			p := preparedFor(in.ids)
+			p.batch.order = append(p.batch.order, in.ids...)
+			p.batch.samples = len(in.ids)
+			for i, id := range in.ids {
+				a := walSeriesAcc{register: true, isNew: true, series: in.series[i], ts: in.ts[i : i+1], values: in.values[i : i+1]}
+				if mode == "relog" {
+					h.registerSeries(in.series[i])
+					a.register, a.knownRef = false, true
+					a.identityRef, _ = h.series.Ref(id)
+				}
+				p.batch.accs[i] = a
+			}
+			require.Equal(t, mode != "oversized identity", p.parallelWorkFits(h.series.View()))
+		})
+	}
+}
+
+func TestNodeExporterPreparedWALFailure(t *testing.T) {
+	t.Parallel()
+	in := nodeExporterInputBatch(4096, 0)
+	for _, failure := range []string{"write", "sync"} {
+		t.Run(failure, func(t *testing.T) {
+			t.Parallel()
+			e, fs := newFaultWALEngine(t, 0)
+			e.cfg.WAL.SetSync(failure == "sync")
+			var ordered atomic.Int32
+			e.parallel.hooks = &parallelHeadHooks{ordered: func([]signal.SeriesID) { ordered.Add(1) }}
+			if failure == "write" {
+				failNextWALWrite(fs)
+			} else {
+				fs.Add(faultfs.Rule{Op: faultfs.OpSync, Times: 1, Err: errInjectedWAL,
+					Match: func(c faultfs.Call) bool { return strings.HasSuffix(c.Name, ".wal") }})
+			}
+			r := in.append(e)
+			require.ErrorIs(t, r.err, errInjectedWAL)
+			require.Equal(t, AppendResult{}, r.result)
+			require.Zero(t, e.HeadSampleCount())
+			require.Zero(t, e.SeriesCount())
+			require.Zero(t, e.parallel.pending.Load())
+			require.Zero(t, e.parallel.pendingSeries.Load())
+			require.Zero(t, replayedHead(t, fs.Crash()).series.Len())
+			r = in.append(e)
+			require.NoError(t, r.err)
+			require.Equal(t, len(in.ids), r.result.Accepted)
+			require.Zero(t, ordered.Load(), "failure and retry both retain the concurrent path")
+			require.Equal(t, []int64{cpuFixtureBase}, headTS(e.head, in.series[len(in.series)-1]))
+			want := []int64{cpuFixtureBase}
+			if failure == "sync" {
+				// A later sync can persist complete records from a previously failed fsync.
+				want = append(want, cpuFixtureBase)
+			}
+			require.Equal(t, want, headTS(replayedHead(t, fs), in.series[len(in.series)-1]))
+		})
+	}
 }
 
 func BenchmarkNodeExporterColdAppend(b *testing.B) {

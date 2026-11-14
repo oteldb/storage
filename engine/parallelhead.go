@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/binary"
 	"math"
 	"slices"
 	"sync"
@@ -188,7 +189,7 @@ func (e *Engine) parallelSnapshots(p *preparedBatch, lookupErr error) (series.Vi
 }
 
 func (p *preparedBatch) parallelWorkFits(view series.View) bool {
-	work := int64(p.batch.samples) * 32
+	work := buildbudget.Add(1024, int64(p.batch.samples)*192)
 	for i := range p.batch.order {
 		a := &p.batch.accs[i]
 		old := sampleBuf{}
@@ -211,17 +212,28 @@ func (p *preparedBatch) parallelWorkFits(view series.View) bool {
 			n = buildbudget.Add(n, buildbudget.Attributes(a.series.Scope.Attributes))
 			n = buildbudget.Add(n, int64(len(a.series.Resource.SchemaURL)+len(a.series.Scope.SchemaURL)))
 			n = buildbudget.Add(n, int64(len(a.series.Scope.Name)+len(a.series.Scope.Version)))
-			work = buildbudget.Add(work, buildbudget.Mul(n, 8))
+			work = buildbudget.Add(work, n)
+			work = buildbudget.Add(work, walIdentityWork(buildbudget.SeriesEncoding(a.series)))
 		} else if a.isNew {
-			work = buildbudget.Add(work, view.IdentityWorkspace(int(a.identityRef)))
 			work = buildbudget.Add(work, view.MaterializationBytes(int(a.identityRef)))
-			work = buildbudget.Add(work, view.EncodingBytes(int(a.identityRef)))
+			resource, scope := view.Context(int(a.identityRef))
+			encoded := buildbudget.SeriesEncoding(signal.Series{Resource: resource, Scope: scope})
+			view.EncodedAttributes(int(a.identityRef), func(key, value []byte) {
+				encoded = buildbudget.Add(encoded, binary.MaxVarintLen64+int64(len(key)))
+				encoded = buildbudget.Add(encoded, int64(len(value)))
+			})
+			work = buildbudget.Add(work, walIdentityWork(encoded))
 		}
 		if work > maxParallelHeadWork {
 			return false
 		}
 	}
 	return true
+}
+
+func walIdentityWork(encoded int64) int64 {
+	// Payload, frame and accumulated frames can each retain up to twice their encoded size.
+	return buildbudget.Mul(buildbudget.Add(encoded, 32), 6)
 }
 
 func (p *preparedBatch) prepareTails() {
