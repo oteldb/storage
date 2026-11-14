@@ -652,3 +652,8 @@ Flush workspace metrics distinguish the configured output target from the admitt
 `storage.flush.reservation.bytes` labels `component=reserved|target` and a bounded `phase`;
 `storage.flush.reservation.wait` records admission wait by phase. `storage.flush.output.series`
 counts distinct identities per completed candidate, including candidates not yet catalog-published.
+`storage.flush.build.workers` and `.jobs` record admitted concurrency and planned jobs per attempt;
+zero jobs identifies legacy sequential planning. `.fallbacks{reason=plan|workspace}` counts retries
+through that planner. Two workers require an additional nonblocking grant from the same pool;
+one admitted worker with several jobs means those jobs run sequentially. These count admission,
+not active CPU utilization or successful publication; failed attempts remain observable.

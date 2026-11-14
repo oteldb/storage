@@ -77,6 +77,20 @@ type Flush struct {
 	reservation     metric.Int64Histogram
 	reservationWait metric.Float64Histogram
 	outputSeries    metric.Int64Histogram
+	buildWorkers    metric.Int64Histogram
+	buildJobs       metric.Int64Histogram
+	buildFallbacks  metric.Int64Counter
+}
+
+// BuildPlan records admitted worker concurrency and queued jobs for a flush attempt.
+func (f *Flush) BuildPlan(ctx context.Context, workers, jobs int) {
+	f.buildWorkers.Record(ctx, int64(workers))
+	f.buildJobs.Record(ctx, int64(jobs))
+}
+
+// BuildFallback records a bounded parallel plan retried through the sequential builder.
+func (f *Flush) BuildFallback(ctx context.Context, reason string) {
+	f.buildFallbacks.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 }
 
 // Reservation records admitted flush workspace and its wait, separately from the part target.
@@ -579,11 +593,15 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 			1<<20, 8<<20, 16<<20, 32<<20, 64<<20, 128<<20, 256<<20, 512<<20, 1<<30, 2<<30),
 		reservationWait: b.f64hist("storage.flush.reservation.wait", "flush workspace admission wait"),
 		outputSeries:    b.i64hist("storage.flush.output.series", "distinct series per completed flush candidate", "{series}"),
-		verified:        b.counter("storage.series.verification_cache.requests", "canonical verification cache probes", "{identity}"),
-		total:           b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
-		duration:        b.f64hist("storage.flush.duration", "flush wall time"),
-		rows:            b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),
-		bytes:           b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
+		buildWorkers:    b.i64hist("storage.flush.build.workers", "admitted builders per flush attempt", "{worker}", 0, 1, 2),
+		buildJobs: b.i64hist("storage.flush.build.jobs", "planned jobs per flush attempt, zero for legacy planning", "{job}",
+			0, 1, 2, 4, 8, 16, 32, 64),
+		buildFallbacks: b.counter("storage.flush.build.fallbacks", "parallel plans retried sequentially", "{attempt}"),
+		verified:       b.counter("storage.series.verification_cache.requests", "canonical verification cache probes", "{identity}"),
+		total:          b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
+		duration:       b.f64hist("storage.flush.duration", "flush wall time"),
+		rows:           b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),
+		bytes:          b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
 	}
 	merge := &Merge{
 		refused:   b.counter("storage.merge.admission_refused", "process-pool merge refusals by pool, across signals", "{attempt}"),

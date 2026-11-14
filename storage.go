@@ -1336,6 +1336,7 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 		MergeMemoryBytes:  s.mergeMemoryBytes(),
 		FlushMemoryBytes:  s.metricFlushMemoryBytes(),
 		FlushAdmission:    s.flushAdmission(),
+		TryFlushAdmission: s.tryFlushAdmission(),
 		MinFreeBytes:      s.opts.MinFreeBytes,
 		MinFreeInodes:     s.opts.MinFreeInodes,
 		OrphanGrace:       s.opts.OrphanGrace,

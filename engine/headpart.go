@@ -25,10 +25,12 @@ type headRunEntry struct {
 }
 
 type headPartBuilder struct {
-	ctx     context.Context //nolint:containedctx // The builder and its streaming writes share one flush lifetime.
-	e       *Engine
-	view    series.View
-	entries []headRunEntry
+	plan                           *headPartPlan
+	fixedLimit, fixedIdentityBytes int64
+	ctx                            context.Context //nolint:containedctx // The builder and its streaming writes share one flush lifetime.
+	e                              *Engine
+	view                           series.View
+	entries                        []headRunEntry
 
 	identities   series.EncodingBudget
 	encoded      int64
@@ -57,6 +59,25 @@ func (e *Engine) flushMemoryBytes() int64 {
 }
 
 func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sampleBuf) ([]*part, int, error) {
+	if e.cfg.FlushAdmission != nil && e.cfg.TryFlushAdmission != nil && backend.StreamsWrites(e.cfg.Backend) && !e.cfg.SeparateSeries {
+		parts, rows, err := e.streamHeadParallel(ctx, samples)
+		if !errors.Is(err, errHeadPlanUnavailable) && !errors.Is(err, errHeadJobBudget) {
+			return parts, rows, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		reason := "plan"
+		if errors.Is(err, errHeadJobBudget) {
+			reason = "workspace"
+		}
+		e.cfg.Obs.Flush.BuildFallback(ctx, reason)
+	}
+	e.cfg.Obs.Flush.BuildPlan(ctx, 1, 0)
+	return e.streamHeadSerial(ctx, samples)
+}
+
+func (e *Engine) streamHeadSerial(ctx context.Context, samples map[signal.SeriesID]*sampleBuf) ([]*part, int, error) {
 	b := headPartBuilder{ctx: ctx, e: e, target: e.flushMemoryBytes()}
 	capacity := min(len(samples), max(1, int(b.target/1024)))
 	buffers := buildbudget.Mul(int64(capacity), memsize.Of[headRunEntry]()+memsize.Of[uint32]())
@@ -133,7 +154,11 @@ func (b *headPartBuilder) baseBytes() int64 {
 	if b.writer != nil {
 		n = buildbudget.Add(n, max(b.writer.identityWriterBytes, b.writer.sidecarWriterBytes))
 	}
-	return buildbudget.Add(n, memsize.Slice(b.entries)+memsize.Slice(b.partRefs))
+	if b.fixedLimit == 0 {
+		n = buildbudget.Add(n, memsize.Slice(b.entries))
+	}
+	n = buildbudget.Add(n, buildbudget.Mul(memsize.Slice(b.parts), 2))
+	return buildbudget.Add(n, memsize.Slice(b.partRefs))
 }
 
 func (b *headPartBuilder) prepareWriter() error {
@@ -171,6 +196,15 @@ func (b *headPartBuilder) reserve(bytes int64) error {
 }
 
 func (b *headPartBuilder) reservePhase(bytes int64, phase string) error {
+	if b.fixedLimit > 0 {
+		if bytes > b.fixedLimit {
+			return errHeadJobBudget
+		}
+		return nil
+	}
+	if b.plan != nil {
+		return b.reservePlan(bytes, phase)
+	}
 	if phase == "metadata" && bytes > b.reserved {
 		bytes = max(bytes, b.reserved+max(b.reserved/2, 1<<20))
 	}
@@ -257,7 +291,11 @@ func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) er
 
 func (b *headPartBuilder) estimate(entries int, encoded, materialized int64, rows int, sorting int64) int64 {
 	n := b.baseBytes()
-	n = buildbudget.Add(n, b.identities.Bytes())
+	identityBytes := b.identities.Bytes()
+	if b.fixedLimit > 0 {
+		identityBytes = b.fixedIdentityBytes
+	}
+	n = buildbudget.Add(n, identityBytes)
 	n = buildbudget.Add(n, buildbudget.Mul(buildbudget.Add(b.encoded, encoded), 4))
 	// Runs, sidecars, references, their serialized forms and slice growth are per identity.
 	n = buildbudget.Add(n, buildbudget.Mul(int64(entries), 512))
@@ -276,6 +314,9 @@ func (b *headPartBuilder) estimate(entries int, encoded, materialized int64, row
 func (b *headPartBuilder) flushRun() error {
 	if len(b.entries) == 0 {
 		return nil
+	}
+	if b.plan != nil {
+		return b.plan.record(b)
 	}
 	if err := b.writer.reserveSeries(len(b.entries)); err != nil {
 		return err
@@ -296,6 +337,7 @@ func (b *headPartBuilder) flushRun() error {
 	clear(b.entries)
 	b.entries = b.entries[:0]
 	b.identities.Reset()
+	b.fixedIdentityBytes = 0
 	b.encoded, b.materialized, b.sorting, b.runRows = 0, 0, 0, 0
 	if next := max(b.reservationFloor, buildbudget.Add(b.baseBytes(), b.identities.Bytes())); b.reserved > next {
 		return b.reserve(next)

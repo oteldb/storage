@@ -107,6 +107,29 @@ func TestFlushReservationMetrics(t *testing.T) {
 	require.Equal(t, map[string]int64{"storage.flush.reservation.bytes/reserved": 16 << 20, "storage.flush.reservation.bytes/target": 448 << 20, "storage.flush.output.series/": 8192}, values)
 }
 
+func TestFlushBuildMetrics(t *testing.T) {
+	t.Parallel()
+	o, collect := newMetered(t)
+	o.Flush.BuildPlan(t.Context(), 2, 4)
+	o.Flush.BuildFallback(t.Context(), "workspace")
+	rm := collect()
+	require.EqualValues(t, 1, counterSum(t, rm, "storage.flush.build.fallbacks", map[string]string{"reason": "workspace"}))
+	values := make(map[string]int64)
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != "storage.flush.build.workers" && m.Name != "storage.flush.build.jobs" {
+				continue
+			}
+			h, ok := m.Data.(metricdata.Histogram[int64])
+			require.True(t, ok)
+			for _, p := range h.DataPoints {
+				values[m.Name] += p.Sum
+			}
+		}
+	}
+	require.Equal(t, map[string]int64{"storage.flush.build.workers": 2, "storage.flush.build.jobs": 4}, values)
+}
+
 func TestCorruptionDetected(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
