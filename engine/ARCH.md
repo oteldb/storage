@@ -178,8 +178,12 @@ Output writers retain references and scalar estimates, not registry views: finis
 fresh view, so several day writers cannot each pin a different generation of growing arenas.
 
 Part writers with a known `backend.WriterMemory` bound stream identity records and symbols into
-an incremental writer. Its captured workspace is charged at merge finishing; head flushes grow
-their reservation before opening it. Unpriced or buffered writers retain the whole-object encoder.
+an incremental writer. Its captured workspace is charged at merge finishing. Head flushes prepare
+the named writer before run sizing and include the larger identity/sidecar finishing workspace
+inside the run target. Candidate symbols enter the estimator only after the sealing decision;
+finishing charges the selected entry count without a prospective extra entry. Normal runs can
+finish within the protected flush share while a merge owns the rest. Oversized identities retain
+their larger admission. Unpriced or buffered writers retain the whole-object encoder.
 The identity body/output allowance remains conservative for both paths. The existing v1 TOC
 supports the streamed series-first and legacy symbols-first section order.
 

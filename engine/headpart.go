@@ -130,7 +130,27 @@ func (b *headPartBuilder) baseBytes() int64 {
 	n = buildbudget.Add(n, b.orderWorkspace)
 	n = buildbudget.Add(n, b.buildScratch.SizeBytes())
 	n = buildbudget.Add(n, b.closedBloomBytes)
+	if b.writer != nil {
+		n = buildbudget.Add(n, max(b.writer.identityWriterBytes, b.writer.sidecarWriterBytes))
+	}
 	return buildbudget.Add(n, memsize.Slice(b.entries)+memsize.Slice(b.partRefs))
+}
+
+func (b *headPartBuilder) prepareWriter() error {
+	if b.writer != nil {
+		return nil
+	}
+	var err error
+	b.writer, err = newPartStreamWriter(b.ctx, b.e, compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
+	if err != nil {
+		return err
+	}
+	b.writer.buildScratch = &b.buildScratch
+	if err := b.writer.reserveSeries(len(b.entries)); err != nil {
+		return err
+	}
+	b.writerRows = b.partRows()
+	return nil
 }
 
 func (b *headPartBuilder) partRows() int {
@@ -179,6 +199,9 @@ func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) er
 			return err
 		}
 	}
+	if err := b.prepareWriter(); err != nil {
+		return err
+	}
 	ordered := ascendingInt64(buf.ts)
 	encoded := b.view.EncodingBytes(int(ref))
 	materialized := b.view.MaterializationBytes(int(ref))
@@ -187,7 +210,8 @@ func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) er
 		// sortedWindow retains its tuple scratch and up to three owned numeric columns.
 		sorting = buildbudget.Mul(int64(len(buf.ts)), 48)
 	}
-	single := buildbudget.Add(b.baseBytes(), b.view.IdentityWorkspace(int(ref)))
+	identityWorkspace := b.view.IdentityWorkspace(int(ref))
+	single := buildbudget.Add(b.baseBytes(), identityWorkspace)
 	single = buildbudget.Add(single, materialized)
 	single = buildbudget.Add(single, sorting)
 	single = buildbudget.Add(single, buildbudget.Mul(encoded, 4))
@@ -195,20 +219,29 @@ func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) er
 		if err := b.flushRun(); err != nil {
 			return err
 		}
+		if err := b.prepareWriter(); err != nil {
+			return err
+		}
+		single = buildbudget.Add(b.baseBytes(), identityWorkspace)
+		single = buildbudget.Add(single, materialized)
+		single = buildbudget.Add(single, sorting)
+		single = buildbudget.Add(single, buildbudget.Mul(encoded, 4))
 		if err := b.reserve(single); err != nil {
 			return err
 		}
 	}
-	b.identities.Add(b.view, int(ref))
-	estimate := b.estimate(encoded, materialized, len(buf.ts), sorting)
+	estimate := buildbudget.Add(b.estimate(len(b.entries)+1, encoded, materialized, len(buf.ts), sorting), identityWorkspace)
 	maxRows := b.partRows()
 	if len(b.entries) > 0 && (estimate > b.target || maxRows > 0 && b.runRows+int64(len(buf.ts)) > int64(maxRows)) {
 		if err := b.flushRun(); err != nil {
 			return err
 		}
-		b.identities.Add(b.view, int(ref))
-		estimate = b.estimate(encoded, materialized, len(buf.ts), sorting)
+		if err := b.prepareWriter(); err != nil {
+			return err
+		}
 	}
+	b.identities.Add(b.view, int(ref))
+	estimate = b.estimate(len(b.entries)+1, encoded, materialized, len(buf.ts), sorting)
 	if estimate > b.reserved {
 		if err := b.reserve(estimate); err != nil {
 			return err
@@ -222,12 +255,12 @@ func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) er
 	return nil
 }
 
-func (b *headPartBuilder) estimate(encoded, materialized int64, rows int, sorting int64) int64 {
+func (b *headPartBuilder) estimate(entries int, encoded, materialized int64, rows int, sorting int64) int64 {
 	n := b.baseBytes()
 	n = buildbudget.Add(n, b.identities.Bytes())
 	n = buildbudget.Add(n, buildbudget.Mul(buildbudget.Add(b.encoded, encoded), 4))
 	// Runs, sidecars, references, their serialized forms and slice growth are per identity.
-	n = buildbudget.Add(n, buildbudget.Mul(int64(len(b.entries)+1), 512))
+	n = buildbudget.Add(n, buildbudget.Mul(int64(entries), 512))
 	n = buildbudget.Add(n, max(b.materialized, materialized))
 	n = buildbudget.Add(n, max(b.sorting, sorting))
 	if !backend.StreamsWrites(b.e.cfg.Backend) {
@@ -243,6 +276,9 @@ func (b *headPartBuilder) estimate(encoded, materialized int64, rows int, sortin
 func (b *headPartBuilder) flushRun() error {
 	if len(b.entries) == 0 {
 		return nil
+	}
+	if err := b.writer.reserveSeries(len(b.entries)); err != nil {
+		return err
 	}
 	for _, entry := range b.entries {
 		buf := entry.buf
@@ -273,17 +309,8 @@ func (b *headPartBuilder) append(id chunk.U128, ref uint32, ts []int64, values, 
 		chunkRows = DefaultMetricBlockRows
 	}
 	for lo := 0; lo < len(ts); {
-		if b.writer == nil {
-			var err error
-			b.writer, err = newPartStreamWriter(b.ctx, b.e, compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
-			if err != nil {
-				return err
-			}
-			b.writer.buildScratch = &b.buildScratch
-			if err := b.writer.reserveSeries(len(b.entries)); err != nil {
-				return err
-			}
-			b.writerRows = b.partRows()
+		if err := b.prepareWriter(); err != nil {
+			return err
 		}
 		limit := b.writerRows
 		hi := min(lo+chunkRows, len(ts))
@@ -322,7 +349,7 @@ func (b *headPartBuilder) finish() error {
 		return err
 	}
 	if b.writer.streamIdentities {
-		needed := buildbudget.Add(b.estimate(0, 0, 0, 0), b.writer.identityWriterBytes)
+		needed := b.estimate(len(b.entries), 0, 0, 0, 0)
 		if needed > b.reserved {
 			if err := b.reserve(needed); err != nil {
 				return err
