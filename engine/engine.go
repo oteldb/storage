@@ -123,6 +123,9 @@ type Config struct {
 	// maintenance. An oversized
 	// flush must run alone, and the callback must release its reservation on every error.
 	FlushAdmission func(ctx context.Context, bytes int64) (release func(), err error)
+	// TryFlushAdmission reserves optional parallel-build workspace without waiting on a sibling.
+	// It must use the same byte pool as FlushAdmission; nil keeps sequential part construction.
+	TryFlushAdmission func(bytes int64) (release func(), ok bool)
 	// FlushMemoryBytes targets additional flush workspace; resident head samples remain charged
 	// separately in HeadBytes. Zero uses a bounded default. A single oversized identity or
 	// unordered series can require a larger exclusive reservation.
