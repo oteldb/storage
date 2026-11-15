@@ -139,7 +139,7 @@ func (e *Engine) captureDiskLabelHead(ctx context.Context, r fetch.Request, c *d
 		return err
 	}
 	e.acquireWindowParts(c.plan, r.Start, r.End, false)
-	for _, buffers := range [2]map[signal.SeriesID]*sampleBuf{e.head.samples, e.flushing} {
+	for _, buffers := range [3]map[signal.SeriesID]*sampleBuf{e.head.samples, e.flushing, e.flushingNext} {
 		for id, buf := range buffers {
 			if err := ctx.Err(); err != nil {
 				return err

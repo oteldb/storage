@@ -179,10 +179,21 @@ type detachedIdentityOrder struct {
 }
 
 func (e *Engine) prepareDetachedOrder(ctx context.Context, selected map[signal.SeriesID]*sampleBuf,
-	reserve func(int64) error,
+	reserve func(int64) error, input ...*headBuildInput,
 ) (detachedIdentityOrder, error) {
 	if err := ctx.Err(); err != nil {
 		return detachedIdentityOrder{}, err
+	}
+	if len(input) > 0 {
+		index := input[0].index
+		view := index.View()
+		var order identityOrder
+		if err := order.update(ctx, index, view, func(bytes int64) error {
+			return reserve(order.bytes.Load() + bytes)
+		}); err != nil {
+			return detachedIdentityOrder{}, err
+		}
+		return detachedIdentityOrder{view: view, runs: order.runs, workspace: order.bytes.Load()}, ctx.Err()
 	}
 	e.mu.RLock()
 	index := e.flushIdentityIndex()
@@ -198,7 +209,7 @@ func (e *Engine) prepareDetachedOrder(ctx context.Context, selected map[signal.S
 }
 
 func (e *Engine) sparseDetachedOrder(ctx context.Context, view series.View,
-	selected map[signal.SeriesID]*sampleBuf, reserve func(int64) error,
+	selected map[signal.SeriesID]*sampleBuf, reserve func(int64) error, indexes ...*series.Index,
 ) (detachedIdentityOrder, error) {
 	if err := reserve(int64(len(selected)) * 4); err != nil {
 		return detachedIdentityOrder{}, err
@@ -211,7 +222,12 @@ func (e *Engine) sparseDetachedOrder(ctx context.Context, view series.View,
 			}
 		}
 	}
-	identitysnapshot.Capture(e.mu.RLocker(), func() *series.Index { return e.flushIdentityIndex() }, ids,
+	identitysnapshot.Capture(e.mu.RLocker(), func() *series.Index {
+		if len(indexes) > 0 {
+			return indexes[0]
+		}
+		return e.flushIdentityIndex()
+	}, ids,
 		func(_ signal.SeriesID, _ series.View, ref uint32) { refs = append(refs, ref) })
 	out := detachedIdentityOrder{view: view, workspace: int64(cap(refs)) * 4}
 	for len(refs) > 0 {

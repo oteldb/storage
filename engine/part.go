@@ -1126,6 +1126,11 @@ func (p *part) releaseSharedSeries() {
 }
 
 func (e *Engine) closePartReadersLocked() {
+	for _, g := range e.pressureGenerations {
+		closePartReaders(g.parts)
+		g.parts, g.ready = nil, false
+		g.head.buildRetained = 0
+	}
 	for _, p := range e.foreignParts {
 		p.closeReaders()
 	}

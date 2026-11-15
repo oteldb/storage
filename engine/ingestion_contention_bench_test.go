@@ -71,6 +71,7 @@ func benchmarkIngestionContention(b *testing.B, input nodeExporterInput, rounds,
 			}
 			e.cfg.ResidentHeadBytes = headBytes
 			e.cfg.AsyncPressureFlush = true
+			e.cfg.PressureGenerations = cpuBenchInt(b, "OTELDB_BENCH_INGEST_GENERATIONS", 1, 2)
 		}
 		observability, metrics := obstest.New(b)
 		e.cfg.Obs = observability

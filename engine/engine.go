@@ -132,6 +132,8 @@ type Config struct {
 	FlushMemoryBytes int64
 	// AsyncPressureFlush rotates standalone disk heads in the background within one resident budget.
 	AsyncPressureFlush bool
+	// PressureGenerations opts in to two independently built frozen generations; zero keeps one.
+	PressureGenerations int
 
 	// AggregateStats writes a per-series aggregate sidecar (count/sum/min/max) alongside each part,
 	// so [Engine.AggregateRange] answers a range-covering aggregate from it without decoding the
@@ -281,7 +283,9 @@ type Engine struct {
 	// flushing holds the sample buffers detached from the head by an in-progress flush, kept readable
 	// by fetch until the flushed part is published (then cleared, atomically with adding the part) — so
 	// a fetch never loses sight of records mid-flush. nil when no flush is in flight.
-	flushing map[signal.SeriesID]*sampleBuf
+	flushing            map[signal.SeriesID]*sampleBuf
+	flushingNext        map[signal.SeriesID]*sampleBuf
+	pressureGenerations []*pressureGeneration
 	// recent is the in-memory recent tier (issue #25 item 4): a read-side mirror of the most recent
 	// flush window, persisted across flushes, that lets planFetch skip part decode for a query whose
 	// range falls inside it. nil when [Config.RecentWindow] is 0 (disabled).
@@ -747,6 +751,7 @@ type enginePlan struct {
 	ids             []signal.SeriesID
 	series          []signal.Series                  // matched-series identities, parallel to ids (zero value when absent)
 	headB           map[signal.SeriesID]*fetch.Batch // head-window samples, copied under the lock
+	nextFlushB      map[signal.SeriesID]*fetch.Batch
 	flushB          map[signal.SeriesID]*fetch.Batch // mid-flush detached samples (not yet a part)
 	recentB         map[signal.SeriesID]*fetch.Batch // recent-tier samples (the in-RAM flush window)
 	liveParts       []*part
@@ -930,15 +935,15 @@ func (p *enginePlan) mergeSeries(ctx context.Context, id signal.SeriesID) (sampl
 // detached buffers and clears e.flushing in the same critical section, so no sample is ever in
 // both. The tier does duplicate samples that also live in a part; the merge dedups by timestamp,
 // and [aggPushdownCheck] sees the resulting source overlap and takes the merging path.
-func (p *enginePlan) memSources() [3]map[signal.SeriesID]*fetch.Batch {
-	return [3]map[signal.SeriesID]*fetch.Batch{p.recentB, p.flushB, p.headB}
+func (p *enginePlan) memSources() [4]map[signal.SeriesID]*fetch.Batch {
+	return [4]map[signal.SeriesID]*fetch.Batch{p.recentB, p.flushB, p.nextFlushB, p.headB}
 }
 
 // memBatches returns id's in-memory batches in [enginePlan.memSources] order; an entry is nil when
 // that source holds no in-window sample for id. It returns an array, not a slice, to stay
 // allocation-free on the per-series merge path.
-func (p *enginePlan) memBatches(id signal.SeriesID) [3]*fetch.Batch {
-	var out [3]*fetch.Batch
+func (p *enginePlan) memBatches(id signal.SeriesID) [4]*fetch.Batch {
+	var out [4]*fetch.Batch
 
 	for i, m := range p.memSources() {
 		out[i] = m[id]
@@ -1185,6 +1190,7 @@ func (p *enginePlan) releaseParts() {
 	}
 	p.engine.putBatchMap(p.headB)
 	p.engine.putBatchMap(p.flushB)
+	p.engine.putBatchMap(p.nextFlushB)
 	p.engine.putBatchMap(p.recentB)
 }
 
@@ -1523,6 +1529,7 @@ func (e *Engine) Reset(ctx context.Context) error {
 			return err
 		}
 	}
+	e.releasePressureGenerationsLocked()
 	e.head.memory.release()
 	e.head.frozenMemory.release()
 	e.head = newHeadWithContexts(e.cfg.SeriesContexts, e.cfg.SeriesTemplates)
@@ -1751,7 +1758,9 @@ func (e *Engine) observeFlush(ctx context.Context, flush func(context.Context) (
 
 	if rows > 0 {
 		span.SetAttributes(attribute.Int("storage.rows", rows), attribute.Int64("storage.flush.bytes", written))
-		e.cfg.Obs.Flush.Record(ctx, metricSignal, time.Since(startNs), int64(rows), written)
+		if !e.twoPressureGenerations() {
+			e.cfg.Obs.Flush.Record(ctx, metricSignal, time.Since(startNs), int64(rows), written)
+		}
 		log.Debug("flushed head to part",
 			zap.String("prefix", e.cfg.Prefix), zap.Int("rows", rows), zap.Int64("bytes", written),
 			zap.Duration("took", time.Since(startNs)))
@@ -1780,6 +1789,9 @@ func (e *Engine) flush(ctx context.Context) (rows int, written int64, err error)
 }
 
 func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, err error) {
+	if e.twoPressureGenerations() {
+		return e.runPressureGenerations(ctx, true)
+	}
 	log := e.cfg.Obs.Logger(ctx).With(zap.String("prefix", e.cfg.Prefix), zap.String("signal", "metric"))
 	phaseDone := obs.ShutdownPhase(ctx, log, "flush_snapshot")
 	defer func() { phaseDone(err) }()
@@ -2170,6 +2182,14 @@ func (e *Engine) planFetch(ids []signal.SeriesID, r fetch.Request) *enginePlan {
 				p.flushB[id] = fb
 			}
 		}
+		if buf := e.flushingNext[id]; buf != nil {
+			if fb := bufBatch(buf, id, p.series[i], r.Start, r.End, e); fb != nil {
+				if p.nextFlushB == nil {
+					p.nextFlushB = e.getBatchMap(len(ids))
+				}
+				p.nextFlushB[id] = fb
+			}
+		}
 	}
 
 	return p
@@ -2214,6 +2234,7 @@ func (e *Engine) planExistence(ids []signal.SeriesID, r fetch.Request, withIdent
 
 		p.memActive[i] = bufHasInWindow(e.head.samples[id], r.Start, r.End) ||
 			bufHasInWindow(e.flushing[id], r.Start, r.End) ||
+			bufHasInWindow(e.flushingNext[id], r.Start, r.End) ||
 			(recent && bufHasInWindow(e.recent[id], r.Start, r.End))
 	}
 

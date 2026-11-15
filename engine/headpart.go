@@ -26,6 +26,7 @@ type headRunEntry struct {
 }
 
 type headPartBuilder struct {
+	input                          *headBuildInput
 	plan                           *headPartPlan
 	fixedLimit, fixedIdentityBytes int64
 	checkedPrivate, trackedPrivate int64
@@ -60,9 +61,9 @@ func (e *Engine) flushMemoryBytes() int64 {
 	return defaultFlushMemoryBytes
 }
 
-func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sampleBuf) ([]*part, int, error) {
+func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sampleBuf, input ...*headBuildInput) ([]*part, int, error) {
 	if e.cfg.FlushAdmission != nil && e.cfg.TryFlushAdmission != nil && backend.StreamsWrites(e.cfg.Backend) && !e.cfg.SeparateSeries {
-		parts, rows, err := e.streamHeadParallel(ctx, samples)
+		parts, rows, err := e.streamHeadParallel(ctx, samples, input...)
 		if !errors.Is(err, errHeadPlanUnavailable) && !errors.Is(err, errHeadJobBudget) {
 			return parts, rows, err
 		}
@@ -76,11 +77,16 @@ func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sa
 		e.cfg.Obs.Flush.BuildFallback(ctx, reason)
 	}
 	e.cfg.Obs.Flush.BuildPlan(ctx, 1, 0)
-	return e.streamHeadSerial(ctx, samples)
+	return e.streamHeadSerial(ctx, samples, input...)
 }
 
-func (e *Engine) streamHeadSerial(ctx context.Context, samples map[signal.SeriesID]*sampleBuf) ([]*part, int, error) {
+func (e *Engine) streamHeadSerial(
+	ctx context.Context, samples map[signal.SeriesID]*sampleBuf, input ...*headBuildInput,
+) ([]*part, int, error) {
 	b := headPartBuilder{ctx: ctx, e: e, target: e.flushMemoryBytes()}
+	if len(input) > 0 {
+		b.input = input[0]
+	}
 	capacity := min(len(samples), max(1, int(b.target/1024)))
 	buffers := buildbudget.Mul(int64(capacity), memsize.Of[headRunEntry]()+memsize.Of[uint32]())
 	b.reservationFloor = b.target
@@ -116,7 +122,7 @@ func (e *Engine) streamHeadSerial(ctx context.Context, samples map[signal.Series
 		}
 		return nil
 	}
-	order, err := e.prepareDetachedOrder(ctx, samples, reserveOrder)
+	order, err := e.prepareDetachedOrder(ctx, samples, reserveOrder, input...)
 	if err == nil {
 		b.orderWorkspace = order.workspace
 		b.view = order.view
@@ -139,6 +145,9 @@ func (e *Engine) streamHeadSerial(ctx context.Context, samples map[signal.Series
 	}
 	if b.rows != expected {
 		return nil, 0, errors.Errorf("head has %d samples without identities", expected-b.rows)
+	}
+	if len(input) > 0 {
+		input[0].retain(b.parts)
 	}
 	completed = true
 	return b.parts, b.rows, nil
@@ -172,7 +181,16 @@ func (b *headPartBuilder) prepareWriter() error {
 		return nil
 	}
 	var err error
-	b.writer, err = newPartStreamWriter(b.ctx, b.e, compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
+	if b.input != nil {
+		id, ok := b.input.names.Next()
+		if !ok {
+			return errors.New("engine: pressure generation part ID space exhausted")
+		}
+		b.writer, err = newPartStreamWriterAt(b.ctx, b.e, b.e.cfg.Prefix+"/"+id.String(),
+			compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
+	} else {
+		b.writer, err = newPartStreamWriter(b.ctx, b.e, compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
+	}
 	if err != nil {
 		return err
 	}
