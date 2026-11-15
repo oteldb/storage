@@ -9,27 +9,38 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/internal/vfs/faultfs"
 	"github.com/oteldb/storage/signal"
 )
 
 func TestPreparedGroupCommit(t *testing.T) {
 	t.Parallel()
-	for _, failure := range []string{"none", "write", "sync"} {
-		for _, cold := range []bool{false, true} {
-			t.Run(failure+"/cold="+strconv.FormatBool(cold), func(t *testing.T) {
-				t.Parallel()
-				testPreparedGroupCommit(t, failure, cold)
-			})
+	for _, syncWrites := range []bool{true, false} {
+		for _, failure := range []string{"none", "write", "sync"} {
+			if !syncWrites && failure == "sync" {
+				continue
+			}
+			for _, cold := range []bool{false, true} {
+				name := "sync=" + strconv.FormatBool(syncWrites) + "/" + failure + "/cold=" + strconv.FormatBool(cold)
+				t.Run(name, func(t *testing.T) {
+					if !syncWrites {
+						reproduce.Unfixed(t, 661, "page-cache appends bypass bounded ready-caller grouping")
+					}
+					t.Parallel()
+					testPreparedGroupCommit(t, failure, cold, syncWrites)
+				})
+			}
 		}
 	}
 }
 
-func testPreparedGroupCommit(t *testing.T, failure string, cold bool) {
+func testPreparedGroupCommit(t *testing.T, failure string, cold, syncWrites bool) {
 	t.Helper()
 	fail := failure != "none"
 	e, fs := newFaultWALEngine(t, 0)
-	e.cfg.WAL.SetSync(true)
+	e.cfg.WAL.SetSync(syncWrites)
+	t.Cleanup(func() { _ = e.CloseWAL() })
 	identities := []signal.Series{stagedTestSeries("a"), stagedTestSeries("b"), stagedTestSeries("c")}
 	for i := range identities {
 		s := identities[i]
@@ -80,12 +91,27 @@ func testPreparedGroupCommit(t *testing.T, failure string, cold bool) {
 	}
 	go appendSeries(0)
 	<-ready
+	if e.parallel.commits.changed == nil {
+		resume()
+		r := <-done
+		require.NoError(t, r.err)
+		t.Fatal("the first ready caller must enter bounded group commit before any follower arrives")
+	}
 	go appendSeries(1)
 	go appendSeries(2)
 	for range 3 {
 		<-queued
 	}
-	require.False(t, e.mu.TryLockWriter(), "queued callers retain lifecycle leases")
+	writerFree := e.mu.TryLockWriter()
+	if writerFree {
+		e.mu.UnlockWriter()
+	}
+	require.False(t, writerFree, "queued callers retain lifecycle leases")
+	select {
+	case <-done:
+		t.Error("a queued batch was acknowledged before its WAL group completed")
+	default:
+	}
 	resume()
 	failures := 0
 	for range 3 {
@@ -128,7 +154,17 @@ func testPreparedGroupCommit(t *testing.T, failure string, cold bool) {
 			}
 		}
 		require.Equal(t, 2, writes)
-		require.Equal(t, 2, syncs)
+		wantSyncs := 0
+		if syncWrites {
+			wantSyncs = 2
+		}
+		require.Equal(t, wantSyncs, syncs)
+	}
+	if !syncWrites {
+		for _, call := range fs.Calls()[beforeCalls:] {
+			require.NotEqual(t, faultfs.OpSync, call.Op, "SyncNone must not add implicit synchronization")
+		}
+		require.NoError(t, e.SyncWAL())
 	}
 	recovered := fs.Crash()
 	replayed := replayedHead(t, recovered)
@@ -148,24 +184,50 @@ func testPreparedGroupCommit(t *testing.T, failure string, cold bool) {
 	require.NoError(t, e.CloseWAL())
 }
 
-func TestPreparedNoSyncBypassesGroup(t *testing.T) {
+func TestPreparedNoSyncGroupPreservesSyncPolicy(t *testing.T) {
+	reproduce.Unfixed(t, 661, "page-cache appends bypass bounded ready-caller grouping")
 	t.Parallel()
-	e, _ := newFaultWALEngine(t, 0)
+	e, fs := newFaultWALEngine(t, 0)
+	e.cfg.WAL.SetSync(false)
+	t.Cleanup(func() { _ = e.CloseWAL() })
 	s := stagedTestSeries("a")
 	_, err := e.Append(s, 0, 0)
 	require.NoError(t, err)
-	e.parallel.hooks = &parallelHeadHooks{queued: func() { t.Error("page-cache writes entered fsync grouping") }}
+	beforeCalls := len(fs.Calls())
+	var queued atomic.Int32
+	e.parallel.hooks = &parallelHeadHooks{queued: func() { queued.Add(1) }}
 	r := appendPreparedTest(e, []signal.SeriesID{s.Hash()}, []int64{1}, nil, AppendLimits{})
 	require.NoError(t, r.err)
 	require.Equal(t, 1, r.result.Accepted)
-	require.Equal(t, []int64{0, 1}, headTS(e.head, s))
-	require.Nil(t, e.parallel.commits.changed)
+	require.EqualValues(t, 1, queued.Load(), "a lone caller must use the queue without waiting for peers")
+	require.NotNil(t, e.parallel.commits.changed)
+	for _, call := range fs.Calls()[beforeCalls:] {
+		require.NotEqual(t, faultfs.OpSync, call.Op)
+	}
+	require.NoError(t, e.SyncWAL())
+	require.Equal(t, []int64{0, 1}, headTS(replayedHead(t, fs.Crash()), s))
+	require.Zero(t, e.parallel.pending.Load())
+	require.Zero(t, e.parallel.pendingSeries.Load())
 }
 
 func TestPreparedGroupDrainsBeforeClose(t *testing.T) {
 	t.Parallel()
+	for _, syncWrites := range []bool{true, false} {
+		t.Run(strconv.FormatBool(syncWrites), func(t *testing.T) {
+			if !syncWrites {
+				reproduce.Unfixed(t, 661, "page-cache appends bypass bounded ready-caller grouping")
+			}
+			t.Parallel()
+			testPreparedGroupDrainsBeforeClose(t, syncWrites)
+		})
+	}
+}
+
+func testPreparedGroupDrainsBeforeClose(t *testing.T, syncWrites bool) {
+	t.Helper()
 	e, fs := newFaultWALEngine(t, 0)
-	e.cfg.WAL.SetSync(true)
+	e.cfg.WAL.SetSync(syncWrites)
+	t.Cleanup(func() { _ = e.CloseWAL() })
 	identities := []signal.Series{stagedTestSeries("a"), stagedTestSeries("b"), stagedTestSeries("c")}
 	for _, s := range identities {
 		_, err := e.Append(s, 0, 0)
@@ -190,6 +252,12 @@ func TestPreparedGroupDrainsBeforeClose(t *testing.T) {
 	}
 	go appendSeries(0)
 	<-ready
+	if e.parallel.commits.changed == nil {
+		resume()
+		r := <-done
+		require.NoError(t, r.err)
+		t.Fatal("the first ready caller must enter bounded group commit before any follower arrives")
+	}
 	go appendSeries(1)
 	go appendSeries(2)
 	for range 3 {
@@ -197,7 +265,11 @@ func TestPreparedGroupDrainsBeforeClose(t *testing.T) {
 	}
 	closed := make(chan error, 1)
 	go func() { closed <- e.CloseWAL() }()
-	require.False(t, e.mu.TryLockWriter())
+	writerFree := e.mu.TryLockWriter()
+	if writerFree {
+		e.mu.UnlockWriter()
+	}
+	require.False(t, writerFree)
 	resume()
 	for range 3 {
 		r := <-done
