@@ -66,8 +66,8 @@ func (e *Engine) prepareMergeWatermarks(ctx context.Context, cohorts []mergeCoho
 			return boundedMergeSelection{}, err
 		}
 		if changed {
-			selection, err = e.selectMergeInputsWithWatermarks(ctx, cohorts, readable, opts, capBytes, idle, turn,
-				selection.allowance, local.fallback)
+			selection, err = e.selectMergeInputsWithAnchor(ctx, cohorts, readable, opts, capBytes, idle, turn,
+				selection.allowance, local.fallback, selection.orderAnchor)
 			if err != nil {
 				return boundedMergeSelection{}, err
 			}

@@ -96,6 +96,11 @@ revalidated after off-lock work and catalog rebases, with rejected readers retir
 part ordering matches the prefix order reconstructed at reopen. Conservative bounds can postpone
 compaction, so workload qualification must check sustained merge debt as well as ingestion rate.
 
+An ordering-vetoed size-tier seed triggers a bounded search of newest-ended chronological tails
+within compatible ladder buckets. Memory and watermark repricing retain the newest anchor while
+removing older inputs. Disk caps, rollup closure and pending-generation/catalog guards still apply;
+a genuinely blocked generation reports deferral rather than hiding it as an empty selection.
+
 Disk-series flush detach transfers symbols, registry, postings and watermark slots to one frozen
 identity owner and installs an empty active owner. New registrations use only the active registry;
 queries resolve both owners and deduplicate canonical IDs. Registry pointer changes invalidate
