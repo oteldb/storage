@@ -1910,6 +1910,7 @@ func (e *Engine) flushAdmitted(ctx context.Context) (rows int, written int64, er
 	e.mu.Unlock()
 
 	frozenMemory.release()
+	e.notifyPressureProgress()
 	written = partsBytes(newParts)
 
 	if err != nil {
