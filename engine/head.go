@@ -25,6 +25,7 @@ var (
 // plus per-series sample buffers in arrival order (sorted on read). It is not safe for
 // concurrent use; the [Engine] holds the lock.
 type head struct {
+	frozen                       *head
 	disk                         *diskHeadState
 	sym                          *symbols.Table
 	series                       *series.Index
@@ -124,6 +125,14 @@ func (h *head) identityBytes() int64 {
 }
 
 func (h *head) residentIdentityBytes() int64 {
+	n := h.ownedIdentityBytes()
+	if h.frozen != nil {
+		n += h.frozen.ownedIdentityBytes()
+	}
+	return n
+}
+
+func (h *head) ownedIdentityBytes() int64 {
 	n := h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
 		memsize.Slice(h.stateRefs) + h.slots.sizeBytes() + memsize.Slice(h.valueScratch)
 	if h.nonStringLabels != nil {
@@ -325,7 +334,7 @@ func (h *head) appendByID(
 	if buf == nil {
 		if !state.known {
 			var done bool
-			if out, effID, logSeries, s, done = h.admitNew(id, ts, value, sf, limits, materialize); done {
+			if out, effID, logSeries, s, done = h.admitNew(id, ts, value, sf, state.historical, limits, materialize); done {
 				return out, effID, logSeries, s
 			}
 			ref, _ = h.series.Ref(id)
@@ -349,20 +358,20 @@ func (h *head) appendByID(
 // done=false means the series was registered normally and the caller should buffer the sample under
 // id (isNew and s are then set).
 func (h *head) admitNew(
-	id signal.SeriesID, ts int64, value, sf float64, limits AppendLimits, materialize func() signal.Series,
+	id signal.SeriesID, ts int64, value, sf float64, historical bool, limits AppendLimits, materialize func() signal.Series,
 ) (out admitOutcome, effID signal.SeriesID, isNew bool, s signal.Series, done bool) {
 	cardinality := h.cardinality()
 
 	// Hard ceiling: reject a new series that would exceed MaxSeries. Existing series are never
 	// blocked, so a query keeps returning what is already admitted.
-	if limits.MaxSeries > 0 && cardinality >= limits.MaxSeries {
+	if !historical && limits.MaxSeries > 0 && cardinality >= limits.MaxSeries {
 		return rejectCardinality, id, false, signal.Series{}, true
 	}
 
 	// Soft budget: between MaxSeriesSoft and MaxSeries a new series is routed to a caller-built
 	// overflow series instead of registered, bounding cardinality while keeping the tenant's
 	// aggregates approximately right. Only on the degraded path — no steady-state hot-path cost.
-	if limits.Overflow != nil && limits.MaxSeriesSoft > 0 && cardinality >= limits.MaxSeriesSoft {
+	if !historical && limits.Overflow != nil && limits.MaxSeriesSoft > 0 && cardinality >= limits.MaxSeriesSoft {
 		o, oid, oNew, oS := h.appendOverflow(limits.Overflow(materialize()), ts, value, sf)
 
 		return o, oid, oNew, oS, true
@@ -564,11 +573,18 @@ func (h *head) addLabel(id uint32, name []byte, v signal.Value) {
 }
 
 // indexSorted reports whether the label index is sorted (so a read will not mutate it).
-func (h *head) indexSorted() bool { return h.post.Sorted() }
+func (h *head) indexSorted() bool {
+	return h.post.Sorted() && (h.frozen == nil || h.frozen.post.Sorted())
+}
 
 // ensureIndexSorted sorts the label index in place. The engine calls it while holding the
 // exclusive lock so that later concurrent [head.resolve] reads never trigger the lazy sort.
-func (h *head) ensureIndexSorted() { h.post.EnsureSorted() }
+func (h *head) ensureIndexSorted() {
+	h.post.EnsureSorted()
+	if h.frozen != nil {
+		h.frozen.post.EnsureSorted()
+	}
+}
 
 // resolve intersects matchers' postings, seeking string hints when the label's types permit it.
 //
@@ -576,7 +592,7 @@ func (h *head) ensureIndexSorted() { h.post.EnsureSorted() }
 // [fetch.Condition] has per row: the matcher is operator-free, so only the language knows whether
 // absence satisfies it (a negation or an is-unset matcher does). Such a matcher unions the value
 // scan with the series lacking the label ([postings.Dense.WithoutName]).
-func (h *head) resolve(matchers []fetch.Matcher) []signal.SeriesID {
+func (h *head) resolveLocal(matchers []fetch.Matcher) []signal.SeriesID {
 	if len(matchers) == 0 {
 		return h.canonicalIDs(drain(h.post.All()))
 	}
@@ -641,7 +657,7 @@ func drain(p postings.Postings) []signal.SeriesID {
 // batch builds a fetch batch for series id within [start, end], or nil if it has no
 // samples in the window.
 func (h *head) batch(id signal.SeriesID, start, end int64, e *Engine) *fetch.Batch {
-	s, _ := h.series.Get(id)
+	s, _ := h.getIdentity(id)
 
 	return bufBatch(h.samples[id], id, s, start, end, e)
 }
@@ -729,6 +745,7 @@ func (h *head) detach() (map[signal.SeriesID]*sampleBuf, int64, time.Time) {
 // buffers are appended onto the detached ones rather than the reverse, and the merged buffer
 // replaces the live one.
 func (h *head) reattach(detached map[signal.SeriesID]*sampleBuf, bytes int64, since time.Time) {
+	h.restoreFrozenIdentity()
 	h.memory.adopt(&h.frozenMemory)
 	if len(detached) > len(h.samples) {
 		h.samples = reuseDetachedSamples(detached, h.samples)

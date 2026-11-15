@@ -178,8 +178,8 @@ func TestStreamBuildScratchFailuresClearReferences(t *testing.T) {
 
 func TestStreamBuildScratchRetainedLimit(t *testing.T) {
 	t.Parallel()
-	scratch := StreamBuildScratch{marks: make([]byte, 0, maxStreamBuildScratchBytes+1)}
-	require.Greater(t, scratch.SizeBytes(), int64(maxStreamBuildScratchBytes))
+	scratch := StreamBuildScratch{marks: make([]byte, 0, MaxStreamBuildScratchBytes+1)}
+	require.Greater(t, scratch.SizeBytes(), int64(MaxStreamBuildScratchBytes))
 	w := NewStreamWriter()
 	require.Error(t, WriteStreamPartWithScratch(t.Context(), backend.Memory(), "empty", w, &scratch))
 	require.Zero(t, scratch.SizeBytes())

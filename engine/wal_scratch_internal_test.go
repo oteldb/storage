@@ -91,8 +91,10 @@ func TestWALStageReleasesBorrowedReferences(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
-			require.Len(t, e.walB.accs, 1)
-			acc := &e.walB.accs[0]
+			prepared := <-e.preparationPool().free
+			defer func() { e.preparationPool().free <- prepared }()
+			require.Len(t, prepared.batch.accs, 1)
+			acc := &prepared.batch.accs[0]
 			assert.Equal(t, signal.Series{}, acc.series)
 			assert.Nil(t, acc.buffer)
 			ts, values, weights := cap(acc.ts), cap(acc.values), cap(acc.sf)

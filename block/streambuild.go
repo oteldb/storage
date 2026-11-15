@@ -7,7 +7,8 @@ import (
 	"github.com/oteldb/storage/internal/memsize"
 )
 
-const maxStreamBuildScratchBytes = 4 << 20
+// MaxStreamBuildScratchBytes bounds scratch retained after a completed write.
+const MaxStreamBuildScratchBytes = 4 << 20
 
 // StreamBuildScratch reuses metadata encoding buffers across sequential part writes.
 // Retained capacity above 4 MiB is released after a write. Raw Marks views are never pooled.
@@ -43,7 +44,7 @@ func (s *StreamBuildScratch) reset() {
 	s.objects = s.objects[:0]
 	s.marks = s.marks[:0]
 	s.manifest = s.manifest[:0]
-	if s.SizeBytes() > maxStreamBuildScratchBytes {
+	if s.SizeBytes() > MaxStreamBuildScratchBytes {
 		*s = StreamBuildScratch{}
 	}
 }

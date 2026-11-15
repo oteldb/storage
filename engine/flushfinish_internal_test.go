@@ -38,6 +38,7 @@ func TestNativeFlushFinishingFitsMergeShare(t *testing.T) {
 				var largest int64
 				e := New(Config{Backend: be, Prefix: "flush-finish", DiskSeries: true, MetricSeriesChunks: true,
 					AggregateStats: true, ResidentHeadBytes: 1 << 30, FlushMemoryBytes: flushBytes,
+					TryFlushAdmission: pool.TryAcquire,
 					FlushAdmission: func(ctx context.Context, bytes int64) (func(), error) {
 						largest = max(largest, bytes)
 						return pool.Acquire(ctx, bytes)
@@ -117,7 +118,7 @@ func TestNativeFlushAdmissionCancellationRestoresHead(t *testing.T) {
 		file, err := backendfile.New(t.TempDir())
 		require.NoError(t, err)
 		e := New(Config{Backend: file, Prefix: "cancel-finish", DiskSeries: true, MetricSeriesChunks: true,
-			FlushMemoryBytes: 16 << 20, FlushAdmission: pool.Acquire})
+			FlushMemoryBytes: 16 << 20, FlushAdmission: pool.Acquire, TryFlushAdmission: pool.TryAcquire})
 		defer func() { require.NoError(t, e.CloseWAL()) }()
 		for i := range 32 {
 			_, err := e.Append(benchSeries(i), 100, float64(i))
@@ -153,7 +154,7 @@ func TestOversizedNativeFlushWaitsForMerge(t *testing.T) {
 		file, err := backendfile.New(t.TempDir())
 		require.NoError(t, err)
 		e := New(Config{Backend: file, Prefix: "oversized-finish", DiskSeries: true, MetricSeriesChunks: true,
-			FlushMemoryBytes: flushBytes, FlushAdmission: pool.Acquire})
+			FlushMemoryBytes: flushBytes, FlushAdmission: pool.Acquire, TryFlushAdmission: pool.TryAcquire})
 		defer func() { require.NoError(t, e.CloseWAL()) }()
 		series := benchSeries(0)
 		series.Resource.SchemaURL = []byte(strings.Repeat("x", 2<<20))

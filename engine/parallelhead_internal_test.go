@@ -143,7 +143,7 @@ func TestConflictingParallelAdmissionUsesCommittedWatermark(t *testing.T) {
 	ready, release, fallback := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
 	resume := sync.OnceFunc(func() { close(release) })
 	t.Cleanup(resume)
-	e.parallel.hooks = &parallelHeadHooks{owned: func() { close(ready); <-release }, fallback: func() { fallback <- struct{}{} }}
+	e.parallel.hooks = &parallelHeadHooks{owned: sync.OnceFunc(func() { close(ready); <-release }), fallback: func() { fallback <- struct{}{} }}
 	done := make(chan parallelAppendResult, 1)
 	go func() { done <- appendPreparedTest(e, []signal.SeriesID{s.Hash()}, []int64{1000}, nil, AppendLimits{}) }()
 	<-ready

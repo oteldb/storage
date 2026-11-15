@@ -34,7 +34,9 @@ func newFaultWALEngine(t *testing.T, oooWindow int64) (*Engine, *faultfs.FS) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
-	return New(Config{WAL: w, OOOWindow: oooWindow}), fsys
+	e := New(Config{WAL: w, OOOWindow: oooWindow})
+	e.parallel.preparations = newBatchPreparations()
+	return e, fsys
 }
 
 func failNextWALWrite(fsys *faultfs.FS) {

@@ -6,7 +6,6 @@ import (
 	"sort"
 
 	"github.com/oteldb/storage/block"
-	"github.com/oteldb/storage/index/symbols"
 )
 
 // PartStat is one flushed part's in-memory shape (no backend I/O, no decode): identity, time
@@ -187,27 +186,26 @@ func (e *Engine) WALState() (segments int, bytes int64, epoch uint64, ok bool) {
 // topN bounds Top; a nonpositive value returns every resident indexed label name.
 func (e *Engine) Cardinality(topN int) CardinalityStat {
 	e.mu.RLock()
+	for !e.head.indexSorted() {
+		e.mu.RUnlock()
+		e.mu.LockState()
+		e.head.ensureIndexSorted()
+		e.mu.UnlockState()
+		e.mu.RLock()
+	}
 	defer e.mu.RUnlock()
 
 	cs := CardinalityStat{
 		TotalSeries:         e.diskSeriesCountLocked(),
 		TotalSeriesComplete: e.diskSeriesCompleteLocked(),
 		IndexScope:          "resident_all_series",
-		SymbolCount:         e.head.sym.Len(),
 	}
 
 	if e.cfg.DiskSeries {
 		cs.IndexScope = "resident_head"
 	}
 
-	e.head.post.ForEachName(func(nameID uint32, distinctValues, totalSeries int) {
-		name := ""
-		if b, ok := e.head.sym.Get(symbols.ID(nameID)); ok {
-			name = string(b)
-		}
-
-		cs.Top = append(cs.Top, LabelCard{Name: name, Series: int64(totalSeries), DistinctValues: distinctValues})
-	})
+	cs.SymbolCount, cs.Top = e.head.residentCardinality()
 
 	cs.DistinctLabelNames = len(cs.Top)
 

@@ -105,7 +105,16 @@ admission, while one atomic batch may exceed the target. `MetricSeriesCacheBytes
 the historical ID/watermark cache per engine (512 MiB default, allocated on demand; negative disables).
 `IdentityBytes` includes its retained bytes and the Bloom filter, but head pressure excludes them
 because flushing cannot reclaim them. Catalog lifecycle changes invalidate the cache; ordinary
-flushes preserve it. The optional recent tier is disabled.
+flushes preserve it. Flushes cache accepted frozen watermarks in bounded 256-series batches before
+catalog publication; delayed lookups preserve newer active/frozen watermarks. Shutdown logs isolate
+this pass as `flush_cache_watermarks`.
+Active and frozen identity owners are both charged to resident pressure until publication;
+retiring the frozen owner preserves the active registry without rebuilding it. A failed flush
+reattaches its frozen ownership and keeps the WAL replayable. The optional recent tier is disabled.
+`MetricAsyncPressureFlush` optionally starts standalone WAL-backed disk-head rotation at half this
+target and waits at the full aggregate target. This overlaps ingestion with one frozen builder
+without multiplying resident/cache targets. It is off by default; cluster, read-only and ephemeral
+modes reject it. Head/flush/queue metrics must qualify the changed batching before capacity claims.
 `engine.Stats.SeriesComplete` is false while historical metadata is unavailable; `Series` then
 preserves the last complete count. All live local admission and head publication wait for repair;
 accepted WAL and replica payloads still restore into the head, with checkpoints unchanged.
@@ -648,3 +657,24 @@ Flush workspace metrics distinguish the configured output target from the admitt
 `storage.flush.reservation.bytes` labels `component=reserved|target` and a bounded `phase`;
 `storage.flush.reservation.wait` records admission wait by phase. `storage.flush.output.series`
 counts distinct identities per completed candidate, including candidates not yet catalog-published.
+`storage.flush.build.workers` and `.jobs` record admitted concurrency and planned jobs per attempt;
+zero jobs identifies legacy sequential planning. `.fallbacks{reason=plan|workspace}` counts retries
+through that planner. Two workers reuse the planner grant and request only a nonblocking aggregate shortfall;
+one admitted worker with several jobs means those jobs run sequentially. These count admission,
+not active CPU utilization or successful publication; failed attempts remain observable.
+`storage.flush.build.memory.bytes{component}` records shared-plan, retained-output, per-job, held
+and additional claims, plus checked-private and structurally tracked-private high-water estimates.
+Held bytes include unused planner credit until the stage ends; job claims exclude discarded planner
+buffers. Tracked values exclude allocator/GC overhead and transient codec allocations. These are
+not heap/RSS measurements. The total pool, merge allowance and part targets are independent of
+this accounting experiment and remain configured as before.
+
+`storage.ingest.prepared.attempts{outcome=done|pressure|snapshot|work_limit|error}` counts
+parallel preparation attempts. `storage.ingest.prepared.batches{path,reason}` counts completed
+prepared calls, including failures; `.samples{path,reason}` counts only their accepted points.
+The path is `parallel` or `ordered`; reasons distinguish initial success, transient misses,
+work-limit/policy fallback and errors. `retry_pressure`/`retry_snapshot` identify successful
+second attempts; `exhausted_pressure`/`exhausted_snapshot` identify ordered fallback after the
+single retry. These cover the prepared-batch API, not every ingestion
+entry point. They do not alter the existing admission totals. The ingestion contention benchmark
+reports these paths and misses per operation alongside samples, flushes and output parts.

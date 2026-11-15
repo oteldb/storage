@@ -145,6 +145,9 @@ type headSeriesState struct {
 func (h *head) seriesState(id signal.SeriesID) headSeriesState {
 	ref, ok := h.series.Ref(id)
 	if !ok {
+		if entry, exists := h.frozenState(id); exists {
+			return entry
+		}
 		if h.disk != nil {
 			entry, ok := h.disk.pending[id]
 			if !ok {
@@ -177,6 +180,9 @@ func (h *head) bufForRef(id signal.SeriesID, ref uint32) *sampleBuf {
 func (h *head) watermark(id signal.SeriesID) (int64, bool) {
 	ref, ok := h.series.Ref(id)
 	if !ok {
+		if h.frozen != nil {
+			return h.frozen.watermark(id)
+		}
 		return 0, false
 	}
 	return h.slots.get(h.stateRefs[ref])

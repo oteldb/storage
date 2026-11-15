@@ -154,12 +154,7 @@ func (e *Engine) rebuildDiskStateLocked(ctx context.Context) (err error) {
 		return nil
 	}
 	next := newDiskHeadStateWithCache(e.diskSeriesCacheBytes())
-	headIDs := make([]signal.SeriesID, e.head.series.Len())
-	view := e.head.series.View()
-	for i := range headIDs {
-		headIDs[i] = view.ID(i)
-	}
-	slices.SortFunc(headIDs, signal.SeriesID.Compare)
+	headIDs := e.head.identityIDs()
 	parts := e.readablePartsLocked()
 	var watermarks []diskHeadEntry
 	if err := e.mu.WithReaders(func() error {
@@ -189,11 +184,20 @@ func (e *Engine) rebuildDiskStateLocked(ctx context.Context) (err error) {
 		return err
 	}
 	for i, entry := range watermarks {
-		if entry.exists {
-			ref, _ := e.head.series.Ref(headIDs[i])
-			e.head.slots.set(e.head.stateRefs[ref], entry.newest)
-			e.head.newest = max(e.head.newest, entry.newest)
+		if !entry.exists {
+			continue
 		}
+		target := e.head
+		ref, ok := target.series.Ref(headIDs[i])
+		if !ok && target.frozen != nil {
+			target = target.frozen
+			ref, ok = target.series.Ref(headIDs[i])
+		}
+		if ok {
+			target.slots.set(target.stateRefs[ref], entry.newest)
+		}
+		next.remember(headIDs[i], entry.newest)
+		e.head.newest = max(e.head.newest, entry.newest)
 	}
 	e.head.disk = next
 	return nil
@@ -239,6 +243,10 @@ func (e *Engine) preloadDiskSeriesOffState(ids []signal.SeriesID) error {
 		if _, ok := s.pending[id]; ok {
 			continue
 		}
+		if entry, ok := e.head.frozenState(id); ok {
+			s.pending[id] = diskHeadEntry{newest: entry.newest, exists: true}
+			continue
+		}
 		if hit, ok := s.cache.get(id); ok {
 			s.pending[id] = hit
 			continue
@@ -263,7 +271,7 @@ func (e *Engine) preloadHistoricalBatch(ids []signal.SeriesID) error {
 	}
 	for _, id := range ids {
 		if entry := s.pending[id]; entry.exists {
-			s.remember(id, entry.newest)
+			e.head.rememberHistorical(id, entry.newest)
 		}
 	}
 	return nil
@@ -339,6 +347,9 @@ func (e *Engine) compactDiskHeadLocked() {
 }
 
 func (e *Engine) flushResidentHead() error {
+	if e.pressurePipelineEnabled() {
+		return e.pipelineResidentPressure()
+	}
 	if !e.cfg.DiskSeries {
 		return nil
 	}
@@ -358,7 +369,12 @@ func (e *Engine) flushResidentHeadLocked() error {
 	}
 	for e.residentHeadOverBudgetLocked() {
 		e.mu.UnlockWriter()
-		err := e.relieveResidentHeadPressure()
+		var err error
+		if e.pressurePipelineEnabled() {
+			err = e.pipelineResidentPressure()
+		} else {
+			err = e.relieveResidentHeadPressure()
+		}
 		e.mu.LockWriter()
 		if err != nil {
 			return err

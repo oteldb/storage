@@ -99,7 +99,7 @@ func (e *Engine) captureDiskHead(
 		return nil, err
 	}
 	// Head matcher iterators and the growing result slice are transient metadata workspace.
-	workspace := buildbudget.Mul(int64(e.head.series.Len()), buildbudget.Mul(int64(len(r.Matchers))+1, 256))
+	workspace := buildbudget.Mul(int64(e.head.identityCount()), buildbudget.Mul(int64(len(r.Matchers))+1, 256))
 	if err := budget.Reserve(workspace); err != nil {
 		e.mu.RUnlock()
 		return nil, err
@@ -133,16 +133,13 @@ func (e *Engine) captureDiskHead(
 
 func (e *Engine) diskHeadSelectionBytes(ids []signal.SeriesID, withIdentity, countOnly bool) int64 {
 	n := buildbudget.Add(4*memsize.MapBase, buildbudget.Mul(int64(len(ids)), diskSelectionBytes(withIdentity)))
-	view := e.head.series.View()
 	for _, id := range ids {
 		if withIdentity {
-			if ref, ok := e.head.series.Ref(id); ok {
-				materialized := view.MaterializationBytes(int(ref))
-				if !countOnly {
-					materialized = buildbudget.Mul(materialized, 2)
-				}
-				n = buildbudget.Add(n, materialized)
+			materialized := e.head.identityMaterializationBytes(id)
+			if !countOnly {
+				materialized = buildbudget.Mul(materialized, 2)
 			}
+			n = buildbudget.Add(n, materialized)
 		}
 		if !countOnly {
 			for _, buf := range [2]*sampleBuf{e.head.samples[id], e.flushing[id]} {

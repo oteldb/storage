@@ -4,6 +4,7 @@ import (
 	"slices"
 
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -13,6 +14,8 @@ type diskSeriesLookup struct {
 	parts      []*part
 	ownParts   int
 	head       *head
+	index      *series.Index
+	frozen     *head
 	disk       *diskHeadState
 	generation bucketindex.Generation
 }
@@ -22,12 +25,13 @@ func (l *diskSeriesLookup) reset() {
 	l.historical = l.historical[:0]
 	clear(l.parts)
 	l.parts = l.parts[:0]
-	l.head, l.disk = nil, nil
+	l.head, l.disk, l.index, l.frozen = nil, nil, nil, nil
 }
 
 func (l *diskSeriesLookup) capture(e *Engine, ids []signal.SeriesID) {
 	l.reset()
 	l.head, l.disk, l.generation = e.head, e.head.disk, e.generation
+	l.index, l.frozen = e.head.series, e.head.frozen
 	if l.pending == nil {
 		l.pending = make(map[signal.SeriesID]diskHeadEntry, len(ids))
 	}
@@ -36,6 +40,10 @@ func (l *diskSeriesLookup) capture(e *Engine, ids []signal.SeriesID) {
 			continue
 		}
 		if _, ok := l.pending[id]; ok {
+			continue
+		}
+		if entry, ok := e.head.frozenState(id); ok {
+			l.pending[id] = diskHeadEntry{newest: entry.newest, exists: true}
 			continue
 		}
 		if hit, ok := l.disk.cache.get(id); ok {
@@ -61,8 +69,13 @@ func (l *diskSeriesLookup) capture(e *Engine, ids []signal.SeriesID) {
 }
 
 func (l *diskSeriesLookup) valid(e *Engine) bool {
-	if l.head != e.head || l.disk != e.head.disk || l.generation != e.generation ||
-		len(l.parts) != len(e.parts)+len(e.foreignParts) || l.ownParts != len(e.parts) {
+	if l.head != e.head || l.index != e.head.series || l.frozen != e.head.frozen || l.disk != e.head.disk || l.generation != e.generation {
+		return false
+	}
+	if len(l.historical) == 0 {
+		return true
+	}
+	if len(l.parts) != len(e.parts)+len(e.foreignParts) || l.ownParts != len(e.parts) {
 		return false
 	}
 	if !slices.Equal(l.parts[:l.ownParts], e.parts) {
@@ -112,7 +125,7 @@ func (e *Engine) preloadPreparedDiskSeriesLocked(ids []signal.SeriesID, l *diskS
 	e.head.disk.pending = l.pending
 	for _, id := range l.historical {
 		if entry := l.pending[id]; entry.exists {
-			e.head.disk.remember(id, entry.newest)
+			e.head.rememberHistorical(id, entry.newest)
 		}
 	}
 	return nil

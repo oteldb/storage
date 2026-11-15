@@ -210,6 +210,8 @@ type Options struct {
 	// MetricDiskSeries uses part-local on-disk metric identities/postings and bounded resident heads.
 	// Existing part identity objects remain readable; legacy readers retain their historical registry.
 	MetricDiskSeries bool
+	// MetricAsyncPressureFlush pipelines standalone WAL-backed disk heads within the resident target.
+	MetricAsyncPressureFlush bool
 	// MetricSeparateSeries stores descriptors/postings in independent immutable runs.
 	// Requires MetricDiskSeries and MetricSeriesChunks; standalone fresh catalogs only.
 	MetricSeparateSeries bool
@@ -538,6 +540,10 @@ func (o *Options) validate() error {
 	if o.MetricSeparateSeries && (!o.MetricDiskSeries || !o.MetricSeriesChunks || o.Cluster != nil) {
 		return errOptionInvalid("MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks without Cluster")
 	}
+	if o.MetricAsyncPressureFlush && (!o.MetricDiskSeries || o.WALDir == "" || o.Cluster != nil || o.ReadOnly ||
+		o.Backend == nil || o.Backend.IsEphemeral()) {
+		return errOptionInvalid("MetricAsyncPressureFlush requires standalone writable disk series and WALDir")
+	}
 	if o.MetricResidentHeadBytes < 0 {
 		return errOptionInvalid("MetricResidentHeadBytes must not be negative")
 	}
@@ -642,6 +648,11 @@ func WithMetricSeriesChunks() Option { return func(o *Options) { o.MetricSeriesC
 
 // WithMetricDiskSeries enables part-local disk identities/postings for metric engines.
 func WithMetricDiskSeries() Option { return func(o *Options) { o.MetricDiskSeries = true } }
+
+// WithMetricAsyncPressureFlush enables bounded background pressure rotation for metric heads.
+func WithMetricAsyncPressureFlush() Option {
+	return func(o *Options) { o.MetricAsyncPressureFlush = true }
+}
 
 // WithMetricSeparateSeries enables independent metric descriptor runs on a fresh standalone store.
 func WithMetricSeparateSeries() Option { return func(o *Options) { o.MetricSeparateSeries = true } }

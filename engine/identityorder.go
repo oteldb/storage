@@ -185,7 +185,7 @@ func (e *Engine) prepareDetachedOrder(ctx context.Context, selected map[signal.S
 		return detachedIdentityOrder{}, err
 	}
 	e.mu.RLock()
-	index := e.head.series
+	index := e.flushIdentityIndex()
 	view := index.View()
 	e.mu.RUnlock()
 	if len(selected) < view.Len()/4+min(view.Len()%4, 1) {
@@ -211,7 +211,7 @@ func (e *Engine) sparseDetachedOrder(ctx context.Context, view series.View,
 			}
 		}
 	}
-	identitysnapshot.Capture(e.mu.RLocker(), func() *series.Index { return e.head.series }, ids,
+	identitysnapshot.Capture(e.mu.RLocker(), func() *series.Index { return e.flushIdentityIndex() }, ids,
 		func(_ signal.SeriesID, _ series.View, ref uint32) { refs = append(refs, ref) })
 	out := detachedIdentityOrder{view: view, workspace: int64(cap(refs)) * 4}
 	for len(refs) > 0 {
