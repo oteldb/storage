@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/internal/obs/obstest"
 	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 )
@@ -24,6 +25,8 @@ func TestPressureMergePrefixPrecedence(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				e, _ := newFaultWALEngine(t, 10)
 				memory := backend.Memory()
+				observability, metrics := obstest.New(t)
+				e.cfg.Obs = observability
 				e.cfg.Backend, e.cfg.Prefix = memory, "merge-prefix"
 				e.cfg.DiskSeries, e.cfg.AsyncPressureFlush, e.cfg.PressureGenerations = true, true, generations
 				e.cfg.ResidentHeadBytes = 1 << 30
@@ -47,6 +50,8 @@ func TestPressureMergePrefixPrecedence(t *testing.T) {
 				err = e.MergeWith(t.Context(), MergeOptions{Force: true})
 				if generations == 2 {
 					require.ErrorIs(t, err, errPressureMergeOrder)
+					require.EqualValues(t, 1, metrics.Counter("storage.merge.order_deferred"))
+					require.Zero(t, metrics.Counter("storage.merge.deferred"), "ordering waits are not memory refusals")
 				} else {
 					require.NoError(t, err)
 				}

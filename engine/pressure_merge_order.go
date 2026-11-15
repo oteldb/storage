@@ -121,7 +121,7 @@ func (e *Engine) admitPressureMerge(ctx context.Context, selected []*part, backg
 		return false, nil
 	}
 	e.mergeDeferred.Store(true)
-	e.cfg.Obs.Merge.Deferred(ctx, metricSignal)
+	e.cfg.Obs.Merge.OrderDeferred(ctx, metricSignal)
 	if background {
 		err = nil
 	}
@@ -135,7 +135,7 @@ func (e *Engine) pressureMergeFailure(
 		return mergeResult{parts: dropped + selected, bytesIn: bytesIn, bytesOut: bytesOut}, err
 	}
 	e.mergeDeferred.Store(true)
-	e.cfg.Obs.Merge.Deferred(ctx, metricSignal)
+	e.cfg.Obs.Merge.OrderDeferred(ctx, metricSignal)
 	if background {
 		err = nil
 	}

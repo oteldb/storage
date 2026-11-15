@@ -263,10 +263,7 @@ type Engine struct {
 	// [Engine.MergeRunning]). Set/cleared around the merge, not held during it.
 	mergeRunning atomic.Bool
 
-	// mergeDeferred records that the last merge selected a run and could not get the memory budget
-	// to compact it. The facade reads it to order such an engine first next cycle — task order is by
-	// head bytes, which the highest-ingest engines keep winning, so without this a quiet tenant
-	// could be declined every cycle while its part count grew.
+	// mergeDeferred prioritizes engines whose selected work awaits memory or safe sample precedence.
 	mergeDeferred atomic.Bool
 	// conflictWarned records that a merge already warned of a policy tier it dropped for conflicting
 	// with a recorded one ([compatibleTiers]); cohortsWarned, of parts recording more than one Agg
@@ -629,10 +626,8 @@ func (e *Engine) AppendBatch(
 	return res, nil
 }
 
-// MergeDeferred reports whether the last merge selected parts but could not claim the process merge
-// budget, so it compacted nothing. The maintenance loop schedules such an engine ahead of the
-// others on its next pass; it is also the signal an operator wants when part counts climb while
-// merges look idle.
+// MergeDeferred reports memory or sample-precedence deferral. Maintenance prioritizes a retry;
+// the corresponding merge counters distinguish the causes.
 func (e *Engine) MergeDeferred() bool { return e.mergeDeferred.Load() }
 
 // HeadBytes returns the head's current buffered sample bytes — the in-flight memory measure a
