@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
@@ -146,27 +147,35 @@ func resize[T any](s []T, n int) []T {
 	return s[:n]
 }
 
+//nolint:contextcheck,nolintlint // Append has no caller context; diagnostics use the engine lifetime.
 func (e *Engine) appendPrepared(
 	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series, limits AppendLimits,
 	p *preparedBatch,
 ) (AppendResult, error) {
+	reason := "policy"
 	if e.parallel != nil {
-		if res, handled, err := e.appendKnownPrepared(ids, ts, values, sf, materialize, limits, p); handled {
+		res, outcome, err := e.appendKnownPrepared(ids, ts, values, sf, materialize, limits, p)
+		e.recordPreparedAttempt(outcome, err)
+		if outcome == preparedDone {
+			result := "first"
+			if err != nil {
+				result = "error"
+			}
+			e.cfg.Obs.Admission.PreparedResult(context.Background(), "parallel", result, res.Accepted)
 			return res, err
 		}
+		reason = outcome.reason()
 		materialize = p.reuseMaterialization(ids, materialize)
-		p.batch.reset()
-		p.warm = false
-		clear(p.next)
-		clear(p.created)
-		p.prepare(ids)
+		p.resetPrepared(ids)
 	}
 	if e.parallel != nil && e.parallel.hooks != nil && e.parallel.hooks.ordered != nil {
 		e.parallel.hooks.ordered(ids)
 	}
 	e.mu.LockWriter()
 	defer e.mu.UnlockWriter()
-	return e.appendPreparedLocked(ids, ts, values, sf, materialize, limits, p)
+	res, err := e.appendPreparedLocked(ids, ts, values, sf, materialize, limits, p)
+	e.cfg.Obs.Admission.PreparedResult(context.Background(), "ordered", reason, res.Accepted)
+	return res, err
 }
 
 func (p *preparedBatch) reuseMaterialization(ids []signal.SeriesID, original func(int) signal.Series) func(int) signal.Series {
@@ -317,4 +326,21 @@ func (p *preparedBatch) seriesState(h *head, id signal.SeriesID) headSeriesState
 		return p.snapshots[p.current]
 	}
 	return h.seriesState(id)
+}
+
+func (p *preparedBatch) resetPrepared(ids []signal.SeriesID) {
+	p.batch.reset()
+	p.warm = false
+	clear(p.next)
+	clear(p.created)
+	p.prepare(ids)
+}
+
+//nolint:contextcheck,nolintlint // Append has no caller context; diagnostics use the engine lifetime.
+func (e *Engine) recordPreparedAttempt(outcome preparedOutcome, err error) {
+	reason := outcome.reason()
+	if err != nil {
+		reason = "error"
+	}
+	e.cfg.Obs.Admission.PreparedAttempt(context.Background(), reason)
 }

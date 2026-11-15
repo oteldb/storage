@@ -49,6 +49,7 @@ func benchmarkIngestionContention(b *testing.B, input nodeExporterInput, rounds,
 	b.Logf("hosts=%d series=%d rounds=%d samples/op=%d native files, WAL sync=false, no merges",
 		len(input.ids)/len(cpuFixtureModes), len(input.ids), rounds, rows)
 	var flushes, parts, remaining int64
+	var parallelRows, orderedRows, orderedBatches, pressureMisses, snapshotMisses, retried, workLimit int64
 	for b.Loop() {
 		b.StopTimer()
 		f := newCPUFixture(b, b.Context(), cpuFixtureOptions{disk: true, flushMemoryBytes: 32 << 20})
@@ -101,6 +102,14 @@ func benchmarkIngestionContention(b *testing.B, input nodeExporterInput, rounds,
 		for err := range errs {
 			b.Error(err)
 		}
+		parallelRows += metrics.Counter("storage.ingest.prepared.samples", "path", "parallel")
+		orderedRows += metrics.Counter("storage.ingest.prepared.samples", "path", "ordered")
+		orderedBatches += metrics.Counter("storage.ingest.prepared.batches", "path", "ordered")
+		pressureMisses += metrics.Counter("storage.ingest.prepared.attempts", "outcome", "pressure")
+		snapshotMisses += metrics.Counter("storage.ingest.prepared.attempts", "outcome", "snapshot")
+		workLimit += metrics.Counter("storage.ingest.prepared.attempts", "outcome", "work_limit")
+		retried += metrics.Counter("storage.ingest.prepared.batches", "path", "parallel", "reason", "retry_pressure")
+		retried += metrics.Counter("storage.ingest.prepared.batches", "path", "parallel", "reason", "retry_snapshot")
 		flushes += metrics.Counter("storage.flush.total")
 		parts += int64(e.PartCount() - initialParts)
 		remaining += int64(e.HeadSampleCount())
@@ -117,6 +126,13 @@ func benchmarkIngestionContention(b *testing.B, input nodeExporterInput, rounds,
 	b.ReportMetric(float64(flushes)/float64(b.N), "flushes/op")
 	b.ReportMetric(float64(parts)/float64(b.N), "parts/op")
 	b.ReportMetric(float64(remaining)/float64(b.N), "head-samples/op")
+	b.ReportMetric(float64(parallelRows)/float64(b.N), "parallel-samples/op")
+	b.ReportMetric(float64(orderedRows)/float64(b.N), "ordered-samples/op")
+	b.ReportMetric(float64(orderedBatches)/float64(b.N), "ordered-batches/op")
+	b.ReportMetric(float64(pressureMisses)/float64(b.N), "pressure-misses/op")
+	b.ReportMetric(float64(snapshotMisses)/float64(b.N), "snapshot-misses/op")
+	b.ReportMetric(float64(workLimit)/float64(b.N), "work-limit/op")
+	b.ReportMetric(float64(retried)/float64(b.N), "retry-success/op")
 }
 
 func replayIngestionShard(e *Engine, input nodeExporterInput, start, end, rounds int) error {

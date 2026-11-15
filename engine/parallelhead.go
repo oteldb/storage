@@ -17,7 +17,7 @@ const maxParallelHeadWork = 32 << 20
 type parallelHeadHooks struct {
 	afterFrozenCacheBatch func()
 	capturing             func()
-	captured func()
+	captured              func()
 	ordered               func([]signal.SeriesID)
 	owned                 func()
 	prepared              func()
@@ -41,7 +41,7 @@ type parallelHead struct {
 func (e *Engine) appendKnownPrepared(
 	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(int) signal.Series,
 	limits AppendLimits, p *preparedBatch,
-) (AppendResult, bool, error) {
+) (AppendResult, preparedOutcome, error) {
 	lookupErr := e.captureParallelDiskSeries(ids, p)
 	if hooks := e.parallel.hooks; hooks != nil && hooks.captured != nil {
 		hooks.captured()
@@ -60,12 +60,15 @@ func (e *Engine) appendKnownPrepared(
 		ph.hooks.owned()
 	}
 	if err := e.refuseWrite(); err != nil {
-		return AppendResult{}, true, err
+		return AppendResult{}, preparedDone, err
 	}
 
 	view, valid, err := e.parallelSnapshots(p, lookupErr)
-	if !valid || err != nil {
-		return AppendResult{}, valid, err
+	if !valid {
+		return AppendResult{}, preparedSnapshot, nil
+	}
+	if err != nil {
+		return AppendResult{}, preparedDone, err
 	}
 	ph.admission.Lock()
 	e.mu.RLock()
@@ -73,7 +76,7 @@ func (e *Engine) appendKnownPrepared(
 		e.head.residentIdentityBytes()+e.head.inFlightBytes()+ph.pending.Load() >= e.cfg.ResidentHeadBytes {
 		e.mu.RUnlock()
 		ph.admission.Unlock()
-		return AppendResult{}, false, nil
+		return AppendResult{}, preparedPressure, nil
 	}
 	p.otherPendingBytes, p.otherPendingSeries = ph.pending.Load(), ph.pendingSeries.Load()
 	p.warm = true
@@ -91,7 +94,7 @@ func (e *Engine) appendKnownPrepared(
 		ph.hooks.fallback()
 	}
 	if p.batch.empty() {
-		return res, true, nil
+		return res, preparedDone, nil
 	}
 	reserved := true
 	defer func() {
@@ -106,20 +109,20 @@ func (e *Engine) appendKnownPrepared(
 		}
 	}
 	if !p.parallelWorkFits(view) {
-		return AppendResult{}, false, nil
+		return AppendResult{}, preparedWorkLimit, nil
 	}
 	p.prepareTails()
 	if err := p.batch.encode(view, false); err != nil {
-		return AppendResult{}, true, err
+		return AppendResult{}, preparedDone, err
 	}
 	if ph.hooks != nil && ph.hooks.prepared != nil {
 		ph.hooks.prepared()
 	}
 	if err := e.commitPrepared(p); err != nil {
-		return AppendResult{}, true, err
+		return AppendResult{}, preparedDone, err
 	}
 	reserved = false
-	return res, true, nil
+	return res, preparedDone, nil
 }
 
 func (e *Engine) captureParallelDiskSeries(ids []signal.SeriesID, p *preparedBatch) error {

@@ -668,3 +668,11 @@ Held bytes include unused planner credit until the stage ends; job claims exclud
 buffers. Tracked values exclude allocator/GC overhead and transient codec allocations. These are
 not heap/RSS measurements. The total pool, merge allowance and part targets are independent of
 this accounting experiment and remain configured as before.
+
+`storage.ingest.prepared.attempts{outcome=done|pressure|snapshot|work_limit|error}` counts
+parallel preparation attempts. `storage.ingest.prepared.batches{path,reason}` counts completed
+prepared calls, including failures; `.samples{path,reason}` counts only their accepted points.
+The path is `parallel` or `ordered`; reasons distinguish initial success, transient misses,
+work-limit/policy fallback and errors. These cover the prepared-batch API, not every ingestion
+entry point. They do not alter the existing admission totals. The ingestion contention benchmark
+reports these paths and misses per operation alongside samples, flushes and output parts.

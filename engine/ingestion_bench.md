@@ -72,3 +72,9 @@ unprofiled measurements.
 File/WAL fixtures are removed after each operation. Keep reports/profiles outside
 tracked source and testdata. Full live workload acceptance, queue loss and freshness
 still need the scale benchmark after any optimization.
+
+Prepared-ingestion diagnostics report `parallel-samples/op`, `ordered-samples/op`,
+`ordered-batches/op`, `pressure-misses/op`, `snapshot-misses/op`, `work-limit/op`
+and `retry-success/op`. These separate transient fallback from unavoidable ordered work.
+Older benchmark binaries do not expose these counters; compare only counters present in both
+revisions or use an instrumented control.

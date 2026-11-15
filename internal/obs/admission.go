@@ -12,10 +12,13 @@ import (
 // per-point), so they cost nothing on the hot inner loops. With the no-op meter every Add is a
 // no-op.
 type Admission struct {
-	accepted metric.Int64Counter
-	rejected metric.Int64Counter
-	sampled  metric.Int64Counter
-	overflow metric.Int64Counter
+	preparedAttempts metric.Int64Counter
+	preparedBatches  metric.Int64Counter
+	preparedSamples  metric.Int64Counter
+	accepted         metric.Int64Counter
+	rejected         metric.Int64Counter
+	sampled          metric.Int64Counter
+	overflow         metric.Int64Counter
 }
 
 func newAdmission(m metric.Meter) (*Admission, error) {
@@ -47,7 +50,15 @@ func newAdmission(m metric.Meter) (*Admission, error) {
 		return nil, err
 	}
 
-	return &Admission{accepted: accepted, rejected: rejected, sampled: sampled, overflow: overflow}, nil
+	b := imb{m: m}
+	attempts := b.counter("storage.ingest.prepared.attempts", "parallel prepared attempts by outcome", "{attempt}")
+	batches := b.counter("storage.ingest.prepared.batches", "completed prepared calls by path and reason", "{batch}")
+	samples := b.counter("storage.ingest.prepared.samples", "accepted prepared samples by path and reason", "{point}")
+	if b.err != nil {
+		return nil, b.err
+	}
+	return &Admission{accepted: accepted, rejected: rejected, sampled: sampled, overflow: overflow,
+		preparedAttempts: attempts, preparedBatches: batches, preparedSamples: samples}, nil
 }
 
 // Accepted records n points accepted for the given signal. A zero n is ignored.
@@ -90,4 +101,18 @@ func (a *Admission) Overflowed(ctx context.Context, n int64, sig string) {
 	}
 
 	a.overflow.Add(ctx, n, metric.WithAttributes(attribute.String("signal", sig)))
+}
+
+// PreparedAttempt counts parallel preparation attempts, including transient misses.
+func (a *Admission) PreparedAttempt(ctx context.Context, outcome string) {
+	a.preparedAttempts.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
+}
+
+// PreparedResult counts completed prepared calls and their accepted samples.
+func (a *Admission) PreparedResult(ctx context.Context, path, reason string, accepted int) {
+	attrs := metric.WithAttributes(attribute.String("path", path), attribute.String("reason", reason))
+	a.preparedBatches.Add(ctx, 1, attrs)
+	if accepted > 0 {
+		a.preparedSamples.Add(ctx, int64(accepted), attrs)
+	}
 }
