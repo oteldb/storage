@@ -231,6 +231,7 @@ type Engine struct {
 	activeBuilds       atomic.Int32
 	flushRun           sync.Mutex
 	mergeRun           sync.Mutex
+	mergeNames         *mergePartNames // Owned by mergeRun; flush builders use their own namespaces.
 	head               *head
 	parts              []*part
 	seriesTable        *seriesSnapshot

@@ -33,6 +33,11 @@ func (e *Engine) pressureMergeOrderLocked(selected, outputs []*part) error {
 	if !e.twoPressureGenerations() || len(selected) == 0 {
 		return nil
 	}
+	var err error
+	outputs, err = e.pressureMergeOutputs(selected, outputs)
+	if err != nil {
+		return err
+	}
 	oldest := selected[0].prefix
 	for _, p := range selected {
 		oldest = min(oldest, p.prefix)
@@ -62,7 +67,12 @@ func (e *Engine) pressureMergeOrderLocked(selected, outputs []*part) error {
 		if g.head.bufferedKnown {
 			lo = g.head.bufferedMin
 		}
-		if mergeExcludedOverlap(selected, outputs, &part{prefix: g.prefixFloor, minTime: lo, maxTime: g.head.newest}) {
+		pending := &part{prefix: g.prefixFloor, minTime: lo, maxTime: g.head.newest}
+		// Representatives combine with raw rows, so prefix order cannot replace rollup closure.
+		if slices.ContainsFunc(outputs, func(p *part) bool { return rollupOverlaps(selected, pending, p.rollup) }) {
+			return errPressureMergeOrder
+		}
+		if mergeExcludedOverlap(selected, outputs, pending) {
 			return errPressureMergeOrder
 		}
 	}

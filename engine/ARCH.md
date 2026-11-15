@@ -89,6 +89,12 @@ Part names use a generation-local ULID sequence with a reserved logical millisec
 creation order across independently scheduled builders and retries without changing the part format.
 Each sequence keeps the full random entropy; exhaustion fails instead of reusing names. Reservations
 can advance the logical clock beyond wall time, conservatively delaying orphan eligibility.
+Each frozen generation also reserves an earlier merge namespace. A merge leases that predecessor
+or reserves its own namespace with the source snapshot, before future freezes. Its fresh attempt
+floor follows earlier outputs from a reused namespace; all outputs precede its timestamp ceiling.
+The lease retains only names and bounds, so generation retirement releases its head normally.
+Overlapping pending raw rows still block rollup publication: representatives combine values rather
+than using prefix precedence, so their closure cannot be replaced by an older output namespace.
 In this opt-in mode, merge admission and catalog guards defer outputs that would override newer
 excluded or frozen data. Disjoint timestamp windows or validated canonical-ID ranges still overlap.
 Manual merges report an overlap error; background merges record deferral. Completed outputs are

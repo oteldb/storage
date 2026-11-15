@@ -120,6 +120,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	opts = e.retentionOptions(opts)
 	unlock := e.lockMerge()
 	defer unlock()
+	defer func() { e.mergeNames = nil }()
 
 	// The tenure the inputs were chosen under: a merge that outlives it commits nothing.
 	stamp := e.term()
@@ -128,7 +129,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	// at a time, as the parts are written.
 	e.mu.Lock()
 
-	if err := e.establishTenureLocked(ctx); err != nil {
+	if err := e.prepareMergeSnapshotLocked(ctx); err != nil {
 		e.mu.Unlock()
 
 		return mergeResult{}, err
@@ -485,7 +486,10 @@ func (e *Engine) writeMergedPart(
 	if e.cfg.MetricSeriesChunks || e.cfg.MetricFloatGroups && (precision == 0 || precision >= 64) {
 		return e.writeGroupedColumns(ctx, cols, mergeProfile(opts.Recompress, maxT, len(cols.ts)), precision, rollup)
 	}
-	prefix := e.newPartPrefix()
+	prefix, err := e.newMergePartPrefix()
+	if err != nil {
+		return nil, err
+	}
 	// The merged part's identities come from the resident index, which spans every live series —
 	// snapshotted here (a brief read lock, off the flush path) because the write itself is off-lock.
 	idents := e.identitiesForColumn(cols.series)
@@ -694,7 +698,7 @@ func (e *Engine) compactStreamWithInputs(
 
 	router := timebucket.Router[*partStreamWriter]{
 		Open: func(int64) (*partStreamWriter, error) {
-			w, err := newPartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker, coders.options()...)
+			w, err := newMergePartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker, coders.options()...)
 			if err != nil {
 				return nil, err
 			}
