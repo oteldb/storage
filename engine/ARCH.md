@@ -67,6 +67,12 @@ the flush slot, avoiding empty/tiny work after a manual flush wins. Close drains
 CloseWAL cancels/drains it without checkpointing failed work. This mode changes part granularity
 and needs workload qualification; it is off by default and rejects cluster/read-only/ephemeral use.
 
+Full-target writers subscribe to memory progress, recheck aggregate pressure and retry admission
+after a wake. Input retirement and failed pending reservations notify waiters; retained allocations
+remain charged. Job completion still owns shutdown joining, while unrelated retired-part deletion
+does not extend a writer's memory wait after frozen inputs are released. WAL checkpoint ordering
+is unchanged.
+
 Disk-series flush detach transfers symbols, registry, postings and watermark slots to one frozen
 identity owner and installs an empty active owner. New registrations use only the active registry;
 queries resolve both owners and deduplicate canonical IDs. Registry pointer changes invalidate

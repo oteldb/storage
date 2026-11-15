@@ -100,6 +100,7 @@ func (e *Engine) appendKnownPrepared(
 		if reserved {
 			ph.pending.Add(-bytes)
 			ph.pendingSeries.Add(-registered)
+			e.notifyPressureProgress()
 		}
 	}()
 	for group, i := range p.materializeAt {

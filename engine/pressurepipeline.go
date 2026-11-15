@@ -14,9 +14,10 @@ type pressureJob struct {
 }
 
 type pressurePipeline struct {
-	mu     sync.Mutex
-	job    *pressureJob
-	closed atomic.Bool
+	mu       sync.Mutex
+	job      *pressureJob
+	progress chan struct{}
+	closed   atomic.Bool
 }
 
 func (e *Engine) pressurePipelineEnabled() bool {
@@ -43,11 +44,43 @@ func (e *Engine) pipelineResidentPressure() error {
 		if used < e.cfg.ResidentHeadBytes {
 			return nil
 		}
-		<-job.done
-		if job.err != nil {
-			return job.err
+		changed := e.pressureProgress()
+		if e.pressure.closed.Load() {
+			return os.ErrClosed
+		}
+		e.mu.RLock()
+		used = e.head.residentIdentityBytes() + e.head.inFlightBytes() + e.parallel.pending.Load()
+		active = e.head.bytes > 0
+		e.mu.RUnlock()
+		if !active || used < e.cfg.ResidentHeadBytes {
+			continue
+		}
+		select {
+		case <-changed:
+		case <-job.done:
+			if job.err != nil {
+				return job.err
+			}
 		}
 	}
+}
+
+func (e *Engine) pressureProgress() <-chan struct{} {
+	e.pressure.mu.Lock()
+	defer e.pressure.mu.Unlock()
+	if e.pressure.progress == nil {
+		e.pressure.progress = make(chan struct{})
+	}
+	return e.pressure.progress
+}
+
+func (e *Engine) notifyPressureProgress() {
+	e.pressure.mu.Lock()
+	if e.pressure.progress != nil {
+		close(e.pressure.progress)
+		e.pressure.progress = nil
+	}
+	e.pressure.mu.Unlock()
 }
 
 func (e *Engine) schedulePressureFlush() {
@@ -112,6 +145,7 @@ func (e *Engine) stopPressurePipeline(ctx context.Context, abort bool) error {
 	e.pressure.closed.Store(true)
 	job := e.pressure.job
 	e.pressure.mu.Unlock()
+	e.notifyPressureProgress()
 	if job == nil {
 		return nil
 	}
