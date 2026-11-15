@@ -19,6 +19,7 @@ type headBuildInput struct {
 }
 
 type pressureGeneration struct {
+	mergeNames      *partid.Sequence
 	names           *partid.Sequence
 	prefixFloor     string
 	started         time.Time
@@ -78,7 +79,11 @@ func (e *Engine) freezePressureGenerationLocked(ctx context.Context) (*pressureG
 	h.detachedBytes += h.bytes
 	h.bytes, h.since, h.bufferedKnown = 0, time.Time{}, false
 	h.detachedKnown = false
-	g := &pressureGeneration{started: time.Now(), names: partid.NewSequence(), head: frozen, epoch: epoch, sequence: sequence, term: term}
+	mergeNames := partid.NewSequence()
+	g := &pressureGeneration{
+		mergeNames: mergeNames, names: partid.NewSequence(), started: time.Now(),
+		head: frozen, epoch: epoch, sequence: sequence, term: term,
+	}
 	floor, _ := g.names.Next()
 	g.prefixFloor = e.cfg.Prefix + "/" + floor.String()
 	e.pressureGenerations = append(e.pressureGenerations, g)
