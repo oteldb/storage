@@ -22,6 +22,7 @@ type headRunEntry struct {
 	buf     *sampleBuf
 	ref     uint32
 	ordered bool
+	work    uint16
 }
 
 type headPartBuilder struct {
@@ -291,7 +292,11 @@ func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) er
 	b.materialized = max(b.materialized, materialized)
 	b.sorting = max(b.sorting, sorting)
 	b.runRows = buildbudget.Add(b.runRows, int64(len(buf.ts)))
-	b.entries = append(b.entries, headRunEntry{id: id, buf: buf, ref: ref, ordered: ordered})
+	var work uint16
+	if b.plan != nil {
+		work = headEntryWork(encoded, materialized, sorting, identityWorkspace, int64(len(buf.ts)))
+	}
+	b.entries = append(b.entries, headRunEntry{id: id, buf: buf, ref: ref, ordered: ordered, work: work})
 	return nil
 }
 

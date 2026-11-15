@@ -45,6 +45,7 @@ func BenchmarkFlushMergeOverlap(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(count) * SampleBytes)
 			var outputs int
+			var outputBytes int64
 			for b.Loop() {
 				parts, rows, err := e.streamHead(b.Context(), e.head.samples)
 				b.StopTimer()
@@ -52,6 +53,7 @@ func BenchmarkFlushMergeOverlap(b *testing.B) {
 					b.Fatalf("rows=%d: %v", rows, err)
 				}
 				outputs += len(parts)
+				outputBytes += partsBytes(parts)
 				closePartReaders(parts)
 				for _, p := range parts {
 					if err := deletePart(b.Context(), file, p.prefix); err != nil {
@@ -62,6 +64,7 @@ func BenchmarkFlushMergeOverlap(b *testing.B) {
 			}
 			b.ReportMetric(float64(count*b.N)/b.Elapsed().Seconds(), "samples/s")
 			b.ReportMetric(float64(outputs)/float64(b.N), "parts/op")
+			b.ReportMetric(float64(outputBytes)/float64(b.N), "output-B/op")
 			var data metricdata.ResourceMetrics
 			if err := reader.Collect(b.Context(), &data); err != nil {
 				b.Fatal(err)

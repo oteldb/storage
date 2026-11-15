@@ -2,20 +2,20 @@ package engine
 
 import (
 	"io"
+	"math"
 	"slices"
 	"testing"
 
+	"github.com/go-faster/errors"
 	"github.com/stretchr/testify/require"
 
 	backendfile "github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/internal/memlimit"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
 
 func TestBalancedHeadJobsPreserveTwoParts(t *testing.T) {
-	reproduce.Unfixed(t, 661, "workspace-first flush jobs leave one large output and a tiny tail")
 	t.Parallel()
 	file, err := backendfile.New(t.TempDir())
 	require.NoError(t, err)
@@ -59,7 +59,7 @@ func TestBalancedHeadJobsPreserveTwoParts(t *testing.T) {
 	seen := 0
 	for {
 		batch, err := it.Next(t.Context())
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		require.NoError(t, err)
@@ -75,4 +75,35 @@ func TestBalancedHeadJobsPreserveTwoParts(t *testing.T) {
 	release, ok := pool.TryAcquire(pool.Total())
 	require.True(t, ok, "all build grants must return")
 	release()
+}
+
+func TestHeadBalanceCutKeepsBounds(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name                  string
+		work                  []uint16
+		rows                  []int
+		original, limit, want int
+	}{
+		{name: "uniform tiny tail", work: []uint16{1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, original: 9, want: 5},
+		{name: "unequal work", work: []uint16{7, 1, 1, 1}, rows: []int{7, 1, 1, 1}, original: 3, want: 1},
+		{name: "row cap blocks extra output", work: []uint16{1, 8, 6}, rows: []int{8, 1, 1}, original: 1, limit: 8, want: 1},
+		{name: "same work without row cap", work: []uint16{1, 8, 6}, rows: []int{8, 1, 1}, original: 1, want: 2},
+		{name: "giant indivisible series", work: []uint16{math.MaxUint16, 1, 1}, original: 2, want: 2},
+		{name: "unknown work", work: []uint16{0, 1, 1}, original: 2, want: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p := headPartPlan{parts: 2}
+			for i, work := range tc.work {
+				rows := 1
+				if tc.rows != nil {
+					rows = tc.rows[i]
+				}
+				p.entries = append(p.entries, headRunEntry{work: work, buf: &sampleBuf{ts: make([]int64, rows)}})
+			}
+			p.jobs = []headPartJob{{entries: p.entries[:tc.original]}, {entries: p.entries[tc.original:]}}
+			require.Equal(t, tc.want, p.balanceCut(tc.limit))
+		})
+	}
 }

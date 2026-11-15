@@ -41,6 +41,7 @@ type headPartPlan struct {
 	parts          int
 	retained       int64
 	workerRetained int64
+	balanced       bool
 }
 
 // reservePlan retains every grant while the planner still owns its buffers.
@@ -164,6 +165,9 @@ func (e *Engine) streamHeadParallel(ctx context.Context, samples map[signal.Seri
 	}
 	// Only the immutable plan survives into encoding; its shared storage is charged once.
 	b.entries, b.partRefs = nil, nil
+	if err := plan.balance(&b); err != nil {
+		return nil, 0, err
+	}
 	b.identities = series.EncodingBudget{}
 	parts, rows, err := plan.build(ctx, &b)
 	if err != nil {
@@ -284,6 +288,9 @@ func (p *headPartPlan) build(ctx context.Context, planner *headPartBuilder) ([]*
 	for _, result := range results {
 		parts = append(parts, result.parts...)
 		rows += result.rows
+	}
+	if p.balanced && len(parts) > p.parts {
+		return nil, 0, errHeadJobBudget
 	}
 	completed = true
 	return parts, rows, nil
