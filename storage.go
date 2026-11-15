@@ -90,8 +90,9 @@ type Storage struct {
 	// shared by every engine of every signal: they run in one process against one memory limit, and
 	// the maintenance loop fans them out together. Without it each engine's per-merge share is
 	// arithmetic nobody enforces. nil ⇒ unlimited.
-	mergePool *memlimit.Pool
-	buildPool *memlimit.Pool
+	mergePool   *memlimit.Pool
+	buildPool   *memlimit.Pool
+	flushMemory int64
 
 	admitMu sync.Mutex                           // guards admit
 	admit   map[signal.TenantID]*tenantAdmission // per-tenant admission state (rate valve + counters)
@@ -170,6 +171,19 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 	if budget := memlimit.MergeBudget(o.MergeMemoryBytes); budget < math.MaxInt64 {
 		s.buildPool = memlimit.NewPool(budget)
 		s.mergePool = memlimit.NewPool(max(budget-budget/4, 1))
+		s.flushMemory = max(budget/4, 1)
+	}
+	if o.BuildMemoryBytes > 0 {
+		if s.mergePool == nil || o.BuildMemoryBytes < s.mergePool.Total() {
+			return nil, errOptionInvalid("BuildMemoryBytes requires a bounded merge allowance that fits the build pool")
+		}
+		s.buildPool = memlimit.NewPool(o.BuildMemoryBytes)
+	}
+	if o.MetricFlushMemoryBytes > 0 {
+		s.flushMemory = o.MetricFlushMemoryBytes
+	}
+	if s.buildPool != nil && s.flushMemory > s.buildPool.Total() {
+		return nil, errOptionInvalid("MetricFlushMemoryBytes must fit the build pool")
 	}
 
 	observer, err := obs.New(obs.Config{Logger: o.Logger, TracerProvider: o.TracerProvider, MeterProvider: o.MeterProvider})
