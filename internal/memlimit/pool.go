@@ -75,10 +75,30 @@ func (p *Pool) Waiting() int {
 // one budget — but not identical: the share is divided by a concurrency that rises as engines appear,
 // so a waiter queued when the process held one engine asks for more than one queued later.
 func (p *Pool) Acquire(ctx context.Context, n int64) (release func(), err error) {
+	return p.AcquireObserved(ctx, n, nil)
+}
+
+// State snapshots the pool's accounting without calling an observer under its lock.
+func (p *Pool) State() State {
+	if p == nil {
+		return State{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	state := State{LimitBytes: p.total, UsedBytes: p.total - p.free, Waiters: len(p.waiters)}
+	if len(p.waiters) > 0 {
+		state.HeadBytes = p.waiters[0].n
+	}
+	return state
+}
+
+// AcquireObserved calls observe only after admission queues and releases the pool lock.
+func (p *Pool) AcquireObserved(ctx context.Context, n int64, observe WaitObserver) (release func(), err error) {
 	if p == nil || p.total <= 0 {
 		return func() {}, nil
 	}
 
+	requested := n
 	n = min(max(n, 1), p.total)
 
 	p.mu.Lock()
@@ -96,14 +116,24 @@ func (p *Pool) Acquire(ctx context.Context, n int64) (release func(), err error)
 	p.waiters = append(p.waiters, w)
 	p.mu.Unlock()
 
-	select {
-	case <-w.ready:
-		return p.releaser(n), nil
-	case <-ctx.Done():
-		p.abandon(w)
-
-		return nil, ctx.Err()
+	wait := func() (bool, error) {
+		select {
+		case <-w.ready:
+			return false, nil
+		case <-ctx.Done():
+			p.abandon(w)
+			return false, ctx.Err()
+		}
 	}
+	if observe != nil {
+		_, err = observe(ctx, Wait{RequestedBytes: requested, ReservedBytes: n, State: p.State}, wait)
+	} else {
+		_, err = wait()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return p.releaser(n), nil
 }
 
 // TryAcquire takes n bytes if they are free right now, reporting whether it got them. It never
