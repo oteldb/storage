@@ -9,12 +9,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oteldb/storage/backend"
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/signal"
 )
 
 func TestTransientSnapshotGetsOneParallelRetry(t *testing.T) {
-	reproduce.Unfixed(t, 661, "invalidated parallel lookups immediately force exclusive ingestion")
 	t.Parallel()
 	for _, tc := range []struct {
 		name          string
@@ -92,7 +90,6 @@ func TestTransientSnapshotGetsOneParallelRetry(t *testing.T) {
 }
 
 func TestTransientPressureRetriesOutsideWriterOwnership(t *testing.T) {
-	reproduce.Unfixed(t, 661, "pressure discovered after capture forces exclusive ordered ingestion")
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		e, fs := newFaultWALEngine(t, 10)

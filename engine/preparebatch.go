@@ -154,17 +154,12 @@ func (e *Engine) appendPrepared(
 ) (AppendResult, error) {
 	reason := "policy"
 	if e.parallel != nil {
-		res, outcome, err := e.appendKnownPrepared(ids, ts, values, sf, materialize, limits, p)
-		e.recordPreparedAttempt(outcome, err)
+		res, outcome, why, err := e.retryPrepared(ids, ts, values, sf, materialize, limits, p)
 		if outcome == preparedDone {
-			result := "first"
-			if err != nil {
-				result = "error"
-			}
-			e.cfg.Obs.Admission.PreparedResult(context.Background(), "parallel", result, res.Accepted)
+			e.cfg.Obs.Admission.PreparedResult(context.Background(), "parallel", why, res.Accepted)
 			return res, err
 		}
-		reason = outcome.reason()
+		reason = why
 		materialize = p.reuseMaterialization(ids, materialize)
 		p.resetPrepared(ids)
 	}
@@ -333,6 +328,8 @@ func (p *preparedBatch) resetPrepared(ids []signal.SeriesID) {
 	p.warm = false
 	clear(p.next)
 	clear(p.created)
+	clear(p.snapshots)
+	p.lookup.reset()
 	p.prepare(ids)
 }
 

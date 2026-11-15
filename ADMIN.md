@@ -673,6 +673,8 @@ this accounting experiment and remain configured as before.
 parallel preparation attempts. `storage.ingest.prepared.batches{path,reason}` counts completed
 prepared calls, including failures; `.samples{path,reason}` counts only their accepted points.
 The path is `parallel` or `ordered`; reasons distinguish initial success, transient misses,
-work-limit/policy fallback and errors. These cover the prepared-batch API, not every ingestion
+work-limit/policy fallback and errors. `retry_pressure`/`retry_snapshot` identify successful
+second attempts; `exhausted_pressure`/`exhausted_snapshot` identify ordered fallback after the
+single retry. These cover the prepared-batch API, not every ingestion
 entry point. They do not alter the existing admission totals. The ingestion contention benchmark
 reports these paths and misses per operation alongside samples, flushes and output parts.

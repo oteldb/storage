@@ -40,6 +40,11 @@ historical watermarks into private maps off state. Publication temporarily suppl
 historical membership to registration, including when the advisory cache is disabled, so a known
 disk identity does not consume cardinality twice. Snapshot and catalog replacement drain shared
 writer leases before invalidating this state.
+Transient resident pressure and invalidated lookup snapshots receive one fresh parallel attempt
+before ordered fallback. Each miss releases series/lifecycle ownership and drops captured state;
+pressure waits run outside ownership. Retries precede materialization and WAL submission. Work
+exceeding the private preparation bound stays ordered immediately; retry exhaustion uses the same
+ordered progress path. Preparation-pool and pending admission bounds are unchanged.
 
 A short admission section stages the accepted subset and reserves pending sample/cardinality
 counts. Identity materialization, numeric copying and WAL framing then use request-owned scratch;
