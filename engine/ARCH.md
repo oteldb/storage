@@ -74,8 +74,12 @@ does not extend a writer's memory wait after frozen inputs are released. WAL che
 is unchanged.
 
 `Options.MetricPressureGenerations=2` / `Config.PressureGenerations=2` opt in to two frozen
-owners under the same aggregate resident target and half-target rotation size. The default remains
-one. Each owner retains its arena, identity index, WAL epoch and sealed sequence; builders use a
+owners under the same aggregate resident target. At half the target, admission waits for the
+initial detach/seal event, not its build, so scheduling delay cannot consume the next owner's
+allowance. Already-admitted batch overshoot retains its existing bound. With one
+unfinished frozen owner, aggregate usage reaching seven eighths can rotate an active owner of at
+least one quarter, leaving room for pending/metadata overhead without tiny generations. The default
+remains one. Each owner retains its arena, identity index, WAL epoch and sealed sequence; builders use a
 private dense ordering workspace. Finished outputs remain charged while waiting behind an earlier
 generation. Queries copy both frozen windows under the state lock; labels/counts inspect both.
 

@@ -102,6 +102,7 @@ func blockedGenerationPair(
 	e.cfg.ResidentHeadBytes = target
 	require.NoError(t, e.flushResidentHead())
 	<-be.first
+	synctest.Wait()
 	e.cfg.ResidentHeadBytes = 1 << 30
 	for i := range 64 {
 		_, err := e.Append(benchSeries(i), 200, 2)
@@ -296,6 +297,7 @@ func TestPressureGenerationsDuplicatePrecedenceIgnoresBuildOrder(t *testing.T) {
 		e.cfg.ResidentHeadBytes = target
 		require.NoError(t, e.flushResidentHead())
 		<-entered
+		synctest.Wait()
 		e.cfg.ResidentHeadBytes = 1 << 30
 		for i := range 64 {
 			_, err := e.Append(benchSeries(i), 100, 2)

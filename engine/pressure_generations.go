@@ -88,6 +88,7 @@ func (e *Engine) freezePressureGenerationLocked(ctx context.Context) (*pressureG
 	g.prefixFloor = e.cfg.Prefix + "/" + floor.String()
 	e.pressureGenerations = append(e.pressureGenerations, g)
 	e.updateGenerationBuffersLocked()
+	e.notifyPressureRotation()
 	return g, nil
 }
 
@@ -208,13 +209,7 @@ func (e *Engine) startGenerationBuilds(
 				if e.pressure.beforeBuild != nil {
 					e.pressure.beforeBuild(g.epoch)
 				}
-				input := &headBuildInput{names: g.names, index: g.head.series, retain: func(parts []*part) {
-					e.mu.LockState()
-					g.head.buildRetained = generationPartBytes(parts)
-					e.mu.UnlockState()
-				}}
-				parts, n, buildErr := e.streamHead(ctx, g.head.samples, input)
-				results <- generationResult{generation: g, parts: parts, rows: n, err: buildErr}
+				results <- e.buildFrozenGeneration(ctx, g)
 			}()
 		}
 	}
@@ -328,7 +323,41 @@ func (e *Engine) releasePressureGenerationsLocked() {
 }
 
 func (e *Engine) generationRotationNeededLocked(force, pressureMode bool) bool {
-	return e.head.bytes > 0 && (force || pressureMode && e.head.ownedIdentityBytes()+e.head.bytes >= e.pressureRotationBytes())
+	if e.head.bytes == 0 {
+		return false
+	}
+	if force {
+		return true
+	}
+	if !pressureMode {
+		return false
+	}
+	active := e.head.ownedIdentityBytes() + e.head.bytes
+	if active >= e.pressureRotationBytes() {
+		return true
+	}
+	if len(e.pressureGenerations) != 1 || e.pressureGenerations[0].ready {
+		return false
+	}
+	used := e.head.residentIdentityBytes() + e.head.inFlightBytes() + e.parallel.pending.Load()
+	return secondPressureRotationNeeded(active, used, e.cfg.ResidentHeadBytes)
+}
+
+func secondPressureRotationNeeded(active, used, limit int64) bool {
+	return active >= max(limit/4, 1) && used >= limit-limit/8
+}
+
+func (e *Engine) buildFrozenGeneration(ctx context.Context, g *pressureGeneration) generationResult {
+	active := e.pressure.generationBuilds.Add(1)
+	defer e.pressure.generationBuilds.Add(-1)
+	e.cfg.Obs.Flush.GenerationStarted(ctx, metricSignal, active > 1)
+	input := &headBuildInput{names: g.names, index: g.head.series, retain: func(parts []*part) {
+		e.mu.LockState()
+		g.head.buildRetained = generationPartBytes(parts)
+		e.mu.UnlockState()
+	}}
+	parts, rows, err := e.streamHead(ctx, g.head.samples, input)
+	return generationResult{generation: g, parts: parts, rows: rows, err: err}
 }
 
 func (e *Engine) generationWake() <-chan struct{} {

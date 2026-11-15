@@ -69,18 +69,28 @@ func sigAttr(sig string) metric.MeasurementOption {
 
 // Flush instruments a head→part flush.
 type Flush struct {
-	total           metric.Int64Counter
-	duration        metric.Float64Histogram
-	rows            metric.Int64Histogram
-	bytes           metric.Int64Counter
-	verified        metric.Int64Counter
-	reservation     metric.Int64Histogram
-	reservationWait metric.Float64Histogram
-	outputSeries    metric.Int64Histogram
-	buildWorkers    metric.Int64Histogram
-	buildJobs       metric.Int64Histogram
-	buildFallbacks  metric.Int64Counter
-	buildMemory     metric.Int64Histogram
+	total            metric.Int64Counter
+	duration         metric.Float64Histogram
+	rows             metric.Int64Histogram
+	bytes            metric.Int64Counter
+	verified         metric.Int64Counter
+	reservation      metric.Int64Histogram
+	reservationWait  metric.Float64Histogram
+	outputSeries     metric.Int64Histogram
+	generationStarts metric.Int64Counter
+	buildWorkers     metric.Int64Histogram
+	buildJobs        metric.Int64Histogram
+	buildFallbacks   metric.Int64Counter
+	buildMemory      metric.Int64Histogram
+}
+
+// GenerationStarted records overlapping build attempts, including admission waits.
+func (f *Flush) GenerationStarted(ctx context.Context, sig string, overlapping bool) {
+	concurrency := "single"
+	if overlapping {
+		concurrency = "overlapping"
+	}
+	f.generationStarts.Add(ctx, 1, sigAttr(sig), metric.WithAttributes(attribute.String("concurrency", concurrency)))
 }
 
 // BuildMemory records shared, retained, job, held and checked structural workspace by component.
@@ -601,6 +611,8 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 	b := &imb{m: m}
 
 	flush := &Flush{
+		generationStarts: b.counter("storage.flush.generation_starts",
+			"generation build attempts started alone or overlapping, including admission waits", "{generation}"),
 		reservation: b.i64hist("storage.flush.reservation.bytes", "flush workspace reservation and part target", "By",
 			1<<20, 8<<20, 16<<20, 32<<20, 64<<20, 128<<20, 256<<20, 512<<20, 1<<30, 2<<30),
 		reservationWait: b.f64hist("storage.flush.reservation.wait", "flush workspace admission wait"),

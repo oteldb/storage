@@ -698,6 +698,10 @@ Flush workspace metrics distinguish the configured output target from the admitt
 `storage.flush.reservation.bytes` labels `component=reserved|target` and a bounded `phase`;
 `storage.flush.reservation.wait` records admission wait by phase. `storage.flush.output.series`
 counts distinct identities per completed candidate, including candidates not yet catalog-published.
+`storage.flush.generation_starts{signal,concurrency=single|overlapping}` records two-generation
+stream builders starting while zero or one other builder is executing. Finished-but-uncollected
+results are excluded. These are overlapping build lifetimes, including admission waits, not CPU
+utilization; completed output overlap and runtime traces establish useful parallel work.
 `storage.flush.build.workers` and `.jobs` record admitted concurrency and planned jobs per attempt;
 zero jobs identifies legacy sequential planning. `.fallbacks{reason=plan|workspace}` counts retries
 through that planner. Two workers reuse the planner grant and request only a nonblocking aggregate shortfall;
