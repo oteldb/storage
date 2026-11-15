@@ -18,11 +18,6 @@ type commitQueue struct {
 var commitBuffers = make(chan []byte, maxPreparedBatches)
 
 func (e *Engine) commitPrepared(p *preparedBatch) error {
-	if !e.cfg.WAL.SyncOnWrite() {
-		e.parallel.walMu.Lock()
-		defer e.parallel.walMu.Unlock()
-		return e.writePreparedGroup([]*preparedBatch{p}, p.batch.frames.Len())
-	}
 	q := &e.parallel.commits
 	q.mu.Lock()
 	if q.changed == nil {

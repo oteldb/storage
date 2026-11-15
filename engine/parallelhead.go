@@ -32,7 +32,6 @@ type parallelHead struct {
 	admission     sync.Mutex
 	pendingSeries atomic.Int64
 	commits       commitQueue
-	walMu         sync.Mutex
 	pending       atomic.Int64
 	preparations  *batchPreparations
 	hooks         *parallelHeadHooks

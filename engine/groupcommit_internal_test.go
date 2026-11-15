@@ -9,7 +9,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/oteldb/storage/internal/reproduce"
 	"github.com/oteldb/storage/internal/vfs/faultfs"
 	"github.com/oteldb/storage/signal"
 )
@@ -24,9 +23,6 @@ func TestPreparedGroupCommit(t *testing.T) {
 			for _, cold := range []bool{false, true} {
 				name := "sync=" + strconv.FormatBool(syncWrites) + "/" + failure + "/cold=" + strconv.FormatBool(cold)
 				t.Run(name, func(t *testing.T) {
-					if !syncWrites {
-						reproduce.Unfixed(t, 661, "page-cache appends bypass bounded ready-caller grouping")
-					}
 					t.Parallel()
 					testPreparedGroupCommit(t, failure, cold, syncWrites)
 				})
@@ -108,7 +104,8 @@ func testPreparedGroupCommit(t *testing.T, failure string, cold, syncWrites bool
 	}
 	require.False(t, writerFree, "queued callers retain lifecycle leases")
 	select {
-	case <-done:
+	case premature := <-done:
+		done <- premature
 		t.Error("a queued batch was acknowledged before its WAL group completed")
 	default:
 	}
@@ -161,8 +158,11 @@ func testPreparedGroupCommit(t *testing.T, failure string, cold, syncWrites bool
 		require.Equal(t, wantSyncs, syncs)
 	}
 	if !syncWrites {
-		for _, call := range fs.Calls()[beforeCalls:] {
-			require.NotEqual(t, faultfs.OpSync, call.Op, "SyncNone must not add implicit synchronization")
+		// Short-write repair syncs its replacement independently of the write policy.
+		if !fail {
+			for _, call := range fs.Calls()[beforeCalls:] {
+				require.NotEqual(t, faultfs.OpSync, call.Op, "SyncNone must not add implicit synchronization")
+			}
 		}
 		require.NoError(t, e.SyncWAL())
 	}
@@ -185,7 +185,6 @@ func testPreparedGroupCommit(t *testing.T, failure string, cold, syncWrites bool
 }
 
 func TestPreparedNoSyncGroupPreservesSyncPolicy(t *testing.T) {
-	reproduce.Unfixed(t, 661, "page-cache appends bypass bounded ready-caller grouping")
 	t.Parallel()
 	e, fs := newFaultWALEngine(t, 0)
 	e.cfg.WAL.SetSync(false)
@@ -214,9 +213,6 @@ func TestPreparedGroupDrainsBeforeClose(t *testing.T) {
 	t.Parallel()
 	for _, syncWrites := range []bool{true, false} {
 		t.Run(strconv.FormatBool(syncWrites), func(t *testing.T) {
-			if !syncWrites {
-				reproduce.Unfixed(t, 661, "page-cache appends bypass bounded ready-caller grouping")
-			}
 			t.Parallel()
 			testPreparedGroupDrainsBeforeClose(t, syncWrites)
 		})
@@ -229,7 +225,8 @@ func testPreparedGroupDrainsBeforeClose(t *testing.T, syncWrites bool) {
 	e.cfg.WAL.SetSync(syncWrites)
 	t.Cleanup(func() { _ = e.CloseWAL() })
 	identities := []signal.Series{stagedTestSeries("a"), stagedTestSeries("b"), stagedTestSeries("c")}
-	for _, s := range identities {
+	for i := range identities {
+		s := identities[i]
 		_, err := e.Append(s, 0, 0)
 		require.NoError(t, err)
 	}
@@ -278,7 +275,8 @@ func testPreparedGroupDrainsBeforeClose(t *testing.T, syncWrites bool) {
 	}
 	require.NoError(t, <-closed)
 	replayed := replayedHead(t, fs.Crash())
-	for _, s := range identities {
+	for i := range identities {
+		s := identities[i]
 		require.Equal(t, []int64{0, 1}, headTS(replayed, s))
 	}
 }

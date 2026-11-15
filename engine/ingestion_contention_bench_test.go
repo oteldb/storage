@@ -48,7 +48,7 @@ func benchmarkIngestionContention(b *testing.B, input nodeExporterInput, rounds,
 	b.SetBytes(rows * SampleBytes)
 	b.Logf("hosts=%d series=%d rounds=%d samples/op=%d native files, WAL sync=false, no merges",
 		len(input.ids)/len(cpuFixtureModes), len(input.ids), rounds, rows)
-	var flushes, parts, remaining int64
+	var flushes, parts, remaining, walAppends int64
 	var parallelRows, orderedRows, orderedBatches, pressureMisses, snapshotMisses, retried, workLimit int64
 	for b.Loop() {
 		b.StopTimer()
@@ -74,6 +74,7 @@ func benchmarkIngestionContention(b *testing.B, input nodeExporterInput, rounds,
 		}
 		observability, metrics := obstest.New(b)
 		e.cfg.Obs = observability
+		e.cfg.WAL.SetObs(observability.WAL)
 		initialParts := e.PartCount()
 		finishProfile := ingestionContentionProfile(b, mode, writers)
 		b.StartTimer()
@@ -110,6 +111,7 @@ func benchmarkIngestionContention(b *testing.B, input nodeExporterInput, rounds,
 		workLimit += metrics.Counter("storage.ingest.prepared.attempts", "outcome", "work_limit")
 		retried += metrics.Counter("storage.ingest.prepared.batches", "path", "parallel", "reason", "retry_pressure")
 		retried += metrics.Counter("storage.ingest.prepared.batches", "path", "parallel", "reason", "retry_snapshot")
+		walAppends += metrics.Counter("storage.wal.appends")
 		flushes += metrics.Counter("storage.flush.total")
 		parts += int64(e.PartCount() - initialParts)
 		remaining += int64(e.HeadSampleCount())
@@ -133,6 +135,7 @@ func benchmarkIngestionContention(b *testing.B, input nodeExporterInput, rounds,
 	b.ReportMetric(float64(snapshotMisses)/float64(b.N), "snapshot-misses/op")
 	b.ReportMetric(float64(workLimit)/float64(b.N), "work-limit/op")
 	b.ReportMetric(float64(retried)/float64(b.N), "retry-success/op")
+	b.ReportMetric(float64(walAppends)/float64(b.N), "wal-appends/op")
 }
 
 func replayIngestionShard(e *Engine, input nodeExporterInput, start, end, rounds int) error {

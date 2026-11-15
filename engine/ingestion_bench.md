@@ -75,6 +75,7 @@ still need the scale benchmark after any optimization.
 
 Prepared-ingestion diagnostics report `parallel-samples/op`, `ordered-samples/op`,
 `ordered-batches/op`, `pressure-misses/op`, `snapshot-misses/op`, `work-limit/op`
-and `retry-success/op`. These separate transient fallback from unavoidable ordered work.
+and `retry-success/op`. `wal-appends/op` counts measured WAL record-batch append calls;
+fixture seeding is excluded. These separate transient fallback from unavoidable ordered work.
 Older benchmark binaries do not expose these counters; compare only counters present in both
 revisions or use an instrumented control.

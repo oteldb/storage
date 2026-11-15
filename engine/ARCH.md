@@ -85,9 +85,11 @@ index entries under writer ownership; successful publication does not. Catalog a
 both owners and hydrates their watermarks under state exclusion. Non-disk mode retains its shared
 historical registry. No WAL or part format changes are required.
 
-Per-write fsync combines ready independent batches in a bounded caller-owned queue, without a timer
-or background worker. Combined frames use at most eight reusable 4 MiB buffers globally; page-cache
-writes retain their existing physical writer path. WAL failure publishes none of the grouped batches.
+Prepared commits combine ready independent batches in a bounded caller-owned queue, without a timer
+or background worker. Page-cache and per-write-sync policies share the same single-owner WAL then
+atomic-publication sequence. Combined frames use at most eight reusable 4 MiB buffers globally.
+WAL failure publishes none of the grouped batches; sync policy and mandatory torn-write repair
+synchronization are unchanged.
 
 Metrics `HasWants` first tries catalog ownership to read all three obligation sets; ingestion
 never mutates them. A busy catalog falls back to the state read lock, preserving reader progress
