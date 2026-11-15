@@ -201,6 +201,9 @@ func (e *Engine) liveIdentities(ctx context.Context, parts []*part) (map[signal.
 		live[id] = struct{}{}
 	}
 
+	for id := range e.flushingNext {
+		live[id] = struct{}{}
+	}
 	for id := range e.flushing {
 		live[id] = struct{}{}
 	}

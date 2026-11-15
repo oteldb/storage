@@ -79,3 +79,7 @@ and `retry-success/op`. `wal-appends/op` counts measured WAL record-batch append
 fixture seeding is excluded. These separate transient fallback from unavoidable ordered work.
 Older benchmark binaries do not expose these counters; compare only counters present in both
 revisions or use an instrumented control.
+
+`OTELDB_BENCH_INGEST_GENERATIONS=2` enables the two-generation pressure variant. Compare against
+`1` at the same head/build limits; the fixture has no concurrent merges and does not establish
+full ingestion capacity or compaction convergence.

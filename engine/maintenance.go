@@ -106,9 +106,11 @@ func (e *Engine) publishMerge(
 		return false, nil
 	}
 	next := replaceParts(e.parts, removed, newParts...)
+	e.sortPressureParts(next)
 
-	if err := e.commitIndexLocked(ctx, next, e.flushedEpoch, stamp, rollupClosureGuard(selected, readable, plan.marker, e)); err != nil {
-		if !errors.Is(err, errRollupConflict) {
+	if err := e.commitIndexLocked(ctx, next, e.flushedEpoch, stamp,
+		e.pressureMergeGuard(selected, newParts, rollupClosureGuard(selected, readable, plan.marker, e))); err != nil {
+		if !errors.Is(err, errRollupConflict) && !errors.Is(err, errPressureMergeOrder) {
 			e.mu.Unlock()
 
 			return false, err
@@ -118,6 +120,10 @@ func (e *Engine) publishMerge(
 		e.retireLocked(newParts)
 		e.mu.Unlock()
 		e.reclaimRetired(ctx)
+
+		if errors.Is(err, errPressureMergeOrder) {
+			return false, err
+		}
 
 		zctx.From(ctx).Warn("merge output dropped: a rival writer committed a part recording a downsample "+
 			"layout that does not nest with this merge's; the next merge replans with it",

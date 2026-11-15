@@ -14,10 +14,12 @@ type pressureJob struct {
 }
 
 type pressurePipeline struct {
-	mu       sync.Mutex
-	job      *pressureJob
-	progress chan struct{}
-	closed   atomic.Bool
+	beforeBuild func(uint64)
+	mu          sync.Mutex
+	job         *pressureJob
+	wake        chan struct{}
+	progress    chan struct{}
+	closed      atomic.Bool
 }
 
 func (e *Engine) pressurePipelineEnabled() bool {
@@ -32,9 +34,9 @@ func (e *Engine) pipelineResidentPressure() error {
 		}
 		e.mu.RLock()
 		used := e.head.residentIdentityBytes() + e.head.inFlightBytes() + e.parallel.pending.Load()
-		active := e.head.bytes > 0
+		active := e.head.bytes > 0 || len(e.pressureGenerations) > 0
 		e.mu.RUnlock()
-		if !active || used < e.cfg.ResidentHeadBytes/2 {
+		if !active || used < e.pressureRotationBytes() {
 			return nil
 		}
 		job := e.startPressureJob()
@@ -50,7 +52,7 @@ func (e *Engine) pipelineResidentPressure() error {
 		}
 		e.mu.RLock()
 		used = e.head.residentIdentityBytes() + e.head.inFlightBytes() + e.parallel.pending.Load()
-		active = e.head.bytes > 0
+		active = e.head.bytes > 0 || len(e.pressureGenerations) > 0
 		e.mu.RUnlock()
 		if !active || used < e.cfg.ResidentHeadBytes {
 			continue
@@ -88,8 +90,8 @@ func (e *Engine) schedulePressureFlush() {
 		return
 	}
 	e.mu.RLock()
-	needed := e.head.bytes > 0 &&
-		e.head.residentIdentityBytes()+e.head.inFlightBytes()+e.parallel.pending.Load() >= e.cfg.ResidentHeadBytes/2
+	needed := (e.head.bytes > 0 || len(e.pressureGenerations) > 0) &&
+		e.head.residentIdentityBytes()+e.head.inFlightBytes()+e.parallel.pending.Load() >= e.pressureRotationBytes()
 	e.mu.RUnlock()
 	if needed {
 		e.startPressureJob()
@@ -104,11 +106,18 @@ func (e *Engine) startPressureJob() *pressureJob {
 		return nil
 	}
 	if job := e.pressure.job; job != nil {
+		select {
+		case e.pressure.wake <- struct{}{}:
+		default:
+		}
 		return job
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	job := &pressureJob{done: make(chan struct{}), cancel: cancel}
 	e.pressure.job = job
+	if e.pressure.wake == nil {
+		e.pressure.wake = make(chan struct{}, 1)
+	}
 	go func() {
 		err := e.observeFlush(ctx, e.buildPressureGeneration)
 		cancel()
@@ -129,10 +138,14 @@ func (e *Engine) buildPressureGeneration(ctx context.Context) (int, int64, error
 	defer unlock()
 	// Another flush may have won the slot before this job began.
 	e.mu.RLock()
-	needed := e.head.bytes > 0 && e.head.residentIdentityBytes()+e.head.inFlightBytes() >= e.cfg.ResidentHeadBytes/2
+	needed := (e.head.bytes > 0 || len(e.pressureGenerations) > 0) &&
+		e.head.residentIdentityBytes()+e.head.inFlightBytes() >= e.pressureRotationBytes()
 	e.mu.RUnlock()
-	if !needed {
+	if !needed && !e.twoPressureGenerations() {
 		return 0, 0, nil
+	}
+	if e.twoPressureGenerations() {
+		return e.runPressureGenerations(ctx, false)
 	}
 	return e.flushAdmitted(ctx)
 }

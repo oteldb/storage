@@ -135,19 +135,20 @@ func (f *Flush) Record(ctx context.Context, sig string, dur time.Duration, rows,
 
 // Merge instruments a background merge (compaction/retention/downsample/recompress).
 type Merge struct {
-	total       metric.Int64Counter
-	duration    metric.Float64Histogram
-	parts       metric.Int64Histogram
-	bytesIn     metric.Int64Counter
-	bytesOut    metric.Int64Counter
-	deferred    metric.Int64Counter
-	over        metric.Int64Counter
-	nonReducing metric.Int64Counter
-	plans       metric.Int64Counter
-	planParts   metric.Int64Histogram
-	planBytes   metric.Int64Histogram
-	outputs     metric.Int64Histogram
-	refused     metric.Int64Counter
+	total         metric.Int64Counter
+	duration      metric.Float64Histogram
+	parts         metric.Int64Histogram
+	bytesIn       metric.Int64Counter
+	bytesOut      metric.Int64Counter
+	deferred      metric.Int64Counter
+	orderDeferred metric.Int64Counter
+	over          metric.Int64Counter
+	nonReducing   metric.Int64Counter
+	plans         metric.Int64Counter
+	planParts     metric.Int64Histogram
+	planBytes     metric.Int64Histogram
+	outputs       metric.Int64Histogram
+	refused       metric.Int64Counter
 }
 
 // Plan separates memory selection from process-pool admission for numeric merges.
@@ -210,6 +211,11 @@ func (m *Merge) Record(ctx context.Context, sig string, dur time.Duration, parts
 // bounded by [Options.MergeMemoryBytes], which is the number to raise if part counts climb.
 func (m *Merge) Deferred(ctx context.Context, sig string) {
 	m.deferred.Add(ctx, 1, sigAttr(sig))
+}
+
+// OrderDeferred accounts a merge deferred to preserve newer sample precedence.
+func (m *Merge) OrderDeferred(ctx context.Context, sig string) {
+	m.orderDeferred.Add(ctx, 1, sigAttr(sig))
 }
 
 // NonReducing accounts an ordinary merge whose output did not reduce parts or apply a required transformation.
@@ -612,16 +618,17 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 		bytes:    b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
 	}
 	merge := &Merge{
-		refused:   b.counter("storage.merge.admission_refused", "process-pool merge refusals by pool, across signals", "{attempt}"),
-		plans:     b.counter("storage.merge.plans", "numeric merge planning outcomes and process-pool refusals", "{attempt}"),
-		planParts: b.i64hist("storage.merge.plan.parts", "numeric merge structural and memory-bounded inputs", "{part}"),
-		planBytes: b.i64hist("storage.merge.plan.bytes", "numeric merge estimated workspace by component", "By"),
-		outputs:   b.i64hist("storage.merge.parts_out", "parts published per numeric merge", "{part}"),
-		total:     b.counter("storage.merge.total", "background merges", "{merge}"),
-		duration:  b.f64hist("storage.merge.duration", "merge wall time"),
-		parts:     b.i64hist("storage.merge.parts_in", "source parts compacted per merge", "{part}"),
-		bytesIn:   b.counter("storage.merge.bytes_in", "part bytes read by merges", "By"),
-		bytesOut:  b.counter("storage.merge.bytes_out", "part bytes written by merges", "By"),
+		refused:       b.counter("storage.merge.admission_refused", "process-pool merge refusals by pool, across signals", "{attempt}"),
+		plans:         b.counter("storage.merge.plans", "numeric merge planning outcomes and process-pool refusals", "{attempt}"),
+		planParts:     b.i64hist("storage.merge.plan.parts", "numeric merge structural and memory-bounded inputs", "{part}"),
+		planBytes:     b.i64hist("storage.merge.plan.bytes", "numeric merge estimated workspace by component", "By"),
+		outputs:       b.i64hist("storage.merge.parts_out", "parts published per numeric merge", "{part}"),
+		total:         b.counter("storage.merge.total", "background merges", "{merge}"),
+		duration:      b.f64hist("storage.merge.duration", "merge wall time"),
+		parts:         b.i64hist("storage.merge.parts_in", "source parts compacted per merge", "{part}"),
+		bytesIn:       b.counter("storage.merge.bytes_in", "part bytes read by merges", "By"),
+		bytesOut:      b.counter("storage.merge.bytes_out", "part bytes written by merges", "By"),
+		orderDeferred: b.counter("storage.merge.order_deferred", "merges deferred to preserve newer sample precedence", "{merge}"),
 		deferred: b.counter("storage.merge.deferred",
 			"merges that selected parts but could not claim the process merge memory budget", "{merge}"),
 		nonReducing: b.counter("storage.merge.non_reducing", "ordinary merges discarded without useful output reduction", "{merge}"),

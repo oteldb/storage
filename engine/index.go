@@ -314,6 +314,7 @@ func (e *Engine) readablePartsLocked() []*part {
 		out = append(out, p)
 	}
 
+	e.sortPressureParts(out)
 	return out
 }
 

@@ -58,7 +58,7 @@ func (h *head) frozenState(id signal.SeriesID) (headSeriesState, bool) {
 	}
 	ref, exists := h.frozen.series.Ref(id)
 	if !exists {
-		return headSeriesState{}, false
+		return h.frozen.frozenState(id)
 	}
 	ts, seen := h.frozen.slots.get(h.frozen.stateRefs[ref])
 	return headSeriesState{newest: ts, seen: seen, historical: true}, true
@@ -77,7 +77,7 @@ func (h *head) getIdentity(id signal.SeriesID) (signal.Series, bool) {
 		return s, true
 	}
 	if h.frozen != nil {
-		return h.frozen.series.Get(id)
+		return h.frozen.getIdentity(id)
 	}
 	return signal.Series{}, false
 }
@@ -95,7 +95,7 @@ func (h *head) identityMaterializationBytes(id signal.SeriesID) int64 {
 func (h *head) identityCount() int {
 	n := h.series.Len()
 	if h.frozen != nil {
-		n += h.frozen.series.Len()
+		n += h.frozen.identityCount()
 	}
 	return n
 }
@@ -107,10 +107,7 @@ func (h *head) identityIDs() []signal.SeriesID {
 		ids = append(ids, view.ID(i))
 	}
 	if h.frozen != nil {
-		view = h.frozen.series.View()
-		for i := range view.Len() {
-			ids = append(ids, view.ID(i))
-		}
+		ids = append(ids, h.frozen.identityIDs()...)
 	}
 	slices.SortFunc(ids, signal.SeriesID.Compare)
 	return slices.Compact(ids)
@@ -119,7 +116,7 @@ func (h *head) identityIDs() []signal.SeriesID {
 func (h *head) resolve(matchers []fetch.Matcher) []signal.SeriesID {
 	ids := h.resolveLocal(matchers)
 	if h.frozen != nil {
-		ids = append(ids, h.frozen.resolveLocal(matchers)...)
+		ids = append(ids, h.frozen.resolve(matchers)...)
 		slices.SortFunc(ids, signal.SeriesID.Compare)
 		ids = slices.Compact(ids)
 	}
@@ -136,6 +133,12 @@ func (e *Engine) flushIdentityIndex() *series.Index {
 func (e *Engine) rememberFrozenWatermarks(ctx context.Context) error {
 	e.mu.RLock()
 	frozen := e.head.frozen
+	e.mu.RUnlock()
+	return e.rememberGenerationWatermarks(ctx, frozen)
+}
+
+func (e *Engine) rememberGenerationWatermarks(ctx context.Context, frozen *head) error {
+	e.mu.RLock()
 	enabled := frozen != nil && e.head.disk.cache != nil
 	e.mu.RUnlock()
 	if !enabled {

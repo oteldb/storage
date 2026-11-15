@@ -79,6 +79,13 @@ func newPartStreamWriter(
 	ctx context.Context, e *Engine, comp compressProfile, precisionBits uint8, withSF, withStats bool,
 	rollup *block.Rollup, extra ...block.PartOption,
 ) (*partStreamWriter, error) {
+	return newPartStreamWriterAt(ctx, e, "", comp, precisionBits, withSF, withStats, rollup, extra...)
+}
+
+func newPartStreamWriterAt(
+	ctx context.Context, e *Engine, prefix string, comp compressProfile, precisionBits uint8, withSF, withStats bool,
+	rollup *block.Rollup, extra ...block.PartOption,
+) (*partStreamWriter, error) {
 	blockRows := e.cfg.MetricBlockRows
 	if blockRows <= 0 {
 		blockRows = DefaultMetricBlockRows
@@ -88,7 +95,9 @@ func newPartStreamWriter(
 	if e.cfg.MetricSeriesChunks {
 		opts = append(opts, block.WithIndependentGroups())
 	}
-	prefix := e.newPartPrefix()
+	if prefix == "" {
+		prefix = e.newPartPrefix()
+	}
 	w := block.NewStreamWriterTo(ctx, e.cfg.Backend, prefix, opts...)
 
 	if err := w.AddColumn(block.Column{Name: colSeries, Kind: block.KindInt128}); err != nil {

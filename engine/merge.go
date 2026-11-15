@@ -156,10 +156,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	readable := append(slices.Clone(src), adopted...)
 
 	cohorts := mergeCohorts(src, readable)
-	if len(cohorts) > 1 && e.cohortsWarned.CompareAndSwap(false, true) {
-		zctx.From(ctx).Warn("parts record downsample layouts that do not nest; each set merges only with its own",
-			zap.String("prefix", e.cfg.Prefix), zap.Int("cohorts", len(cohorts)))
-	}
+	e.warnMergeCohorts(ctx, len(cohorts))
 
 	allowance := e.mergeMemoryBudgetBytes()
 	turn := e.cohortTurn.Add(1) - 1
@@ -191,6 +188,10 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		e.reclaimRetired(ctx)
 
 		return mergeResult{parts: dropped}, nil
+	}
+
+	if deferred, err := e.admitPressureMerge(ctx, selected, opts.Background); deferred {
+		return mergeResult{deferred: true, parts: dropped}, err
 	}
 
 	// Past here the merge decodes and buffers, so this is where its memory allowance must be one it
@@ -293,7 +294,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 
 	committed, err := e.publishMerge(ctx, selected, newParts, readable, stamp, plan, opts.RetainFrom)
 	if err != nil {
-		return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, err
+		return e.pressureMergeFailure(ctx, err, opts.Background, dropped, len(selected), bytesIn, partsBytes(newParts))
 	}
 	if !committed {
 		return mergeResult{parts: dropped}, nil
@@ -957,4 +958,11 @@ func (e *Engine) SyncWAL() error {
 	}
 
 	return nil
+}
+
+func (e *Engine) warnMergeCohorts(ctx context.Context, cohorts int) {
+	if cohorts > 1 && e.cohortsWarned.CompareAndSwap(false, true) {
+		zctx.From(ctx).Warn("parts record downsample layouts that do not nest; each set merges only with its own",
+			zap.String("prefix", e.cfg.Prefix), zap.Int("cohorts", cohorts))
+	}
 }

@@ -220,6 +220,8 @@ type Options struct {
 	MetricDiskSeries bool
 	// MetricAsyncPressureFlush pipelines standalone WAL-backed disk heads within the resident target.
 	MetricAsyncPressureFlush bool
+	// MetricPressureGenerations permits two frozen generations; zero and one retain the default.
+	MetricPressureGenerations int
 	// MetricSeparateSeries stores descriptors/postings in independent immutable runs.
 	// Requires MetricDiskSeries and MetricSeriesChunks; standalone fresh catalogs only.
 	MetricSeparateSeries bool
@@ -557,6 +559,12 @@ func errOptionInvalid(reason string) error {
 func (o *Options) validate() error {
 	if o.BuildMemoryBytes < 0 || o.MetricFlushMemoryBytes < 0 {
 		return errOptionInvalid("BuildMemoryBytes and MetricFlushMemoryBytes must not be negative")
+	}
+	if o.MetricPressureGenerations < 0 || o.MetricPressureGenerations > 2 {
+		return errOptionInvalid("MetricPressureGenerations must be zero, one or two")
+	}
+	if o.MetricPressureGenerations == 2 && (!o.MetricAsyncPressureFlush || o.MetricSeparateSeries) {
+		return errOptionInvalid("MetricPressureGenerations=2 requires MetricAsyncPressureFlush without MetricSeparateSeries")
 	}
 	if o.MetricSeparateSeries && (!o.MetricDiskSeries || !o.MetricSeriesChunks || o.Cluster != nil) {
 		return errOptionInvalid("MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks without Cluster")

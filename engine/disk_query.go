@@ -142,7 +142,7 @@ func (e *Engine) diskHeadSelectionBytes(ids []signal.SeriesID, withIdentity, cou
 			n = buildbudget.Add(n, materialized)
 		}
 		if !countOnly {
-			for _, buf := range [2]*sampleBuf{e.head.samples[id], e.flushing[id]} {
+			for _, buf := range [3]*sampleBuf{e.head.samples[id], e.flushing[id], e.flushingNext[id]} {
 				if buf != nil {
 					n = buildbudget.Add(n, buildbudget.Mul(int64(len(buf.ts)), 32))
 				}

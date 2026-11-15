@@ -189,7 +189,7 @@ func (e *Engine) rebuildDiskStateLocked(ctx context.Context) (err error) {
 		}
 		target := e.head
 		ref, ok := target.series.Ref(headIDs[i])
-		if !ok && target.frozen != nil {
+		for !ok && target.frozen != nil {
 			target = target.frozen
 			ref, ok = target.series.Ref(headIDs[i])
 		}
