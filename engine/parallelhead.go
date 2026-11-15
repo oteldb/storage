@@ -17,6 +17,7 @@ const maxParallelHeadWork = 32 << 20
 type parallelHeadHooks struct {
 	afterFrozenCacheBatch func()
 	capturing             func()
+	captured func()
 	ordered               func([]signal.SeriesID)
 	owned                 func()
 	prepared              func()
@@ -42,6 +43,9 @@ func (e *Engine) appendKnownPrepared(
 	limits AppendLimits, p *preparedBatch,
 ) (AppendResult, bool, error) {
 	lookupErr := e.captureParallelDiskSeries(ids, p)
+	if hooks := e.parallel.hooks; hooks != nil && hooks.captured != nil {
+		hooks.captured()
+	}
 	e.mu.RLockWriter()
 	defer e.mu.RUnlockWriter()
 	ph := e.parallel
