@@ -203,6 +203,16 @@ the second worker consumes only remaining jobs that fit its bound. Otherwise job
 at the same part target. Jobs cannot queue for more bytes held by their siblings.
 Oversized plans or changed working-set estimates retry through the sequential planner.
 
+Two-job plans can rebalance their contiguous canonical ranges without adding jobs or output parts.
+A compact scheduling score uses row, encoding, materialization, identity-workspace and sorting costs
+already collected during planning; the score fits unused entry padding. Only materially skewed
+plans reprice the two candidate identity dictionaries with the original planner accumulator,
+retaining its conservative capacity charge across resets. Each candidate stays below the original
+largest private claim, the workspace target and existing reservation. Row-part limits, oversized
+indivisible work and unknown scores retain the original plan. Publication rejects unexpected extra
+outputs and retries through the original bounded serial path. Other job counts keep their existing
+scheduler; the two-worker ceiling and shared/frozen ownership are unchanged.
+
 Any job failure cancels siblings and joins all builders before closing candidate readers or
 releasing grants. Outputs are collected in planned order; the whole stage keeps one catalog
 publication and WAL checkpoint. Separate-series and nonstreaming modes retain the sequential path.
