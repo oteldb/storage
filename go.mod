@@ -19,7 +19,7 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.33
 	github.com/prometheus/prometheus v0.312.0
 	github.com/stretchr/testify v1.12.1
-	github.com/valyala/gozstd v1.26.0
+	github.com/valyala/gozstd v1.27.0
 	github.com/zeebo/xxh3 v1.1.0
 	go.etcd.io/etcd/api/v3 v3.7.3
 	go.etcd.io/etcd/client/v3 v3.7.3
