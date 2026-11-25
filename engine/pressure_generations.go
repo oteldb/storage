@@ -40,7 +40,7 @@ type generationResult struct {
 }
 
 func (e *Engine) twoPressureGenerations() bool {
-	return e.cfg.PressureGenerations == 2 && e.pressurePipelineEnabled() && !e.cfg.SeparateSeries
+	return e.cfg.PressureGenerations == 2 && e.pressurePipelineEnabled()
 }
 
 func (e *Engine) pressureRotationBytes() int64 { return e.cfg.ResidentHeadBytes / 2 }

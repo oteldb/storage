@@ -68,6 +68,20 @@ func (e *Engine) prepareSharedPart(ctx context.Context, p *part) error {
 }
 
 func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySnapshot, reserve func(int64) error) error {
+	for {
+		err := e.writeSeriesDelta(ctx, entries, reserve)
+		if !errors.Is(err, errSeriesSnapshotChanged) {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+}
+
+var errSeriesSnapshotChanged = errors.New("engine: shared series snapshot changed during planning")
+
+func (e *Engine) writeSeriesDelta(ctx context.Context, entries identitySnapshot, reserve func(int64) error) error {
 	e.mu.RLock()
 	snapshot := e.seriesTable
 	snapshot.acquire()
@@ -127,7 +141,23 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 			return err
 		}
 	}
-	run, err := seriestable.WriteWithIDCache(ctx, e.cfg.Backend, prefix, &builder, e.seriesIDs)
+	return e.installSeriesDelta(ctx, entries, snapshot, known, prefix, &builder)
+}
+
+func (e *Engine) installSeriesDelta(
+	ctx context.Context, entries identitySnapshot, snapshot *seriesSnapshot, known []bool, prefix string, builder *seriestable.Builder,
+) error {
+	// No workspace acquisition while owning the writer. A sibling may have added the
+	// same descriptors while we planned off-lock.
+	e.seriesBuildMu.Lock()
+	defer e.seriesBuildMu.Unlock()
+	e.mu.RLock()
+	stale := snapshot != e.seriesTable
+	e.mu.RUnlock()
+	if stale {
+		return errSeriesSnapshotChanged
+	}
+	run, err := seriestable.WriteWithIDCache(ctx, e.cfg.Backend, prefix, builder, e.seriesIDs)
 	if err != nil {
 		return errors.Wrap(err, "write shared series delta")
 	}

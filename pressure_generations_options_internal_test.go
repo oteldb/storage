@@ -17,7 +17,7 @@ func TestPressureGenerationsOptions(t *testing.T) {
 		{name: "negative", generations: -1, want: "must be zero, one or two"},
 		{name: "unbounded", generations: 3, want: "must be zero, one or two"},
 		{name: "requires pipeline", generations: 2, want: "requires MetricAsyncPressureFlush"},
-		{name: "separate series", generations: 2, async: true, separate: true, want: "requires MetricAsyncPressureFlush"},
+		{name: "separate series without chunks", generations: 2, async: true, separate: true, want: "MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

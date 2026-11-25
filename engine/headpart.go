@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -64,16 +63,8 @@ func (e *Engine) flushMemoryBytes() int64 {
 }
 
 func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sampleBuf, input ...*headBuildInput) ([]*part, int, error) {
-	// Take metadata ownership before reserving workspace, so a waiting
-	// generation cannot hold the bytes needed by the metadata owner.
-	unlock := func() {}
-	if e.cfg.SeparateSeries {
-		e.seriesBuildMu.Lock()
-		unlock = sync.OnceFunc(e.seriesBuildMu.Unlock)
-		defer unlock()
-	}
 	if e.cfg.FlushAdmission != nil && e.cfg.TryFlushAdmission != nil && backend.StreamsWrites(e.cfg.Backend) {
-		parts, rows, err := e.streamHeadParallel(ctx, samples, unlock, input...)
+		parts, rows, err := e.streamHeadParallel(ctx, samples, input...)
 		if !errors.Is(err, errHeadPlanUnavailable) && !errors.Is(err, errHeadJobBudget) {
 			return parts, rows, err
 		}
@@ -85,11 +76,6 @@ func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sa
 			reason = "workspace"
 		}
 		e.cfg.Obs.Flush.BuildFallback(ctx, reason)
-		if e.cfg.SeparateSeries {
-			unlock()
-			e.seriesBuildMu.Lock()
-			defer e.seriesBuildMu.Unlock()
-		}
 	}
 	e.cfg.Obs.Flush.BuildPlan(ctx, 1, 0)
 	return e.streamHeadSerial(ctx, samples, input...)

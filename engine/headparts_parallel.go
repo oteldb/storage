@@ -117,7 +117,7 @@ func (p *headPartPlan) record(b *headPartBuilder) error {
 }
 
 func (e *Engine) streamHeadParallel(
-	ctx context.Context, samples map[signal.SeriesID]*sampleBuf, releaseMetadata func(), input ...*headBuildInput,
+	ctx context.Context, samples map[signal.SeriesID]*sampleBuf, input ...*headBuildInput,
 ) ([]*part, int, error) {
 	plan := headPartPlan{}
 	plan.shared = buildbudget.Add(buildbudget.Mul(int64(len(samples)), memsize.Of[headRunEntry]()),
@@ -179,7 +179,6 @@ func (e *Engine) streamHeadParallel(
 			return nil, 0, err
 		}
 		b.sharedIdentitiesReady = true
-		releaseMetadata()
 	}
 	parts, rows, err := plan.build(ctx, &b)
 	if err != nil {

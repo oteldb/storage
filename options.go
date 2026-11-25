@@ -563,8 +563,8 @@ func (o *Options) validate() error {
 	if o.MetricPressureGenerations < 0 || o.MetricPressureGenerations > 2 {
 		return errOptionInvalid("MetricPressureGenerations must be zero, one or two")
 	}
-	if o.MetricPressureGenerations == 2 && (!o.MetricAsyncPressureFlush || o.MetricSeparateSeries) {
-		return errOptionInvalid("MetricPressureGenerations=2 requires MetricAsyncPressureFlush without MetricSeparateSeries")
+	if o.MetricPressureGenerations == 2 && !o.MetricAsyncPressureFlush {
+		return errOptionInvalid("MetricPressureGenerations=2 requires MetricAsyncPressureFlush")
 	}
 	if o.MetricSeparateSeries && (!o.MetricDiskSeries || !o.MetricSeriesChunks || o.Cluster != nil) {
 		return errOptionInvalid("MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks without Cluster")

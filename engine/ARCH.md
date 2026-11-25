@@ -2185,6 +2185,11 @@ retention, size splitting and overlapping series preserve the output's own canon
 numeric parts carry SIDX, coverage watermarks and aggregate statistics, with a manifest-bound
 `series-ref` marker instead of identities/postings. Numeric compaction never rebuilds descriptors.
 
+Flush planning checks descriptors by bounded series-ID ranges before launching parallel numeric
+builders. A metadata writer serializes additions after workspace admission and retries if a sibling
+changed the descriptor snapshot. Planned scratch grows only with nonblocking grants. Two frozen
+generations may build concurrently. Publication and WAL coverage advance in generation order.
+
 Catalog v9 names metadata roots independently of sample entries and publishes their union with
 numeric parts and the WAL checkpoint in one CAS. Runs sync before publication; failed commits
 retain pending roots through retries and reloads. A missing or invalid root fences loading.
