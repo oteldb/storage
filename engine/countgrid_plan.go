@@ -109,7 +109,7 @@ func (e *Engine) snapshotCountGrid(ctx context.Context, r fetch.Request, presenc
 		if recent {
 			recentBuf = e.recent[id]
 		}
-		if err := presence.addBuffers(ctx, r, [3]*sampleBuf{e.head.samples[id], e.flushing[id], recentBuf}); err != nil {
+		if err := presence.addBuffers(ctx, r, [4]*sampleBuf{e.head.samples[id], e.flushing[id], e.flushingNext[id], recentBuf}); err != nil {
 			return cp, err
 		}
 		p.memActive[i] = presence.complete()
@@ -121,7 +121,7 @@ func (e *Engine) snapshotCountGrid(ctx context.Context, r fetch.Request, presenc
 	return cp, nil
 }
 
-func (presence *gridPresence) addBuffers(ctx context.Context, r fetch.Request, buffers [3]*sampleBuf) error {
+func (presence *gridPresence) addBuffers(ctx context.Context, r fetch.Request, buffers [4]*sampleBuf) error {
 	for _, buf := range buffers {
 		if buf == nil || presence.complete() {
 			continue
@@ -150,7 +150,7 @@ func (e *Engine) snapshotDiskCountGrid(ctx context.Context, r fetch.Request, pre
 		heads = make(map[signal.SeriesID][]gridSpan, len(p.ids))
 		for i, id := range p.ids {
 			presence.reset()
-			if err := presence.addBuffers(ctx, r, [3]*sampleBuf{e.head.samples[id], e.flushing[id], nil}); err != nil {
+			if err := presence.addBuffers(ctx, r, [4]*sampleBuf{e.head.samples[id], e.flushing[id], e.flushingNext[id], nil}); err != nil {
 				return err
 			}
 			p.memActive[i] = presence.complete()

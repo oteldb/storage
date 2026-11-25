@@ -67,6 +67,35 @@ the flush slot, avoiding empty/tiny work after a manual flush wins. Close drains
 CloseWAL cancels/drains it without checkpointing failed work. This mode changes part granularity
 and needs workload qualification; it is off by default and rejects cluster/read-only/ephemeral use.
 
+Full-target writers subscribe to memory progress, recheck aggregate pressure and retry admission
+after a wake. Input retirement and failed pending reservations notify waiters; retained allocations
+remain charged. Job completion still owns shutdown joining, while unrelated retired-part deletion
+does not extend a writer's memory wait after frozen inputs are released. WAL checkpoint ordering
+is unchanged.
+
+`Options.MetricPressureGenerations=2` / `Config.PressureGenerations=2` opt in to two frozen
+owners under the same aggregate resident target and half-target rotation size. The default remains
+one. Each owner retains its arena, identity index, WAL epoch and sealed sequence; builders use a
+private dense ordering workspace. Finished outputs remain charged while waiting behind an earlier
+generation. Queries copy both frozen windows under the state lock; labels/counts inspect both.
+
+Generation outputs publish in WAL order. Failed builds retain immutable input and retry in place;
+completed later outputs are reused. Ambiguous catalog candidates remain locally readable while WAL
+is retained. Only confirmed prefix publication permits checkpointing its sealed sequence. Identity
+watermarks transfer in bounded state windows, and retired arenas return to their bounded pools after
+state exclusion ends. Close joins workers before closing WAL or private output readers.
+
+Part names use a generation-local ULID sequence with a reserved logical millisecond, preserving
+creation order across independently scheduled builders and retries without changing the part format.
+Each sequence keeps the full random entropy; exhaustion fails instead of reusing names. Reservations
+can advance the logical clock beyond wall time, conservatively delaying orphan eligibility.
+In this opt-in mode, merge admission and catalog guards defer outputs that would override newer
+excluded or frozen data. Disjoint timestamp windows or validated canonical-ID ranges still overlap.
+Manual merges report an overlap error; background merges record deferral. Completed outputs are
+revalidated after off-lock work and catalog rebases, with rejected readers retired. Live/candidate
+part ordering matches the prefix order reconstructed at reopen. Conservative bounds can postpone
+compaction, so workload qualification must check sustained merge debt as well as ingestion rate.
+
 Disk-series flush detach transfers symbols, registry, postings and watermark slots to one frozen
 identity owner and installs an empty active owner. New registrations use only the active registry;
 queries resolve both owners and deduplicate canonical IDs. Registry pointer changes invalidate
@@ -203,6 +232,16 @@ the second worker consumes only remaining jobs that fit its bound. Otherwise job
 at the same part target. Jobs cannot queue for more bytes held by their siblings.
 Oversized plans or changed working-set estimates retry through the sequential planner.
 
+Two-job plans can rebalance their contiguous canonical ranges without adding jobs or output parts.
+A compact scheduling score uses row, encoding, materialization, identity-workspace and sorting costs
+already collected during planning; the score fits unused entry padding. Only materially skewed
+plans reprice the two candidate identity dictionaries with the original planner accumulator,
+retaining its conservative capacity charge across resets. Each candidate stays below the original
+largest private claim, the workspace target and existing reservation. Row-part limits, oversized
+indivisible work and unknown scores retain the original plan. Publication rejects unexpected extra
+outputs and retries through the original bounded serial path. Other job counts keep their existing
+scheduler; the two-worker ceiling and shared/frozen ownership are unchanged.
+
 Any job failure cancels siblings and joins all builders before closing candidate readers or
 releasing grants. Outputs are collected in planned order; the whole stage keeps one catalog
 publication and WAL checkpoint. Separate-series and nonstreaming modes retain the sequential path.
@@ -246,7 +285,8 @@ again. Completed output handles grow with the number of output parts until atomi
 The periodic/catch-up worker and a separate pressure-flush worker have bounded fan-out. A paused
 merge does not stop pressure wakes. Completed pressure passes wake merge catch-up. Close cancels
 queued maintenance admission, drains both workers, then performs the final engine flush. There is
-only one frozen generation per engine; part builders share that stage and no extra flush queue is introduced.
+one frozen generation per engine by default; the explicit two-generation mode bounds its extra
+frozen owner within the same resident target.
 
 Single-node background metrics maintenance uses `Engine.FlushIfIdle`: atomic try-locks skip a
 flush already owned by the pressure worker, so compaction can proceed over immutable parts.

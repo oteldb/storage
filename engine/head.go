@@ -26,6 +26,7 @@ var (
 // concurrent use; the [Engine] holds the lock.
 type head struct {
 	frozen                       *head
+	buildRetained                int64
 	disk                         *diskHeadState
 	sym                          *symbols.Table
 	series                       *series.Index
@@ -127,13 +128,13 @@ func (h *head) identityBytes() int64 {
 func (h *head) residentIdentityBytes() int64 {
 	n := h.ownedIdentityBytes()
 	if h.frozen != nil {
-		n += h.frozen.ownedIdentityBytes()
+		n += h.frozen.residentIdentityBytes()
 	}
 	return n
 }
 
 func (h *head) ownedIdentityBytes() int64 {
-	n := h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
+	n := h.buildRetained + h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
 		memsize.Slice(h.stateRefs) + h.slots.sizeBytes() + memsize.Slice(h.valueScratch)
 	if h.nonStringLabels != nil {
 		n += memsize.Map(h.nonStringLabels)
@@ -574,7 +575,7 @@ func (h *head) addLabel(id uint32, name []byte, v signal.Value) {
 
 // indexSorted reports whether the label index is sorted (so a read will not mutate it).
 func (h *head) indexSorted() bool {
-	return h.post.Sorted() && (h.frozen == nil || h.frozen.post.Sorted())
+	return h.post.Sorted() && (h.frozen == nil || h.frozen.indexSorted())
 }
 
 // ensureIndexSorted sorts the label index in place. The engine calls it while holding the
@@ -582,7 +583,7 @@ func (h *head) indexSorted() bool {
 func (h *head) ensureIndexSorted() {
 	h.post.EnsureSorted()
 	if h.frozen != nil {
-		h.frozen.post.EnsureSorted()
+		h.frozen.ensureIndexSorted()
 	}
 }
 

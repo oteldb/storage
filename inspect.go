@@ -72,9 +72,8 @@ type SignalStats struct {
 	MaxTimeUnixNano int64
 	// MergeRunning is true while a compaction/merge is executing on this engine.
 	MergeRunning bool
-	// MergeDeferred is true when the last merge selected parts and could not claim the process
-	// merge-memory budget, so it compacted nothing. Part counts climbing while merges look idle and
-	// this is set means compaction is bounded by [Options.MergeMemoryBytes], not by the selector.
+	// MergeDeferred is true when memory or sample precedence deferred the last merge.
+	// The corresponding merge counters distinguish the causes.
 	MergeDeferred bool
 	// SealedParts is the parts at the merge cap, excluded from size compaction. Forced rewrites
 	// may still take them.

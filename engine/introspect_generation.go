@@ -1,6 +1,9 @@
 package engine
 
-import "github.com/oteldb/storage/index/symbols"
+import (
+	"github.com/oteldb/storage/index/symbols"
+	"github.com/oteldb/storage/signal"
+)
 
 func (h *head) localCardinality() (int, []LabelCard) {
 	var cards []LabelCard
@@ -20,19 +23,19 @@ func (h *head) residentCardinality() (int, []LabelCard) {
 	if h.frozen == nil {
 		return h.localCardinality()
 	}
-	if h.series.Len() == 0 {
-		return h.frozen.localCardinality()
-	}
-	shared := make(map[uint32]struct{})
-	view := h.series.View()
-	for i := range view.Len() {
-		if h.frozen.series.Has(view.ID(i)) {
-			shared[uint32(i)] = struct{}{}
-		}
-	}
 	syms := make(map[string]struct{})
 	labels := make(map[string]*generationLabelCard)
-	for _, owner := range [2]*head{h.frozen, h} {
+	seen := make(map[signal.SeriesID]struct{})
+	for owner := h; owner != nil; owner = owner.frozen {
+		shared := make(map[uint32]struct{})
+		view := owner.series.View()
+		for i := range view.Len() {
+			id := view.ID(i)
+			if _, ok := seen[id]; ok {
+				shared[uint32(i)] = struct{}{}
+			}
+			seen[id] = struct{}{}
+		}
 		for _, symbol := range owner.sym.Snapshot() {
 			syms[string(symbol)] = struct{}{}
 		}
@@ -47,7 +50,7 @@ func (h *head) residentCardinality() (int, []LabelCard) {
 			for _, valueID := range owner.post.LabelValues(nameID) {
 				value, _ := owner.sym.Get(symbols.ID(valueID))
 				card.values[string(value)] = struct{}{}
-				if owner == h && len(shared) > 0 {
+				if len(shared) > 0 {
 					card.series -= sharedPostingCount(owner, nameID, valueID, shared)
 				}
 			}

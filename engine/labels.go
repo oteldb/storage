@@ -278,7 +278,8 @@ func (p *labelProbe) release() { p.plan.releaseParts() }
 func (p *labelProbe) seriesLive(ctx context.Context, e *Engine, id signal.SeriesID) (bool, error) {
 	start, end := p.plan.start, p.plan.end
 
-	if bufHasInWindow(e.head.samples[id], start, end) || bufHasInWindow(e.flushing[id], start, end) {
+	if bufHasInWindow(e.head.samples[id], start, end) || bufHasInWindow(e.flushing[id], start, end) ||
+		bufHasInWindow(e.flushingNext[id], start, end) {
 		return true, nil
 	}
 

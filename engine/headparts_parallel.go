@@ -41,6 +41,7 @@ type headPartPlan struct {
 	parts          int
 	retained       int64
 	workerRetained int64
+	balanced       bool
 }
 
 // reservePlan retains every grant while the planner still owns its buffers.
@@ -115,11 +116,16 @@ func (p *headPartPlan) record(b *headPartBuilder) error {
 	return b.reservePhase(max(b.reservationFloor, buildbudget.Add(b.baseBytes(), b.identities.Bytes())), "shape")
 }
 
-func (e *Engine) streamHeadParallel(ctx context.Context, samples map[signal.SeriesID]*sampleBuf) ([]*part, int, error) {
+func (e *Engine) streamHeadParallel(
+	ctx context.Context, samples map[signal.SeriesID]*sampleBuf, input ...*headBuildInput,
+) ([]*part, int, error) {
 	plan := headPartPlan{}
 	plan.shared = buildbudget.Add(buildbudget.Mul(int64(len(samples)), memsize.Of[headRunEntry]()),
 		buildbudget.Mul(maxHeadPartJobs, memsize.Of[headPartJob]()+memsize.Of[headPartResult]()))
 	b := headPartBuilder{ctx: ctx, e: e, target: e.flushMemoryBytes(), plan: &plan, orderWorkspace: plan.shared}
+	if len(input) > 0 {
+		b.input = input[0]
+	}
 	capacity := min(len(samples), max(1, int(b.target/1024)))
 	plan.workerRetained = buildbudget.Add(block.MaxStreamBuildScratchBytes, buildbudget.Mul(int64(capacity), 8))
 	buffers := buildbudget.Mul(int64(capacity), memsize.Of[headRunEntry]()+memsize.Of[uint32]())
@@ -141,7 +147,7 @@ func (e *Engine) streamHeadParallel(ctx context.Context, samples map[signal.Seri
 	plan.jobs = make([]headPartJob, 0, maxHeadPartJobs)
 	order, err := e.prepareDetachedOrder(ctx, samples, func(bytes int64) error {
 		return b.reservePhase(max(b.reservationFloor, buildbudget.Add(b.baseBytes(), bytes)), "order")
-	})
+	}, input...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -164,6 +170,9 @@ func (e *Engine) streamHeadParallel(ctx context.Context, samples map[signal.Seri
 	}
 	// Only the immutable plan survives into encoding; its shared storage is charged once.
 	b.entries, b.partRefs = nil, nil
+	if err := plan.balance(&b); err != nil {
+		return nil, 0, err
+	}
 	b.identities = series.EncodingBudget{}
 	parts, rows, err := plan.build(ctx, &b)
 	if err != nil {
@@ -176,6 +185,9 @@ func (e *Engine) streamHeadParallel(ctx context.Context, samples map[signal.Seri
 	if rows != expected {
 		closePartReaders(parts)
 		return nil, 0, errors.Errorf("head has %d samples without identities", expected-rows)
+	}
+	if len(input) > 0 {
+		input[0].retain(parts)
 	}
 	return parts, rows, nil
 }
@@ -253,7 +265,7 @@ func (p *headPartPlan) build(ctx context.Context, planner *headPartBuilder) ([]*
 	var next atomic.Uint32
 	for i := range workers {
 		b := &workers[i]
-		*b = headPartBuilder{ctx: workCtx, e: planner.e, view: planner.view, target: planner.target,
+		*b = headPartBuilder{input: planner.input, ctx: workCtx, e: planner.e, view: planner.view, target: planner.target,
 			reserved: planner.reserved, reservationFloor: planner.reserved, fixedLimit: admission.primary}
 		if i == 1 {
 			b.fixedLimit = admission.secondary
@@ -284,6 +296,9 @@ func (p *headPartPlan) build(ctx context.Context, planner *headPartBuilder) ([]*
 	for _, result := range results {
 		parts = append(parts, result.parts...)
 		rows += result.rows
+	}
+	if p.balanced && len(parts) > p.parts {
+		return nil, 0, errHeadJobBudget
 	}
 	completed = true
 	return parts, rows, nil
