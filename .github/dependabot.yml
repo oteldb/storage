@@ -28,6 +28,9 @@ updates:
           - "github.com/aws/aws-sdk-go-v2"
           - "github.com/aws/aws-sdk-go-v2/*"
           - "github.com/aws/smithy-go"
+      etcd:
+        patterns:
+          - "go.etcd.io/*"
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
