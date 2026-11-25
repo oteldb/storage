@@ -173,6 +173,19 @@ func (e *Engine) runPressureGenerations(ctx context.Context, force bool) (rows i
 func (e *Engine) startGenerationBuilds(
 	ctx context.Context, force, pressureMode bool, results chan<- generationResult,
 ) (started int, froze bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	e.mu.RLock()
+	needed := len(e.pressureGenerations) < 2 && e.generationRotationNeededLocked(force, pressureMode)
+	for _, g := range e.pressureGenerations {
+		needed = needed || !g.building && !g.ready
+	}
+	e.mu.RUnlock()
+	if !needed {
+		return 0, false, nil
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := ctx.Err(); err != nil {
