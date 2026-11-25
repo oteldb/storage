@@ -12,6 +12,7 @@ import (
 	backendfile "github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/query/fetch"
+	"github.com/oteldb/storage/readbudget"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -49,7 +50,9 @@ func TestBalancedHeadJobsPreserveTwoParts(t *testing.T) {
 	require.Equal(t, want, ids, "canonical ranges remain contiguous without lost/duplicated IDs")
 	reader := New(Config{Backend: file, DiskSeries: true, MetricSeriesChunks: true})
 	reader.parts = parts
-	it, err := reader.Fetch(t.Context(), fetch.Request{Start: cpuFixtureBase, End: cpuFixtureBase})
+	// This full-fixture read verifies the output, independent of the host's query allowance.
+	ctx := readbudget.With(t.Context(), readbudget.New(2<<30))
+	it, err := reader.Fetch(ctx, fetch.Request{Start: cpuFixtureBase, End: cpuFixtureBase})
 	require.NoError(t, err)
 	defer func() { require.NoError(t, it.Close()) }()
 	values := make(map[signal.SeriesID]float64, count)
@@ -58,7 +61,7 @@ func TestBalancedHeadJobsPreserveTwoParts(t *testing.T) {
 	}
 	seen := 0
 	for {
-		batch, err := it.Next(t.Context())
+		batch, err := it.Next(ctx)
 		if errors.Is(err, io.EOF) {
 			break
 		}
