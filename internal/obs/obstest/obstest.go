@@ -62,6 +62,20 @@ func (m *Metrics) Counter(name string, attrs ...string) int64 {
 	return total
 }
 
+// IntHistogram returns the combined sum and count of an int64 histogram.
+func (m *Metrics) IntHistogram(name string) (sum int64, count uint64) {
+	m.t.Helper()
+	for _, md := range m.collect(name) {
+		h, ok := md.Data.(metricdata.Histogram[int64])
+		require.Truef(m.t, ok, "%s is not an int64 histogram", name)
+		for _, dp := range h.DataPoints {
+			sum += dp.Sum
+			count += dp.Count
+		}
+	}
+	return sum, count
+}
+
 // Gauge returns the int64 gauge name at the data point carrying every attr, and whether one was
 // recorded.
 func (m *Metrics) Gauge(name string, attrs ...string) (int64, bool) {
