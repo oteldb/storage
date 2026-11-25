@@ -14,10 +14,7 @@ func (s *Storage) mergeMemoryBytes() int64 {
 }
 
 func (s *Storage) metricFlushMemoryBytes() int64 {
-	if s.buildPool == nil {
-		return 0
-	}
-	return max(s.buildPool.Total()/4, 1)
+	return s.flushMemory
 }
 
 func (s *Storage) flushAdmission() func(context.Context, int64) (func(), error) {

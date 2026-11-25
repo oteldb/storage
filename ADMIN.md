@@ -646,6 +646,11 @@ unconditional overwrite.
 
 ## Merge memory admission (`MergeMemoryBytes`)
 
+`BuildMemoryBytes` overrides shared build admission capacity while keeping the existing merge
+allowance. `MetricFlushMemoryBytes` independently sets the metric flush workspace target. Increasing
+capacity alone admits more overlap without enlarging jobs or output parts. A configured build pool
+must fit the bounded merge allowance and flush target. These are workspace estimates, not RSS caps.
+
 Every engine in the process draws its merge memory from one budget. How many merges run at once is
 derived from that budget — enough that each gets a usable allowance — capped by the maintenance
 fan-out, so lowering `MergeMemoryBytes` buys **fewer, better-fed merges** rather than the same

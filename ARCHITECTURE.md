@@ -59,6 +59,10 @@ engines over the fetch seam (`query/fetch`).
 
 ## 3. Public surface (root package)
 
+`BuildMemoryBytes` can raise shared flush/merge admission capacity without changing workspace or
+output limits. `MergeMemoryBytes` retains its existing merge allowance and default metric flush
+target; `MetricFlushMemoryBytes` overrides that target separately. Unset overrides preserve defaults.
+
 `Inspect().Cluster.Placements` reports this node's replica/EC owner sets for locally known shard
 keys, using the routing placement and per-tenant policy. It is an in-memory observation, not a
 complete cluster inventory; `Owned` separately names held compaction claims.

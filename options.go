@@ -167,6 +167,14 @@ type Options struct {
 	// their allowance is unavailable; the independent pressure worker still services flush wakes.
 	MergeMemoryBytes int64
 
+	// BuildMemoryBytes overrides shared flush/merge admission capacity without changing their
+	// workspace targets. Zero retains the allowance derived from MergeMemoryBytes.
+	BuildMemoryBytes int64
+
+	// MetricFlushMemoryBytes overrides the metric flush job workspace target. Zero retains one
+	// quarter of the allowance derived from MergeMemoryBytes, independently of BuildMemoryBytes.
+	MetricFlushMemoryBytes int64
+
 	// MinFreeBytes is the headroom each engine leaves unused on a backend that reports free space.
 	// Once the medium holds less than a pending flush plus this, the engine refuses to flush and
 	// starts rejecting writes with an error wrapping [backend.ErrNoSpace] rather than accepting data
@@ -448,6 +456,16 @@ func WithMergeMemory(maxBytes int64) Option {
 	return func(o *Options) { o.MergeMemoryBytes = maxBytes }
 }
 
+// WithBuildMemory sets shared admission capacity independently of the workspace targets.
+func WithBuildMemory(maxBytes int64) Option {
+	return func(o *Options) { o.BuildMemoryBytes = maxBytes }
+}
+
+// WithMetricFlushMemory sets the metric flush job workspace target.
+func WithMetricFlushMemory(maxBytes int64) Option {
+	return func(o *Options) { o.MetricFlushMemoryBytes = maxBytes }
+}
+
 // WithDiskReserve sets the free bytes and free inodes each engine keeps in hand before it refuses
 // to flush and starts rejecting writes. Zero takes the defaults, negative disables that axis. See
 // [Options.MinFreeBytes] and [Options.MinFreeInodes].
@@ -537,6 +555,9 @@ func errOptionInvalid(reason string) error {
 
 // validate checks the option combination before construction.
 func (o *Options) validate() error {
+	if o.BuildMemoryBytes < 0 || o.MetricFlushMemoryBytes < 0 {
+		return errOptionInvalid("BuildMemoryBytes and MetricFlushMemoryBytes must not be negative")
+	}
 	if o.MetricSeparateSeries && (!o.MetricDiskSeries || !o.MetricSeriesChunks || o.Cluster != nil) {
 		return errOptionInvalid("MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks without Cluster")
 	}
