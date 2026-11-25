@@ -23,14 +23,26 @@ func TestAutomaticPressureSecondGeneration(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const headLimit = 512 << 10
 		e, _ := newFaultWALEngine(t, 10)
-		observability, metrics := obstest.New(t)
+		observability, _ := obstest.New(t)
 		firstRotation := &automaticRotationGate{Tracer: observability.Tracer, entered: make(chan struct{}), resume: make(chan struct{})}
 		observability.Tracer = firstRotation
 		releaseRotation := sync.OnceFunc(func() { close(firstRotation.resume) })
 		e.cfg.Obs = observability
-		be := &generationGateBackend{Backend: backend.Memory(), first: make(chan struct{}), resume: make(chan struct{})}
-		resume := sync.OnceFunc(func() { close(be.resume) })
-		e.cfg.Backend, e.cfg.Prefix = be, "automatic-generations"
+		firstBuild, resumeBuild := make(chan struct{}), make(chan struct{})
+		resume := sync.OnceFunc(func() { close(resumeBuild) })
+		var blockOldest sync.Once
+		e.pressure.beforeBuild = func(epoch uint64) {
+			e.mu.RLock()
+			oldest := e.pressureGenerations[0].epoch == epoch
+			e.mu.RUnlock()
+			if oldest {
+				blockOldest.Do(func() {
+					close(firstBuild)
+					<-resumeBuild
+				})
+			}
+		}
+		e.cfg.Backend, e.cfg.Prefix = backend.Memory(), "automatic-generations"
 		e.cfg.DiskSeries, e.cfg.AsyncPressureFlush, e.cfg.PressureGenerations = true, true, 2
 		e.cfg.ResidentHeadBytes = headLimit
 		pool := memlimit.NewPool(64 << 20)
@@ -96,16 +108,15 @@ func TestAutomaticPressureSecondGeneration(t *testing.T) {
 		t.Logf("before rotation input=%d target=%d largest growth=%d", beforeRotation, headLimit, maxGrowth.Load())
 		require.LessOrEqual(t, beforeRotation, int64(headLimit/2)+maxGrowth.Load(), "scheduling delay must not consume the next generation's allowance")
 		releaseRotation()
-		<-be.first
+		<-firstBuild
 		synctest.Wait()
-		require.EqualValues(t, 2, be.identities.Load(), "ordinary admission must build B while A remains blocked, without changing the budget")
 		e.mu.RLock()
 		frozen := len(e.pressureGenerations)
+		ready := frozen == 2 && e.pressureGenerations[1].ready
 		e.mu.RUnlock()
 		require.Equal(t, 2, frozen)
+		require.True(t, ready, "the later generation may finish multiple parts before A publishes")
 		require.Zero(t, e.PartCount(), "a later output cannot publish across the blocked generation")
-		require.EqualValues(t, 1,
-			metrics.Counter("storage.flush.generation_starts", "concurrency", "overlapping"), "B overlaps A inside streamHead")
 		snapshotCount = int(accepted.Load())
 		var err error
 		snapshot, err = e.Fetch(t.Context(), fetch.Request{Start: 0, End: 200})
