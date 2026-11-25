@@ -235,6 +235,7 @@ type Engine struct {
 	head               *head
 	parts              []*part
 	seriesTable        *seriesSnapshot
+	seriesBuildMu      sync.Mutex
 	seriesRetired      []bucketindex.SeriesRoot
 	seriesIDs          *seriestable.IDCache
 	verifiedIdentities *verifiedIdentityCache

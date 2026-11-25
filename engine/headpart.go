@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -41,17 +42,18 @@ type headPartBuilder struct {
 	sorting      int64
 	runRows      int64
 
-	target, reserved int64
-	reservationFloor int64
-	release          func()
-	writer           *partStreamWriter
-	writerRows       int
-	partRefs         []uint32
-	parts            []*part
-	rows             int
-	orderWorkspace   int64
-	buildScratch     block.StreamBuildScratch
-	closedBloomBytes int64
+	target, reserved      int64
+	reservationFloor      int64
+	release               func()
+	writer                *partStreamWriter
+	writerRows            int
+	partRefs              []uint32
+	parts                 []*part
+	rows                  int
+	orderWorkspace        int64
+	buildScratch          block.StreamBuildScratch
+	closedBloomBytes      int64
+	sharedIdentitiesReady bool
 }
 
 func (e *Engine) flushMemoryBytes() int64 {
@@ -62,8 +64,16 @@ func (e *Engine) flushMemoryBytes() int64 {
 }
 
 func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sampleBuf, input ...*headBuildInput) ([]*part, int, error) {
-	if e.cfg.FlushAdmission != nil && e.cfg.TryFlushAdmission != nil && backend.StreamsWrites(e.cfg.Backend) && !e.cfg.SeparateSeries {
-		parts, rows, err := e.streamHeadParallel(ctx, samples, input...)
+	// Take metadata ownership before reserving workspace, so a waiting
+	// generation cannot hold the bytes needed by the metadata owner.
+	unlock := func() {}
+	if e.cfg.SeparateSeries {
+		e.seriesBuildMu.Lock()
+		unlock = sync.OnceFunc(e.seriesBuildMu.Unlock)
+		defer unlock()
+	}
+	if e.cfg.FlushAdmission != nil && e.cfg.TryFlushAdmission != nil && backend.StreamsWrites(e.cfg.Backend) {
+		parts, rows, err := e.streamHeadParallel(ctx, samples, unlock, input...)
 		if !errors.Is(err, errHeadPlanUnavailable) && !errors.Is(err, errHeadJobBudget) {
 			return parts, rows, err
 		}
@@ -75,6 +85,11 @@ func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sa
 			reason = "workspace"
 		}
 		e.cfg.Obs.Flush.BuildFallback(ctx, reason)
+		if e.cfg.SeparateSeries {
+			unlock()
+			e.seriesBuildMu.Lock()
+			defer e.seriesBuildMu.Unlock()
+		}
 	}
 	e.cfg.Obs.Flush.BuildPlan(ctx, 1, 0)
 	return e.streamHeadSerial(ctx, samples, input...)
@@ -195,6 +210,7 @@ func (b *headPartBuilder) prepareWriter() error {
 		return err
 	}
 	b.writer.buildScratch = &b.buildScratch
+	b.writer.sharedIdentitiesReady = b.sharedIdentitiesReady
 	if err := b.writer.reserveSeries(len(b.entries)); err != nil {
 		return err
 	}
@@ -435,7 +451,7 @@ func (b *headPartBuilder) finish() error {
 			}
 		}
 	}
-	if b.e.cfg.SeparateSeries {
+	if b.e.cfg.SeparateSeries && !b.sharedIdentitiesReady {
 		b.writer.reserveSeriesMetadata = func(bytes int64) error {
 			numeric := buildbudget.Add(b.baseBytes(), buildbudget.Add(b.writer.residentBytes(), b.writer.w.FinishBytes()))
 			needed := buildbudget.Add(numeric, bytes)

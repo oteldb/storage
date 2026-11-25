@@ -61,6 +61,7 @@ type partStreamWriter struct {
 	buildScratch *block.StreamBuildScratch
 
 	streamIdentities      bool
+	sharedIdentitiesReady bool
 	reserveSeriesMetadata func(int64) error
 	identityWriterBytes   int64
 	sidecarWriterBytes    int64
@@ -401,6 +402,9 @@ func (p *partStreamWriter) ensureSharedIdentities(ctx context.Context, identitie
 		if identities.view.ID(int(ref)) != u128ToID(p.runs[i].Value) {
 			return errors.New("engine: shared series identity mismatch")
 		}
+	}
+	if p.sharedIdentitiesReady {
+		return nil
 	}
 	return p.e.ensureSeriesIdentities(ctx, identities, p.reserveSeriesMetadata)
 }

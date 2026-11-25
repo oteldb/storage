@@ -78,10 +78,24 @@ var errParallelPartWrite = errors.New("injected parallel part write failure")
 
 func TestParallelPartBuildsReachWritersBeforePublication(t *testing.T) {
 	t.Parallel()
+	testParallelPartBuildsReachWritersBeforePublication(t, false)
+}
+
+func TestSharedSeriesParallelPartBuildsReachWritersBeforePublication(t *testing.T) {
+	t.Parallel()
+	testParallelPartBuildsReachWritersBeforePublication(t, true)
+}
+
+func testParallelPartBuildsReachWritersBeforePublication(t *testing.T, separate bool) {
+	t.Helper()
 	synctest.Test(t, func(t *testing.T) {
 		const share = 32 << 20
 		pool := memlimit.NewPool(4 * share)
-		merge, err := pool.Acquire(t.Context(), 3*share)
+		held := int64(3 * share)
+		if separate {
+			held = share
+		}
+		merge, err := pool.Acquire(t.Context(), held)
 		require.NoError(t, err)
 		defer merge()
 		file, err := backendfile.New(t.TempDir())
@@ -94,6 +108,7 @@ func TestParallelPartBuildsReachWritersBeforePublication(t *testing.T) {
 		e.cfg.Obs = observability
 		e.cfg.Backend, e.cfg.Prefix = be, "parallel-parts"
 		e.cfg.DiskSeries, e.cfg.MetricSeriesChunks = true, true
+		e.cfg.SeparateSeries = separate
 		e.cfg.ResidentHeadBytes, e.cfg.FlushMemoryBytes = 1<<30, share
 		e.cfg.MaxPartBytes = 4 * partRowBytes
 		e.cfg.FlushAdmission, e.cfg.TryFlushAdmission = pool.Acquire, pool.TryAcquire
@@ -128,6 +143,14 @@ func TestParallelPartBuildsReachWritersBeforePublication(t *testing.T) {
 		require.Len(t, be.seen, 4, "parallel work must not produce abandoned retry parts")
 		require.Zero(t, measured.Counter("storage.flush.build.fallbacks"))
 		require.Equal(t, []int64{200}, headTS(replayedHead(t, fs), benchSeries(0)), "checkpoint must leave the concurrent append replayable")
+		if separate {
+			require.NoError(t, e.LoadParts(t.Context()))
+			it, err := e.Fetch(t.Context(), fetch.Request{Start: 100, End: 100})
+			require.NoError(t, err)
+			batches, err := fetch.Drain(t.Context(), it)
+			require.NoError(t, err)
+			require.Len(t, batches, 16, "all numeric parts resolve their descriptors after reload")
+		}
 		require.Zero(t, pool.Waiting())
 		release, ok := pool.TryAcquire(share)
 		require.True(t, ok, "all flush workspace must return while the merge still holds its share")

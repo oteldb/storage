@@ -117,7 +117,7 @@ func (p *headPartPlan) record(b *headPartBuilder) error {
 }
 
 func (e *Engine) streamHeadParallel(
-	ctx context.Context, samples map[signal.SeriesID]*sampleBuf, input ...*headBuildInput,
+	ctx context.Context, samples map[signal.SeriesID]*sampleBuf, releaseMetadata func(), input ...*headBuildInput,
 ) ([]*part, int, error) {
 	plan := headPartPlan{}
 	plan.shared = buildbudget.Add(buildbudget.Mul(int64(len(samples)), memsize.Of[headRunEntry]()),
@@ -174,6 +174,13 @@ func (e *Engine) streamHeadParallel(
 		return nil, 0, err
 	}
 	b.identities = series.EncodingBudget{}
+	if e.cfg.SeparateSeries {
+		if err := plan.prepareSharedIdentities(ctx, &b); err != nil {
+			return nil, 0, err
+		}
+		b.sharedIdentitiesReady = true
+		releaseMetadata()
+	}
 	parts, rows, err := plan.build(ctx, &b)
 	if err != nil {
 		return nil, 0, err
@@ -266,7 +273,8 @@ func (p *headPartPlan) build(ctx context.Context, planner *headPartBuilder) ([]*
 	for i := range workers {
 		b := &workers[i]
 		*b = headPartBuilder{input: planner.input, ctx: workCtx, e: planner.e, view: planner.view, target: planner.target,
-			reserved: planner.reserved, reservationFloor: planner.reserved, fixedLimit: admission.primary}
+			reserved: planner.reserved, reservationFloor: planner.reserved, fixedLimit: admission.primary,
+			sharedIdentitiesReady: planner.sharedIdentitiesReady}
 		if i == 1 {
 			b.fixedLimit = admission.secondary
 		}
