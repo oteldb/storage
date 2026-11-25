@@ -58,12 +58,18 @@ func TestResidentLimitedCompactionConverges(t *testing.T) {
 	e := convergenceEngine(t)
 	rows, want := recordDigest(t, e)
 	for range 24 {
+		shape := e.MergeShape()
+		if shape.Candidates == 0 && shape.ForceCandidates == 0 {
+			break
+		}
+		// Scoring can stop ordinary selection while force still has a feasible run.
+		opts := MergeOptions{Force: shape.Candidates == 0}
 		before := e.PartPrefixes()
-		selected := e.selectMergeParts(e.parts, MergeOptions{}, e.mergeCapBytes(t.Context()))
+		selected := e.selectMergeParts(e.parts, opts, e.mergeCapBytes(t.Context()))
 		compressed := !slices.ContainsFunc(selected, e.compressionForces)
 		index, err := e.cfg.Backend.Read(t.Context(), e.indexKey())
 		require.NoError(t, err)
-		changed, err := e.MergeStep(t.Context(), MergeOptions{})
+		changed, err := e.MergeStep(t.Context(), opts)
 		require.NoError(t, err)
 		if changed && compressed {
 			require.LessOrEqual(t, e.PartCount(), len(before), "ordinary compaction must not multiply already-compressed parts")
@@ -75,15 +81,11 @@ func TestResidentLimitedCompactionConverges(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, index, after, "rejection must not publish an index or block claim")
 		}
-		if e.MergeShape().Candidates == 0 {
-			break
-		}
 	}
-	require.Zero(t, e.MergeShape().Candidates, "unchanged resident-limited runs must reach a fixed point")
-	t.Logf("fixed_point_parts=%d non_reducing_merges=%d", e.PartCount(), e.MergeShape().NonReducingMerges)
-	if e.PartCount() > 1 {
-		require.Positive(t, e.MergeShape().NonReducingMerges, "a resident-limited fixed point must remember the rejected output")
-	}
+	shape := e.MergeShape()
+	require.Zero(t, shape.Candidates, "unchanged resident-limited runs must reach a fixed point")
+	require.Zero(t, shape.ForceCandidates, "force must also exhaust its feasible runs")
+	t.Logf("fixed_point_parts=%d non_reducing_merges=%d", e.PartCount(), shape.NonReducingMerges)
 	gotRows, got := recordDigest(t, e)
 	assert.Equal(t, rows, gotRows)
 	assert.Equal(t, want, got)
