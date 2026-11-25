@@ -5,8 +5,8 @@ go 1.26.6
 require (
 	github.com/VictoriaMetrics/easyproto v1.2.0
 	github.com/aws/aws-sdk-go-v2 v1.48.0
-	github.com/aws/aws-sdk-go-v2/credentials v1.21.0
-	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.10
+	github.com/aws/aws-sdk-go-v2/credentials v1.21.3
+	github.com/aws/aws-sdk-go-v2/service/s3 v1.116.0
 	github.com/aws/smithy-go v1.28.9
 	github.com/go-faster/errors v0.8.0
 	github.com/go-faster/fs v0.15.0
