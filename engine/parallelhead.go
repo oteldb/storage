@@ -28,6 +28,7 @@ type parallelHeadHooks struct {
 }
 
 type parallelHead struct {
+	generation    sync.RWMutex
 	ownership     seriesOwnership
 	admission     sync.Mutex
 	pendingSeries atomic.Int64
@@ -48,6 +49,10 @@ func (e *Engine) appendKnownPrepared(
 	e.mu.RLockWriter()
 	defer e.mu.RUnlockWriter()
 	ph := e.parallel
+	if e.commitOwnedRotation() {
+		ph.generation.RLock()
+		defer ph.generation.RUnlock()
+	}
 	p.prepareOwnership()
 	var conflict func()
 	if ph.hooks != nil {

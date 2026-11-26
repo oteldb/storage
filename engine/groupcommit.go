@@ -1,6 +1,10 @@
 package engine
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/go-faster/errors"
+)
 
 type preparedCommit struct {
 	done, owner bool
@@ -74,6 +78,23 @@ func (e *Engine) commitPrepared(p *preparedBatch) error {
 	q.changed.Broadcast()
 	q.mu.Unlock()
 	return err
+}
+
+// control joins the commit owner after its caller has closed the preparation gate.
+func (q *commitQueue) control(run func() error) error {
+	q.mu.Lock()
+	if q.active || q.n != 0 {
+		q.mu.Unlock()
+		return errors.New("engine: generation rotated with pending commits")
+	}
+	q.active = true
+	q.mu.Unlock()
+	defer func() {
+		q.mu.Lock()
+		q.active = false
+		q.mu.Unlock()
+	}()
+	return run()
 }
 
 func (e *Engine) writePreparedGroup(group []*preparedBatch, size int) error {

@@ -2191,7 +2191,9 @@ builders. Native descriptor builders borrow the pinned series view and spill sor
 oversized batches. A bounded fan-in combines contiguous ordinal ranges into one immutable run,
 so temporary spills do not add catalog roots. A metadata writer serializes final bindings after
 workspace admission and retries if a sibling changed the descriptor snapshot. Two frozen
-generations may build concurrently. Publication and WAL coverage advance in generation order.
+generations may build concurrently. In standalone mode the commit owner seals and swaps after a
+generation-specific gate drains prepared tails. The lifecycle gate stays shared across the seal.
+Publication and WAL coverage advance in generation order.
 
 Catalog v9 names metadata roots independently of sample entries and publishes their union with
 numeric parts and the WAL checkpoint in one CAS. Runs sync before publication; failed commits
@@ -2202,8 +2204,11 @@ Existing operations retain old root leases, and pending numeric outputs retain t
 leases through failed commits. Numeric membership, never
 metadata-run cardinality, determines active series and coverage; descriptors survive retention.
 
-Metadata compaction streams at most eight roots through bounded output builders under ordinary merge
-admission. Catalog v10 carries exact retired root bindings, preventing stale-writer rebases from
+Metadata compaction has its own background maintenance turns under shared merge admission.
+It scans up to eight roots by canonical ID, compares raw bytes for duplicate IDs and streams winners
+from mapped ordinals into the native output index. Existing postings are remapped and merged.
+A bounded history skips exact input groups that produced no reduction at the same allowance.
+Buffered backends retain the rebuilding fallback. Catalog v10 carries exact retired root bindings, preventing stale-writer rebases from
 resurrecting compacted roots; uncompacted stores retain v9 encoding. Retirement records are retained
 and charged as identity metadata; compaction stops at 4096 records. Source objects are not deleted,
 so descriptor garbage collection remains unavailable.

@@ -177,6 +177,9 @@ func (e *Engine) startGenerationBuilds(
 	if err := ctx.Err(); err != nil {
 		return 0, false, err
 	}
+	if e.commitOwnedRotation() {
+		return e.startCommitOwnedGenerationBuilds(ctx, force, pressureMode, results)
+	}
 	e.mu.RLock()
 	needed := len(e.pressureGenerations) < 2 && e.generationRotationNeededLocked(force, pressureMode)
 	for _, g := range e.pressureGenerations {
@@ -198,23 +201,86 @@ func (e *Engine) startGenerationBuilds(
 		}
 		froze = true
 	}
-	if err == nil && ctx.Err() == nil {
-		for _, g := range e.pressureGenerations {
-			if g.building || g.ready {
-				continue
-			}
-			g.building = true
-			started++
-			go func() {
-				if e.pressure.beforeBuild != nil {
-					e.pressure.beforeBuild(g.epoch)
-				}
-				results <- e.buildFrozenGeneration(ctx, g)
-			}()
-		}
+	if err == nil {
+		started = e.launchGenerationBuildsLocked(ctx, results)
 	}
 
 	return started, froze, err
+}
+
+// commitOwnedRotation is scoped to the standalone two-generation pipeline.
+func (e *Engine) commitOwnedRotation() bool {
+	return e.twoPressureGenerations() && e.cfg.Term == nil && e.cfg.WriterID == ""
+}
+
+func (e *Engine) startCommitOwnedGenerationBuilds(ctx context.Context, force, pressureMode bool,
+	results chan<- generationResult,
+) (int, bool, error) {
+	e.mu.RLock()
+	rotate := len(e.pressureGenerations) < 2 && e.generationRotationNeededLocked(force, pressureMode)
+	needsBuilder := false
+	for _, g := range e.pressureGenerations {
+		needsBuilder = needsBuilder || !g.building && !g.ready
+	}
+	e.mu.RUnlock()
+	if !rotate && !needsBuilder {
+		return 0, false, nil
+	}
+	var froze bool
+	if rotate {
+		var err error
+		froze, err = e.rotateWithCommitOwner(ctx, force, pressureMode)
+		if err != nil {
+			return 0, false, err
+		}
+	}
+	e.mu.LockState()
+	defer e.mu.UnlockState()
+	return e.launchGenerationBuildsLocked(ctx, results), froze, ctx.Err()
+}
+
+func (e *Engine) rotateWithCommitOwner(ctx context.Context, force, pressureMode bool) (bool, error) {
+	// Lifetime stays pinned, while the narrower generation gate prevents new
+	// preparations and drains the old ones through publication before WAL seal.
+	e.mu.RLockWriter()
+	defer e.mu.RUnlockWriter()
+	ph := e.parallel
+	ph.generation.Lock()
+	defer ph.generation.Unlock()
+	var froze bool
+	err := ph.commits.control(func() (err error) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		e.mu.Publish(func() {
+			if len(e.pressureGenerations) < 2 && e.generationRotationNeededLocked(force, pressureMode) {
+				_, err = e.freezePressureGenerationLocked(ctx)
+				froze = err == nil
+			}
+		})
+		return err
+	})
+	return froze, err
+}
+
+func (e *Engine) launchGenerationBuildsLocked(ctx context.Context, results chan<- generationResult) (started int) {
+	if ctx.Err() != nil {
+		return 0
+	}
+	for _, g := range e.pressureGenerations {
+		if g.building || g.ready {
+			continue
+		}
+		g.building = true
+		started++
+		go func() {
+			if e.pressure.beforeBuild != nil {
+				e.pressure.beforeBuild(g.epoch)
+			}
+			results <- e.buildFrozenGeneration(ctx, g)
+		}()
+	}
+	return started
 }
 
 func (e *Engine) publishReadyGenerations(ctx context.Context) (rows int, written int64, err error) {
