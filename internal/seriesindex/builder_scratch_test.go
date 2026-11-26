@@ -27,6 +27,7 @@ func TestBuilderOwnsRepeatedPostingKeys(t *testing.T) {
 		}
 		src[i] = signal.Series{Attributes: signal.NewAttributes(
 			signal.KeyValue{Key: name, Value: typed},
+			signal.KeyValue{Key: []byte{'l'}, Value: signal.StringValue(bytes.Repeat(value, 64))},
 			signal.KeyValue{Key: []byte("id"), Value: signal.IntValue(int64(i))},
 		)}
 	}
@@ -49,7 +50,7 @@ func TestBuilderOwnsRepeatedPostingKeys(t *testing.T) {
 			input[i] = 255
 		}
 	}
-	for _, scratch := range [3][]byte{builder.canonicalScratch, builder.valueScratch, builder.postingScratch} {
+	for _, scratch := range [2][]byte{builder.canonicalScratch, builder.valueScratch} {
 		for i := range scratch {
 			scratch[i] = 255
 		}
@@ -75,25 +76,17 @@ func TestBuilderOwnsRepeatedPostingKeys(t *testing.T) {
 	require.NoError(t, index.Visit(t.Context(), refs, func(id signal.SeriesID, _ []byte, _ Metadata) error { selected = append(selected, id); return nil }))
 	require.Equal(t, stringsOnly, selected)
 	require.NoError(t, refs.Err())
-	require.Len(t, builder.names, 2)
-	require.Len(t, builder.values, 6, "typed values and unique IDs retain separate postings")
+	require.Len(t, builder.names, 3)
+	require.Len(t, builder.names["l\x00n"].values, 2, "typed values retain separate postings")
+	require.Len(t, builder.names["id"].values, 4)
 }
 
 func TestBuilderScratchCapacityIsPriced(t *testing.T) {
 	t.Parallel()
-	for _, name := range []string{"value", "posting"} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			var builder Builder
-			before, encodedBefore := builder.Bytes(), builder.EncodedBound()
-			const capacity = 4096
-			if name == "value" {
-				builder.valueScratch = make([]byte, 0, capacity)
-			} else {
-				builder.postingScratch = make([]byte, 0, capacity)
-			}
-			require.GreaterOrEqual(t, builder.Bytes()-before, int64(capacity))
-			require.Equal(t, encodedBefore, builder.EncodedBound(), "unserialized scratch belongs to retained memory, not encoded output")
-		})
-	}
+	var builder Builder
+	before, encodedBefore := builder.Bytes(), builder.EncodedBound()
+	const capacity = 4096
+	builder.valueScratch = make([]byte, 0, capacity)
+	require.GreaterOrEqual(t, builder.Bytes()-before, int64(capacity))
+	require.Equal(t, encodedBefore, builder.EncodedBound(), "unserialized scratch belongs to retained memory, not encoded output")
 }

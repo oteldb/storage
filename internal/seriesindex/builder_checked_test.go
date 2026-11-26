@@ -20,7 +20,6 @@ func TestBuilderCheckedHashDoesNotPublishMismatch(t *testing.T) {
 	require.Zero(t, builder.Count())
 	require.Zero(t, builder.registry.Len())
 	require.Empty(t, builder.names)
-	require.Empty(t, builder.values)
 	var reference Builder
 	registry := series.New()
 	for i := range input {

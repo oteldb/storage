@@ -42,12 +42,14 @@ type record struct {
 
 type namePosting struct {
 	refs      []uint32
+	values    map[string]*valuePosting
+	keyBytes  int
 	nonString bool
 }
 
 type valuePosting struct {
-	key  string
-	refs []uint32
+	refs     []uint32
+	keyBytes int
 }
 
 // Builder owns one output part's metadata. Callers include Bytes in their build admission.
@@ -57,10 +59,9 @@ type Builder struct {
 	borrowedRefs                     []uint32
 	records                          []record
 	names                            map[string]*namePosting
-	values                           map[string]*valuePosting
 	bytes                            int64
 	canonicalScratch                 []byte
-	valueScratch, postingScratch     []byte
+	valueScratch                     []byte
 	parentDigest                     [32]byte
 	encodedRaw, encodedRecords       int64
 	maxKeyBytes, maxCanonicalBytes   int
@@ -74,7 +75,7 @@ func NewBorrowedBuilder(view series.View) Builder { return Builder{borrowed: &vi
 
 // Bytes bounds retained metadata and sorting/directory scratch during writing.
 func (b *Builder) Bytes() int64 {
-	n := b.bytes + memsize.Slice(b.borrowedRefs) + int64(cap(b.canonicalScratch)) + int64(cap(b.valueScratch)) + int64(cap(b.postingScratch))
+	n := b.bytes + memsize.Slice(b.borrowedRefs) + int64(cap(b.canonicalScratch)) + int64(cap(b.valueScratch))
 	if b.registry != nil {
 		n += b.registry.SizeBytes()
 	}
@@ -241,6 +242,10 @@ func visitLabels(s signal.Series, visit func([]byte, signal.Value)) {
 	}
 }
 
+func appendLabelKey(dst []byte, section byte, name []byte) []byte {
+	return appendEscaped(append(dst, section), name)
+}
+
 func appendEscaped(dst, src []byte) []byte {
 	for _, b := range src {
 		dst = append(dst, b)
@@ -304,8 +309,11 @@ func (b *Builder) Write(dst io.Writer) error {
 			return err
 		}
 	}
+	var labelKey [128]byte
+	keyScratch := labelKey[:0]
 	for _, name := range names {
-		if err := postings.write(appendEscaped([]byte{'h'}, []byte(name)), b.names[name].refs); err != nil {
+		keyScratch = appendLabelKey(keyScratch[:0], 'h', []byte(name))
+		if err := postings.write(keyScratch, b.names[name].refs); err != nil {
 			return err
 		}
 	}
@@ -332,24 +340,18 @@ func (b *Builder) Write(dst io.Writer) error {
 		if b.names[name].nonString {
 			value = 1
 		}
-		if err := w.Append(appendEscaped([]byte{'n'}, []byte(name)), []byte{value}); err != nil {
+		keyScratch = appendLabelKey(keyScratch[:0], 'n', []byte(name))
+		if err := w.Append(keyScratch, []byte{value}); err != nil {
 			return err
 		}
 	}
-	values := make([]string, 0, len(b.values))
-	for key := range b.values {
-		values = append(values, key)
-	}
-	slices.Sort(values)
 	if b.mergedPostings != nil {
 		if err := b.writeMergedPostings(w, 'p'); err != nil {
 			return err
 		}
 	}
-	for _, key := range values {
-		if err := postings.write([]byte(key), b.values[key].refs); err != nil {
-			return err
-		}
+	if err := b.writeValuePostings(&postings, names, keyScratch); err != nil {
+		return err
 	}
 	var value []byte
 	view := b.View()
@@ -385,6 +387,28 @@ func (b *Builder) WriteObject(ctx context.Context, dst backend.Backend, key stri
 		return err
 	}
 	return w.Commit(ctx)
+}
+
+func (b *Builder) writeValuePostings(w *postingsWriter, names []string, key []byte) error {
+	var values []string
+	for _, name := range names {
+		n := b.names[name]
+		values = slices.Grow(values[:0], len(n.values))
+		for value := range n.values {
+			values = append(values, value)
+		}
+		// Escaping preserves byte order, including a prefix sorting before its extensions.
+		slices.Sort(values)
+		key = appendLabelKey(key[:0], 'p', []byte(name))
+		nameBytes := len(key)
+		for _, value := range values {
+			key = appendEscaped(key[:nameBytes], []byte(value))
+			if err := w.write(key, n.values[value].refs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (b *Builder) addViewLabels(view series.View, i int, ref uint32) {
@@ -517,8 +541,8 @@ func decodeRecord(data []byte) (signal.SeriesID, []byte, Metadata, error) {
 
 func (b *Builder) initPostings() {
 	if b.names == nil {
-		b.names, b.values = make(map[string]*namePosting), make(map[string]*valuePosting)
-		b.bytes += 2 * memsize.MapBase
+		b.names = make(map[string]*namePosting)
+		b.bytes += memsize.MapBase
 	}
 }
 
@@ -531,9 +555,9 @@ func (b *Builder) addEncodedLabel(ref uint32, name, encoded []byte) {
 	b.initPostings()
 	n := b.names[string(name)]
 	if n == nil {
-		n = &namePosting{}
+		n = &namePosting{values: make(map[string]*valuePosting), keyBytes: 3 + len(name) + bytes.Count(name, []byte{0})}
 		b.names[string(name)] = n
-		b.bytes += int64(len(name)) + memsize.MapEntry[string, *namePosting]() + memsize.Of[namePosting]()
+		b.bytes += int64(len(name)) + memsize.MapEntry[string, *namePosting]() + memsize.Of[namePosting]() + memsize.MapBase
 	}
 	n.nonString = n.nonString || signal.ValueKind(encoded[0]) != signal.KindStr
 	if len(n.refs) == 0 || n.refs[len(n.refs)-1] != ref {
@@ -541,20 +565,16 @@ func (b *Builder) addEncodedLabel(ref uint32, name, encoded []byte) {
 		n.refs = append(n.refs, ref)
 		b.bytes += int64(cap(n.refs)-prior) * 4
 	}
-	b.postingScratch = append(b.postingScratch[:0], 'p')
-	b.postingScratch = appendEscaped(b.postingScratch, name)
-	nameBytes := len(b.postingScratch)
-	b.postingScratch = appendEscaped(b.postingScratch, encoded)
-	b.maxKeyBytes = max(b.maxKeyBytes, len(b.postingScratch)+4)
-	b.encodedRaw = buildbudget.Add(b.encodedRaw, 2*int64(nameBytes)+int64(len(b.postingScratch))+129)
-	b.encodedRecords = buildbudget.Add(b.encodedRecords, 3)
-	// Keep the lookup conversion temporary; only newly stored keys own a copy.
-	p := b.values[string(b.postingScratch)]
+	// Only a new key takes ownership of encoded bytes.
+	p := n.values[string(encoded)]
 	if p == nil {
-		p = &valuePosting{key: string(b.postingScratch)}
-		b.values[p.key] = p
-		b.bytes += int64(len(b.postingScratch)) + memsize.MapEntry[string, *valuePosting]() + memsize.Of[valuePosting]()
+		p = &valuePosting{keyBytes: n.keyBytes + 2 + len(encoded) + bytes.Count(encoded, []byte{0})}
+		n.values[string(encoded)] = p
+		b.maxKeyBytes = max(b.maxKeyBytes, p.keyBytes+4)
+		b.bytes += int64(len(encoded)) + memsize.MapEntry[string, *valuePosting]() + memsize.Of[valuePosting]()
 	}
+	b.encodedRaw = buildbudget.Add(b.encodedRaw, 2*int64(n.keyBytes)+int64(p.keyBytes)+129)
+	b.encodedRecords = buildbudget.Add(b.encodedRecords, 3)
 	if len(p.refs) > 0 && p.refs[len(p.refs)-1] == ref {
 		return
 	}
