@@ -53,6 +53,8 @@ type valuePosting struct {
 // Builder owns one output part's metadata. Callers include Bytes in their build admission.
 type Builder struct {
 	registry                         *series.Index
+	borrowed                         *series.View
+	borrowedRefs                     []uint32
 	records                          []record
 	names                            map[string]*namePosting
 	values                           map[string]*valuePosting
@@ -61,6 +63,7 @@ type Builder struct {
 	valueScratch, postingScratch     []byte
 	parentDigest                     [32]byte
 	encodedRaw, encodedRecords       int64
+	maxKeyBytes                      int
 	mergedPostings                   *PostingMerge
 	fallbackBytes                    int64
 	mergeCanonicalBytes, mergeLabels int64
@@ -68,7 +71,7 @@ type Builder struct {
 
 // Bytes bounds retained metadata and sorting/directory scratch during writing.
 func (b *Builder) Bytes() int64 {
-	n := b.bytes + int64(cap(b.canonicalScratch)) + int64(cap(b.valueScratch)) + int64(cap(b.postingScratch))
+	n := b.bytes + memsize.Slice(b.borrowedRefs) + int64(cap(b.canonicalScratch)) + int64(cap(b.valueScratch)) + int64(cap(b.postingScratch))
 	if b.registry != nil {
 		n += b.registry.SizeBytes()
 	}
@@ -82,6 +85,41 @@ func (b *Builder) EncodedBound() int64 {
 	return buildbudget.Add(buildbudget.Add(buildbudget.Mul(raw, 2), buildbudget.Mul(records, 45)), footerSize)
 }
 
+// StreamingDirectoryBytes prices the page keys, page records and final sparse directory.
+// The caller separately prices page compression and the largest record.
+func (b *Builder) StreamingDirectoryBytes() int64 {
+	// Each pair of consecutive pages spans at least a target page in full-key
+	// bytes. EncodedBound includes full keys before prefix compression.
+	full := b.EncodedBound()
+	pages := 2 + full/(pageSize/2)
+	keys := min(full, buildbudget.Mul(pages, int64(max(b.maxKeyBytes, 17))))
+	return buildbudget.Add(buildbudget.Mul(keys, 3),
+		buildbudget.Mul(pages, 4*memsize.Of[pageInfo]()+directorySize))
+}
+
+// NewBorrowedBuilder borrows a pinned registry view. Use AddBorrowed to append references.
+func NewBorrowedBuilder(view series.View) Builder { return Builder{borrowed: &view} }
+
+// AddBorrowed appends an ordered reference into the borrowed view.
+func (b *Builder) AddBorrowed(i int, meta Metadata) error {
+	if b.borrowed == nil || i < 0 || i >= b.borrowed.Len() || uint64(i) > math.MaxUint32 {
+		return errors.New("seriesindex: identity reference outside view")
+	}
+	view := *b.borrowed
+	id := view.ID(i)
+	if err := b.checkID(id); err != nil {
+		return err
+	}
+	b.canonicalScratch = view.AppendCanonical(b.canonicalScratch[:0], i)
+	ref := b.appendRecord(id, meta, len(b.canonicalScratch))
+	b.borrowedRefs = append(b.borrowedRefs, uint32(i))
+	b.addViewLabels(view, i, ref)
+	return nil
+}
+
+// ID returns the canonical ID of the ordered output reference i.
+func (b *Builder) ID(i int) signal.SeriesID { return b.records[i].id }
+
 // BindParent binds the index to the raw parent manifest digest.
 func (b *Builder) BindParent(digest [32]byte) { b.parentDigest = digest }
 
@@ -90,6 +128,9 @@ func (b *Builder) Count() int { return len(b.records) }
 
 // Entry materializes one identity, reusing the caller's attribute headers.
 func (b *Builder) Entry(i int, attrs signal.Attributes) series.Entry {
+	if b.borrowed != nil {
+		return series.Entry{ID: b.records[i].id, Series: b.borrowed.At(int(b.borrowedRefs[i]), attrs)}
+	}
 	return series.Entry{ID: b.records[i].id, Series: b.registry.View().At(i, attrs)}
 }
 
@@ -130,12 +171,16 @@ func (b *Builder) AddView(view series.View, i int, meta Metadata) error {
 	}
 	b.registry.AddView(view, i)
 	ref := b.appendRecord(id, meta, len(b.canonicalScratch))
+	b.addViewLabels(view, i, ref)
+	return nil
+}
+
+func (b *Builder) addViewLabels(view series.View, i int, ref uint32) {
 	resource, scope := view.Context(i)
 	visitLabels(signal.Series{Resource: resource, Scope: scope}, func(name []byte, value signal.Value) {
 		b.addLabel(ref, name, value)
 	})
 	view.EncodedAttributes(i, func(name, encoded []byte) { b.addEncodedLabel(ref, name, encoded) })
-	return nil
 }
 
 // MergePostings chooses immutable source postings for subsequent AddIdentity calls.
@@ -319,7 +364,11 @@ func (b *Builder) Write(dst io.Writer) error {
 		value = binary.BigEndian.AppendUint64(value[:0], r.id.Hi)
 		value = binary.BigEndian.AppendUint64(value, r.id.Lo)
 		value = appendMetadata(value, r.meta)
-		value = view.AppendCanonical(value, i)
+		if b.borrowed != nil {
+			value = b.borrowed.AppendCanonical(value, int(b.borrowedRefs[i]))
+		} else {
+			value = view.AppendCanonical(value, i)
+		}
 		binary.BigEndian.PutUint32(recordKeyBuffer[1:], uint32(i))
 		if err := w.Append(recordKeyBuffer[:], value); err != nil {
 			return err
@@ -491,6 +540,7 @@ func (b *Builder) addEncodedLabel(ref uint32, name, encoded []byte) {
 	b.postingScratch = appendEscaped(b.postingScratch, name)
 	nameBytes := len(b.postingScratch)
 	b.postingScratch = appendEscaped(b.postingScratch, encoded)
+	b.maxKeyBytes = max(b.maxKeyBytes, len(b.postingScratch)+4)
 	b.encodedRaw = buildbudget.Add(b.encodedRaw, 2*int64(nameBytes)+int64(len(b.postingScratch))+129)
 	b.encodedRecords = buildbudget.Add(b.encodedRecords, 3)
 	// Keep the lookup conversion temporary; only newly stored keys own a copy.

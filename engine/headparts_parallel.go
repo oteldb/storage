@@ -61,11 +61,17 @@ func (b *headPartBuilder) reservePlan(bytes int64, phase string) error {
 			return err
 		}
 	} else {
-		bytes = min(b.target, max(bytes, b.reserved+max(b.reserved/2, 1<<20)))
+		rounded := min(b.target, max(bytes, buildbudget.Add(b.reserved, max(b.reserved/2, 1<<20))))
 		var ok bool
-		release, ok = b.e.cfg.TryFlushAdmission(bytes - b.reserved)
-		if !ok {
-			return errHeadPlanUnavailable
+		for _, want := range [2]int64{rounded, bytes} {
+			release, ok = b.e.cfg.TryFlushAdmission(want - b.reserved)
+			if ok {
+				bytes = want
+				break
+			}
+			if want == bytes {
+				return errHeadPlanUnavailable
+			}
 		}
 	}
 	prior := b.release
@@ -159,7 +165,7 @@ func (e *Engine) streamHeadParallel(
 	}
 	if err := walkIdentityOrder(ctx, order.view, order.runs, func(id signal.SeriesID, ref uint32) error {
 		if buf := samples[id]; buf != nil && len(buf.ts) > 0 {
-			return b.add(id, ref, buf)
+			return b.add(ref, buf)
 		}
 		return nil
 	}); err != nil {

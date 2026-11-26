@@ -105,7 +105,10 @@ func (e *Engine) writeSeriesDelta(ctx context.Context, entries identitySnapshot,
 		return err
 	}
 
-	var builder seriestable.Builder
+	if backend.StreamsWrites(e.cfg.Backend) {
+		return e.writeNativeSeriesDelta(ctx, entries, known, snapshot, base, reserve)
+	}
+	builder := seriestable.NewBorrowedBuilder(entries.view)
 	var largest int64
 	for i, ref := range entries.refs {
 		if known[i] {
@@ -121,7 +124,7 @@ func (e *Engine) writeSeriesDelta(ctx context.Context, entries identitySnapshot,
 				return err
 			}
 		}
-		if err := builder.AddView(entries.view, int(ref)); err != nil {
+		if err := builder.AddBorrowed(int(ref)); err != nil {
 			return err
 		}
 	}
@@ -130,10 +133,7 @@ func (e *Engine) writeSeriesDelta(ctx context.Context, entries identitySnapshot,
 		return nil
 	}
 	prefix := e.cfg.Prefix + "/s-" + partid.New().String()
-	writerBytes, priced := backend.WriterMemory(e.cfg.Backend, prefix+"/series-index")
-	if backend.StreamsWrites(e.cfg.Backend) && !priced {
-		return errors.New("engine: separate series requires bounded writer memory")
-	}
+	writerBytes, _ := backend.WriterMemory(e.cfg.Backend, prefix+"/series-index")
 	needed := buildbudget.Add(base, buildbudget.Add(builder.Bytes(), buildbudget.Mul(builder.EncodedBound(), 4)))
 	needed = buildbudget.Add(needed, buildbudget.Add(buildbudget.Mul(writerBytes, 4), buildbudget.Mul(max(64<<10, largest), 160)))
 	if reserve != nil {
@@ -141,11 +141,13 @@ func (e *Engine) writeSeriesDelta(ctx context.Context, entries identitySnapshot,
 			return err
 		}
 	}
-	return e.installSeriesDelta(ctx, entries, snapshot, known, prefix, &builder)
+	return e.installSeriesDelta(ctx, entries, snapshot, known, prefix, func() (*seriestable.Run, error) {
+		return seriestable.WriteWithIDCache(ctx, e.cfg.Backend, prefix, &builder, e.seriesIDs)
+	})
 }
 
 func (e *Engine) installSeriesDelta(
-	ctx context.Context, entries identitySnapshot, snapshot *seriesSnapshot, known []bool, prefix string, builder *seriestable.Builder,
+	ctx context.Context, entries identitySnapshot, snapshot *seriesSnapshot, known []bool, prefix string, write func() (*seriestable.Run, error),
 ) error {
 	// No workspace acquisition while owning the writer. A sibling may have added the
 	// same descriptors while we planned off-lock.
@@ -157,7 +159,7 @@ func (e *Engine) installSeriesDelta(
 	if stale {
 		return errSeriesSnapshotChanged
 	}
-	run, err := seriestable.WriteWithIDCache(ctx, e.cfg.Backend, prefix, builder, e.seriesIDs)
+	run, err := write()
 	if err != nil {
 		return errors.Wrap(err, "write shared series delta")
 	}

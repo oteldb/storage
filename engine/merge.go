@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"maps"
+	"math"
 	"slices"
 	"time"
 
@@ -204,6 +205,27 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{}, err
 	}
 
+	// A background merge may still make progress with fewer inputs while a flush
+	// owns part of the pool. Use the smaller grant for every subsequent phase.
+	if !admitted && opts.Background && allowance < math.MaxInt64 && allowance >= 128<<20 {
+		reduced := allowance / 2
+		smaller, planErr := e.selectBoundedMergeWithAllowance(ctx, cohorts, readable, opts, capBytes, e.mergeIdle(opts), turn, reduced)
+		if planErr != nil && !errors.Is(planErr, errMergeInputMemory) {
+			return mergeResult{parts: dropped}, planErr
+		}
+		if planErr == nil && len(smaller.parts) > 0 {
+			if deferred, err := e.admitPressureMerge(ctx, smaller.parts, true); deferred {
+				return mergeResult{deferred: true, parts: dropped}, err
+			}
+			release, admitted, err = e.admitMergeBytes(ctx, true, reduced)
+			if err != nil {
+				return mergeResult{parts: dropped}, err
+			}
+			if admitted {
+				selection, allowance = smaller, reduced
+			}
+		}
+	}
 	if !admitted {
 		e.recordMergePlan(ctx, selection.plan, "pool_busy")
 		// Remembered so the facade can order this engine first next cycle. Without it the task
@@ -735,6 +757,8 @@ func (e *Engine) compactStreamWithInputs(
 	var m sampleMerge
 	var item mergeIdentityItem
 	encoded := e.newEncodedMergePlan(precision, withSF, plan.tiers)
+	var windows mergeSeriesWindows
+	plain := plainMergeInputs(src, plan.tiers)
 	reached := func(w *partStreamWriter) bool {
 		return budget.Reached(w.encodedBytes(), buildbudget.Add(held, w.mergeResidentBytes()))
 	}
@@ -751,6 +775,20 @@ func (e *Engine) compactStreamWithInputs(
 			return nil, err
 		}
 		if copied {
+			continue
+		}
+		if plain && largeMergeSeries(item.ranges) {
+			err := windows.merge(ctx, streams, item.ranges, start, item.covered, func(ts []int64, values []float64, covered int64) error {
+				return router.Append(ts[0], func(w *partStreamWriter) (bool, error) {
+					if err := item.appendTo(w, ts, values, nil, covered); err != nil {
+						return false, err
+					}
+					return reached(w), nil
+				})
+			})
+			if err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if err := mergeStreamedSeries(&m, src, streams, scratch, item.ranges, start); err != nil {

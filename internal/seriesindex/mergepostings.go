@@ -20,6 +20,8 @@ type mergePostingSource struct {
 	pairs      []referencePair
 	dense      []uint32
 	denseStart uint32
+	offset     uint32
+	contiguous bool
 }
 
 // PostingMerge remaps immutable source postings into one output's canonical reference order.
@@ -33,6 +35,7 @@ type PostingMerge struct {
 	nameBytes      int64
 	selectedSource int
 	outputCount    int
+	contiguous     bool
 }
 
 // NewPostingMerge retains index handles; the enclosing merge must keep their parts pinned.
@@ -109,7 +112,7 @@ func (m *PostingMerge) activeSources() []mergePostingSource {
 func (b *Builder) writeMergedPostings(w *TableWriter, prefix byte) error {
 	m := b.mergedPostings
 	sources := m.activeSources()
-	if prefix == 'h' {
+	if prefix == 'h' && !m.contiguous {
 		m.names = m.names[:0]
 		m.nameBytes = 0
 		for i := range sources {
@@ -138,14 +141,14 @@ func (b *Builder) writeMergedPostings(w *TableWriter, prefix byte) error {
 			}
 			continue
 		}
-		if prefix == 'h' {
+		if prefix == 'h' && !m.contiguous {
 			m.rememberName(writer.group)
 		}
 		if err := writer.writeReferences(); err != nil {
 			return err
 		}
 	}
-	if prefix == 'n' && nameCount != len(m.names) {
+	if prefix == 'n' && !m.contiguous && nameCount != len(m.names) {
 		return errors.Wrap(ErrCorrupt, "merge label name missing")
 	}
 	return nil
@@ -186,9 +189,10 @@ func (w *mergedPostingWriter) writeName(m *PostingMerge) (bool, error) {
 			}
 		}
 	}
-	_, keep := slices.BinarySearch(m.names, string(w.group))
-	if !keep {
-		return false, nil
+	if !m.contiguous {
+		if _, keep := slices.BinarySearch(m.names, string(w.group)); !keep {
+			return false, nil
+		}
 	}
 	return true, w.writer.table.Append(w.group, []byte{flag})
 }
@@ -381,6 +385,9 @@ func (s *mergePostingSource) prepareDense() {
 }
 
 func (s *mergePostingSource) lookup(ref uint32) (uint32, bool) {
+	if s.contiguous {
+		return s.offset + ref, true
+	}
 	if len(s.dense) > 0 {
 		if ref < s.denseStart || uint64(ref-s.denseStart) >= uint64(len(s.dense)) {
 			return 0, false

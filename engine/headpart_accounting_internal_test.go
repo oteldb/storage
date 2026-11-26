@@ -59,9 +59,11 @@ func TestHeadJobsUseAggregateReservation(t *testing.T) {
 					for _, id := range in.ids[2*i : 2*i+2] {
 						ref, ok := e.head.series.Ref(id)
 						require.True(t, ok)
-						entries = append(entries, headRunEntry{id: id, ref: ref, buf: e.head.samples[id], ordered: true})
+						entries = append(entries, headRunEntry{ref: ref, buf: e.head.samples[id], ordered: true})
 					}
-					slices.SortFunc(entries, func(a, b headRunEntry) int { return a.id.Compare(b.id) })
+					slices.SortFunc(entries, func(a, b headRunEntry) int {
+						return e.head.series.View().ID(int(a.ref)).Compare(e.head.series.View().ID(int(b.ref)))
+					})
 					plan.jobs = append(plan.jobs, headPartJob{
 						entries: entries, rows: 2, privateBytes: tc.peaks[i] * mib, retainedBytes: mib / int64(len(tc.peaks)),
 					})

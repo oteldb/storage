@@ -1481,9 +1481,9 @@ the EC wrapper, a minimal embedder backend — where each ranged read would itse
 `s3.ObjectStore` without `RangeObjectStore` claims `ReaderAt` yet answers every range with a whole GET,
 so a merge over it re-reads each column once per window.
 
-**The merge unit is still one whole series.** `decodeRange` holds a series' range per source and
-`collect` materializes the merged series before downsampling, so a part of few series with many samples
-each holds O(one series × parts), and one hot series can approach a whole part.
+**Series with more than 4,096 raw, unweighted rows** use 512-row input and output windows.
+The timestamp heap preserves original source order on ties, even when duplicates span input
+windows. Other series retain the existing whole-series fallback, including weighted rollups.
 
 **The write side.** Streaming the output decouples granularity from memory: the row cap sets part
 size only, where buffering the output would also make it the peak-memory knob (`capRows × 32 B`, 512
@@ -2186,8 +2186,10 @@ numeric parts carry SIDX, coverage watermarks and aggregate statistics, with a m
 `series-ref` marker instead of identities/postings. Numeric compaction never rebuilds descriptors.
 
 Flush planning checks descriptors by bounded series-ID ranges before launching parallel numeric
-builders. A metadata writer serializes additions after workspace admission and retries if a sibling
-changed the descriptor snapshot. Planned scratch grows only with nonblocking grants. Two frozen
+builders. Native descriptor builders borrow the pinned series view and spill sorted postings from
+oversized batches. A bounded fan-in combines contiguous ordinal ranges into one immutable run,
+so temporary spills do not add catalog roots. A metadata writer serializes final bindings after
+workspace admission and retries if a sibling changed the descriptor snapshot. Two frozen
 generations may build concurrently. Publication and WAL coverage advance in generation order.
 
 Catalog v9 names metadata roots independently of sample entries and publishes their union with

@@ -18,7 +18,6 @@ import (
 const defaultFlushMemoryBytes = 64 << 20
 
 type headRunEntry struct {
-	id      signal.SeriesID
 	buf     *sampleBuf
 	ref     uint32
 	ordered bool
@@ -135,7 +134,7 @@ func (e *Engine) streamHeadSerial(
 			if buf == nil || len(buf.ts) == 0 {
 				return nil
 			}
-			return b.add(id, ref, buf)
+			return b.add(ref, buf)
 		})
 	}
 	if err == nil {
@@ -232,8 +231,23 @@ func (b *headPartBuilder) reservePhase(bytes int64, phase string) error {
 	if b.plan != nil {
 		return b.reservePlan(bytes, phase)
 	}
-	if phase == "metadata" && bytes > b.reserved {
-		bytes = max(bytes, b.reserved+max(b.reserved/2, 1<<20))
+	if phase == "metadata" && b.release != nil && b.e.cfg.TryFlushAdmission != nil && bytes > b.reserved {
+		rounded := max(bytes, buildbudget.Add(b.reserved, max(b.reserved/2, 1<<20)))
+		for _, want := range [2]int64{rounded, bytes} {
+			if release, ok := b.e.cfg.TryFlushAdmission(want - b.reserved); ok {
+				prior := b.release
+				b.release = func() {
+					release()
+					prior()
+				}
+				b.reserved = want
+				b.e.cfg.Obs.Flush.Reservation(b.ctx, phase, want, b.target, 0)
+				return nil
+			}
+			if want == bytes {
+				break
+			}
+		}
 	}
 	if b.release != nil {
 		b.release()
@@ -254,7 +268,7 @@ func (b *headPartBuilder) reservePhase(bytes int64, phase string) error {
 	return nil
 }
 
-func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) error {
+func (b *headPartBuilder) add(ref uint32, buf *sampleBuf) error {
 	if len(b.entries) == cap(b.entries) {
 		if err := b.flushRun(); err != nil {
 			return err
@@ -316,7 +330,7 @@ func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) er
 	if b.plan != nil {
 		work = headEntryWork(encoded, materialized, sorting, identityWorkspace, int64(len(buf.ts)))
 	}
-	b.entries = append(b.entries, headRunEntry{id: id, buf: buf, ref: ref, ordered: ordered, work: work})
+	b.entries = append(b.entries, headRunEntry{buf: buf, ref: ref, ordered: ordered, work: work})
 	return nil
 }
 
@@ -358,7 +372,7 @@ func (b *headPartBuilder) flushRun() error {
 		if !entry.ordered {
 			ts, values, sf = sortedWindow(buf, minInt64, maxInt64, nil)
 		}
-		if err := b.append(idToU128(entry.id), entry.ref, ts, values, sf); err != nil {
+		if err := b.append(idToU128(b.view.ID(int(entry.ref))), entry.ref, ts, values, sf); err != nil {
 			return err
 		}
 	}
