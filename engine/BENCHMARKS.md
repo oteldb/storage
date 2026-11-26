@@ -95,3 +95,35 @@ For four hourly inputs at 15-second cadence, use `OTELDB_BENCH_CPU_HOSTS=1000` a
 `OTELDB_BENCH_CPU_POINTS=240`; the fixture stays bounded at 8,000 series and 7.68 million samples.
 Point counts up to 1,024 are supported. `OTELDB_BENCH_CPU_QUERY_MERGE=true` makes the query
 benchmark compact its fixture before measuring, so it can check the resulting chunk layout.
+
+## Frozen-head finish
+
+`BenchmarkFrozenHeadFinish` measures one WAL-sealed generation on native files in shared-series mode.
+The CPU fixture has 10,000 hosts, eight series per host and one sample per series by default.
+Input generation, appends, WAL seal, prior-root construction and teardown are outside the timer.
+
+- `new-descriptors` starts with an empty catalog. `existing-descriptors` seeds the same IDs in eight prior flushes.
+- `build` measures descriptor preflight, part construction and keeping the finished generation ready for publication.
+- `publish` measures installation of the already-built generation, including the catalog update and WAL checkpoint.
+
+The fixture uses an 8 GiB build pool, a 64 MiB per-flush target, a 4 MiB series cache and WAL sync disabled.
+Set `OTELDB_BENCH_CPU_HOSTS`, `OTELDB_BENCH_CPU_POINTS` or `OTELDB_BENCH_FROZEN_FLUSH_MIB` to vary fixture size and job allowance.
+The output reports rows, parts, existing roots and backend read bytes per operation. Build also reports
+samples per second, new descriptor roots, admitted builders and serial fallbacks.
+
+```sh
+GOMAXPROCS=8 go test -vet=off ./engine -run '^$' -bench '^BenchmarkFrozenHeadFinish$' \
+  -benchtime=1x -count=6 -benchmem
+```
+
+Set `OTELDB_BENCH_FROZEN_PROFILE` to an output path prefix and select one leaf with
+`-benchtime=1x -count=1` to capture CPU and allocation profiles for that phase. Use the before
+and after allocation snapshots with `go tool pprof -base` to exclude allocations from setup.
+For denser CPU profiles across several iterations, use `-cpuprofile` and filter with
+`go tool pprof -tagfocus="frozen-head-phase=build"` or `-tagfocus="frozen-head-phase=publish"`.
+
+```sh
+OTELDB_BENCH_FROZEN_PROFILE=/path/to/profiles/frozen GOMAXPROCS=8 \
+  go test -vet=off ./engine -run '^$' \
+  -bench '^BenchmarkFrozenHeadFinish$/^existing-descriptors$/^build$' -benchtime=1x -count=1 -benchmem
+```
