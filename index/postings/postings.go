@@ -112,6 +112,15 @@ func (p *memoryPostings[T]) Get(nameID, valueID uint32) Postings {
 	return p.fromSlice(p.bucket(pos - 1).series)
 }
 
+// PostingCount bounds the number of references for one exact pair without sorting.
+func (p *memoryPostings[T]) PostingCount(nameID, valueID uint32) int {
+	pos := p.byPair[postingKey(nameID, valueID)]
+	if pos == 0 {
+		return 0
+	}
+	return len(p.bucket(pos - 1).series)
+}
+
 // ForName returns the series that carry the attribute nameID with any value.
 func (p *memoryPostings[T]) ForName(nameID uint32) Postings {
 	p.ensureSorted()

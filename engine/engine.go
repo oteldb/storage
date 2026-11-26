@@ -185,6 +185,9 @@ type Config struct {
 	// ResidentHeadBytes flushes disk-indexed heads under memory pressure. Zero uses 128 MiB.
 	// One atomic caller batch may exceed the target and flushes before the next write.
 	ResidentHeadBytes int64
+	// HeadRotationBytes sets the active generation target in the standalone two-generation pipeline.
+	// Zero derives the target from ResidentHeadBytes.
+	HeadRotationBytes int64
 	// SeriesCacheBytes bounds historical ID/watermark cache memory per disk-indexed engine.
 	// SeparateSeries reserves one eighth each for sorted IDs and verified ID membership;
 	// the rest holds watermarks.

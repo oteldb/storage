@@ -384,7 +384,8 @@ func (e *Engine) flushResidentHeadLocked() error {
 }
 
 func (e *Engine) residentHeadOverBudgetLocked() bool {
-	return e.head.bytes > 0 && e.head.residentIdentityBytes()+e.head.inFlightBytes() >= e.cfg.ResidentHeadBytes
+	used := e.head.residentIdentityBytes() + e.head.inFlightBytes()
+	return e.head.bytes > 0 && e.headPressureLocked(used)
 }
 
 //nolint:contextcheck,nolintlint // The context analyzer consumes this intentional API boundary before reporting.

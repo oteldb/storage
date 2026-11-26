@@ -33,6 +33,7 @@ type parallelHead struct {
 	admission     sync.Mutex
 	pendingSeries atomic.Int64
 	commits       commitQueue
+	ready         readyCommitQueue
 	pending       atomic.Int64
 	preparations  *batchPreparations
 	hooks         *parallelHeadHooks
@@ -76,8 +77,7 @@ func (e *Engine) appendKnownPrepared(
 	}
 	ph.admission.Lock()
 	e.mu.RLock()
-	if e.cfg.DiskSeries && e.head.bytes > 0 &&
-		e.head.residentIdentityBytes()+e.head.inFlightBytes()+ph.pending.Load() >= e.cfg.ResidentHeadBytes {
+	if e.cfg.DiskSeries && e.head.bytes > 0 && e.headPressureLocked(e.head.residentIdentityBytes()+e.head.inFlightBytes()+ph.pending.Load()) {
 		e.mu.RUnlock()
 		ph.admission.Unlock()
 		return AppendResult{}, preparedPressure, nil

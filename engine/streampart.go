@@ -65,6 +65,7 @@ type partStreamWriter struct {
 
 	streamIdentities      bool
 	sharedIdentitiesReady bool
+	deferSharedBinding    bool
 	reserveSeriesMetadata func(int64) error
 	identityWriterBytes   int64
 	sidecarWriterBytes    int64
@@ -379,7 +380,7 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 	if err != nil {
 		return nil, err
 	}
-	if p.e.cfg.SeparateSeries {
+	if p.e.cfg.SeparateSeries && !p.deferSharedBinding {
 		if err := p.e.attachSharedSeries(part); err != nil {
 			part.closeReaders()
 			return nil, err

@@ -180,13 +180,7 @@ func (e *Engine) streamHeadParallel(
 		return nil, 0, err
 	}
 	b.identities = series.EncodingBudget{}
-	if e.cfg.SeparateSeries {
-		if err := plan.prepareSharedIdentities(ctx, &b); err != nil {
-			return nil, 0, err
-		}
-		b.sharedIdentitiesReady = true
-	}
-	parts, rows, err := plan.build(ctx, &b)
+	parts, rows, err := plan.buildHeadParts(ctx, &b)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -248,6 +242,12 @@ func (p *headPartPlan) build(ctx context.Context, planner *headPartBuilder) ([]*
 	if admission.release != nil {
 		defer admission.release()
 	}
+	return p.buildAdmitted(ctx, planner, admission)
+}
+
+func (p *headPartPlan) buildAdmitted(
+	ctx context.Context, planner *headPartBuilder, admission headPartAdmission,
+) ([]*part, int, error) {
 	planner.e.cfg.Obs.Flush.BuildMemory(ctx, "shared", p.shared)
 	planner.e.cfg.Obs.Flush.BuildMemory(ctx, "retained", p.retained)
 	planner.e.cfg.Obs.Flush.BuildMemory(ctx, "held", admission.held)
@@ -261,15 +261,7 @@ func (p *headPartPlan) build(ctx context.Context, planner *headPartBuilder) ([]*
 	completed := false
 	defer func() {
 		for i := range workers {
-			if workers[i].writer != nil {
-				workers[i].writer.abort()
-			}
-			if !completed {
-				closePartReaders(workers[i].parts)
-			}
-			planner.e.cfg.Obs.Flush.BuildMemory(ctx, "checked_private", workers[i].checkedPrivate)
-			planner.e.cfg.Obs.Flush.BuildMemory(ctx, "tracked_private", workers[i].trackedPrivate)
-			workers[i] = headPartBuilder{}
+			workers[i].closeHeadPartWorker(ctx, completed)
 		}
 	}()
 	workCtx, cancel := context.WithCancel(ctx)
@@ -277,9 +269,11 @@ func (p *headPartPlan) build(ctx context.Context, planner *headPartBuilder) ([]*
 	var next atomic.Uint32
 	for i := range workers {
 		b := &workers[i]
-		*b = headPartBuilder{input: planner.input, ctx: workCtx, e: planner.e, view: planner.view, target: planner.target,
+		*b = headPartBuilder{
+			input: planner.input, ctx: workCtx, e: planner.e, view: planner.view, target: planner.target,
 			reserved: planner.reserved, reservationFloor: planner.reserved, fixedLimit: admission.primary,
-			sharedIdentitiesReady: planner.sharedIdentitiesReady}
+			sharedIdentitiesReady: planner.sharedIdentitiesReady, deferSharedBinding: planner.deferSharedBinding,
+		}
 		if i == 1 {
 			b.fixedLimit = admission.secondary
 		}
@@ -315,6 +309,26 @@ func (p *headPartPlan) build(ctx context.Context, planner *headPartBuilder) ([]*
 	}
 	completed = true
 	return parts, rows, nil
+}
+
+func (b *headPartBuilder) closeHeadPartWorker(ctx context.Context, completed bool) {
+	if w := b.writer; w != nil {
+		w.abort()
+		if b.deferSharedBinding {
+			b.e.discardPrivateHeadPart(ctx, w.prefix)
+		}
+	}
+	if !completed {
+		closePartReaders(b.parts)
+		if b.deferSharedBinding {
+			for _, output := range b.parts {
+				b.e.discardPrivateHeadPart(ctx, output.prefix)
+			}
+		}
+	}
+	b.e.cfg.Obs.Flush.BuildMemory(ctx, "checked_private", b.checkedPrivate)
+	b.e.cfg.Obs.Flush.BuildMemory(ctx, "tracked_private", b.trackedPrivate)
+	*b = headPartBuilder{}
 }
 
 func (p *headPartPlan) runJobs(ctx context.Context, b *headPartBuilder, next *atomic.Uint32, results []headPartResult, skip int) error {

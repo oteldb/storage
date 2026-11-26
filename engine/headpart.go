@@ -52,6 +52,7 @@ type headPartBuilder struct {
 	buildScratch          block.StreamBuildScratch
 	closedBloomBytes      int64
 	sharedIdentitiesReady bool
+	deferSharedBinding    bool
 }
 
 func (e *Engine) flushMemoryBytes() int64 {
@@ -196,6 +197,7 @@ func (b *headPartBuilder) prepareWriter() error {
 	}
 	b.writer.buildScratch = &b.buildScratch
 	b.writer.sharedIdentitiesReady = b.sharedIdentitiesReady
+	b.writer.deferSharedBinding = b.deferSharedBinding
 	if err := b.writer.reserveSeries(len(b.entries)); err != nil {
 		return err
 	}

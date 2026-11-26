@@ -2195,6 +2195,15 @@ generations may build concurrently. In standalone mode the commit owner seals an
 generation-specific gate drains prepared tails. The lifecycle gate stays shared across the seal.
 Publication and WAL coverage advance in generation order.
 
+A configured standalone rotation target bounds the active generation independently of
+the resident ceiling. Producers can fill the active generation while a frozen build owns
+the previous one. Prepared batches hold their generation leases through acknowledgement
+and use a bounded atomic handoff to the WAL group owner. Publication still uses the
+engine state lock. With enough combined workspace, numeric builders can finish private
+outputs while descriptor preflight runs. They bind shared roots only after preflight
+succeeds. Catalog publication keeps the same generation order and WAL coverage checks.
+
+
 Catalog v9 names metadata roots independently of sample entries and publishes their union with
 numeric parts and the WAL checkpoint in one CAS. Runs sync before publication; failed commits
 retain pending roots through retries and reloads. A missing or invalid root fences loading.

@@ -43,7 +43,25 @@ func (e *Engine) twoPressureGenerations() bool {
 	return e.cfg.PressureGenerations == 2 && e.pressurePipelineEnabled()
 }
 
-func (e *Engine) pressureRotationBytes() int64 { return e.cfg.ResidentHeadBytes / 2 }
+func (e *Engine) pressureRotationBytes() int64 {
+	limit := e.cfg.ResidentHeadBytes / 2
+	if e.fixedHeadRotation() {
+		return min(limit, e.cfg.HeadRotationBytes)
+	}
+	return limit
+}
+
+// headPressureLocked caps both aggregate ownership and the active generation.
+func (e *Engine) headPressureLocked(used int64) bool {
+	if used >= e.cfg.ResidentHeadBytes {
+		return true
+	}
+	return e.fixedHeadRotation() && e.head.ownedIdentityBytes()+e.head.bytes >= e.pressureRotationBytes()
+}
+
+func (e *Engine) fixedHeadRotation() bool {
+	return e.cfg.HeadRotationBytes > 0 && e.commitOwnedRotation()
+}
 
 // freezePressureGenerationLocked seals before transferring ownership, so seal failure leaves active state intact.
 func (e *Engine) freezePressureGenerationLocked(ctx context.Context) (*pressureGeneration, error) {
@@ -402,7 +420,7 @@ func (e *Engine) generationRotationNeededLocked(force, pressureMode bool) bool {
 	if active >= e.pressureRotationBytes() {
 		return true
 	}
-	if len(e.pressureGenerations) != 1 || e.pressureGenerations[0].ready {
+	if e.fixedHeadRotation() || len(e.pressureGenerations) != 1 || e.pressureGenerations[0].ready {
 		return false
 	}
 	used := e.head.residentIdentityBytes() + e.head.inFlightBytes() + e.parallel.pending.Load()

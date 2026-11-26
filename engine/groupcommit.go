@@ -9,6 +9,8 @@ import (
 type preparedCommit struct {
 	done, owner bool
 	err         error
+	next        *preparedBatch
+	ack         chan error
 }
 
 type commitQueue struct {
@@ -22,6 +24,9 @@ type commitQueue struct {
 var commitBuffers = make(chan []byte, maxPreparedBatches)
 
 func (e *Engine) commitPrepared(p *preparedBatch) error {
+	if e.fixedHeadRotation() {
+		return e.commitReady(p)
+	}
 	q := &e.parallel.commits
 	q.mu.Lock()
 	if q.changed == nil {

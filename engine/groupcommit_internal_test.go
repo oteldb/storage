@@ -24,18 +24,33 @@ func TestPreparedGroupCommit(t *testing.T) {
 				name := "sync=" + strconv.FormatBool(syncWrites) + "/" + failure + "/cold=" + strconv.FormatBool(cold)
 				t.Run(name, func(t *testing.T) {
 					t.Parallel()
-					testPreparedGroupCommit(t, failure, cold, syncWrites)
+					testPreparedGroupCommit(t, failure, cold, syncWrites, false)
 				})
 			}
 		}
 	}
 }
 
-func testPreparedGroupCommit(t *testing.T, failure string, cold, syncWrites bool) {
+func TestPlannerReadyGroupCommit(t *testing.T) {
+	t.Parallel()
+	for _, failure := range []string{"none", "write", "sync"} {
+		t.Run(failure, func(t *testing.T) {
+			t.Parallel()
+			testPreparedGroupCommit(t, failure, true, true, true)
+		})
+	}
+}
+
+func testPreparedGroupCommit(t *testing.T, failure string, cold, syncWrites, planner bool) {
 	t.Helper()
 	fail := failure != "none"
 	e, fs := newFaultWALEngine(t, 0)
 	e.cfg.WAL.SetSync(syncWrites)
+	if planner {
+		e.cfg.DiskSeries, e.cfg.AsyncPressureFlush, e.cfg.PressureGenerations = true, true, 2
+		e.cfg.ResidentHeadBytes, e.cfg.HeadRotationBytes = 1<<30, 256<<20
+		e.head.disk = newDiskHeadState()
+	}
 	t.Cleanup(func() { _ = e.CloseWAL() })
 	identities := []signal.Series{stagedTestSeries("a"), stagedTestSeries("b"), stagedTestSeries("c")}
 	for i := range identities {
@@ -87,7 +102,7 @@ func testPreparedGroupCommit(t *testing.T, failure string, cold, syncWrites bool
 	}
 	go appendSeries(0)
 	<-ready
-	if e.parallel.commits.changed == nil {
+	if !planner && e.parallel.commits.changed == nil {
 		resume()
 		r := <-done
 		require.NoError(t, r.err)

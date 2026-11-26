@@ -115,6 +115,10 @@ reattaches its frozen ownership and keeps the WAL replayable. The optional recen
 target and waits at the full aggregate target. This overlaps ingestion with one frozen builder
 without multiplying resident/cache targets. It is off by default; cluster, read-only and ephemeral
 modes reject it. Head/flush/queue metrics must qualify the changed batching before capacity claims.
+With `MetricPressureGenerations=2`, set `MetricHeadRotationBytes` to rotate the active generation
+independently of the aggregate resident limit. An active generation above its target waits for
+rotation when both frozen slots are occupied. The option requires a standalone writable engine
+and a target at most half of `MetricResidentHeadBytes`.
 `engine.Stats.SeriesComplete` is false while historical metadata is unavailable; `Series` then
 preserves the last complete count. All live local admission and head publication wait for repair;
 accepted WAL and replica payloads still restore into the head, with checkpoints unchanged.
