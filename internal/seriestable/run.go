@@ -38,7 +38,14 @@ func Open(ctx context.Context, be backend.Backend, prefix string, expected ...[3
 }
 
 // OpenWithIDCache retains validated IDs within cache's separate memory budget.
-func OpenWithIDCache(ctx context.Context, be backend.Backend, prefix string, cache *IDCache, expected ...[32]byte) (_ *Run, err error) {
+func OpenWithIDCache(ctx context.Context, be backend.Backend, prefix string, cache *IDCache, expected ...[32]byte) (*Run, error) {
+	return openRun(ctx, be, prefix, cache, 0, expected...)
+}
+
+// A positive writtenMax comes from the writer of this private prefix.
+func openRun(ctx context.Context, be backend.Backend, prefix string, cache *IDCache, writtenMax int64,
+	expected ...[32]byte,
+) (_ *Run, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -85,7 +92,7 @@ func OpenWithIDCache(ctx context.Context, be backend.Backend, prefix string, cac
 		return nil, errors.Wrap(ErrCorrupt, "index manifest binding")
 	}
 	r := &Run{part: p, index: idx, idCache: cache}
-	if err := r.validate(ctx, be, prefix+"/c/0", c); err != nil {
+	if err := r.validate(ctx, be, prefix+"/c/0", c, writtenMax); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -108,7 +115,7 @@ func requireObject(ctx context.Context, be backend.Backend, key string, limit in
 // Count is descriptor cardinality, not active sample cardinality.
 func (r *Run) Count() uint32 { return r.index.Count() }
 
-// MaxCanonicalBytes is the maximum canonical record size observed during validation.
+// MaxCanonicalBytes is the maximum canonical record size.
 func (r *Run) MaxCanonicalBytes() int64 { return r.maxCanonicalBytes }
 
 // PostingIndex exposes the immutable index while the caller pins the run.

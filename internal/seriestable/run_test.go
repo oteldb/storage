@@ -100,6 +100,26 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWriteSkipsDescriptorReadback(t *testing.T) {
+	t.Parallel()
+	be := backendtest.NewByteCounter(backend.Memory())
+	data := descriptors(2000)
+	var largest int
+	for _, s := range data {
+		largest = max(largest, len(s.AppendHashInput(nil)))
+	}
+	written := buildRun(t, be, "fresh", data)
+	require.EqualValues(t, largest, written.MaxCanonicalBytes())
+	writeReadBytes := be.Bytes()
+
+	be.Reset()
+	reopened, err := Open(t.Context(), be, "fresh", written.Digest())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reopened.Close()) }()
+	require.Equal(t, written.MaxCanonicalBytes(), reopened.MaxCanonicalBytes())
+	require.Greater(t, be.Bytes(), writeReadBytes, "reopening reads descriptor pages")
+}
+
 func TestBuilderOwnership(t *testing.T) {
 	t.Parallel()
 	data := descriptors(1)

@@ -70,9 +70,12 @@ func WriteWithIDCache(ctx context.Context, be backend.Backend, prefix string, b 
 	if b == nil || b.Count() == 0 {
 		return nil, errors.New("seriestable: empty run")
 	}
-	return writeRun(ctx, be, prefix, b.Count(), b.index.ID, func(key string, digest [32]byte) error {
+	return writeRun(ctx, be, prefix, b.Count(), b.index.ID, func(key string, digest [32]byte) (int, error) {
 		b.index.BindParent(digest)
-		return b.index.WriteObject(ctx, be, key)
+		if err := b.index.WriteObject(ctx, be, key); err != nil {
+			return 0, err
+		}
+		return b.index.MaxCanonicalBytes(), nil
 	}, cache)
 }
 
@@ -81,7 +84,7 @@ func WriteContiguous(ctx context.Context, be backend.Backend, prefix string, vie
 	inputs []*seriesindex.Index, cache *IDCache,
 ) (*Run, error) {
 	return writeRun(ctx, be, prefix, len(refs), func(i int) signal.SeriesID { return view.ID(int(refs[i])) },
-		func(key string, digest [32]byte) error {
+		func(key string, digest [32]byte) (int, error) {
 			return seriesindex.WriteContiguous(ctx, be, key, digest, view, refs, inputs)
 		}, cache)
 }
@@ -90,13 +93,13 @@ func WriteContiguous(ctx context.Context, be backend.Backend, prefix string, vie
 func WriteOrdinalMerge(ctx context.Context, be backend.Backend, prefix string, count int,
 	merge *seriesindex.PostingMerge, idAt func(int) signal.SeriesID, rawAt func(int) ([]byte, error), cache *IDCache,
 ) (*Run, error) {
-	return writeRun(ctx, be, prefix, count, idAt, func(key string, digest [32]byte) error {
+	return writeRun(ctx, be, prefix, count, idAt, func(key string, digest [32]byte) (int, error) {
 		return seriesindex.WriteOrdinalMerge(ctx, be, key, digest, count, merge, idAt, rawAt)
 	}, cache)
 }
 
 func writeRun(ctx context.Context, be backend.Backend, prefix string, count int, idAt func(int) signal.SeriesID,
-	writeIndex func(string, [32]byte) error, cache *IDCache,
+	writeIndex func(string, [32]byte) (int, error), cache *IDCache,
 ) (*Run, error) {
 	w := block.NewStreamWriterTo(ctx, be, prefix, block.WithSizingStats())
 	defer w.Abort()
@@ -119,11 +122,12 @@ func writeRun(ctx context.Context, be backend.Backend, prefix string, count int,
 	if err != nil {
 		return nil, err
 	}
-	if err := writeIndex(prefix+"/series-index", digest); err != nil {
+	maxCanonicalBytes, err := writeIndex(prefix+"/series-index", digest)
+	if err != nil {
 		return nil, err
 	}
 	if err := backend.SyncPrefix(ctx, be, prefix); err != nil {
 		return nil, err
 	}
-	return OpenWithIDCache(ctx, be, prefix, cache, digest)
+	return openRun(ctx, be, prefix, cache, int64(maxCanonicalBytes), digest)
 }

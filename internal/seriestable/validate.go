@@ -21,7 +21,7 @@ import (
 
 const validationBuffer = 64 << 10
 
-func (r *Run) validate(ctx context.Context, be backend.Backend, key string, desc block.ColumnDesc) (err error) {
+func (r *Run) validate(ctx context.Context, be backend.Backend, key string, desc block.ColumnDesc, writtenMax int64) (err error) {
 	r.idFilter = r.idCache.reserveFilter(r.Count())
 	retained := r.idCache.reserve(r)
 	defer func() {
@@ -29,10 +29,12 @@ func (r *Run) validate(ctx context.Context, be backend.Backend, key string, desc
 			r.removeCachedIDs()
 		}
 	}()
-	return r.validateContents(ctx, be, key, desc, retained)
+	return r.validateContents(ctx, be, key, desc, retained, writtenMax)
 }
 
-func (r *Run) validateContents(ctx context.Context, be backend.Backend, key string, desc block.ColumnDesc, retained *cachedIDs) error {
+func (r *Run) validateContents(ctx context.Context, be backend.Backend, key string, desc block.ColumnDesc,
+	retained *cachedIDs, writtenMax int64,
+) error {
 	// Descriptor materialization is bounded by one page, never by run cardinality.
 	n := 20*r.MaxPageBytes() + 4*validationBuffer
 	budget := readbudget.From(ctx)
@@ -45,10 +47,12 @@ func (r *Run) validateContents(ctx context.Context, be backend.Backend, key stri
 	if err != nil {
 		return err
 	}
-	rawReader := r.index.RawReader(ctx)
-	rawReader.StreamPages()
-	var identity signal.Series
-	var canonical []byte
+	var descriptors descriptorValidator
+	if writtenMax == 0 {
+		descriptors.reader = r.index.RawReader(ctx)
+		descriptors.reader.StreamPages()
+	}
+	r.maxCanonicalBytes = writtenMax
 	var encoded [17]byte
 	var seen uint32
 	if err := r.index.VisitIDs(ctx, func(indexID signal.SeriesID, ref uint32, inline seriesindex.Metadata) error {
@@ -62,26 +66,19 @@ func (r *Run) validateContents(ctx context.Context, be backend.Backend, key stri
 		if encoded[16] != 1 || id != indexID {
 			return errors.Wrap(ErrCorrupt, "ID column and index disagree")
 		}
-		raw, meta, err := rawReader.LookupOrdinal(id, ref)
-		if err != nil {
-			return err
-		}
-		if inline != (seriesindex.Metadata{}) || meta != (seriesindex.Metadata{}) {
+		if inline != (seriesindex.Metadata{}) {
 			return errors.Wrap(ErrCorrupt, "descriptor sample metadata")
-		}
-		used, err := signal.DecodeSeriesInto(&identity, raw)
-		if err != nil || used != len(raw) {
-			return errors.Wrap(ErrCorrupt, "canonical descriptor")
-		}
-		canonical = identity.AppendHashInput(canonical[:0])
-		if !bytes.Equal(raw, canonical) {
-			return errors.Wrap(ErrCorrupt, "noncanonical descriptor")
 		}
 		if ref != seen {
 			return errors.Wrap(ErrCorrupt, "noncanonical descriptor ordinal")
 		}
-
-		r.maxCanonicalBytes = max(r.maxCanonicalBytes, int64(len(raw)))
+		if descriptors.reader != nil {
+			size, err := descriptors.check(id, ref)
+			if err != nil {
+				return err
+			}
+			r.maxCanonicalBytes = max(r.maxCanonicalBytes, size)
+		}
 		retained.set(seen, id)
 		if r.idFilter != nil {
 			r.idFilter.add(id.Lo)
@@ -108,6 +105,31 @@ func (r *Run) validateContents(ctx context.Context, be backend.Backend, key stri
 	}
 	r.idCache.publish(r)
 	return nil
+}
+
+type descriptorValidator struct {
+	reader    *seriesindex.RawReader
+	identity  signal.Series
+	canonical []byte
+}
+
+func (v *descriptorValidator) check(id signal.SeriesID, ref uint32) (int64, error) {
+	raw, meta, err := v.reader.LookupOrdinal(id, ref)
+	if err != nil {
+		return 0, err
+	}
+	if meta != (seriesindex.Metadata{}) {
+		return 0, errors.Wrap(ErrCorrupt, "descriptor sample metadata")
+	}
+	used, err := signal.DecodeSeriesInto(&v.identity, raw)
+	if err != nil || used != len(raw) {
+		return 0, errors.Wrap(ErrCorrupt, "canonical descriptor")
+	}
+	v.canonical = v.identity.AppendHashInput(v.canonical[:0])
+	if !bytes.Equal(raw, v.canonical) {
+		return 0, errors.Wrap(ErrCorrupt, "noncanonical descriptor")
+	}
+	return int64(len(raw)), nil
 }
 
 func (r *Run) openIDColumn(

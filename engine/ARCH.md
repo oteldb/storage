@@ -2231,8 +2231,9 @@ keyed by the low word with a high-word check and a collision map. Entries name a
 by token and are usable only while the checking snapshot contains that root. Adding unrelated roots
 preserves cached membership. The remaining three quarters hold historical watermarks.
 `VerifiedIdentityCacheStats` reports positive membership hit/miss counts. Pending arrays count against the cache limit
-before allocation and become readable only after full run validation; eviction falls back to the
-existing bounded disk reader. Cached IDs never determine active cardinality or sample coverage.
+before allocation and become readable after validating the run binding and ID stream. Reopened runs
+also validate descriptor payloads. Eviction falls back to the existing bounded disk reader. Cached IDs
+never determine active cardinality or sample coverage.
 
 Shared-part ingestion metadata probes reuse the SIDX ordinal and read SMAX through an
 operation-local 32-KiB window. The scratch window is reset and reused across parts; coverage opens

@@ -93,7 +93,7 @@ func (s *seriesDeltaSpills) reduce(ctx context.Context, spills []seriesDeltaSpil
 			start, end := group[0].lo, group[len(group)-1].hi
 			key := s.key()
 			s.active[key] = struct{}{}
-			if err := seriesindex.WriteContiguous(ctx, s.be, key, [32]byte{}, s.entries.view, s.entries.refs[start:end], indexes); err != nil {
+			if _, err := seriesindex.WriteContiguous(ctx, s.be, key, [32]byte{}, s.entries.view, s.entries.refs[start:end], indexes); err != nil {
 				return nil, err
 			}
 			index, err := seriesindex.Open(ctx, s.be, key)

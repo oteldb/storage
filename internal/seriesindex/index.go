@@ -63,7 +63,7 @@ type Builder struct {
 	valueScratch, postingScratch     []byte
 	parentDigest                     [32]byte
 	encodedRaw, encodedRecords       int64
-	maxKeyBytes                      int
+	maxKeyBytes, maxCanonicalBytes   int
 	mergedPostings                   *PostingMerge
 	fallbackBytes                    int64
 	mergeCanonicalBytes, mergeLabels int64
@@ -119,6 +119,9 @@ func (b *Builder) AddBorrowed(i int, meta Metadata) error {
 
 // ID returns the canonical ID of the ordered output reference i.
 func (b *Builder) ID(i int) signal.SeriesID { return b.records[i].id }
+
+// MaxCanonicalBytes returns the largest descriptor emitted by the builder.
+func (b *Builder) MaxCanonicalBytes() int { return b.maxCanonicalBytes }
 
 // BindParent binds the index to the raw parent manifest digest.
 func (b *Builder) BindParent(digest [32]byte) { b.parentDigest = digest }
@@ -356,11 +359,13 @@ func (b *Builder) Write(dst io.Writer) error {
 		value = binary.BigEndian.AppendUint64(value[:0], r.id.Hi)
 		value = binary.BigEndian.AppendUint64(value, r.id.Lo)
 		value = appendMetadata(value, r.meta)
+		start := len(value)
 		if b.borrowed != nil {
 			value = b.borrowed.AppendCanonical(value, int(b.borrowedRefs[i]))
 		} else {
 			value = view.AppendCanonical(value, i)
 		}
+		b.maxCanonicalBytes = max(b.maxCanonicalBytes, len(value)-start)
 		binary.BigEndian.PutUint32(recordKeyBuffer[1:], uint32(i))
 		if err := w.Append(recordKeyBuffer[:], value); err != nil {
 			return err
