@@ -228,22 +228,25 @@ type Engine struct {
 	mu             engineguard.Mutex
 	// The build barrier excludes reset, prune and repair; admitted flush/merge builds take read slots.
 	// Identity lifecycle precedes catalog -> writer -> reader-visible state (see ARCH.md).
-	flushMu            sync.RWMutex
-	identityMu         sync.RWMutex
-	identityOrder      identityOrder
-	activeBuilds       atomic.Int32
-	flushRun           sync.Mutex
-	mergeRun           sync.Mutex
-	mergeNames         *mergePartNames // Owned by mergeRun; flush builders use their own namespaces.
-	head               *head
-	parts              []*part
-	seriesTable        *seriesSnapshot
-	seriesBuildMu      sync.Mutex
-	seriesNoGain       descriptorMergeHistory // Owned by mergeRun.
-	seriesRetired      []bucketindex.SeriesRoot
-	seriesIDs          *seriestable.IDCache
-	verifiedIdentities *verifiedIdentityCache
-	lastMergePlan      atomic.Pointer[MergePlan]
+	flushMu       sync.RWMutex
+	identityMu    sync.RWMutex
+	identityOrder identityOrder
+	activeBuilds  atomic.Int32
+	flushRun      sync.Mutex
+	mergeRun      sync.Mutex
+	mergeNames    *mergePartNames // Owned by mergeRun; flush builders use their own namespaces.
+	head          *head
+	parts         []*part
+	seriesTable   *seriesSnapshot
+	// Confirmed only by a landed CAS or a loaded catalog, under state ownership.
+	compactMetricMetadata bool
+	confirmedSeriesEpoch  uint64
+	seriesBuildMu         sync.Mutex
+	seriesNoGain          descriptorMergeHistory // Owned by mergeRun.
+	seriesRetired         []bucketindex.SeriesRoot
+	seriesIDs             *seriestable.IDCache
+	verifiedIdentities    *verifiedIdentityCache
+	lastMergePlan         atomic.Pointer[MergePlan]
 	// tsCodec is the codec flushes and merges write the timestamp column with. It is a field, not a
 	// constant, only so a test can write the [chunk.CodecDoD] parts earlier builds wrote and check
 	// they merge.
@@ -1714,7 +1717,7 @@ func (e *Engine) ApplyReplicated(data []byte) error {
 		defer e.clearDiskPendingLocked()
 		return e.applyDiskReplicatedLocked(data)
 	}
-	return wal.Replay(data, e.replayHandlers())
+	return wal.Replay(data, e.replayHandlers(context.Background()))
 }
 
 // HeadSampleCount returns the number of samples currently buffered in the head (across all
@@ -2262,9 +2265,10 @@ func bufHasInWindow(buf *sampleBuf, start, end int64) bool {
 // replayHandlers returns the WAL handlers that rebuild the head from logged records — registering
 // each series and appending its samples (plain or scale-factor-carrying) verbatim. Shared by the
 // durable-restart [Engine.Replay] and the trusting [Engine.ApplyReplicated]. The caller holds e.mu.
-func (e *Engine) replayHandlers() wal.Handlers {
+func (e *Engine) replayHandlers(ctx context.Context) wal.Handlers {
 	var encoded []byte
 	return wal.Handlers{
+		OnDescriptorReference: func(id signal.SeriesID) error { return e.replayDescriptorReference(ctx, id) },
 		OnSeries: func(id signal.SeriesID, s signal.Series) error {
 			if e.cfg.DiskSeries {
 				if err := e.replayResidentGuard(0); err != nil {

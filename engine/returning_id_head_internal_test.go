@@ -9,6 +9,7 @@ import (
 	"github.com/oteldb/storage/internal/memlimit"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
+	"github.com/oteldb/storage/wal"
 )
 
 func TestReturningIDHeadReadsAndReplays(t *testing.T) {
@@ -42,7 +43,31 @@ func TestReturningIDHeadReadsAndReplays(t *testing.T) {
 	require.Len(t, e.head.encodedRefs, 1)
 	require.Equal(t, s.AppendHashInput(nil), e.head.series.View().EncodedDescriptor(int(e.head.encodedRefs[0])))
 	require.Zero(t, e.head.sym.Len(), "returning attachments skip eager label interning")
-	require.Equal(t, []int64{200, 201}, headTS(replayedHead(t, fs), s))
+	cfg := e.cfg
+	cfg.WAL = nil
+	reopened := New(cfg)
+	require.NoError(t, reopened.LoadPartsReadOnly(t.Context()))
+	require.True(t, reopened.compactMetricMetadata)
+	entries, err := fs.ReadDir(".")
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the descriptor WAL was checkpointed")
+	data, err := fs.ReadFile(entries[0].Name())
+	require.NoError(t, err)
+	var descriptors, references int
+	require.NoError(t, wal.Replay(data, wal.Handlers{
+		OnSeries: func(signal.SeriesID, signal.Series) error { descriptors++; return nil },
+		OnDescriptorReference: func(got signal.SeriesID) error {
+			require.Equal(t, id, got)
+			references++
+			return nil
+		},
+	}))
+	require.Zero(t, descriptors)
+	require.Equal(t, 1, references)
+	require.ErrorIs(t, wal.Replay(data, New(Config{}).replayHandlers(t.Context())), wal.ErrCorrupt)
+	require.NoError(t, wal.Replay(data, reopened.replayHandlers(t.Context())))
+	require.Equal(t, []int64{200, 201}, headTS(reopened.head, s))
+	require.NoError(t, reopened.CloseWAL())
 
 	for _, value := range []string{"resource", "point", "missing"} {
 		matcher := fetch.EqualMatcher{Name: "host", Value: value}

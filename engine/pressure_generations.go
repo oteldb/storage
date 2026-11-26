@@ -343,7 +343,11 @@ func (e *Engine) finishGenerationBuild(r generationResult) {
 }
 
 func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGeneration) error {
-	if err := e.rememberGenerationWatermarks(ctx, g.head); err != nil {
+	var descriptorEpoch uint64
+	if e.cfg.SeparateSeries && e.fixedHeadRotation() {
+		descriptorEpoch = g.epoch
+	}
+	if err := e.rememberGenerationWatermarks(ctx, g.head, descriptorEpoch); err != nil {
 		return err
 	}
 	var released sampleArena

@@ -187,6 +187,7 @@ type pagedIndex struct {
 	readContext func(context.Context) context.Context
 	be          backend.Backend
 	key         string
+	crc         [4]byte
 	n           int // distinct series
 	maxRows     int // largest series range, captured while validating the index.
 	total       int // rows
@@ -221,7 +222,7 @@ func (p *pagedIndex) entries(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 
-	if n != p.n || total != p.total {
+	if n != p.n || total != p.total || [4]byte(data[len(data)-4:]) != p.crc {
 		return nil, errors.Wrap(errSidxCorrupt, "reload mismatch")
 	}
 
@@ -342,7 +343,7 @@ func openPagedIndex(
 
 	_, viewer := b.(backend.Viewer)
 
-	p := &pagedIndex{be: b, key: key, n: n, maxRows: maxRows, total: total, keep: !viewer, offset: int64(len(data) - 4 - len(ents))}
+	p := &pagedIndex{be: b, key: key, n: n, crc: [4]byte(data[len(data)-4:]), maxRows: maxRows, total: total, keep: !viewer, offset: int64(len(data) - 4 - len(ents))}
 	if n > 0 {
 		p.first, p.last = sidxEntryID(ents, 0), sidxEntryID(ents, n-1)
 		p.bounded = true

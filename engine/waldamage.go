@@ -12,7 +12,7 @@ import (
 // salvageHandlers is [Engine.replayHandlers] for a WAL directory: a damaged region is counted, logged
 // and skipped, so the engine opens with the records that survive instead of refusing to.
 func (e *Engine) salvageHandlers(ctx context.Context, dir string) wal.Handlers {
-	h := e.replayHandlers()
+	h := e.replayHandlers(ctx)
 	h.OnDamage = func(d wal.Damage) error {
 		ctx := e.cfg.Obs.Base(ctx)
 		e.cfg.Obs.Corruption.Detected(ctx, "wal", obs.CorruptTolerated)

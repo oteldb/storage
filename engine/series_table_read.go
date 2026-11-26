@@ -264,7 +264,7 @@ func (p *part) lookupSharedDiskSeries(ctx context.Context, id signal.SeriesID) (
 
 func (p *part) sharedSeriesMetadata(ctx context.Context, id signal.SeriesID) (seriesindex.Metadata, bool, error) {
 	ctx = p.reader.ReaderContext(ctx)
-	present, err := p.index.has(ctx, id)
+	pos, present, err := p.index.position(ctx, id)
 	if err != nil || !present {
 		return seriesindex.Metadata{}, false, err
 	}
@@ -273,7 +273,7 @@ func (p *part) sharedSeriesMetadata(ctx context.Context, id signal.SeriesID) (se
 		return seriesindex.Metadata{}, false, err
 	}
 
-	covered, found, err := r.Lookup(ctx, id)
+	covered, found, err := r.LookupSeries(ctx, id, pos)
 	if err != nil {
 		return seriesindex.Metadata{}, false, err
 	}
@@ -288,7 +288,7 @@ func (p *part) sharedWatermarkReader(ctx context.Context) (*watermark.Reader, er
 	p.diskWatermarkMu.Lock()
 	r := p.diskWatermark
 	if r == nil {
-		r, err = watermark.OpenReader(ctx, p.be, watermark.Key(p.prefix), p.index.seriesCount())
+		r, err = p.openPartWatermarks(ctx)
 		if err == nil {
 			p.diskWatermark = r
 		}
@@ -315,11 +315,13 @@ func (p *part) sharedSeriesStats(ctx context.Context) (map[signal.SeriesID]Serie
 	if len(raw) < 8 {
 		return nil, nil
 	}
-	count, used := binary.Uvarint(raw[4 : len(raw)-4])
-	if used <= 0 || count != uint64(p.index.seriesCount()) || count > uint64((len(raw)-8)/41) {
-		return nil, nil
+	if binary.BigEndian.Uint32(raw) != statsOrdinalMagic {
+		count, used := binary.Uvarint(raw[4 : len(raw)-4])
+		if used <= 0 || count != uint64(p.index.seriesCount()) || count > uint64((len(raw)-8)/41) {
+			return nil, nil
+		}
 	}
-	stats, err := decodeSeriesStats(raw)
+	stats, err := p.decodePartStats(p.reader.ReaderContext(ctx), raw)
 	if err != nil {
 		return nil, nil
 	}

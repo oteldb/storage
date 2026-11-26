@@ -337,6 +337,9 @@ func (sw *SegmentWriter) Write(p []byte) (int, error) {
 	good := sw.size
 
 	n, err := sw.f.Write(p)
+	if sw.metrics != nil && n > 0 {
+		sw.metrics.Written(n)
+	}
 	if err == nil {
 		sw.size += n
 

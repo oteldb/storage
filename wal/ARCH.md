@@ -12,6 +12,7 @@ Record types (additive — an old reader **skips** an unknown type):
 | series | `SeriesID` + typed attribute encoding |
 | samples | metric samples |
 | scale-factor samples | metric samples carrying per-sample lossy-sampling weights (written only when sampling occurred) |
+| referenced samples | samples or weighted samples whose first descriptor is resolved from a confirmed v11 metric catalog |
 | records | opaque record-engine payload (logs/traces/profiles) |
 | side | opaque content-addressed side-store delta (the profile symbol store) |
 

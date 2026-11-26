@@ -14,11 +14,13 @@ import (
 // Record type tags. New types may be appended; unknown types are skipped on replay so
 // an old reader tolerates a newer log.
 const (
-	recordSeries    byte = 1
-	recordSamples   byte = 2
-	recordRecords   byte = 3 // generic, engine-encoded record payload (logs, traces, …)
-	recordSide      byte = 4 // opaque, engine-encoded side-store delta (profiles symbol store)
-	recordSamplesSF byte = 5 // samples that also carry a per-sample lossy-sampling scale factor
+	recordSeries       byte = 1
+	recordSamples      byte = 2
+	recordRecords      byte = 3 // generic, engine-encoded record payload (logs, traces, …)
+	recordSide         byte = 4 // opaque, engine-encoded side-store delta (profiles symbol store)
+	recordSamplesSF    byte = 5 // samples that also carry a per-sample lossy-sampling scale factor
+	recordSamplesRef   byte = 6
+	recordSamplesSFRef byte = 7
 )
 
 // seriesIDLen is the fixed 16-byte big-endian width of a [signal.SeriesID] on the wire.
@@ -37,9 +39,11 @@ type Handlers struct {
 	// OnSamplesSF receives samples that carry per-sample lossy-sampling scale factors (len(sf) ==
 	// len(ts)). If unset, such records fall back to OnSamples (the weights are dropped, i.e. read as
 	// 1) so a reader that does not care about sampling still recovers the samples.
-	OnSamplesSF func(id signal.SeriesID, ts []int64, values, sf []float64) error
-	OnRecords   func(id signal.SeriesID, payload []byte) error
-	OnSide      func(payload []byte) error
+	// OnDescriptorReference resolves the catalog identity before applying the first samples.
+	OnDescriptorReference func(signal.SeriesID) error
+	OnSamplesSF           func(id signal.SeriesID, ts []int64, values, sf []float64) error
+	OnRecords             func(id signal.SeriesID, payload []byte) error
+	OnSide                func(payload []byte) error
 	// OnDamage, when set, makes directory replay ([ReplayDirFrom]) salvage a damaged log: each region
 	// it cannot read is reported here and skipped, and replay goes on with the next valid frame and
 	// every later segment. Returning an error stops replay with it. When nil, damage fails replay with
@@ -103,6 +107,23 @@ func (wr *Writer) WriteSamplesSF(id signal.SeriesID, ts []int64, values, sf []fl
 		return errors.Wrap(err, "write record")
 	}
 
+	return nil
+}
+
+// WriteReferencedSamples logs samples whose identity has already been committed in the catalog.
+func (wr *Writer) WriteReferencedSamples(id signal.SeriesID, ts []int64, values, sf []float64, sampled bool) error {
+	typ := recordSamplesRef
+	prefix := id.AppendBinary(wr.payload[:0])
+	if sampled {
+		typ = recordSamplesSFRef
+		wr.payload = appendSamplesSF(prefix, ts, values, sf)
+	} else {
+		wr.payload = appendSamples(prefix, ts, values)
+	}
+	wr.frame = appendFrame(wr.frame[:0], typ, wr.payload)
+	if _, err := wr.w.Write(wr.frame); err != nil {
+		return errors.Wrap(err, "write referenced samples")
+	}
 	return nil
 }
 
@@ -178,8 +199,8 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 		}
 
 		return h.OnSeries(id, s)
-	case recordSamples:
-		if h.OnSamples == nil {
+	case recordSamples, recordSamplesRef:
+		if typ == recordSamples && h.OnSamples == nil {
 			return nil
 		}
 
@@ -188,11 +209,25 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 			return decodeError{err}
 		}
 
-		return h.OnSamples(id, ts, values)
-	case recordSamplesSF:
+		if typ == recordSamplesRef {
+			if err := resolveDescriptor(h, id); err != nil {
+				return err
+			}
+		}
+		if h.OnSamples != nil {
+			return h.OnSamples(id, ts, values)
+		}
+		return nil
+	case recordSamplesSF, recordSamplesSFRef:
 		id, ts, values, sf, err := parseSamplesSF(payload)
 		if err != nil {
 			return decodeError{err}
+		}
+
+		if typ == recordSamplesSFRef {
+			if err := resolveDescriptor(h, id); err != nil {
+				return err
+			}
 		}
 
 		// Prefer the sf-aware handler; fall back to the plain one (dropping the weights) so a
@@ -225,6 +260,13 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 	default:
 		return nil // unknown record type: skip for forward compatibility
 	}
+}
+
+func resolveDescriptor(h Handlers, id signal.SeriesID) error {
+	if h.OnDescriptorReference == nil {
+		return errors.Wrap(ErrCorrupt, "unsupported descriptor reference")
+	}
+	return h.OnDescriptorReference(id)
 }
 
 // appendFrame appends [uvarint bodyLen][type][payload][u32 CRC32C(len+body)] to dst. The length is

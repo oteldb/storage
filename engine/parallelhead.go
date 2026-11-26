@@ -184,6 +184,7 @@ func (e *Engine) parallelSnapshots(p *preparedBatch, lookupErr error) (series.Vi
 	if err := e.checkDiskAdmissionLocked(); err != nil {
 		return series.View{}, true, err
 	}
+	p.confirmedSeriesEpoch = e.confirmedSeriesEpoch
 	p.snapshots = resize(p.snapshots, len(p.groups))
 	for i, id := range p.ownedIDs {
 		ref, known := e.head.series.Ref(id)
@@ -197,6 +198,7 @@ func (e *Engine) parallelSnapshots(p *preparedBatch, lookupErr error) (series.Vi
 		} else if e.cfg.DiskSeries {
 			entry := p.lookup.pending[id]
 			state.historical, state.seen, state.newest = entry.exists, entry.exists, entry.newest
+			state.descriptorEpoch = entry.descriptorEpoch
 		}
 		p.snapshots[i] = state
 	}

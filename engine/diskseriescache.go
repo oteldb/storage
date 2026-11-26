@@ -12,8 +12,9 @@ const diskCacheWays = 16
 const diskCacheShards = 256
 
 type diskCacheEntry struct {
-	id     signal.SeriesID
-	newest int64
+	id              signal.SeriesID
+	newest          int64
+	descriptorEpoch uint64
 }
 
 type diskCacheBucket struct {
@@ -96,12 +97,16 @@ func (c *diskSeriesCache) get(id signal.SeriesID) (diskHeadEntry, bool) {
 		return diskHeadEntry{}, false
 	}
 	if entry := c.lookup(s, h, id); entry != nil {
-		return diskHeadEntry{newest: entry.newest, exists: true}, true
+		return diskHeadEntry{newest: entry.newest, descriptorEpoch: entry.descriptorEpoch, exists: true}, true
 	}
 	return diskHeadEntry{}, false
 }
 
 func (c *diskSeriesCache) put(id signal.SeriesID, newest int64) {
+	c.remember(id, newest, 0)
+}
+
+func (c *diskSeriesCache) remember(id signal.SeriesID, newest int64, descriptorEpoch uint64) {
 	if c == nil {
 		return
 	}
@@ -110,17 +115,20 @@ func (c *diskSeriesCache) put(id signal.SeriesID, newest int64) {
 	if len(s.buckets) > 0 {
 		if entry := c.lookup(s, h, id); entry != nil {
 			entry.newest = max(entry.newest, newest)
+			if descriptorEpoch != 0 && (entry.descriptorEpoch == 0 || descriptorEpoch < entry.descriptorEpoch) {
+				entry.descriptorEpoch = descriptorEpoch
+			}
 			return
 		}
 	}
 	if len(s.buckets) == 0 || (s.count >= len(s.buckets)*diskCacheWays*3/4 && len(s.buckets) < c.maxBuckets) {
 		c.grow(s)
 	}
-	c.insert(s, id, newest)
+	c.insert(s, diskCacheEntry{id: id, newest: newest, descriptorEpoch: descriptorEpoch})
 }
 
-func (c *diskSeriesCache) insert(s *diskCacheShard, id signal.SeriesID, newest int64) {
-	hash := diskCacheHash(id)
+func (c *diskSeriesCache) insert(s *diskCacheShard, entry diskCacheEntry) {
+	hash := diskCacheHash(entry.id)
 	first := int((hash / uint64(len(c.shards))) % uint64(len(s.buckets)))
 	b, second := &s.buckets[first], &s.buckets[diskCacheSecond(hash, first, len(s.buckets))]
 	if second.used < b.used {
@@ -134,7 +142,7 @@ func (c *diskSeriesCache) insert(s *diskCacheShard, id signal.SeriesID, newest i
 	} else {
 		b.next = (b.next + 1) % diskCacheWays
 	}
-	b.entries[pos] = diskCacheEntry{id: id, newest: newest}
+	b.entries[pos] = entry
 }
 
 func (c *diskSeriesCache) grow(s *diskCacheShard) {
@@ -145,7 +153,7 @@ func (c *diskSeriesCache) grow(s *diskCacheShard) {
 	for i := range old {
 		for j := range int(old[i].used) {
 			entry := old[i].entries[j]
-			c.insert(s, entry.id, entry.newest)
+			c.insert(s, entry)
 		}
 	}
 }
