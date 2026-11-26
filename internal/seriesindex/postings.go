@@ -217,6 +217,18 @@ func (r *Index) IDs(ctx context.Context) postings.Postings {
 	return &idPostings{index: r, cursor: r.table.Cursor(ctx)}
 }
 
+// VisitIDs scans the sequential ID section with its checked ordinal and inline metadata.
+func (r *Index) VisitIDs(ctx context.Context, visit func(signal.SeriesID, uint32, Metadata) error) error {
+	p := idPostings{index: r, cursor: r.table.Cursor(ctx)}
+	p.cursor.streaming = true
+	for p.Next() {
+		if err := visit(p.id, p.ref, p.meta); err != nil {
+			return err
+		}
+	}
+	return p.Err()
+}
+
 type idPostings struct {
 	index   *Index
 	seen    uint32
@@ -225,6 +237,8 @@ type idPostings struct {
 	started bool
 	done    bool
 	id      signal.SeriesID
+	ref     uint32
+	meta    Metadata
 }
 
 func (p *idPostings) Next() bool {
@@ -332,7 +346,7 @@ func (p *idPostings) current(ok bool) bool {
 		p.cursor.err = errors.Wrap(ErrCorrupt, "canonical ID entry")
 		return false
 	}
-	ref, _, _, err := decodeIDValue(p.cursor.Value())
+	ref, meta, _, err := decodeIDValue(p.cursor.Value())
 	if err != nil {
 		p.cursor.err = err
 		return false
@@ -345,6 +359,7 @@ func (p *idPostings) current(ok bool) bool {
 		p.seen++
 	}
 	p.id = signal.SeriesID{Hi: binary.BigEndian.Uint64(p.cursor.Key()[1:]), Lo: binary.BigEndian.Uint64(p.cursor.Key()[9:])}
+	p.ref, p.meta = ref, meta
 	return true
 }
 

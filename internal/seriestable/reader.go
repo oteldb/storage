@@ -75,6 +75,29 @@ func (r *Reader) LookupRaw(id signal.SeriesID) ([]byte, bool, error) {
 	return raw, found, nil
 }
 
+// IDs returns a sorted ID cursor valid while this reader pins the immutable run.
+func (r *Reader) IDs(ctx context.Context) postings.Postings {
+	if r.ids != nil {
+		return postings.FromSlice(r.ids.ids)
+	}
+	return r.run.index.IDs(r.run.ReaderContext(ctx))
+}
+
+// LookupOrdinal reads a descriptor at a known position and checks its full ID.
+func (r *Reader) LookupOrdinal(id signal.SeriesID, ordinal uint32) ([]byte, error) {
+	if r.run == nil {
+		return nil, ErrClosed
+	}
+	if err := r.ctx.Err(); err != nil {
+		return nil, err
+	}
+	raw, meta, err := r.rawReader().LookupOrdinal(id, ordinal)
+	if err == nil && meta != (seriesindex.Metadata{}) {
+		err = errors.Wrap(ErrCorrupt, "descriptor sample metadata")
+	}
+	return raw, err
+}
+
 // Close releases owned scratch and its run pin.
 func (r *Reader) Close() error {
 	if r == nil || r.run == nil {

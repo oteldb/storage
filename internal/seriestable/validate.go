@@ -45,13 +45,13 @@ func (r *Run) validateContents(ctx context.Context, be backend.Backend, key stri
 	if err != nil {
 		return err
 	}
-	ids := r.index.IDs(ctx)
 	rawReader := r.index.RawReader(ctx)
+	rawReader.StreamPages()
 	var identity signal.Series
 	var canonical []byte
 	var encoded [17]byte
 	var seen uint32
-	for ids.Next() {
+	if err := r.index.VisitIDs(ctx, func(indexID signal.SeriesID, ref uint32, inline seriesindex.Metadata) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -59,14 +59,14 @@ func (r *Run) validateContents(ctx context.Context, be backend.Backend, key stri
 			return errors.Wrap(err, "read ID column")
 		}
 		id := signal.SeriesID{Hi: binary.BigEndian.Uint64(encoded[:8]), Lo: binary.BigEndian.Uint64(encoded[8:16])}
-		if encoded[16] != 1 || id != ids.At() {
+		if encoded[16] != 1 || id != indexID {
 			return errors.Wrap(ErrCorrupt, "ID column and index disagree")
 		}
-		ref, raw, meta, found, err := rawReader.LookupRef(id)
+		raw, meta, err := rawReader.LookupOrdinal(id, ref)
 		if err != nil {
 			return err
 		}
-		if !found || meta != (seriesindex.Metadata{}) {
+		if inline != (seriesindex.Metadata{}) || meta != (seriesindex.Metadata{}) {
 			return errors.Wrap(ErrCorrupt, "descriptor sample metadata")
 		}
 		used, err := signal.DecodeSeriesInto(&identity, raw)
@@ -81,13 +81,14 @@ func (r *Run) validateContents(ctx context.Context, be backend.Backend, key stri
 			return errors.Wrap(ErrCorrupt, "noncanonical descriptor ordinal")
 		}
 
+		r.maxCanonicalBytes = max(r.maxCanonicalBytes, int64(len(raw)))
 		retained.set(seen, id)
 		if r.idFilter != nil {
 			r.idFilter.add(id.Lo)
 		}
 		seen++
-	}
-	if err := ids.Err(); err != nil {
+		return nil
+	}); err != nil {
 		return err
 	}
 	if seen != r.Count() {

@@ -86,6 +86,15 @@ func WriteContiguous(ctx context.Context, be backend.Backend, prefix string, vie
 		}, cache)
 }
 
+// WriteOrdinalMerge writes a descriptor run from pinned source ordinals.
+func WriteOrdinalMerge(ctx context.Context, be backend.Backend, prefix string, count int,
+	merge *seriesindex.PostingMerge, idAt func(int) signal.SeriesID, rawAt func(int) ([]byte, error), cache *IDCache,
+) (*Run, error) {
+	return writeRun(ctx, be, prefix, count, idAt, func(key string, digest [32]byte) error {
+		return seriesindex.WriteOrdinalMerge(ctx, be, key, digest, count, merge, idAt, rawAt)
+	}, cache)
+}
+
 func writeRun(ctx context.Context, be backend.Backend, prefix string, count int, idAt func(int) signal.SeriesID,
 	writeIndex func(string, [32]byte) error, cache *IDCache,
 ) (*Run, error) {

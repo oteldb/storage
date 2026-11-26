@@ -9,6 +9,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/index/series"
+	"github.com/oteldb/storage/signal"
 )
 
 // WriteContiguous merges postings from disjoint, consecutive ranges of the same
@@ -31,6 +32,30 @@ func WriteContiguous(ctx context.Context, be backend.Backend, key string, digest
 	if offset != uint64(len(refs)) {
 		return errors.New("seriesindex: postings spill count mismatch")
 	}
+	var scratch []byte
+	return writeCanonical(ctx, be, key, digest, len(refs), merge,
+		func(i int) signal.SeriesID { return view.ID(int(refs[i])) },
+		func(i int) ([]byte, error) {
+			scratch = view.AppendCanonical(scratch[:0], int(refs[i]))
+			return scratch, nil
+		})
+}
+
+// WriteOrdinalMerge streams borrowed canonical records and remapped postings
+// from validated immutable sources. The caller pins them through the write.
+func WriteOrdinalMerge(ctx context.Context, be backend.Backend, key string, digest [32]byte,
+	count int, merge *PostingMerge, idAt func(int) signal.SeriesID, rawAt func(int) ([]byte, error),
+) error {
+	merge.selectCovering(count)
+	return writeCanonical(ctx, be, key, digest, count, merge, idAt, rawAt)
+}
+
+func writeCanonical(ctx context.Context, be backend.Backend, key string, digest [32]byte, count int,
+	merge *PostingMerge, idAt func(int) signal.SeriesID, rawAt func(int) ([]byte, error),
+) error {
+	if count <= 0 || uint64(count) > math.MaxUint32 {
+		return errors.New("seriesindex: invalid series count")
+	}
 	w, err := backend.CreateObjectDeferred(ctx, be, key)
 	if err != nil {
 		return err
@@ -38,10 +63,10 @@ func WriteContiguous(ctx context.Context, be backend.Backend, key string, digest
 	defer w.Abort()
 
 	table := NewTableWriter(w)
-	table.seriesCount, table.parentDigest = uint32(len(refs)), digest
-	var count [4]byte
-	binary.BigEndian.PutUint32(count[:], table.seriesCount)
-	if err := table.Append([]byte{'c'}, count[:]); err != nil {
+	table.seriesCount, table.parentDigest = uint32(count), digest
+	var countBytes [4]byte
+	binary.BigEndian.PutUint32(countBytes[:], table.seriesCount)
+	if err := table.Append([]byte{'c'}, countBytes[:]); err != nil {
 		return err
 	}
 
@@ -52,11 +77,11 @@ func WriteContiguous(ctx context.Context, be backend.Backend, key string, digest
 	var keyID [17]byte
 	keyID[0] = 'i'
 	var value [13]byte
-	for i, ref := range refs {
+	for i := range count {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		id := view.ID(int(ref))
+		id := idAt(i)
 		binary.BigEndian.PutUint64(keyID[1:], id.Hi)
 		binary.BigEndian.PutUint64(keyID[9:], id.Lo)
 		binary.BigEndian.PutUint32(value[:], uint32(i))
@@ -71,17 +96,21 @@ func WriteContiguous(ctx context.Context, be backend.Backend, key string, digest
 	}
 	var keyRef [5]byte
 	keyRef[0] = 's'
-	var raw []byte
-	for i, ref := range refs {
+	var record []byte
+	for i := range count {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		id := view.ID(int(ref))
-		raw = id.AppendBinary(raw[:0])
-		raw = appendMetadata(raw, Metadata{})
-		raw = view.AppendCanonical(raw, int(ref))
+		id := idAt(i)
+		raw, err := rawAt(i)
+		if err != nil {
+			return err
+		}
+		record = id.AppendBinary(record[:0])
+		record = appendMetadata(record, Metadata{})
+		record = append(record, raw...)
 		binary.BigEndian.PutUint32(keyRef[1:], uint32(i))
-		if err := table.Append(keyRef[:], raw); err != nil {
+		if err := table.Append(keyRef[:], record); err != nil {
 			return err
 		}
 	}

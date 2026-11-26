@@ -236,6 +236,7 @@ type Engine struct {
 	parts              []*part
 	seriesTable        *seriesSnapshot
 	seriesBuildMu      sync.Mutex
+	seriesNoGain       descriptorMergeHistory // Owned by mergeRun.
 	seriesRetired      []bucketindex.SeriesRoot
 	seriesIDs          *seriestable.IDCache
 	verifiedIdentities *verifiedIdentityCache

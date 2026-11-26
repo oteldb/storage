@@ -22,13 +22,14 @@ var ErrClosed = errors.New("seriestable: closed run")
 
 // Run retains immutable metadata only. The engine owns catalog and object reclamation.
 type Run struct {
-	idCache  *IDCache
-	idFilter *idRoutingFilter
-	part     *block.PartReader
-	index    *seriesindex.Index
-	mu       sync.Mutex
-	refs     int
-	closed   bool
+	maxCanonicalBytes int64
+	idCache           *IDCache
+	idFilter          *idRoutingFilter
+	part              *block.PartReader
+	index             *seriesindex.Index
+	mu                sync.Mutex
+	refs              int
+	closed            bool
 }
 
 // Open validates a run and optionally checks its catalog-bound manifest digest.
@@ -106,6 +107,12 @@ func requireObject(ctx context.Context, be backend.Backend, key string, limit in
 
 // Count is descriptor cardinality, not active sample cardinality.
 func (r *Run) Count() uint32 { return r.index.Count() }
+
+// MaxCanonicalBytes is the maximum canonical record size observed during validation.
+func (r *Run) MaxCanonicalBytes() int64 { return r.maxCanonicalBytes }
+
+// PostingIndex exposes the immutable index while the caller pins the run.
+func (r *Run) PostingIndex() *seriesindex.Index { return r.index }
 
 // Digest is the catalog binding for this run.
 func (r *Run) Digest() [32]byte { return r.part.ManifestDigest() }
