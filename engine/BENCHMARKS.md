@@ -127,3 +127,28 @@ OTELDB_BENCH_FROZEN_PROFILE=/path/to/profiles/frozen GOMAXPROCS=8 \
   go test -vet=off ./engine -run '^$' \
   -bench '^BenchmarkFrozenHeadFinish$/^existing-descriptors$/^build$' -benchtime=1x -count=1 -benchmem
 ```
+
+## Head registration
+
+`BenchmarkHeadRegistration` registers prehashed node-exporter CPU series in memory. The
+`descriptor` case measures insertion into the compact identity registry. The `postings` case
+starts with the descriptors already registered and measures the label-to-series index.
+`descriptor-and-postings` measures the production registration method. The timer excludes
+fixture generation, prehashing, head creation, and seeding. It includes no samples, WAL, or
+flush. The default is 80,000 series. Set `OTELDB_BENCH_CPU_HOSTS` to change the host count.
+
+```sh
+GOMAXPROCS=8 go test -vet=off ./engine -run '^$' -bench '^BenchmarkHeadRegistration$' \
+  -benchtime=1x -count=6 -benchmem
+```
+
+For a CPU capture, select one case and keep its test binary. Filter the profile to
+`head-registration` to exclude fixture creation and the untimed registry seed.
+
+```sh
+GOMAXPROCS=8 go test -vet=off -o /path/to/profiles/engine.test ./engine -run '^$' \
+  -bench '^BenchmarkHeadRegistration$/^postings$' -benchtime=16x \
+  -cpuprofile=/path/to/profiles/postings.cpu
+go tool pprof -tagfocus='head-registration=postings' -relative_percentages \
+  /path/to/profiles/engine.test /path/to/profiles/postings.cpu
+```

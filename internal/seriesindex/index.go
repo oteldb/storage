@@ -290,6 +290,8 @@ func (b *Builder) Write(dst io.Writer) error {
 	if err := b.prepareMergedPostings(); err != nil {
 		return err
 	}
+	// The table writer requires ascending keys across all sections.
+	// Separate key prefixes let readers seek to one section independently.
 	w := NewTableWriter(dst)
 	w.seriesCount = uint32(len(b.records))
 	w.parentDigest = b.parentDigest
@@ -317,6 +319,7 @@ func (b *Builder) Write(dst io.Writer) error {
 			return err
 		}
 	}
+	// ID lookups use inline metadata and the ordinal shared by postings and descriptors.
 	var idKeyBuffer [17]byte
 	idKeyBuffer[0] = 'i'
 	var idValueBuffer [45]byte
@@ -353,6 +356,8 @@ func (b *Builder) Write(dst io.Writer) error {
 	if err := b.writeValuePostings(&postings, names, keyScratch); err != nil {
 		return err
 	}
+	// Descriptor records store the canonical bytes under the local ordinal.
+	// Borrowed builders translate that ordinal back to a row in the source view.
 	var value []byte
 	view := b.View()
 	var recordKeyBuffer [5]byte
