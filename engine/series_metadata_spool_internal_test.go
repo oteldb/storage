@@ -8,6 +8,7 @@ import (
 	backendfile "github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
+	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/internal/sidecar"
 	"github.com/oteldb/storage/internal/watermark"
 	"github.com/oteldb/storage/signal"
@@ -98,6 +99,14 @@ func TestOrdinalSeriesSidecarsSkipSpool(t *testing.T) {
 		require.Equal(t, watermark.Entry{ID: id, Max: int64(i + 4)}, ent)
 		require.Equal(t, SeriesAgg{Count: 2, Rows: 2, Sum: 5, Min: 2, Max: 3}, stats[id])
 	}
+	ids := []signal.SeriesID{{Hi: 1, Lo: 1}, {Hi: 1, Lo: count - 1}}
+	var visited []watermark.Entry
+	require.NoError(t, part.visitSharedDiskMetadata(t.Context(), ids, &watermark.Cursor{},
+		func(id signal.SeriesID, meta seriesindex.Metadata) {
+			visited = append(visited, watermark.Entry{ID: id, Max: meta.Covered})
+		}))
+	require.Equal(t, []watermark.Entry{{ID: ids[0], Max: 5}, {ID: ids[1], Max: count + 3}}, visited)
+
 	part.index.paged.crc[0] ^= 1
 	_, err = part.openPartWatermarks(t.Context())
 	require.ErrorIs(t, err, watermark.ErrCorrupt)

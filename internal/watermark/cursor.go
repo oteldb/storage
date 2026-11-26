@@ -35,6 +35,9 @@ func (c *Cursor) Reset(ctx context.Context, r *Reader) {
 
 // At reads an ordinal, retaining its page for subsequent ordinals.
 func (c *Cursor) At(index int) (Entry, error) {
+	if c.reader.ordinal {
+		return Entry{}, errors.Wrap(ErrCorrupt, "ordinal cursor requires SIDX ID")
+	}
 	return c.AtSeries(index, signal.SeriesID{})
 }
 

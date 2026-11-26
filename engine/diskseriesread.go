@@ -515,7 +515,7 @@ func (p *part) visitSharedDiskMetadata(ctx context.Context, ids []signal.SeriesI
 			cursor.Reset(ctx, r)
 			bound = true
 		}
-		entry, err := cursor.At(pos)
+		entry, err := cursor.AtSeries(pos, id)
 		if err != nil {
 			return err
 		}
