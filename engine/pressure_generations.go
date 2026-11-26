@@ -343,12 +343,11 @@ func (e *Engine) finishGenerationBuild(r generationResult) {
 }
 
 func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGeneration) error {
-	var descriptorEpoch uint64
-	if e.cfg.SeparateSeries && e.fixedHeadRotation() {
-		descriptorEpoch = g.epoch
-	}
-	if err := e.rememberGenerationWatermarks(ctx, g.head, descriptorEpoch); err != nil {
-		return err
+	rememberPublished := e.cfg.SeparateSeries && e.fixedHeadRotation()
+	if !rememberPublished {
+		if err := e.rememberGenerationWatermarks(ctx, g.head, false); err != nil {
+			return err
+		}
 	}
 	var released sampleArena
 	retired := false
@@ -372,6 +371,14 @@ func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGener
 	}
 	e.sortPressureParts(next)
 	err := e.commitIndexLocked(ctx, next, max(g.epoch, e.flushedEpoch), g.term, nil)
+	if rememberPublished {
+		// Leave the old head attached while admitting writes during the cache update.
+		// Only a confirmed catalog can authorize descriptor references.
+		published := err == nil && e.compactMetricMetadata
+		_ = e.mu.WithWriters(func() error {
+			return e.rememberGenerationWatermarks(context.WithoutCancel(ctx), g.head, published)
+		})
+	}
 	// Keep ambiguous candidates queryable and retain WAL exactly as the single-generation path does.
 	e.parts, e.flushedEpoch = next, max(g.epoch, e.flushedEpoch)
 	if e.recentEnabled() {

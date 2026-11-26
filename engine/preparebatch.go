@@ -96,7 +96,6 @@ type preparedBatch struct {
 	sf                                    []float64
 	current                               int
 	warm, encodedReturning                bool
-	confirmedSeriesEpoch                  uint64
 	snapshots                             []headSeriesState
 	next                                  []sampleBuf
 	created                               []*sampleBuf
@@ -225,7 +224,6 @@ func (e *Engine) stagePreparedBatch(
 	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series, limits AppendLimits,
 	p *preparedBatch,
 ) (AppendResult, error) {
-	p.confirmedSeriesEpoch = e.confirmedSeriesEpoch
 	res := e.stagePreparedRows(ids, ts, values, sf, materialize, limits, p)
 	if p.batch.empty() {
 		return res, nil
@@ -304,8 +302,7 @@ func (p *preparedBatch) admit(
 			}
 			acc.register, acc.series = true, materialize()
 			acc.encodedHead = p.encodedReturning && state.historical
-			acc.descriptorRef = acc.encodedHead && state.descriptorEpoch != 0 &&
-				state.descriptorEpoch <= p.confirmedSeriesEpoch
+			acc.descriptorRef = acc.encodedHead && state.descriptorPublished
 		}
 	}
 	k = len(b.order)

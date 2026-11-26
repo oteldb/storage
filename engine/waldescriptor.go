@@ -5,19 +5,9 @@ import (
 
 	"github.com/go-faster/errors"
 
-	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
 )
-
-// confirmMetricMetadata is called only after adopting a published catalog.
-func (e *Engine) confirmMetricMetadata(ix *bucketindex.Index) {
-	e.compactMetricMetadata = ix.CompactMetricMetadata
-	e.confirmedSeriesEpoch = 0
-	if ix.CompactMetricMetadata {
-		e.confirmedSeriesEpoch = ix.WriterEpoch(e.cfg.WriterID)
-	}
-}
 
 func (e *Engine) replayDescriptorReference(ctx context.Context, id signal.SeriesID) error {
 	if !e.compactMetricMetadata || !e.cfg.SeparateSeries {

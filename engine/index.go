@@ -125,7 +125,7 @@ func (e *Engine) commitOnceLocked(ctx context.Context, parts []*part, epoch uint
 	}
 
 	e.indexVersion = version
-	e.confirmMetricMetadata(ix)
+	e.compactMetricMetadata = ix.CompactMetricMetadata
 	// Only a commit that landed discharges a want: the obligation is dropped from the engine's own
 	// list here, never while building an index that may not be written.
 	e.wants = ix.Wanted
@@ -174,7 +174,7 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	}
 
 	e.indexVersion = version
-	e.confirmMetricMetadata(ix)
+	e.compactMetricMetadata = ix.CompactMetricMetadata
 	if ix.Generation.Compare(e.generation) > 0 {
 		e.generation = ix.Generation
 	}
@@ -824,7 +824,7 @@ func (e *Engine) adoptLoadLocked(l *indexLoad) {
 	// names, so nothing is foreign any more. The adopted handles' objects belong to their writer and
 	// are not deleted here.
 	e.indexVersion = l.version
-	e.confirmMetricMetadata(l.ix)
+	e.compactMetricMetadata = l.ix.CompactMetricMetadata
 	e.foreign, e.foreignParts = nil, nil
 
 	e.holes, e.lostParts, e.allocated = l.holes, l.ix.LostParts, l.ix.AllocatedBlocks

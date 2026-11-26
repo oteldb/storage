@@ -5,7 +5,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/signal"
 )
 
@@ -36,9 +35,7 @@ func TestDiskSeriesCacheSharesBucketCapacity(t *testing.T) {
 func TestDiskSeriesCacheHighOccupancy(t *testing.T) {
 	t.Parallel()
 	const count = 16000
-	// Keep five buckets per shard so occupancy is independent of the entry layout.
-	budget := memsize.Of[diskSeriesCache]() + diskCacheShards*(memsize.Of[diskCacheShard]()+5*memsize.Of[diskCacheBucket]())
-	c := newDiskSeriesCache(budget)
+	c := newDiskSeriesCache(512 << 10)
 	ids := make([]signal.SeriesID, count)
 	for i := range ids {
 		ids[i] = signal.SeriesID{Hi: mixDiskBloom(uint64(i)), Lo: mixDiskBloom(uint64(i) + 1)}
@@ -53,6 +50,6 @@ func TestDiskSeriesCacheHighOccupancy(t *testing.T) {
 			c.put(id, 101+int64(pass))
 		}
 		require.GreaterOrEqual(t, hits, count*99/100)
-		require.LessOrEqual(t, c.sizeBytes(), budget)
+		require.LessOrEqual(t, c.sizeBytes(), int64(512<<10))
 	}
 }

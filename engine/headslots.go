@@ -134,13 +134,13 @@ func (s *headBuffers) sizeBytes() int64 {
 }
 
 type headSeriesState struct {
-	descriptorEpoch uint64
-	historical      bool
-	buffer          *sampleBuf
-	newest          int64
-	ref             uint32
-	seen            bool
-	known           bool
+	descriptorPublished bool
+	historical          bool
+	buffer              *sampleBuf
+	newest              int64
+	ref                 uint32
+	seen                bool
+	known               bool
 }
 
 func (h *head) seriesState(id signal.SeriesID) headSeriesState {
@@ -154,7 +154,7 @@ func (h *head) seriesState(id signal.SeriesID) headSeriesState {
 			if !ok {
 				entry, _ = h.disk.cache.get(id)
 			}
-			return headSeriesState{newest: entry.newest, seen: entry.exists, historical: entry.exists, descriptorEpoch: entry.descriptorEpoch}
+			return headSeriesState{newest: entry.newest, seen: entry.exists, historical: entry.exists, descriptorPublished: entry.descriptorPublished}
 		}
 		return headSeriesState{}
 	}

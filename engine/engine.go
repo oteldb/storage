@@ -240,7 +240,6 @@ type Engine struct {
 	seriesTable   *seriesSnapshot
 	// Confirmed only by a landed CAS or a loaded catalog, under state ownership.
 	compactMetricMetadata bool
-	confirmedSeriesEpoch  uint64
 	seriesBuildMu         sync.Mutex
 	seriesNoGain          descriptorMergeHistory // Owned by mergeRun.
 	seriesRetired         []bucketindex.SeriesRoot
