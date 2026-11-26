@@ -18,7 +18,7 @@ func TestCatchupRunsBetweenOverdueTicks(t *testing.T) {
 	fresh := func() []mergeTask {
 		tasks := make([]mergeTask, len(calls))
 		for i := range calls {
-			tasks[i] = mergeTask{key: mergeTaskKey{signal.TenantID(string(rune('a' + i))), signal.Log}, run: func() mergeTurn {
+			tasks[i] = mergeTask{key: mergeTaskKey{tenant: signal.TenantID(string(rune('a' + i))), signal: signal.Log}, run: func() mergeTurn {
 				calls[i]++
 				return mergeTurn{more: true, progress: true}
 			}}
@@ -42,9 +42,9 @@ func TestCatchupRunsBetweenOverdueTicks(t *testing.T) {
 
 func TestRefreshMergeTasks(t *testing.T) {
 	t.Parallel()
-	a := mergeTaskKey{"a", signal.Log}
-	b := mergeTaskKey{"b", signal.Exemplar}
-	c := mergeTaskKey{"c", signal.Metric}
+	a := mergeTaskKey{tenant: "a", signal: signal.Log}
+	b := mergeTaskKey{tenant: "b", signal: signal.Exemplar}
+	c := mergeTaskKey{tenant: "c", signal: signal.Metric}
 	for _, tt := range []struct {
 		name           string
 		pending, fresh []mergeTask
@@ -64,4 +64,20 @@ func TestRefreshMergeTasks(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestDescriptorAndSampleWorkHaveSeparateTurns(t *testing.T) {
+	t.Parallel()
+	var done []string
+	makeTask := func(descriptor bool, name string) mergeTask {
+		return mergeTask{key: mergeTaskKey{tenant: "same", signal: signal.Metric, descriptor: descriptor},
+			run: func() mergeTurn { done = append(done, name); return mergeTurn{progress: true} }}
+	}
+	samples, descriptors := makeTask(false, "samples"), makeTask(true, "descriptors")
+	tasks := refreshMergeTasks(nil, []mergeTask{samples, descriptors})
+	require.Len(t, tasks, 2)
+	tasks = runMergeTasks(tasks, 8)
+	require.Equal(t, []string{"samples"}, done)
+	require.Empty(t, runMergeTasks(tasks, 8))
+	require.Equal(t, []string{"samples", "descriptors"}, done)
 }

@@ -1487,7 +1487,7 @@ func (s *Storage) runMaintenance(ctx context.Context, interval time.Duration) {
 			return
 		case maintenanceTick:
 			s.maintainWith(ctx, true)
-			pending = refreshMergeTasks(pending, s.mergeCatchupTasks(ctx))
+			pending = refreshMergeTasks(pending, append(s.mergeCatchupTasks(ctx), s.descriptorMergeTasks(ctx)...))
 			preferMerge = true
 		case maintenanceFlush:
 			if len(pending) == 0 {
@@ -1793,7 +1793,11 @@ func (s *Storage) maintainWith(ctx context.Context, background bool) {
 		// it runs on a single goroutine shared with flush pressure.
 		opts.Background = true
 
-		if err := eng.MergeWith(ctx, opts); err != nil {
+		merge := eng.MergeStep
+		if background {
+			merge = eng.MergeSamplesStep
+		}
+		if _, err := merge(ctx, opts); err != nil {
 			return err
 		}
 

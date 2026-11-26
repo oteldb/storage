@@ -42,7 +42,17 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 
 // MergeStep is [Engine.MergeWith], reporting whether a successful pass compacted or retired parts.
 // Retention may change parts even when compaction is deferred.
-func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool, err error) {
+func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (bool, error) {
+	samplesChanged, err := e.MergeSamplesStep(ctx, opts)
+	if err != nil {
+		return false, err
+	}
+	seriesChanged, err := e.MergeSeriesStep(ctx, opts.Background)
+	return samplesChanged || seriesChanged, err
+}
+
+// MergeSamplesStep compacts numeric parts without scheduling descriptor compaction.
+func (e *Engine) MergeSamplesStep(ctx context.Context, opts MergeOptions) (changed bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -107,11 +117,7 @@ func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool
 		log.Debug("merge no-op (nothing to compact)", zap.String("prefix", e.cfg.Prefix))
 	}
 
-	seriesChanged, err := e.compactSeriesRuns(ctx, opts.Background)
-	if err != nil {
-		return res.parts > 0, err
-	}
-	return res.parts > 0 || seriesChanged, nil
+	return res.parts > 0, nil
 }
 
 // merge compacts a bounded, size-tiered group of the engine's parts per opts and returns the number
