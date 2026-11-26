@@ -2225,13 +2225,12 @@ Separate metadata reserves one eighth of `SeriesCacheBytes` for a bounded
 cache of routing filters and validated, sorted `SeriesID` arrays. Per-run filters use the low 64
 bits to reject absent IDs without seeking prefix-coded keys. They take at most half of this
 budget and remain charged until all readers of the run drain. Exact ID arrays use the remaining
-space and can bypass a disk ID seek on a hit. Possible matches still check the full ID and
-canonical descriptor. A second eighth holds exact canonical byte
-proofs for one immutable catalog generation; the remaining three quarters hold historical
-watermarks. Proofs are checked once per input identity before walking metadata roots. Catalog
-changes force fresh verification, and a full proof cache stops admitting entries rather than
-churning allocations for every miss. `VerifiedIdentityCacheStats` reports actual hit/miss counts;
-a fitting component benchmark does not establish that the whole host workload fits. Pending arrays count against the cache limit
+space and can bypass a disk ID seek on a hit. Flush checks the full content ID in the immutable index
+without reading or re-encoding its descriptor. A second eighth holds positive membership proofs
+keyed by the low word with a high-word check and a collision map. Entries name an immutable root
+by token and are usable only while the checking snapshot contains that root. Adding unrelated roots
+preserves cached membership. The remaining three quarters hold historical watermarks.
+`VerifiedIdentityCacheStats` reports positive membership hit/miss counts. Pending arrays count against the cache limit
 before allocation and become readable only after full run validation; eviction falls back to the
 existing bounded disk reader. Cached IDs never determine active cardinality or sample coverage.
 

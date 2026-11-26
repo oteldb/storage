@@ -26,42 +26,46 @@ func identityCacheInput(n int) identitySnapshot {
 	return identitySnapshot{view: view, refs: refs}
 }
 
-func TestVerifiedIdentityCacheOwnershipAndBudget(t *testing.T) {
+func TestVerifiedIdentityCacheBudgetAndLowWordCollision(t *testing.T) {
 	t.Parallel()
 	const budget = 4096
 	cache := newVerifiedIdentityCache(budget)
-	generation := uint64(1)
-	key := signal.SeriesID{Lo: 1}
-	raw := []byte("canonical")
-	cache.put(generation, key, raw)
-	raw[0] = 'X'
-	got, ok := cache.get(generation, key)
-	require.True(t, ok)
-	require.Equal(t, "canonical", string(got))
+	id, collision, missing := signal.SeriesID{Hi: 1, Lo: 1}, signal.SeriesID{Hi: 2, Lo: 1}, signal.SeriesID{Hi: 3, Lo: 1}
+	cache.putIDs(1, []signal.SeriesID{id})
+	cache.putIDs(2, []signal.SeriesID{collision})
 	for i := range 1000 {
-		cache.put(generation, signal.SeriesID{Lo: uint64(i + 2)}, raw)
+		cache.putIDs(1, []signal.SeriesID{{Lo: uint64(i + 2)}})
 		require.LessOrEqual(t, cache.sizeBytes(), int64(budget))
 	}
-	_, ok = cache.get(generation, key)
-	require.True(t, ok, "a saturated generation does not churn existing proofs")
-	key.Lo = 2000
-	cache.put(generation, key, make([]byte, budget))
-	_, ok = cache.get(generation, key)
-	require.False(t, ok, "an oversized identity bypasses the cache")
+	registry := series.New()
+	for _, seriesID := range []signal.SeriesID{id, collision, missing} {
+		registry.AddEntry(series.Entry{ID: seriesID, Series: benchSeries(1)})
+	}
+	entries := identitySnapshot{view: registry.View(), refs: []uint32{0, 1, 2}}
+	known := make([]bool, len(entries.refs))
+	snapshot := &seriesSnapshot{tokens: map[uint64]struct{}{1: {}, 2: {}}}
+	require.Equal(t, 2, cache.match(snapshot, entries, known))
+	require.Equal(t, []bool{true, true, false}, known, "a low-word hit needs the matching high word")
+
+	clear(known)
+	snapshot = &seriesSnapshot{tokens: map[uint64]struct{}{2: {}}}
+	require.Equal(t, 1, cache.match(snapshot, entries, known))
+	require.Equal(t, []bool{false, true, false}, known)
 	require.Nil(t, newVerifiedIdentityCache(0))
 }
 
-func TestVerifiedIdentityOldGenerationCannotReplaceNewProofs(t *testing.T) {
+func TestOlderRootCannotReplaceNewerMembership(t *testing.T) {
 	t.Parallel()
 	cache := newVerifiedIdentityCache(4096)
-	id := signal.SeriesID{Lo: 1}
-	require.True(t, cache.put(2, id, []byte("new")))
-	require.False(t, cache.put(1, id, []byte("old")))
-	raw, ok := cache.get(2, id)
-	require.True(t, ok)
-	require.Equal(t, "new", string(raw))
-	_, ok = cache.get(1, id)
-	require.False(t, ok)
+	registry := series.New()
+	id := registry.Add(benchSeries(1))
+	entries := identitySnapshot{view: registry.View(), refs: []uint32{0}}
+	cache.putIDs(2, []signal.SeriesID{id})
+	cache.putIDs(1, []signal.SeriesID{id})
+	known := make([]bool, len(entries.refs))
+	snapshot := &seriesSnapshot{tokens: map[uint64]struct{}{2: {}}}
+	require.Equal(t, 1, cache.match(snapshot, entries, known))
+	require.Equal(t, []bool{true}, known)
 }
 
 func TestVerifiedIdentityAcrossHeadsAndCatalogChanges(t *testing.T) {
@@ -81,7 +85,7 @@ func TestVerifiedIdentityAcrossHeadsAndCatalogChanges(t *testing.T) {
 	known, err := e.seriesTable.knownIdentities(t.Context(), input, e.verifiedIdentities)
 	require.NoError(t, err)
 	require.NotContains(t, known, false)
-	require.Zero(t, reads.Bytes(), "a completed root write seeds exact canonical verification")
+	require.Zero(t, reads.Bytes(), "a completed root write seeds exact ID membership")
 	for i := range 32 {
 		_, err = e.Append(benchSeries(i), 200, 1)
 		require.NoError(t, err)
@@ -91,9 +95,11 @@ func TestVerifiedIdentityAcrossHeadsAndCatalogChanges(t *testing.T) {
 	// The old descriptor cannot authorize a different root, even with the same ID.
 	other := catalogRoot(t, reads, "other", 99)
 	require.NoError(t, e.installSeriesRootsLocked(t.Context(), []bucketindex.SeriesRoot{other}))
+	reads.Reset()
 	known, err = e.seriesTable.knownIdentities(t.Context(), input, e.verifiedIdentities)
 	require.NoError(t, err)
-	require.NotContains(t, known, false, "adding an unrelated root preserves the original proof")
+	require.NotContains(t, known, false, "adding an unrelated root preserves the original membership proof")
+	require.Zero(t, reads.Bytes(), "the unchanged root should not be read again")
 	// A new snapshot with only the unrelated root must not reuse existence from the old root.
 	handle := e.seriesTable.roots[slices.IndexFunc(e.seriesTable.roots, func(h *seriesRootHandle) bool { return h.binding == other })]
 	onlyOther := newSeriesSnapshot([]*seriesRootHandle{handle})
@@ -107,7 +113,7 @@ func TestVerifiedIdentityAcrossHeadsAndCatalogChanges(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
-func TestVerifiedIdentityRejectsCanonicalConflict(t *testing.T) {
+func TestDescriptorMembershipChecksOnlyID(t *testing.T) {
 	t.Parallel()
 	e := separateCatalogEngine(backend.Memory())
 	t.Cleanup(func() { require.NoError(t, e.CloseWAL()) })
@@ -115,12 +121,13 @@ func TestVerifiedIdentityRejectsCanonicalConflict(t *testing.T) {
 	_, err := e.Append(s, 100, 1)
 	require.NoError(t, err)
 	require.NoError(t, e.Flush(t.Context()))
-	// Deliberately force an ID collision to exercise the canonical check independently of hashing.
+	// A mismatched descriptor here catches any accidental materialization on the lookup path.
 	registry := series.New()
 	registry.AddEntry(series.Entry{ID: s.Hash(), Series: benchSeries(2)})
 	input := identitySnapshot{view: registry.View(), refs: []uint32{0}}
-	_, err = e.seriesTable.knownIdentities(t.Context(), input, e.verifiedIdentities)
-	require.ErrorContains(t, err, "canonical identity conflict")
-	_, err = e.seriesTable.knownIdentities(t.Context(), input)
-	require.ErrorContains(t, err, "canonical identity conflict")
+	for _, cache := range []*verifiedIdentityCache{e.verifiedIdentities, nil} {
+		known, err := e.seriesTable.knownIdentities(t.Context(), input, cache)
+		require.NoError(t, err)
+		require.Equal(t, []bool{true}, known)
+	}
 }

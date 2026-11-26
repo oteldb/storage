@@ -186,7 +186,7 @@ type Config struct {
 	// One atomic caller batch may exceed the target and flushes before the next write.
 	ResidentHeadBytes int64
 	// SeriesCacheBytes bounds historical ID/watermark cache memory per disk-indexed engine.
-	// SeparateSeries reserves one eighth each for sorted IDs and verified canonical bytes;
+	// SeparateSeries reserves one eighth each for sorted IDs and verified ID membership;
 	// the rest holds watermarks.
 	// Zero uses 512 MiB, allocated on demand; negative disables the cache.
 	SeriesCacheBytes int64

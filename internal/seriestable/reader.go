@@ -75,6 +75,24 @@ func (r *Reader) LookupRaw(id signal.SeriesID) ([]byte, bool, error) {
 	return raw, found, nil
 }
 
+// HasID tests exact membership without touching any descriptor record.
+func (r *Reader) HasID(id signal.SeriesID) (bool, error) {
+	if r.run == nil {
+		return false, ErrClosed
+	}
+	if err := r.ctx.Err(); err != nil {
+		return false, err
+	}
+	if filter := r.run.idFilter; filter != nil && !filter.mayContain(id.Lo) {
+		return false, nil
+	}
+	if r.ids != nil {
+		_, found := slices.BinarySearchFunc(r.ids.ids, id, signal.SeriesID.Compare)
+		return found, nil
+	}
+	return r.rawReader().HasID(id)
+}
+
 // IDs returns a sorted ID cursor valid while this reader pins the immutable run.
 func (r *Reader) IDs(ctx context.Context) postings.Postings {
 	if r.ids != nil {

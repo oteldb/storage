@@ -262,3 +262,20 @@ func TestRoutingFilterBudgetAndValidation(t *testing.T) {
 	require.Error(t, err)
 	require.Zero(t, cache.filterUsed, "failed validation releases the filter charge")
 }
+
+func TestHasIDChecksBothWordsWithoutRetainedIDs(t *testing.T) {
+	t.Parallel()
+	run := cachedRun(t, backend.Memory(), "has-id", nil)
+	reader, err := run.NewReader(t.Context())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reader.Close()) }()
+	reader.StreamPages()
+	id := descriptors(16)[0].Hash()
+	collision := signal.SeriesID{Hi: id.Hi ^ 1, Lo: id.Lo}
+	found, err := reader.HasID(collision)
+	require.NoError(t, err)
+	require.False(t, found)
+	found, err = reader.HasID(id)
+	require.NoError(t, err)
+	require.True(t, found)
+}

@@ -623,7 +623,7 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 		buildFallbacks: b.counter("storage.flush.build.fallbacks", "parallel plans retried sequentially", "{attempt}"),
 		buildMemory: b.i64hist("storage.flush.build.memory.bytes", "planned and checked flush working sets", "By",
 			1<<20, 8<<20, 16<<20, 32<<20, 64<<20, 128<<20, 256<<20, 512<<20, 1<<30),
-		verified: b.counter("storage.series.verification_cache.requests", "canonical verification cache probes", "{identity}"),
+		verified: b.counter("storage.series.verification_cache.requests", "shared-series ID membership cache probes", "{identity}"),
 		total:    b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
 		duration: b.f64hist("storage.flush.duration", "flush wall time"),
 		rows:     b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),

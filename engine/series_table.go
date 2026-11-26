@@ -19,6 +19,7 @@ type seriesRootHandle struct {
 	binding bucketindex.SeriesRoot
 	run     *seriestable.Run
 	refs    atomic.Int32
+	token   atomic.Uint64
 }
 
 func (h *seriesRootHandle) acquire() { h.refs.Add(1) }
@@ -30,20 +31,23 @@ func (h *seriesRootHandle) release() {
 
 // Parts retain one snapshot lease until their last reader and owner have drained.
 type seriesSnapshot struct {
-	generation uint64
-	refs       atomic.Int32
-	roots      []*seriesRootHandle
-	retired    int
+	tokens  map[uint64]struct{}
+	refs    atomic.Int32
+	roots   []*seriesRootHandle
+	retired int
 }
 
-var seriesSnapshotGeneration atomic.Uint64
+var seriesRootToken atomic.Uint64
 
 func newSeriesSnapshot(roots []*seriesRootHandle) *seriesSnapshot {
-	s := &seriesSnapshot{roots: slices.Clone(roots)}
-	s.generation = seriesSnapshotGeneration.Add(1)
+	s := &seriesSnapshot{roots: slices.Clone(roots), tokens: make(map[uint64]struct{}, len(roots))}
 	slices.SortFunc(s.roots, func(a, b *seriesRootHandle) int { return strings.Compare(a.binding.Prefix, b.binding.Prefix) })
 	s.refs.Store(1)
 	for _, h := range s.roots {
+		if h.token.Load() == 0 {
+			h.token.CompareAndSwap(0, seriesRootToken.Add(1))
+		}
+		s.tokens[h.token.Load()] = struct{}{}
 		h.acquire()
 	}
 	return s

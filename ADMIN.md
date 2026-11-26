@@ -714,6 +714,10 @@ buffers. Tracked values exclude allocator/GC overhead and transient codec alloca
 not heap/RSS measurements. The total pool, merge allowance and part targets are independent of
 this accounting experiment and remain configured as before.
 
+`storage.series.verification_cache.requests` records shared-series ID membership cache hits and
+misses. A hit confirms that the full series ID is present in an immutable descriptor root in the
+flush snapshot.
+
 `storage.ingest.prepared.attempts{outcome=done|pressure|snapshot|work_limit|error}` counts
 parallel preparation attempts. `storage.ingest.prepared.batches{path,reason}` counts completed
 prepared calls, including failures; `.samples{path,reason}` counts only their accepted points.
