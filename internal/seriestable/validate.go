@@ -22,10 +22,11 @@ import (
 const validationBuffer = 64 << 10
 
 func (r *Run) validate(ctx context.Context, be backend.Backend, key string, desc block.ColumnDesc) (err error) {
+	r.idFilter = r.idCache.reserveFilter(r.Count())
 	retained := r.idCache.reserve(r)
 	defer func() {
 		if err != nil {
-			r.idCache.remove(r)
+			r.removeCachedIDs()
 		}
 	}()
 	return r.validateContents(ctx, be, key, desc, retained)
@@ -81,6 +82,9 @@ func (r *Run) validateContents(ctx context.Context, be backend.Backend, key stri
 		}
 
 		retained.set(seen, id)
+		if r.idFilter != nil {
+			r.idFilter.add(id.Lo)
+		}
 		seen++
 	}
 	if err := ids.Err(); err != nil {

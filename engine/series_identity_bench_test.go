@@ -15,15 +15,15 @@ import (
 
 func BenchmarkSharedIdentityMisses(b *testing.B) {
 	for _, roots := range []int{1, 16, 64} {
-		for _, retain := range []bool{false, true} {
-			b.Run(fmt.Sprintf("roots=%d/retained=%t", roots, retain), func(b *testing.B) {
-				benchmarkSharedIdentityMisses(b, roots, retain)
+		for _, budget := range []int64{0, 256 << 10, 8 << 20} {
+			b.Run(fmt.Sprintf("roots=%d/budget=%d", roots, budget), func(b *testing.B) {
+				benchmarkSharedIdentityMisses(b, roots, budget)
 			})
 		}
 	}
 }
 
-func benchmarkSharedIdentityMisses(b *testing.B, roots int, retain bool) {
+func benchmarkSharedIdentityMisses(b *testing.B, roots int, budget int64) {
 	b.Helper()
 	files, err := backendfile.New(b.TempDir())
 	if err != nil {
@@ -31,10 +31,7 @@ func benchmarkSharedIdentityMisses(b *testing.B, roots int, retain bool) {
 	}
 	counter := &cpuFixtureFile{File: files}
 	be := backend.Cached(counter, 64<<20)
-	var cache *seriestable.IDCache
-	if retain {
-		cache = seriestable.NewIDCache(8 << 20)
-	}
+	cache := seriestable.NewIDCache(budget)
 	handles := make([]*seriesRootHandle, 0, roots)
 	const perRun = 2048
 	for run := range roots {

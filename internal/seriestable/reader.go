@@ -49,6 +49,9 @@ func (r *Reader) LookupRaw(id signal.SeriesID) ([]byte, bool, error) {
 	if err := r.ctx.Err(); err != nil {
 		return nil, false, err
 	}
+	if filter := r.run.idFilter; filter != nil && !filter.mayContain(id.Lo) {
+		return nil, false, nil
+	}
 	var ref int
 	var found bool
 	var raw []byte

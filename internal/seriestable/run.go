@@ -22,12 +22,13 @@ var ErrClosed = errors.New("seriestable: closed run")
 
 // Run retains immutable metadata only. The engine owns catalog and object reclamation.
 type Run struct {
-	idCache *IDCache
-	part    *block.PartReader
-	index   *seriesindex.Index
-	mu      sync.Mutex
-	refs    int
-	closed  bool
+	idCache  *IDCache
+	idFilter *idRoutingFilter
+	part     *block.PartReader
+	index    *seriesindex.Index
+	mu       sync.Mutex
+	refs     int
+	closed   bool
 }
 
 // Open validates a run and optionally checks its catalog-bound manifest digest.
@@ -129,7 +130,7 @@ func (r *Run) Close() error {
 	closePart := r.refs == 0
 	r.mu.Unlock()
 	if closePart {
-		r.idCache.remove(r)
+		r.removeCachedIDs()
 		return r.part.Close()
 	}
 	return nil
@@ -153,7 +154,13 @@ func (r *Run) release() {
 	closePart := r.closed && r.refs == 0
 	r.mu.Unlock()
 	if closePart {
-		r.idCache.remove(r)
+		r.removeCachedIDs()
 		_ = r.part.Close()
 	}
+}
+
+func (r *Run) removeCachedIDs() {
+	r.idCache.remove(r)
+	r.idCache.releaseFilter(r.idFilter)
+	r.idFilter = nil
 }

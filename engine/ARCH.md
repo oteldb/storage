@@ -2214,8 +2214,11 @@ Validation never substitutes sample timestamps for missing coverage. Byte-based 
 numeric parts only; retained metadata source objects require separate disk-capacity monitoring.
 
 Separate metadata reserves one eighth of `SeriesCacheBytes` for a bounded
-LRU of validated, sorted `SeriesID` arrays. Exact binary search returns a descriptor ordinal or a
-negative result without decoding prefix-coded keys. A second eighth holds exact canonical byte
+cache of routing filters and validated, sorted `SeriesID` arrays. Per-run filters use the low 64
+bits to reject absent IDs without seeking prefix-coded keys. They take at most half of this
+budget and remain charged until all readers of the run drain. Exact ID arrays use the remaining
+space and can bypass a disk ID seek on a hit. Possible matches still check the full ID and
+canonical descriptor. A second eighth holds exact canonical byte
 proofs for one immutable catalog generation; the remaining three quarters hold historical
 watermarks. Proofs are checked once per input identity before walking metadata roots. Catalog
 changes force fresh verification, and a full proof cache stops admitting entries rather than
