@@ -41,7 +41,10 @@ type partStreamWriter struct {
 	stats []SeriesAgg
 
 	// covered is aligned with the writer-owned runs.
-	covered []int64
+	covered       []int64
+	meta          *seriesMetadataSpool
+	metaWorkspace int64
+	metaCtx       context.Context //nolint:containedctx // Appends are scoped to the part writer.
 
 	withSF       bool
 	withStats    bool
@@ -154,6 +157,11 @@ func newPartStreamWriterAt(
 		streamIdentities: streamIdentities, identityWriterBytes: identityBytes,
 	}
 	out.sidecarWriterBytes, _ = out.sidecarWorkspace()
+	if e.cfg.SeparateSeries && out.sidecarWriterBytes > 0 {
+		if bytes, ok := backend.ReaderMemory(e.cfg.Backend, prefix+"/.series-meta"); ok {
+			out.metaWorkspace, out.metaCtx = bytes+metadataSpoolBuffer+out.sidecarWriterBytes, ctx
+		}
+	}
 	return out, nil
 }
 
@@ -165,6 +173,11 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 		return nil
 	}
 	sameSeries := len(p.runs) > 0 && p.runs[len(p.runs)-1].Value == id
+	if !sameSeries {
+		if err := p.nextSeriesMetadata(); err != nil {
+			return err
+		}
+	}
 	if p.seriesChunks && len(p.runs) > 0 && !sameSeries {
 		if err := p.w.EndGroup(); err != nil {
 			return err
@@ -230,9 +243,13 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 func (p *partStreamWriter) encodedBytes() int64 { return p.w.EncodedBytes() }
 
 func (p *partStreamWriter) reserveSeries(n int) error {
-	p.covered = slices.Grow(p.covered, max(n-len(p.covered), 0))
+	sidecars := n
+	if p.metaWorkspace > 0 {
+		sidecars = min(sidecars, seriesMetadataMemoryLimit)
+	}
+	p.covered = slices.Grow(p.covered, max(sidecars-len(p.covered), 0))
 	if p.withStats {
-		p.stats = slices.Grow(p.stats, max(n-len(p.stats), 0))
+		p.stats = slices.Grow(p.stats, max(sidecars-len(p.stats), 0))
 	}
 	if err := p.w.ReserveU128Runs(colSeriesIdx, n); err != nil {
 		return err
@@ -261,7 +278,7 @@ func (p *partStreamWriter) residentBytes() int64 {
 		total += partIDBloomBytes(len(p.runs))
 	}
 	total += int64(cap(p.stats)) * aggBytes
-	total += int64(cap(p.covered)) * 8
+	total += int64(cap(p.covered))*8 + p.metaWorkspace
 	total += int64(cap(p.ones)) * 8
 
 	if p.buffered {
@@ -272,7 +289,10 @@ func (p *partStreamWriter) residentBytes() int64 {
 
 // abort releases the part's in-flight column objects, so an abandoned merge leaves no half-written
 // object behind. Idempotent, and a no-op once the part has been written.
-func (p *partStreamWriter) abort() { p.w.Abort() }
+func (p *partStreamWriter) abort() {
+	p.w.Abort()
+	p.dropSeriesMetadata()
+}
 
 // weights materializes the unit vector for an unsampled series, so a declared weight column stays
 // aligned with the other columns.
@@ -324,6 +344,7 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 	}
 
 	prefix := p.prefix
+	defer p.dropSeriesMetadata()
 	if err := p.ensureSharedIdentities(ctx, identities); err != nil {
 		return nil, err
 	}
@@ -335,6 +356,7 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 	if err := p.writeSeriesSidecars(ctx); err != nil {
 		return nil, errors.Wrapf(err, "write series sidecars %q", prefix)
 	}
+	p.dropSeriesMetadata()
 
 	if err := p.writeIdentity(ctx, identities); err != nil {
 		return nil, err

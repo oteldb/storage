@@ -1491,8 +1491,9 @@ MiB at the default), so a cap raised to widen parts would raise merge RSS with i
 streaming costs 3.7–5.4× less total allocation and 2.9–3.8× less peak heap than buffering, the wider
 margin on counter-shaped data.
 
-Sidecars stream with it: series index, identities and aggregate stats come from the same per-series
-calls, each run- or series-shaped, so they cost O(distinct series), not O(rows). Encoding decisions
+Sidecars stream with it. Native shared-series writers spill watermarks and aggregates after
+32,768 series into a checked private stream; the sealed part keeps the existing sidecar format.
+The ID run list and frame directories still scale with the output cardinality. Encoding decisions
 must be fixed before the first row — compression profile, precision budget, whether a weight column
 exists — so `mergeEncoding` derives them from the sources up front; its doc has why that is equivalent.
 

@@ -21,6 +21,13 @@ var checksums = crc32.MakeTable(crc32.Castagnoli)
 
 // Write emits header, records and a big-endian CRC without a whole-object encoding buffer.
 func Write(ctx context.Context, b backend.Backend, key string, header []byte, count, maxEntry int, entry func([]byte, int) []byte) error {
+	return WriteChecked(ctx, b, key, header, count, maxEntry, func(dst []byte, i int) ([]byte, error) {
+		return entry(dst, i), nil
+	})
+}
+
+// WriteChecked streams records from a source that can fail.
+func WriteChecked(ctx context.Context, b backend.Backend, key string, header []byte, count, maxEntry int, entry func([]byte, int) ([]byte, error)) error {
 	if count < 0 || maxEntry <= 0 || maxEntry > ScratchBytes-4 || len(header) > ScratchBytes-4 {
 		return errors.New("sidecar: invalid record geometry")
 	}
@@ -59,7 +66,10 @@ func Write(ctx context.Context, b backend.Backend, key string, header []byte, co
 			}
 		}
 		start := len(buf)
-		buf = entry(buf, i)
+		buf, err = entry(buf, i)
+		if err != nil {
+			return err
+		}
 		if len(buf)-start > maxEntry {
 			return errors.New("sidecar: record exceeds bound")
 		}

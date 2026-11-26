@@ -165,7 +165,7 @@ func (b *headPartBuilder) baseBytes() int64 {
 		n = buildbudget.Add(n, b.closedBloomBytes)
 	}
 	if b.writer != nil {
-		n = buildbudget.Add(n, max(b.writer.identityWriterBytes, b.writer.sidecarWriterBytes))
+		n = buildbudget.Add(n, max(b.writer.identityWriterBytes, b.writer.sidecarWriterBytes)+b.writer.metaWorkspace)
 	}
 	if b.fixedLimit == 0 {
 		n = buildbudget.Add(n, memsize.Slice(b.entries))
