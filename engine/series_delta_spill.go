@@ -181,7 +181,7 @@ func (e *Engine) writeNativeSeriesDelta(ctx context.Context, entries identitySna
 		if err := reserve(needed); err != nil {
 			return err
 		}
-		return e.installSeriesDelta(ctx, entries, snapshot, known, prefix, func() (*seriestable.Run, error) {
+		return e.installSeriesDelta(entries, snapshot, known, prefix, func() (*seriestable.Run, error) {
 			return seriestable.WriteWithIDCache(ctx, e.cfg.Backend, prefix, &b, e.seriesIDs)
 		})
 	}
@@ -198,7 +198,7 @@ func (e *Engine) writeNativeSeriesDelta(ctx context.Context, entries identitySna
 	if err != nil {
 		return err
 	}
-	return e.installSeriesDelta(ctx, entries, snapshot, known, prefix, func() (*seriestable.Run, error) {
+	return e.installSeriesDelta(entries, snapshot, known, prefix, func() (*seriestable.Run, error) {
 		return seriestable.WriteContiguous(ctx, e.cfg.Backend, prefix, delta.view, delta.refs, indexes, e.seriesIDs)
 	})
 }

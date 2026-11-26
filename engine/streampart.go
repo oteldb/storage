@@ -291,7 +291,7 @@ func (p *partStreamWriter) residentBytes() int64 {
 // object behind. Idempotent, and a no-op once the part has been written.
 func (p *partStreamWriter) abort() {
 	p.w.Abort()
-	p.dropSeriesMetadata()
+	p.dropSeriesMetadata(p.metaCtx)
 }
 
 // weights materializes the unit vector for an unsampled series, so a declared weight column stays
@@ -344,7 +344,7 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 	}
 
 	prefix := p.prefix
-	defer p.dropSeriesMetadata()
+	defer p.dropSeriesMetadata(ctx)
 	if err := p.ensureSharedIdentities(ctx, identities); err != nil {
 		return nil, err
 	}
@@ -356,7 +356,7 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 	if err := p.writeSeriesSidecars(ctx); err != nil {
 		return nil, errors.Wrapf(err, "write series sidecars %q", prefix)
 	}
-	p.dropSeriesMetadata()
+	p.dropSeriesMetadata(ctx)
 
 	if err := p.writeIdentity(ctx, identities); err != nil {
 		return nil, err

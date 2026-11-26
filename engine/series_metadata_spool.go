@@ -76,9 +76,6 @@ func (s *seriesMetadataSpool) append(covered int64, agg SeriesAgg) error {
 }
 
 func (p *partStreamWriter) openSeriesMetadata(ctx context.Context) (backend.ObjectReader, error) {
-	if p.meta == nil {
-		return nil, nil
-	}
 	if err := p.nextSeriesMetadata(); err != nil {
 		return nil, err
 	}
@@ -106,12 +103,12 @@ func (p *partStreamWriter) openSeriesMetadata(ctx context.Context) (backend.Obje
 	return r, nil
 }
 
-func (p *partStreamWriter) dropSeriesMetadata() {
+func (p *partStreamWriter) dropSeriesMetadata(ctx context.Context) {
 	if s := p.meta; s != nil {
 		p.meta = nil
 		s.writer.Abort()
 		if s.committed {
-			ctx, cancel := context.WithTimeout(context.WithoutCancel(p.metaCtx), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancel()
 			_ = p.e.cfg.Backend.Delete(ctx, s.key)
 		}

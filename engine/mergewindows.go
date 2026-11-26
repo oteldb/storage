@@ -79,6 +79,34 @@ func (h *mergeSampleHeap) Pop() any {
 	return v
 }
 
+func (h *mergeSampleHeap) next(streams []*partStream) (int64, float64, error) {
+	first := &h.sources[h.order[0]]
+	ts := first.ts[first.at]
+	var value float64
+	// Consume ties even across windows. Later sources and later rows in a source win.
+	for h.Len() != 0 {
+		i := h.order[0]
+		s := &h.sources[i]
+		next := s.ts[s.at]
+		if next != ts {
+			if next < ts {
+				return 0, 0, errors.New("engine: unsorted metric merge input")
+			}
+			break
+		}
+		value = s.values[s.at]
+		if err := s.advance(streams[i]); err != nil {
+			return 0, 0, err
+		}
+		if s.at == len(s.ts) {
+			heap.Pop(h)
+		} else {
+			heap.Fix(h, 0)
+		}
+	}
+	return ts, value, nil
+}
+
 // mergeSeriesWindows uses one decoded window per input for raw, unweighted series.
 type mergeSeriesWindows struct {
 	heap mergeSampleHeap
@@ -113,29 +141,9 @@ func (m *mergeSeriesWindows) merge(ctx context.Context, streams []*partStream, r
 				return err
 			}
 		}
-		first := &m.heap.sources[m.heap.order[0]]
-		ts := first.ts[first.at]
-		var value float64
-		// Consume ties even across windows. Later sources and later rows in a source win.
-		for m.heap.Len() != 0 {
-			i := m.heap.order[0]
-			s := &m.heap.sources[i]
-			next := s.ts[s.at]
-			if next != ts {
-				if next < ts {
-					return errors.New("engine: unsorted metric merge input")
-				}
-				break
-			}
-			value = s.values[s.at]
-			if err := s.advance(streams[i]); err != nil {
-				return err
-			}
-			if s.at == len(s.ts) {
-				heap.Pop(&m.heap)
-			} else {
-				heap.Fix(&m.heap, 0)
-			}
+		ts, value, err := m.heap.next(streams)
+		if err != nil {
+			return err
 		}
 		if ts < start {
 			continue

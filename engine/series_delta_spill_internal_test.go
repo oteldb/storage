@@ -31,7 +31,7 @@ func TestSharedSeriesPostingSpillsPublishOneRoot(t *testing.T) {
 	require.NotContains(t, known, false)
 	for _, matchers := range [][]fetch.Matcher{nil, {{Name: []byte("instance"), Match: func(v signal.Value) bool { return v.Kind() == signal.KindStr }}}} {
 		visited := 0
-		require.NoError(t, e.seriesTable.visit(t.Context(), matchers, func(id signal.SeriesID, raw []byte) error {
+		require.NoError(t, e.seriesTable.visit(t.Context(), matchers, func(id signal.SeriesID, _ []byte) error {
 			require.Equal(t, entries.view.ID(int(entries.refs[visited])), id)
 			visited++
 			return nil

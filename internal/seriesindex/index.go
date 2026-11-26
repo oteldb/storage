@@ -69,6 +69,9 @@ type Builder struct {
 	mergeCanonicalBytes, mergeLabels int64
 }
 
+// NewBorrowedBuilder borrows a pinned registry view. Use AddBorrowed to append references.
+func NewBorrowedBuilder(view series.View) Builder { return Builder{borrowed: &view} }
+
 // Bytes bounds retained metadata and sorting/directory scratch during writing.
 func (b *Builder) Bytes() int64 {
 	n := b.bytes + memsize.Slice(b.borrowedRefs) + int64(cap(b.canonicalScratch)) + int64(cap(b.valueScratch)) + int64(cap(b.postingScratch))
@@ -96,9 +99,6 @@ func (b *Builder) StreamingDirectoryBytes() int64 {
 	return buildbudget.Add(buildbudget.Mul(keys, 3),
 		buildbudget.Mul(pages, 4*memsize.Of[pageInfo]()+directorySize))
 }
-
-// NewBorrowedBuilder borrows a pinned registry view. Use AddBorrowed to append references.
-func NewBorrowedBuilder(view series.View) Builder { return Builder{borrowed: &view} }
 
 // AddBorrowed appends an ordered reference into the borrowed view.
 func (b *Builder) AddBorrowed(i int, meta Metadata) error {
@@ -173,14 +173,6 @@ func (b *Builder) AddView(view series.View, i int, meta Metadata) error {
 	ref := b.appendRecord(id, meta, len(b.canonicalScratch))
 	b.addViewLabels(view, i, ref)
 	return nil
-}
-
-func (b *Builder) addViewLabels(view series.View, i int, ref uint32) {
-	resource, scope := view.Context(i)
-	visitLabels(signal.Series{Resource: resource, Scope: scope}, func(name []byte, value signal.Value) {
-		b.addLabel(ref, name, value)
-	})
-	view.EncodedAttributes(i, func(name, encoded []byte) { b.addEncodedLabel(ref, name, encoded) })
 }
 
 // MergePostings chooses immutable source postings for subsequent AddIdentity calls.
@@ -388,6 +380,14 @@ func (b *Builder) WriteObject(ctx context.Context, dst backend.Backend, key stri
 		return err
 	}
 	return w.Commit(ctx)
+}
+
+func (b *Builder) addViewLabels(view series.View, i int, ref uint32) {
+	resource, scope := view.Context(i)
+	visitLabels(signal.Series{Resource: resource, Scope: scope}, func(name []byte, value signal.Value) {
+		b.addLabel(ref, name, value)
+	})
+	view.EncodedAttributes(i, func(name, encoded []byte) { b.addEncodedLabel(ref, name, encoded) })
 }
 
 func (b *Builder) checkID(id signal.SeriesID) error {

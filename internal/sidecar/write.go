@@ -27,7 +27,9 @@ func Write(ctx context.Context, b backend.Backend, key string, header []byte, co
 }
 
 // WriteChecked streams records from a source that can fail.
-func WriteChecked(ctx context.Context, b backend.Backend, key string, header []byte, count, maxEntry int, entry func([]byte, int) ([]byte, error)) error {
+func WriteChecked(ctx context.Context, b backend.Backend, key string, header []byte,
+	count, maxEntry int, entry func([]byte, int) ([]byte, error),
+) error {
 	if count < 0 || maxEntry <= 0 || maxEntry > ScratchBytes-4 || len(header) > ScratchBytes-4 {
 		return errors.New("sidecar: invalid record geometry")
 	}

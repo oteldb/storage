@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/internal/buildbudget"
@@ -205,25 +206,17 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{}, err
 	}
 
-	// A background merge may still make progress with fewer inputs while a flush
-	// owns part of the pool. Use the smaller grant for every subsequent phase.
-	if !admitted && opts.Background && allowance < math.MaxInt64 && allowance >= 128<<20 {
-		reduced := allowance / 2
-		smaller, planErr := e.selectBoundedMergeWithAllowance(ctx, cohorts, readable, opts, capBytes, e.mergeIdle(opts), turn, reduced)
-		if planErr != nil && !errors.Is(planErr, errMergeInputMemory) {
-			return mergeResult{parts: dropped}, planErr
+	// A background merge may still make progress while a flush owns pool space.
+	if !admitted && opts.Background && allowance < math.MaxInt64 && allowance >= 128<<20 &&
+		backend.StreamsWrites(e.cfg.Backend) {
+		var smaller boundedMergeSelection
+		var deferred bool
+		smaller, release, deferred, err = e.trySmallerMerge(ctx, cohorts, readable, opts, capBytes, turn, allowance/2)
+		if err != nil || deferred {
+			return mergeResult{deferred: deferred, parts: dropped}, err
 		}
-		if planErr == nil && len(smaller.parts) > 0 {
-			if deferred, err := e.admitPressureMerge(ctx, smaller.parts, true); deferred {
-				return mergeResult{deferred: true, parts: dropped}, err
-			}
-			release, admitted, err = e.admitMergeBytes(ctx, true, reduced)
-			if err != nil {
-				return mergeResult{parts: dropped}, err
-			}
-			if admitted {
-				selection, allowance = smaller, reduced
-			}
+		if release != nil {
+			selection, allowance, admitted = smaller, smaller.allowance, true
 		}
 	}
 	if !admitted {
@@ -327,6 +320,27 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	e.recordMergePlan(ctx, selection.plan, "completed")
 	e.cfg.Obs.Merge.Outputs(ctx, metricSignal, int64(len(newParts)))
 	return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, nil
+}
+
+// trySmallerMerge replans before admitting the reduced allowance.
+func (e *Engine) trySmallerMerge(ctx context.Context, cohorts []mergeCohort, readable []*part,
+	opts MergeOptions, capBytes int64, turn uint64, allowance int64,
+) (boundedMergeSelection, func(), bool, error) {
+	selection, err := e.selectBoundedMergeWithAllowance(ctx, cohorts, readable, opts, capBytes, e.mergeIdle(opts), turn, allowance)
+	if errors.Is(err, errMergeInputMemory) {
+		return boundedMergeSelection{}, nil, false, nil
+	}
+	if err != nil || len(selection.parts) == 0 {
+		return boundedMergeSelection{}, nil, false, err
+	}
+	if deferred, err := e.admitPressureMerge(ctx, selection.parts, true); deferred {
+		return boundedMergeSelection{}, nil, true, err
+	}
+	release, admitted, err := e.admitMergeBytes(ctx, true, allowance)
+	if err != nil || !admitted {
+		return boundedMergeSelection{}, nil, false, err
+	}
+	return selection, release, false, nil
 }
 
 // errRollupConflict aborts a merge whose commit would put a layout in the index that does not nest

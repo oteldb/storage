@@ -44,7 +44,7 @@ func TestSpilledSeriesSidecarsPreserveStatsAndCoverage(t *testing.T) {
 		require.Equal(t, int64(i+4), ent.Max)
 		require.Equal(t, SeriesAgg{Count: 2, Rows: 2, Sum: 5, Min: 2, Max: 3}, stats[id])
 	}
-	p.dropSeriesMetadata()
+	p.dropSeriesMetadata(t.Context())
 	keys, err := files.List(t.Context(), p.prefix+"/")
 	require.NoError(t, err)
 	require.NotContains(t, keys, p.prefix+"/.series-meta")

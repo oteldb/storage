@@ -231,22 +231,12 @@ func (b *headPartBuilder) reservePhase(bytes int64, phase string) error {
 	if b.plan != nil {
 		return b.reservePlan(bytes, phase)
 	}
-	if phase == "metadata" && b.release != nil && b.e.cfg.TryFlushAdmission != nil && bytes > b.reserved {
+	if phase == "metadata" && bytes > b.reserved {
 		rounded := max(bytes, buildbudget.Add(b.reserved, max(b.reserved/2, 1<<20)))
-		for _, want := range [2]int64{rounded, bytes} {
-			if release, ok := b.e.cfg.TryFlushAdmission(want - b.reserved); ok {
-				prior := b.release
-				b.release = func() {
-					release()
-					prior()
-				}
-				b.reserved = want
-				b.e.cfg.Obs.Flush.Reservation(b.ctx, phase, want, b.target, 0)
-				return nil
-			}
-			if want == bytes {
-				break
-			}
+		if b.e.cfg.TryFlushAdmission == nil {
+			bytes = rounded
+		} else if b.release != nil && b.tryMetadataGrowth(rounded, bytes) {
+			return nil
 		}
 	}
 	if b.release != nil {
@@ -266,6 +256,25 @@ func (b *headPartBuilder) reservePhase(bytes int64, phase string) error {
 	}
 	b.reserved = bytes
 	return nil
+}
+
+func (b *headPartBuilder) tryMetadataGrowth(rounded, exact int64) bool {
+	for _, want := range [2]int64{rounded, exact} {
+		if release, ok := b.e.cfg.TryFlushAdmission(want - b.reserved); ok {
+			prior := b.release
+			b.release = func() {
+				release()
+				prior()
+			}
+			b.reserved = want
+			b.e.cfg.Obs.Flush.Reservation(b.ctx, "metadata", want, b.target, 0)
+			return true
+		}
+		if want == exact {
+			break
+		}
+	}
+	return false
 }
 
 func (b *headPartBuilder) add(ref uint32, buf *sampleBuf) error {

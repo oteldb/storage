@@ -141,13 +141,13 @@ func (e *Engine) writeSeriesDelta(ctx context.Context, entries identitySnapshot,
 			return err
 		}
 	}
-	return e.installSeriesDelta(ctx, entries, snapshot, known, prefix, func() (*seriestable.Run, error) {
+	return e.installSeriesDelta(entries, snapshot, known, prefix, func() (*seriestable.Run, error) {
 		return seriestable.WriteWithIDCache(ctx, e.cfg.Backend, prefix, &builder, e.seriesIDs)
 	})
 }
 
 func (e *Engine) installSeriesDelta(
-	ctx context.Context, entries identitySnapshot, snapshot *seriesSnapshot, known []bool, prefix string, write func() (*seriestable.Run, error),
+	entries identitySnapshot, snapshot *seriesSnapshot, known []bool, prefix string, write func() (*seriestable.Run, error),
 ) error {
 	// No workspace acquisition while owning the writer. A sibling may have added the
 	// same descriptors while we planned off-lock.

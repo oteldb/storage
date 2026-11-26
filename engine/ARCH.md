@@ -1492,7 +1492,7 @@ streaming costs 3.7–5.4× less total allocation and 2.9–3.8× less peak heap
 margin on counter-shaped data.
 
 Sidecars stream with it. Native shared-series writers spill watermarks and aggregates after
-32,768 series into a checked private stream; the sealed part keeps the existing sidecar format.
+32,768 series into a checked private stream. The sealed part keeps the existing sidecar format.
 The ID run list and frame directories still scale with the output cardinality. Encoding decisions
 must be fixed before the first row — compression profile, precision budget, whether a weight column
 exists — so `mergeEncoding` derives them from the sources up front; its doc has why that is equivalent.

@@ -32,6 +32,6 @@ func TestMergeWindowTiesAndWatermarks(t *testing.T) {
 	require.Len(t, data[0].Values, rows-mergeSeriesWindow+1)
 	for i, ts := range data[0].Timestamps {
 		require.Equal(t, int64(i+mergeSeriesWindow), ts)
-		require.Equal(t, float64(int(ts)-1+rows), data[0].Values[i])
+		require.InDelta(t, float64(int(ts)-1+rows), data[0].Values[i], 0)
 	}
 }
