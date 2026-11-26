@@ -20,8 +20,8 @@ type Index struct {
 	// Cached empty-context references are offset by one to reserve zero for unknown.
 	emptyResource, emptyScope uint64
 
-	resources []signal.Resource
-	scopes    []signal.Scope
+	resources []indexedResource
+	scopes    []indexedScope
 	contexts  []identityContext
 	res       map[string]uint32
 	scope     map[string]uint32
@@ -52,8 +52,18 @@ type row struct {
 type contextKey struct{ resource, scope uint32 }
 
 type identityContext struct {
-	resource signal.Resource
-	scope    signal.Scope
+	resource, scope    uint32
+	attributeWorkspace int64
+}
+
+type indexedResource struct {
+	value signal.Resource
+	key   string
+}
+
+type indexedScope struct {
+	value signal.Scope
+	key   string
 }
 
 // Entry is a materialized series identity and its canonical ID.
@@ -104,16 +114,7 @@ func (ix *Index) AddEntry(entry Entry) signal.SeriesID {
 		panic("series: local reference exhausted")
 	}
 
-	c := contextKey{resource: ix.internResource(s.Resource), scope: ix.internScope(s.Scope)}
-	context, ok := ix.context[c]
-	if !ok {
-		context = uint32(len(ix.contexts))
-		ix.context[c] = context
-		ix.contexts = append(ix.contexts, identityContext{
-			resource: ix.resources[c.resource], scope: ix.scopes[c.scope],
-		})
-		ix.bytes += memsize.MapEntry[contextKey, uint32]()
-	}
+	context := ix.internContext(s.Resource, s.Scope)
 	keys, offset := ix.storeAttributes(s.Attributes)
 	ix.byID.put(id, uint32(len(ix.rows)), ix.rows)
 	ix.rows = append(ix.rows, row{id: id, offset: offset, context: context, keys: keys})
@@ -193,8 +194,9 @@ func (ix *Index) internResource(r signal.Resource) uint32 {
 	} else {
 		stored, shared = ix.shared.resource(ix.kbuf, r, func() signal.Resource { return r.Intern(ix.sym.Bytes) })
 	}
-	ix.resources = append(ix.resources, stored)
-	ix.res[string(ix.kbuf)] = ref
+	key := string(ix.kbuf)
+	ix.resources = append(ix.resources, indexedResource{value: stored, key: key})
+	ix.res[key] = ref
 	ix.bytes += memsize.MapEntry[string, uint32]() + int64(len(ix.kbuf))
 	if !shared {
 		ix.bytes += memsize.Slice(stored.Attributes)
@@ -222,8 +224,9 @@ func (ix *Index) internScope(s signal.Scope) uint32 {
 	} else {
 		stored, shared = ix.shared.scope(ix.kbuf, s, func() signal.Scope { return s.Intern(ix.sym.Bytes) })
 	}
-	ix.scopes = append(ix.scopes, stored)
-	ix.scope[string(ix.kbuf)] = ref
+	key := string(ix.kbuf)
+	ix.scopes = append(ix.scopes, indexedScope{value: stored, key: key})
+	ix.scope[key] = ref
 	ix.bytes += memsize.MapEntry[string, uint32]() + int64(len(ix.kbuf))
 	if !shared {
 		ix.bytes += memsize.Slice(stored.Attributes)

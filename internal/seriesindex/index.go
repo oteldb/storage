@@ -60,7 +60,6 @@ type Builder struct {
 	records                          []record
 	names                            map[string]*namePosting
 	bytes                            int64
-	canonicalScratch                 []byte
 	valueScratch                     []byte
 	parentDigest                     [32]byte
 	encodedRaw, encodedRecords       int64
@@ -75,7 +74,7 @@ func NewBorrowedBuilder(view series.View) Builder { return Builder{borrowed: &vi
 
 // Bytes bounds retained metadata and sorting/directory scratch during writing.
 func (b *Builder) Bytes() int64 {
-	n := b.bytes + memsize.Slice(b.borrowedRefs) + int64(cap(b.canonicalScratch)) + int64(cap(b.valueScratch))
+	n := b.bytes + memsize.Slice(b.borrowedRefs) + int64(cap(b.valueScratch))
 	if b.registry != nil {
 		n += b.registry.SizeBytes()
 	}
@@ -111,8 +110,7 @@ func (b *Builder) AddBorrowed(i int, meta Metadata) error {
 	if err := b.checkID(id); err != nil {
 		return err
 	}
-	b.canonicalScratch = view.AppendCanonical(b.canonicalScratch[:0], i)
-	ref := b.appendRecord(id, meta, len(b.canonicalScratch))
+	ref := b.appendRecord(id, meta, view.CanonicalBytes(i))
 	b.borrowedRefs = append(b.borrowedRefs, uint32(i))
 	b.addViewLabels(view, i, ref)
 	return nil
@@ -169,12 +167,11 @@ func (b *Builder) AddView(view series.View, i int, meta Metadata) error {
 	if err := b.checkID(id); err != nil {
 		return err
 	}
-	b.canonicalScratch = view.AppendCanonical(b.canonicalScratch[:0], i)
 	if b.registry == nil {
 		b.registry = series.New()
 	}
 	b.registry.AddView(view, i)
-	ref := b.appendRecord(id, meta, len(b.canonicalScratch))
+	ref := b.appendRecord(id, meta, view.CanonicalBytes(i))
 	b.addViewLabels(view, i, ref)
 	return nil
 }

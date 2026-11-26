@@ -108,8 +108,9 @@ func TestIndexAddViewOwnsCopy(t *testing.T) {
 	for _, symbol := range source.sym.Snapshot() {
 		clear(symbol)
 	}
-	clear(source.contexts[0].resource.Attributes)
-	clear(source.contexts[0].scope.Attributes)
+	resource, scope := source.View().Context(0)
+	clear(resource.Attributes)
+	clear(scope.Attributes)
 	source.sym.Release()
 	require.Equal(t, id, target.View().ID(0))
 	require.Equal(t, want, target.View().AppendCanonical(nil, 0))

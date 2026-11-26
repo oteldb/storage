@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/oteldb/storage/index/symbols"
+	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/signal"
 )
@@ -19,8 +20,8 @@ func (ix *Index) AddView(v View, i int) signal.SeriesID {
 	if uint64(len(ix.rows)) > math.MaxUint32 {
 		panic("series: local reference exhausted")
 	}
-	c := v.contexts[r.context]
-	context := ix.internContext(c.resource, c.scope)
+	resource, scope := v.Context(i)
+	context := ix.internContext(resource, scope)
 	var keys uint32
 	var offset uint64
 	if ix.templates == nil && r.keys&templateFlag == 0 {
@@ -50,7 +51,8 @@ func (ix *Index) internContext(resource signal.Resource, scope signal.Scope) uin
 		ref = uint32(len(ix.contexts))
 		ix.context[c] = ref
 		ix.contexts = append(ix.contexts, identityContext{
-			resource: ix.resources[c.resource], scope: ix.scopes[c.scope],
+			resource: c.resource, scope: c.scope,
+			attributeWorkspace: buildbudget.Add(buildbudget.Attributes(resource.Attributes), buildbudget.Attributes(scope.Attributes)),
 		})
 		ix.bytes += memsize.MapEntry[contextKey, uint32]()
 	}

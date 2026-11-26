@@ -8,18 +8,36 @@ import (
 // EncodingBudget bounds the symbol workspace for selected identities of one [View].
 type EncodingBudget struct {
 	symbols   map[symbols.ID]struct{}
+	dense     []uint64
 	contexts  map[uint32]struct{}
 	bytes     int64
 	retained  int64
 	templates map[*attributeTemplate]struct{}
 }
 
+// DenseBudgetBytes prices a bitmap when the selection is large enough to amortize it.
+func (v View) DenseBudgetBytes(selected int) int64 {
+	const maxSymbols = 8 << 20
+	if selected < 1024 || len(v.symbols) > maxSymbols || len(v.symbols)/8 > selected {
+		return 0
+	}
+	return int64((len(v.symbols) + 63) / 64 * 8)
+}
+
+// UseDenseSymbols initializes a fresh budget with admitted [View.DenseBudgetBytes].
+func (b *EncodingBudget) UseDenseSymbols(bytes int64) {
+	b.dense = make([]uint64, bytes/8)
+	b.bytes = bytes
+}
+
 // Add includes identity i, counting shared payloads and estimator entries once.
 func (b *EncodingBudget) Add(v View, i int) {
-	if b.symbols == nil {
-		b.symbols = make(map[symbols.ID]struct{})
+	if b.contexts == nil {
 		b.contexts = make(map[uint32]struct{})
-		b.bytes = 256
+		if len(b.dense) == 0 {
+			b.symbols = make(map[symbols.ID]struct{})
+		}
+		b.bytes = buildbudget.Add(256+int64(cap(b.dense))*8, b.retained)
 	}
 	r := v.rows[i]
 	if _, ok := b.contexts[r.context]; !ok {
@@ -49,16 +67,17 @@ func (b *EncodingBudget) Add(v View, i int) {
 	}
 }
 
-// Bytes reports the conservative symbol workspace, including this accumulator's maps.
+// Bytes reports the conservative symbol workspace, including the estimator.
 func (b *EncodingBudget) Bytes() int64 { return b.bytes }
 
 // Reset clears selected identities while charging retained estimator capacity.
 func (b *EncodingBudget) Reset() {
 	b.retained = max(b.retained, buildbudget.Mul(int64(len(b.symbols)+len(b.contexts)+len(b.templates)), 64))
 	clear(b.symbols)
+	clear(b.dense)
 	clear(b.contexts)
 	clear(b.templates)
-	b.bytes = buildbudget.Add(256, b.retained)
+	b.bytes = buildbudget.Add(256+int64(cap(b.dense))*8, b.retained)
 }
 
 // IdentityWorkspace bounds a single identity's workspace without allocating an estimator.
@@ -84,8 +103,8 @@ func (v View) IdentityWorkspace(i int) int64 {
 
 func (v View) contextWorkspace(ref uint32) int64 {
 	c := v.contexts[ref]
-	n := buildbudget.Add(buildbudget.Attributes(c.resource.Attributes), buildbudget.Attributes(c.scope.Attributes))
-	n = buildbudget.Add(n, int64(len(c.resource.SchemaURL)+len(c.scope.Name)+len(c.scope.Version)+len(c.scope.SchemaURL)))
+	resource, scope := &v.resources[c.resource].value, &v.scopes[c.scope].value
+	n := buildbudget.Add(c.attributeWorkspace, int64(len(resource.SchemaURL)+len(scope.Name)+len(scope.Version)+len(scope.SchemaURL)))
 	return buildbudget.Add(128, buildbudget.Mul(n, 4))
 }
 
@@ -94,9 +113,18 @@ func (v View) symbolWorkspace(id symbols.ID) int64 {
 }
 
 func (b *EncodingBudget) addSymbol(v View, id symbols.ID) {
-	if _, ok := b.symbols[id]; ok {
-		return
+	if len(b.dense) != 0 {
+		word := &b.dense[id/64]
+		mask := uint64(1) << (id % 64)
+		if *word&mask != 0 {
+			return
+		}
+		*word |= mask
+	} else {
+		if _, ok := b.symbols[id]; ok {
+			return
+		}
+		b.symbols[id] = struct{}{}
 	}
-	b.symbols[id] = struct{}{}
 	b.bytes = buildbudget.Add(b.bytes, v.symbolWorkspace(id))
 }

@@ -14,7 +14,8 @@ func (b *headPartBuilder) reserveHeadShape(ctx context.Context, samples map[sign
 	if !backend.StreamsWrites(b.e.cfg.Backend) {
 		return nil
 	}
-	n := buildbudget.Add(b.baseBytes(), buildbudget.Mul(order.view.EncodingWorkspace(), 2))
+	denseBytes := order.view.DenseBudgetBytes(len(samples))
+	n := buildbudget.Add(buildbudget.Add(b.baseBytes(), denseBytes), buildbudget.Mul(order.view.EncodingWorkspace(), 2))
 	var sorting int64
 	err := walkIdentityOrder(ctx, order.view, order.runs, func(id signal.SeriesID, ref uint32) error {
 		buf := samples[id]
@@ -29,8 +30,14 @@ func (b *headPartBuilder) reserveHeadShape(ctx context.Context, samples map[sign
 		return err
 	}
 	b.reservationFloor = min(b.target, buildbudget.Add(n, sorting))
-	if b.reservationFloor > b.reserved {
-		return b.reservePhase(b.reservationFloor, "shape")
+	need := max(b.reservationFloor, buildbudget.Add(b.baseBytes(), denseBytes))
+	if need > b.reserved {
+		if err := b.reservePhase(need, "shape"); err != nil {
+			return err
+		}
+	}
+	if denseBytes > 0 {
+		b.identities.UseDenseSymbols(denseBytes)
 	}
 	return nil
 }

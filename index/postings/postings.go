@@ -20,7 +20,7 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// MemPostings is the in-memory inverted index: nameID → valueID → sorted series list,
+// MemPostings indexes each name/value pair to a sorted series list,
 // plus the set of all series. The zero value is not usable; create one with
 // [NewMemPostings]. Not safe for concurrent use; callers own synchronization (the first
 // read sorts the lists in place).
@@ -30,62 +30,56 @@ type MemPostings = memoryPostings[signal.SeriesID]
 type Dense = memoryPostings[uint32]
 
 type memoryPostings[T comparable] struct {
-	m         map[uint32]map[uint32][]T
-	all       []T
-	compare   func(T, T) int
-	fromSlice func([]T) Postings
-	sorted    bool
+	byPair      map[uint64]int
+	byName      map[uint32][]int
+	buckets     []*[postingBucketPage]postingBucket[T]
+	bucketCount int
+	all         []T
+	compare     func(T, T) int
+	fromSlice   func([]T) Postings
+	sorted      bool
 	// bytes accumulates the index's owned memory (map entries and posting-list capacity) as it is
 	// added, so [MemPostings.SizeBytes] does not walk every list. The index is identity state that
 	// outlives every flush, so its size is metered.
 	bytes int64
 }
 
-// Sizes of the index's owned structures. Posting lists are counted by capacity, which the in-place
-// sort/dedup on first read shrinks the length of but never the capacity.
-var (
-	// A name entry costs its slot in p.m — whose value is one pointer word, since a map value *is*
-	// a pointer to the runtime's map header — plus that header, allocated once per label name.
-	nameEntryBytes  = memsize.MapEntry[uint32, map[uint32][]signal.SeriesID]() + memsize.MapBase
-	valueEntryBytes = memsize.MapEntry[uint32, []signal.SeriesID]()
-)
+const postingBucketPage = 64
+
+type postingBucket[T comparable] struct {
+	series  []T
+	valueID uint32
+}
+
+func postingKey(nameID, valueID uint32) uint64 {
+	return uint64(nameID)<<32 | uint64(valueID)
+}
 
 // NewMemPostings returns an empty index.
 func NewMemPostings() *MemPostings {
-	return &MemPostings{m: make(map[uint32]map[uint32][]signal.SeriesID), compare: signal.SeriesID.Compare, fromSlice: FromSlice}
+	return &MemPostings{compare: signal.SeriesID.Compare, fromSlice: FromSlice}
 }
 
 // NewDense returns an empty index of local uint32 references.
 func NewDense() *Dense {
-	return &Dense{m: make(map[uint32]map[uint32][]uint32), compare: cmp.Compare[uint32], fromSlice: fromDenseSlice}
+	return &Dense{compare: cmp.Compare[uint32], fromSlice: fromDenseSlice}
 }
 
-// SizeBytes returns the index's resident footprint: the name→value maps and every posting list's
-// backing array (the all-set included). Symbol ids are the keys, so no label bytes are counted
-// here — they belong to the symbol table.
+// SizeBytes includes the pair lookup, per-name directory and posting lists.
 func (p *memoryPostings[T]) SizeBytes() int64 { return p.bytes }
 
 // Add records that series carries the attribute nameID=valueID (both interned symbol
 // ids). Re-adding the same triple is fine; duplicates are removed on the first read.
 func (p *memoryPostings[T]) Add(series T, nameID, valueID uint32) {
-	byVal := p.m[nameID]
-	if byVal == nil {
-		byVal = make(map[uint32][]T)
-		p.m[nameID] = byVal
-		p.bytes += nameEntryBytes
+	key := postingKey(nameID, valueID)
+	pos := p.byPair[key]
+	if pos == 0 {
+		pos = p.addBucket(key, nameID, valueID)
 	}
-
-	// A bucket, once created, always holds at least one id, so a nil list means a new value —
-	// checked without the second-result map probe the hot path would otherwise pay per Add.
-	ids := byVal[valueID]
-	if ids == nil {
-		p.bytes += valueEntryBytes
-	}
-
-	grown := cap(ids)
-	ids = append(ids, series)
-	byVal[valueID] = ids
-	p.bytes += int64(cap(ids)-grown) * memsize.Of[T]()
+	bucket := p.bucket(pos - 1)
+	grown := cap(bucket.series)
+	bucket.series = append(bucket.series, series)
+	p.bytes += int64(cap(bucket.series)-grown) * memsize.Of[T]()
 
 	p.addAll(series)
 	p.sorted = false
@@ -111,26 +105,25 @@ func (p *memoryPostings[T]) All() Postings {
 func (p *memoryPostings[T]) Get(nameID, valueID uint32) Postings {
 	p.ensureSorted()
 
-	byVal := p.m[nameID]
-	if byVal == nil {
+	pos := p.byPair[postingKey(nameID, valueID)]
+	if pos == 0 {
 		return Empty()
 	}
-
-	return p.fromSlice(byVal[valueID])
+	return p.fromSlice(p.bucket(pos - 1).series)
 }
 
 // ForName returns the series that carry the attribute nameID with any value.
 func (p *memoryPostings[T]) ForName(nameID uint32) Postings {
 	p.ensureSorted()
 
-	byVal := p.m[nameID]
-	if len(byVal) == 0 {
+	indices := p.byName[nameID]
+	if len(indices) == 0 {
 		return Empty()
 	}
 
-	its := make([]Postings, 0, len(byVal))
-	for _, ids := range byVal {
-		its = append(its, p.fromSlice(ids))
+	its := make([]Postings, 0, len(indices))
+	for _, i := range indices {
+		its = append(its, p.fromSlice(p.bucket(i).series))
 	}
 
 	return Merge(its...)
@@ -143,14 +136,14 @@ func (p *memoryPostings[T]) WithoutName(nameID uint32) Postings {
 
 // LabelValues returns, sorted, the distinct value ids seen for nameID.
 func (p *memoryPostings[T]) LabelValues(nameID uint32) []uint32 {
-	byVal := p.m[nameID]
-	if len(byVal) == 0 {
+	indices := p.byName[nameID]
+	if len(indices) == 0 {
 		return nil
 	}
 
-	out := make([]uint32, 0, len(byVal))
-	for valueID := range byVal {
-		out = append(out, valueID)
+	out := make([]uint32, 0, len(indices))
+	for _, i := range indices {
+		out = append(out, p.bucket(i).valueID)
 	}
 
 	slices.Sort(out)
@@ -169,13 +162,13 @@ func (p *memoryPostings[T]) LabelValues(nameID uint32) []uint32 {
 func (p *memoryPostings[T]) ForEachName(fn func(nameID uint32, distinctValues, totalSeries int)) {
 	p.ensureSorted()
 
-	for nameID, byVal := range p.m {
+	for nameID, indices := range p.byName {
 		total := 0
-		for _, ids := range byVal {
-			total += len(ids)
+		for _, i := range indices {
+			total += len(p.bucket(i).series)
 		}
 
-		fn(nameID, len(byVal), total)
+		fn(nameID, len(indices), total)
 	}
 }
 
@@ -186,15 +179,16 @@ func (p *memoryPostings[T]) ForEachName(fn func(nameID uint32, distinctValues, t
 func (p *memoryPostings[T]) Select(nameID uint32, match func(valueID uint32) bool) Postings {
 	p.ensureSorted()
 
-	byVal := p.m[nameID]
-	if len(byVal) == 0 {
+	indices := p.byName[nameID]
+	if len(indices) == 0 {
 		return Empty()
 	}
 
 	var its []Postings
-	for valueID, ids := range byVal {
-		if match(valueID) {
-			its = append(its, p.fromSlice(ids))
+	for _, i := range indices {
+		b := p.bucket(i)
+		if match(b.valueID) {
+			its = append(its, p.fromSlice(b.series))
 		}
 	}
 
@@ -241,6 +235,38 @@ func (p *memoryPostings[T]) Sorted() bool { return p.sorted }
 func (p *memoryPostings[T]) EnsureSorted() { p.ensureSorted() }
 
 // addAll appends to the all-set, accounting for the backing array's growth.
+func (p *memoryPostings[T]) addBucket(key uint64, nameID, valueID uint32) int {
+	if p.byPair == nil {
+		p.byPair = make(map[uint64]int)
+		p.byName = make(map[uint32][]int)
+		p.bytes += 2 * memsize.MapBase
+	}
+	if p.bucketCount%postingBucketPage == 0 {
+		before := cap(p.buckets)
+		p.buckets = append(p.buckets, new([postingBucketPage]postingBucket[T]))
+		p.bytes += memsize.Of[[postingBucketPage]postingBucket[T]]()
+		p.bytes += int64(cap(p.buckets)-before) * memsize.Of[*[postingBucketPage]postingBucket[T]]()
+	}
+	p.bucket(p.bucketCount).valueID = valueID
+	p.bucketCount++
+	pos := p.bucketCount
+	p.byPair[key] = pos
+	p.bytes += memsize.MapEntry[uint64, int]()
+	names := p.byName[nameID]
+	if names == nil {
+		p.bytes += memsize.MapEntry[uint32, []int]()
+	}
+	before := cap(names)
+	names = append(names, pos-1)
+	p.byName[nameID] = names
+	p.bytes += int64(cap(names)-before) * memsize.Of[int]()
+	return pos
+}
+
+func (p *memoryPostings[T]) bucket(i int) *postingBucket[T] {
+	return &p.buckets[i/postingBucketPage][i%postingBucketPage]
+}
+
 func (p *memoryPostings[T]) addAll(series T) {
 	if n := len(p.all); n > 0 && p.all[n-1] == series {
 		return
@@ -257,10 +283,9 @@ func (p *memoryPostings[T]) ensureSorted() {
 		return
 	}
 
-	for _, byVal := range p.m {
-		for valueID, ids := range byVal {
-			byVal[valueID] = sortDedup(ids, p.compare)
-		}
+	for i := range p.bucketCount {
+		b := p.bucket(i)
+		b.series = sortDedup(b.series, p.compare)
 	}
 
 	p.all = sortDedup(p.all, p.compare)

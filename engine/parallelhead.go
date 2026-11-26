@@ -222,13 +222,9 @@ func (p *preparedBatch) parallelWorkFits(view series.View) bool {
 			work = buildbudget.Add(work, buildbudget.Mul(int64(needed), 16))
 		}
 		if a.register {
-			n := buildbudget.Attributes(a.series.Attributes)
-			n = buildbudget.Add(n, buildbudget.Attributes(a.series.Resource.Attributes))
-			n = buildbudget.Add(n, buildbudget.Attributes(a.series.Scope.Attributes))
-			n = buildbudget.Add(n, int64(len(a.series.Resource.SchemaURL)+len(a.series.Scope.SchemaURL)))
-			n = buildbudget.Add(n, int64(len(a.series.Scope.Name)+len(a.series.Scope.Version)))
+			n, encoded := buildbudget.SeriesWorkspace(a.series)
 			work = buildbudget.Add(work, n)
-			work = buildbudget.Add(work, walIdentityWork(buildbudget.SeriesEncoding(a.series)))
+			work = buildbudget.Add(work, walIdentityWork(encoded))
 		} else if a.isNew {
 			work = buildbudget.Add(work, view.MaterializationBytes(int(a.identityRef)))
 			resource, scope := view.Context(int(a.identityRef))

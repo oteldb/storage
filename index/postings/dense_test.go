@@ -25,6 +25,27 @@ func TestDensePostings(t *testing.T) {
 	assert.False(t, p.All().Seek(signal.SeriesID{Lo: 1 << 32}))
 }
 
+func TestDensePostingsEnumeratePackedKeys(t *testing.T) {
+	t.Parallel()
+	p := NewDense()
+	const name, otherName = ^uint32(0), uint32(0)
+	for ref := range uint32(2*postingBucketPage + 1) {
+		p.Add(ref, name, ref)
+		p.Add(ref, otherName, name-ref)
+	}
+	p.Add(1, name, name)
+	got, err := ToSlice(p.Get(name, name))
+	require.NoError(t, err)
+	require.Equal(t, []signal.SeriesID{{Lo: 1}}, got)
+	got, err = ToSlice(p.Get(otherName, name))
+	require.NoError(t, err)
+	require.Equal(t, []signal.SeriesID{{Lo: 0}}, got)
+	got, err = ToSlice(p.Select(name, func(valueID uint32) bool { return valueID >= 2*postingBucketPage }))
+	require.NoError(t, err)
+	require.Equal(t, []signal.SeriesID{{Lo: 1}, {Lo: 2 * postingBucketPage}}, got)
+	require.Len(t, p.LabelValues(name), 2*postingBucketPage+2)
+}
+
 func FuzzDenseIntersection(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 3, 0, 2, 255})
 	f.Add([]byte{})

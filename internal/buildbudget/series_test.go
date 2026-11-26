@@ -50,6 +50,22 @@ func TestSeriesEncodingBound(t *testing.T) {
 	require.GreaterOrEqual(t, SeriesEncoding(signal.Series{}), int64(len((signal.Series{}).AppendHashInput(nil))))
 }
 
+func TestSeriesWorkspaceMatchesSeparateEstimates(t *testing.T) {
+	t.Parallel()
+	cases := seriesEncodingCases()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := budgetSeries(tc.value)
+			work, encoded := SeriesWorkspace(s)
+			want := Attributes(s.Attributes) + Attributes(s.Resource.Attributes) + Attributes(s.Scope.Attributes)
+			want += int64(len(s.Resource.SchemaURL) + len(s.Scope.SchemaURL) + len(s.Scope.Name) + len(s.Scope.Version))
+			require.Equal(t, want, work)
+			require.Equal(t, SeriesEncoding(s), encoded)
+		})
+	}
+}
+
 //nolint:paralleltest // AllocsPerRun changes the process concurrency setting.
 func TestSeriesEncodingAllocations(t *testing.T) {
 	for _, tc := range seriesEncodingCases() {

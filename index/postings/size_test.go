@@ -25,7 +25,7 @@ func TestMemPostingsSizeBytes(t *testing.T) {
 	p.Add(signal.SeriesID{Lo: 3}, 2, 20)
 	newName := p.SizeBytes() - one - sameBucket
 
-	assert.Greater(t, newName, sameBucket, "a new label name costs a map of its own")
+	assert.Greater(t, newName, sameBucket, "a new label name adds directory and bucket entries")
 }
 
 func TestMemPostingsSizeBytesStableAcrossSort(t *testing.T) {

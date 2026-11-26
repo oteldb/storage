@@ -50,10 +50,8 @@ func TestBuilderOwnsRepeatedPostingKeys(t *testing.T) {
 			input[i] = 255
 		}
 	}
-	for _, scratch := range [2][]byte{builder.canonicalScratch, builder.valueScratch} {
-		for i := range scratch {
-			scratch[i] = 255
-		}
+	for i := range builder.valueScratch {
+		builder.valueScratch[i] = 255
 	}
 	var encoded bytes.Buffer
 	require.NoError(t, builder.Write(&encoded))
