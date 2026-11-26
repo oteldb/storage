@@ -96,6 +96,7 @@ func TestHeadPlannerBuildsNumericWhileDescriptorsAreBlocked(t *testing.T) {
 		e.cfg.DiskSeries, e.cfg.AsyncPressureFlush, e.cfg.PressureGenerations = true, true, 2
 		e.cfg.SeparateSeries, e.cfg.MetricSeriesChunks = true, true
 		e.cfg.ResidentHeadBytes, e.cfg.HeadRotationBytes, e.cfg.FlushMemoryBytes = 1<<30, 256<<20, 64<<20
+		e.cfg.MaxPartBytes = 4 * partRowBytes
 		pool := memlimit.NewPool(512 << 20)
 		e.cfg.FlushAdmission, e.cfg.TryFlushAdmission = pool.Acquire, pool.TryAcquire
 		e.head.disk = newDiskHeadState()
@@ -125,6 +126,7 @@ func TestHeadPlannerBuildsNumericWhileDescriptorsAreBlocked(t *testing.T) {
 		require.Len(t, replayedHead(t, fs).samples, 16)
 		resume()
 		require.NoError(t, <-done)
+		require.Equal(t, 4, e.PartCount())
 		require.NoError(t, e.LoadParts(t.Context()))
 		it, err := e.Fetch(t.Context(), fetch.Request{Start: 100, End: 100})
 		require.NoError(t, err)

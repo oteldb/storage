@@ -390,8 +390,13 @@ func (b *headPartBuilder) flushRun() error {
 	if err := b.finish(); err != nil {
 		return err
 	}
-	clear(b.entries)
-	b.entries = b.entries[:0]
+	if b.fixedLimit == 0 {
+		clear(b.entries)
+		b.entries = b.entries[:0]
+	} else {
+		// Numeric workers borrow the plan's entries. Descriptor preflight can still read them.
+		b.entries = nil
+	}
 	b.identities.Reset()
 	b.fixedIdentityBytes = 0
 	b.encoded, b.materialized, b.sorting, b.runRows = 0, 0, 0, 0
