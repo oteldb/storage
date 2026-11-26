@@ -14,6 +14,9 @@ import (
 // The index owns its copy; the source view can be discarded afterward.
 func (ix *Index) AddView(v View, i int) signal.SeriesID {
 	r := v.rows[i]
+	if raw := v.EncodedDescriptor(i); raw != nil {
+		return ix.AddEntry(Entry{ID: r.id, Series: v.At(i, nil)})
+	}
 	if _, ok := ix.byID.get(r.id, ix.rows); ok {
 		return r.id
 	}

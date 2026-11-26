@@ -42,19 +42,23 @@ func (h *head) matcherWorkspace(matchers []fetch.Matcher) int64 {
 	for owner := h; owner != nil; owner = owner.frozen {
 		n := owner.exactMatcherBound(matchers)
 		workspace = buildbudget.Add(workspace, buildbudget.Mul(int64(n), perRef))
+		if len(owner.encodedRefs) != 0 {
+			workspace = buildbudget.Add(workspace, buildbudget.Mul(int64(len(owner.encodedRefs)), 64))
+			workspace = buildbudget.Add(workspace, buildbudget.Mul(int64(owner.maxEncodedDescriptor), 128))
+		}
 	}
 	return workspace
 }
 
 func (h *head) exactMatcherBound(matchers []fetch.Matcher) int {
-	n := h.series.Len()
+	n := h.series.Len() - len(h.encodedRefs)
 	if n == 0 {
 		return 0
 	}
 	var scratch [256]byte
 	for _, m := range matchers {
 		if m.Spec == nil || len(m.Spec.Value) > 128 || m.Match(signal.EmptyValue()) {
-			return h.series.Len()
+			return h.series.Len() - len(h.encodedRefs)
 		}
 		name, ok := h.sym.Lookup(m.Name)
 		if !ok {
@@ -62,7 +66,7 @@ func (h *head) exactMatcherBound(matchers []fetch.Matcher) int {
 			continue
 		}
 		if _, mixed := h.nonStringLabels[uint32(name)]; mixed {
-			return h.series.Len()
+			return h.series.Len() - len(h.encodedRefs)
 		}
 		encoded := signal.AppendValue(scratch[:0], signal.StringValue([]byte(m.Spec.Value)))
 		value, ok := h.sym.Lookup(encoded)

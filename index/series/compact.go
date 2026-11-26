@@ -29,6 +29,7 @@ type Index struct {
 	keys      [][]symbols.ID
 	keysets   map[string]uint32
 	values    []symbols.ID
+	encoded   []byte
 
 	buf, kbuf, vbuf []byte
 	bytes           int64
@@ -172,7 +173,7 @@ func (ix *Index) ForEach(fn func(id signal.SeriesID, s signal.Series)) {
 // SizeBytes reports the owned resident structures and interned payloads.
 func (ix *Index) SizeBytes() int64 {
 	return ix.bytes + ix.byID.sizeBytes() + ix.sym.SizeBytes() + memsize.Slice(ix.rows) + memsize.Slice(ix.values) +
-		memsize.Slice(ix.resources) + memsize.Slice(ix.scopes) + memsize.Slice(ix.contexts) +
+		memsize.Slice(ix.resources) + memsize.Slice(ix.scopes) + memsize.Slice(ix.contexts) + memsize.Slice(ix.encoded) +
 		memsize.Slice(ix.keys) + memsize.Slice(ix.buf) + memsize.Slice(ix.kbuf) + memsize.Slice(ix.vbuf) +
 		memsize.Slice(ix.templateRows) + memsize.Slice(ix.templateBuf) + memsize.Slice(ix.templateFields)
 }

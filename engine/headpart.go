@@ -289,14 +289,17 @@ func (b *headPartBuilder) add(ref uint32, buf *sampleBuf) error {
 		return err
 	}
 	ordered := ascendingInt64(buf.ts)
-	encoded := b.view.EncodingBytes(int(ref))
-	materialized := b.view.MaterializationBytes(int(ref))
+	var encoded, materialized, identityWorkspace int64
+	if b.view.EncodedDescriptor(int(ref)) == nil {
+		encoded = b.view.EncodingBytes(int(ref))
+		materialized = b.view.MaterializationBytes(int(ref))
+		identityWorkspace = b.view.IdentityWorkspace(int(ref))
+	}
 	var sorting int64
 	if !ordered {
 		// sortedWindow retains its tuple scratch and up to three owned numeric columns.
 		sorting = buildbudget.Mul(int64(len(buf.ts)), 48)
 	}
-	identityWorkspace := b.view.IdentityWorkspace(int(ref))
 	single := buildbudget.Add(b.baseBytes(), identityWorkspace)
 	single = buildbudget.Add(single, materialized)
 	single = buildbudget.Add(single, sorting)

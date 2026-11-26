@@ -2204,6 +2204,14 @@ outputs while descriptor preflight runs. They bind shared roots only after prefl
 succeeds. Catalog publication keeps the same generation order and WAL coverage checks.
 
 
+With a fixed rotation target, prepared writes for returning IDs append a numeric slot and
+keep the canonical bytes from their self-contained WAL registration. This head row needs
+no compact label registry insertion or eager postings. Head matching scans encoded rows with reusable scratch and keeps typed, repeated-label
+and absent-label semantics.
+Numeric planning and sorting use the same local ordinal space for both row layouts.
+Descriptor builders can copy the retained canonical bytes if a shared descriptor is missing.
+The WAL layout and replay format are identical for both kinds of head row.
+
 Catalog v9 names metadata roots independently of sample entries and publishes their union with
 numeric parts and the WAL checkpoint in one CAS. Runs sync before publication; failed commits
 retain pending roots through retries and reloads. A missing or invalid root fences loading.

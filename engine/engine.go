@@ -2263,6 +2263,7 @@ func bufHasInWindow(buf *sampleBuf, start, end int64) bool {
 // each series and appending its samples (plain or scale-factor-carrying) verbatim. Shared by the
 // durable-restart [Engine.Replay] and the trusting [Engine.ApplyReplicated]. The caller holds e.mu.
 func (e *Engine) replayHandlers() wal.Handlers {
+	var encoded []byte
 	return wal.Handlers{
 		OnSeries: func(id signal.SeriesID, s signal.Series) error {
 			if e.cfg.DiskSeries {
@@ -2271,7 +2272,16 @@ func (e *Engine) replayHandlers() wal.Handlers {
 				}
 				e.preloadAuthoritativeSeriesLocked(id)
 			}
-			e.head.registerSeries(s)
+			if e.cfg.SeparateSeries && e.fixedHeadRotation() && !e.head.series.Has(id) && e.head.seriesState(id).historical {
+				encoded = s.AppendHashInput(encoded[:0])
+				if signal.HashBytes(encoded) == id {
+					e.head.registerEncoded(id, encoded)
+				} else {
+					e.head.registerSeries(s)
+				}
+			} else {
+				e.head.registerSeries(s)
+			}
 			e.clearDiskPendingLocked()
 
 			return nil

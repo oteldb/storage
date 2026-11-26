@@ -61,14 +61,21 @@ func NewWriter(w io.Writer) *Writer { return &Writer{w: w} }
 // WriteSeries logs a series registration: its [signal.SeriesID] and full identity
 // (Resource + Scope + data-point attributes). Replaying it reconstructs the series.
 func (wr *Writer) WriteSeries(id signal.SeriesID, s signal.Series) error {
+	_, _, err := wr.WriteSeriesRange(id, s)
+	return err
+}
+
+// WriteSeriesRange writes a series and returns the canonical descriptor's byte range
+// relative to the start of the written frame.
+func (wr *Writer) WriteSeriesRange(id signal.SeriesID, s signal.Series) (start, size int, err error) {
 	wr.payload = s.AppendHashInput(id.AppendBinary(wr.payload[:0]))
 	wr.frame = appendFrame(wr.frame[:0], recordSeries, wr.payload)
-
 	if _, err := wr.w.Write(wr.frame); err != nil {
-		return errors.Wrap(err, "write record")
+		return 0, 0, errors.Wrap(err, "write record")
 	}
-
-	return nil
+	size = len(wr.payload) - seriesIDLen
+	// The descriptor ends immediately before the frame's CRC32C.
+	return len(wr.frame) - 4 - size, size, nil
 }
 
 // WriteSamples logs a run of samples for one series: its [signal.SeriesID] then the

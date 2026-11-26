@@ -32,6 +32,9 @@ func (b *EncodingBudget) UseDenseSymbols(bytes int64) {
 
 // Add includes identity i, counting shared payloads and estimator entries once.
 func (b *EncodingBudget) Add(v View, i int) {
+	if v.EncodedDescriptor(i) != nil {
+		return
+	}
 	if b.contexts == nil {
 		b.contexts = make(map[uint32]struct{})
 		if len(b.dense) == 0 {
@@ -82,6 +85,9 @@ func (b *EncodingBudget) Reset() {
 
 // IdentityWorkspace bounds a single identity's workspace without allocating an estimator.
 func (v View) IdentityWorkspace(i int) int64 {
+	if raw := v.EncodedDescriptor(i); raw != nil {
+		return buildbudget.Add(256, buildbudget.Mul(int64(len(raw)), 128))
+	}
 	r := v.rows[i]
 	n := buildbudget.Add(256, v.contextWorkspace(r.context))
 	if r.keys&templateFlag != 0 {

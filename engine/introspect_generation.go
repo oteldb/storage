@@ -19,14 +19,33 @@ type generationLabelCard struct {
 	values map[string]struct{}
 }
 
+// Cardinality introspection needs exact value membership across generations.
+func (h *head) cardinalityPostings() *head {
+	if len(h.encodedRefs) == 0 {
+		return h
+	}
+	scratch := newHead()
+	scratch.series = h.series
+	view := h.series.View()
+	var attrs signal.Attributes
+	for i := range view.Len() {
+		s := view.At(i, attrs)
+		attrs = s.Attributes
+		scratch.indexLabels(view.ID(i), s)
+	}
+	scratch.post.EnsureSorted()
+	return scratch
+}
+
 func (h *head) residentCardinality() (int, []LabelCard) {
 	if h.frozen == nil {
-		return h.localCardinality()
+		return h.cardinalityPostings().localCardinality()
 	}
 	syms := make(map[string]struct{})
 	labels := make(map[string]*generationLabelCard)
 	seen := make(map[signal.SeriesID]struct{})
-	for owner := h; owner != nil; owner = owner.frozen {
+	for source := h; source != nil; source = source.frozen {
+		owner := source.cardinalityPostings()
 		shared := make(map[uint32]struct{})
 		view := owner.series.View()
 		for i := range view.Len() {

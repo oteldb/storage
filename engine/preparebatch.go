@@ -95,7 +95,7 @@ type preparedBatch struct {
 	values                                []float64
 	sf                                    []float64
 	current                               int
-	warm                                  bool
+	warm, encodedReturning                bool
 	snapshots                             []headSeriesState
 	next                                  []sampleBuf
 	created                               []*sampleBuf
@@ -152,6 +152,7 @@ func (e *Engine) appendPrepared(
 	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series, limits AppendLimits,
 	p *preparedBatch,
 ) (AppendResult, error) {
+	p.encodedReturning = e.cfg.SeparateSeries && e.fixedHeadRotation()
 	reason := "policy"
 	if e.parallel != nil {
 		res, outcome, why, err := e.retryPrepared(ids, ts, values, sf, materialize, limits, p)
@@ -289,8 +290,10 @@ func (p *preparedBatch) admit(
 		state = p.seriesState(h, id)
 		newest, seen = state.newest, state.seen
 	}
-	acc := walSeriesAcc{buffer: state.buffer, priorNewest: newest, hadNewest: seen,
-		identityRef: state.ref, knownRef: state.known, historical: state.historical}
+	acc := walSeriesAcc{
+		buffer: state.buffer, priorNewest: newest, hadNewest: seen,
+		identityRef: state.ref, knownRef: state.known, historical: state.historical,
+	}
 	if acc.buffer == nil {
 		acc.isNew = true
 		if !acc.knownRef {
@@ -298,6 +301,7 @@ func (p *preparedBatch) admit(
 				return rejectCardinality
 			}
 			acc.register, acc.series = true, materialize()
+			acc.encodedHead = p.encodedReturning && state.historical
 		}
 	}
 	k = len(b.order)

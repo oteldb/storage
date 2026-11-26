@@ -45,20 +45,22 @@ type walBatch struct {
 }
 
 type walSeriesAcc struct {
-	historical  bool
-	isNew       bool // the series starts a buffer, so its identity record is logged
-	register    bool // the identity is not in the head's index yet
-	knownRef    bool
-	series      signal.Series // the identity, set when isNew
-	newest      int64         // the newest admitted timestamp
-	buffer      *sampleBuf
-	priorNewest int64
-	hadNewest   bool
-	identityRef uint32
-	ts          []int64
-	values      []float64
-	sf          []float64 // per-sample scale factors (aligned with ts)
-	sampled     bool      // true once any sf != 1 — selects the sf-carrying WAL frame on flush
+	historical        bool
+	encodedHead       bool
+	rawStart, rawSize int
+	isNew             bool // the series starts a buffer, so its identity record is logged
+	register          bool // the identity is not in the head's index yet
+	knownRef          bool
+	series            signal.Series // the identity, set when isNew
+	newest            int64         // the newest admitted timestamp
+	buffer            *sampleBuf
+	priorNewest       int64
+	hadNewest         bool
+	identityRef       uint32
+	ts                []int64
+	values            []float64
+	sf                []float64 // per-sample scale factors (aligned with ts)
+	sampled           bool      // true once any sf != 1 — selects the sf-carrying WAL frame on flush
 }
 
 func newWALBatch() *walBatch {
@@ -109,8 +111,10 @@ func (b *walBatch) admit(
 		state = h.seriesState(id)
 		newest, seen = state.newest, state.seen
 	}
-	acc := walSeriesAcc{buffer: state.buffer, priorNewest: newest, hadNewest: seen,
-		identityRef: state.ref, knownRef: state.known, historical: state.historical}
+	acc := walSeriesAcc{
+		buffer: state.buffer, priorNewest: newest, hadNewest: seen,
+		identityRef: state.ref, knownRef: state.known, historical: state.historical,
+	}
 	if acc.buffer != nil {
 		b.add(b.start(id, acc), ts, value, sf)
 		return admitted
@@ -133,8 +137,10 @@ func (b *walBatch) admit(
 			b.add(k, ts, value, sf)
 		} else {
 			state := h.seriesState(oid)
-			a := walSeriesAcc{buffer: state.buffer, priorNewest: state.newest, hadNewest: state.seen,
-				identityRef: state.ref, knownRef: state.known, historical: state.historical}
+			a := walSeriesAcc{
+				buffer: state.buffer, priorNewest: state.newest, hadNewest: state.seen,
+				identityRef: state.ref, knownRef: state.known, historical: state.historical,
+			}
 			a.isNew = a.buffer == nil
 			if a.isNew {
 				a.register, a.series = !a.knownRef, ov
@@ -254,7 +260,14 @@ func (b *walBatch) encode(view series.View, everySeries bool) error {
 			if !a.register {
 				s = b.identity(view, a)
 			}
-			if err := b.fw.WriteSeries(id, s); err != nil {
+			if a.encodedHead {
+				base := b.frames.Len()
+				start, size, err := b.fw.WriteSeriesRange(id, s)
+				if err != nil {
+					return err
+				}
+				a.rawStart, a.rawSize = base+start, size
+			} else if err := b.fw.WriteSeries(id, s); err != nil {
 				return err
 			}
 		case everySeries:
@@ -301,9 +314,7 @@ func (b *walBatch) apply(h *head) {
 	for k, id := range b.order {
 		a := &b.accs[k]
 
-		if a.register && !h.series.Has(id) {
-			h.register(series.Entry{ID: id, Series: a.series})
-		}
+		b.registerIdentity(h, id, a)
 
 		ref := a.identityRef
 		if !a.knownRef {
@@ -327,6 +338,17 @@ func (b *walBatch) apply(h *head) {
 	if wasEmpty && h.bytes > 0 {
 		h.since = b.first
 	}
+}
+
+func (b *walBatch) registerIdentity(h *head, id signal.SeriesID, a *walSeriesAcc) {
+	if !a.register || h.series.Has(id) {
+		return
+	}
+	if a.rawSize != 0 {
+		h.registerEncoded(id, b.frames.Bytes()[a.rawStart:a.rawStart+a.rawSize])
+		return
+	}
+	h.register(series.Entry{ID: id, Series: a.series})
 }
 
 func (b *walBatch) reset() {

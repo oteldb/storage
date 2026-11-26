@@ -318,9 +318,7 @@ func (p *preparedBatch) publishTails(h *head) {
 	minTS := int64(math.MaxInt64)
 	for i, id := range p.batch.order {
 		a := &p.batch.accs[i]
-		if a.register && !h.series.Has(id) {
-			h.register(series.Entry{ID: id, Series: a.series})
-		}
+		p.batch.registerIdentity(h, id, a)
 		if !a.knownRef {
 			a.identityRef, a.knownRef = h.series.Ref(id)
 		}

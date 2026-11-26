@@ -9,6 +9,7 @@ import (
 // View is an immutable snapshot, safe to read while its index receives additions.
 type View struct {
 	rows      []row
+	encoded   []byte
 	contexts  []identityContext
 	resources []indexedResource
 	scopes    []indexedScope
@@ -21,7 +22,7 @@ type View struct {
 // View captures the append-only arenas without materializing identities.
 func (ix *Index) View() View {
 	return View{
-		rows: ix.rows, contexts: ix.contexts, resources: ix.resources, scopes: ix.scopes,
+		rows: ix.rows, encoded: ix.encoded, contexts: ix.contexts, resources: ix.resources, scopes: ix.scopes,
 		keys: ix.keys, values: ix.values, symbols: ix.sym.Snapshot(), templates: ix.templateRows,
 	}
 }
@@ -34,6 +35,9 @@ func (v View) ID(i int) signal.SeriesID { return v.rows[i].id }
 
 // EncodingBytes bounds the series-record bytes, including repeated resource/scope references.
 func (v View) EncodingBytes(i int) int64 {
+	if raw := v.EncodedDescriptor(i); raw != nil {
+		return int64(len(raw))
+	}
 	r := v.rows[i]
 	c := v.contexts[r.context]
 	attrs := len(v.resources[c.resource].value.Attributes) + len(v.scopes[c.scope].value.Attributes)
@@ -60,6 +64,9 @@ func (v View) EncodingWorkspace() int64 {
 
 // MaterializationBytes bounds a decoded point-attribute slice, including nested values.
 func (v View) MaterializationBytes(i int) int64 {
+	if raw := v.EncodedDescriptor(i); raw != nil {
+		return buildbudget.Mul(int64(len(raw)), 128)
+	}
 	n := buildbudget.Mul(int64(v.AttributeCount(i)), 160)
 	v.EncodedAttributes(i, func(_, data []byte) {
 		if len(data) > 0 && (signal.ValueKind(data[0]) == signal.KindSlice || signal.ValueKind(data[0]) == signal.KindMap) {
@@ -71,6 +78,11 @@ func (v View) MaterializationBytes(i int) int64 {
 
 // At materializes identity i, reusing dst for its point attributes.
 func (v View) At(i int, dst signal.Attributes) signal.Series {
+	if raw := v.EncodedDescriptor(i); raw != nil {
+		decoded := signal.Series{Attributes: dst}
+		decodeEncodedDescriptor(&decoded, raw)
+		return decoded
+	}
 	r := v.rows[i]
 	resource, scope := v.Context(i)
 	if r.keys == 0 {
