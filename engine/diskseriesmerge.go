@@ -111,14 +111,14 @@ func (item *mergeIdentityItem) next(ctx context.Context, e *Engine, keys *series
 	return err == nil, err
 }
 
-func (item *mergeIdentityItem) appendTo(w *partStreamWriter, ts []int64, values, sf []float64, covered int64) error {
+func (item *mergeIdentityItem) appendTo(w *partStreamWriter, ts []int64, values, sf []float64, covered int64, singleton bool) error {
 	if w.e.cfg.SeparateSeries {
-		return w.appendSeries(idToU128(item.id), ts, values, sf, covered)
+		return w.appendNumericRun(idToU128(item.id), ts, values, sf, covered, singleton)
 	}
 	if w.e.cfg.DiskSeries {
-		return w.appendDiskMergeSeries(item.id, item.identity, ts, values, sf, covered, item.positions)
+		return w.appendDiskMergeSeries(item.id, item.identity, ts, values, sf, covered, item.positions, singleton)
 	}
-	return w.appendMergeSeries(item.view, item.ref, item.found, item.id, ts, values, sf, covered)
+	return w.appendMergeSeries(item.view, item.ref, item.found, item.id, ts, values, sf, covered, singleton)
 }
 
 func newDiskMergeSource(ctx context.Context, p *part) (*diskMergeSource, error) {
@@ -211,14 +211,14 @@ func mergeDiskIdentity(id signal.SeriesID, positions []mergestream.Position,
 }
 
 func (p *partStreamWriter) appendDiskMergeSeries(id signal.SeriesID, identity signal.Series,
-	ts []int64, values, sf []float64, covered int64, positions []mergestream.Position,
+	ts []int64, values, sf []float64, covered int64, positions []mergestream.Position, singleton bool,
 ) error {
 	if len(ts) > 0 && (len(p.runs) == 0 || u128ToID(p.runs[len(p.runs)-1].Value) != id) {
 		if err := p.addMergedDiskIdentity(id, identity, positions); err != nil {
 			return err
 		}
 	}
-	return p.appendSeries(idToU128(id), ts, values, sf, covered)
+	return p.appendNumericRun(idToU128(id), ts, values, sf, covered, singleton)
 }
 
 func (p *partStreamWriter) addMergedDiskIdentity(id signal.SeriesID, identity signal.Series, positions []mergestream.Position) error {

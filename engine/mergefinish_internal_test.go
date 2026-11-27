@@ -78,7 +78,7 @@ func TestMergeFinishBoundsWrittenSidecars(t *testing.T) {
 					weights = []float64{2}
 				}
 				for point := range 2 {
-					require.NoError(t, w.appendMergeSeries(view, ref, true, id, []int64{int64(point + 1)}, []float64{float64(point)}, weights, int64(point+1)))
+					require.NoError(t, w.appendMergeSeries(view, ref, true, id, []int64{int64(point + 1)}, []float64{float64(point)}, weights, int64(point+1), false))
 				}
 			}
 			require.Len(t, w.mergeFinish.refs, len(ids), "consecutive chunks retain only one reference per output identity")
@@ -148,7 +148,7 @@ func TestMergeFinishReferencesSurviveRegistryGrowth(t *testing.T) {
 	for _, id := range ids {
 		ref, ok := e.head.series.Ref(id)
 		require.True(t, ok)
-		require.NoError(t, w.appendMergeSeries(view, ref, true, id, []int64{100}, []float64{7}, nil, 100))
+		require.NoError(t, w.appendMergeSeries(view, ref, true, id, []int64{100}, []float64{7}, nil, 100, false))
 	}
 	for i := len(ids); i < 4099; i++ {
 		_, err := e.Append(registryGrowthSeries(i), 200, 9)

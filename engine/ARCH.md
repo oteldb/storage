@@ -2183,7 +2183,7 @@ retention, size splitting and overlapping series preserve the output's own canon
 ## Sparse head chunks
 
 `MetricSeriesChunks` packs up to 32 adjacent one-point series into each numeric chunk during
-head flush. The builder knows which series has one point before encoding. It preserves individual
+flush and after merge deduplication, retention, and rollup. It preserves individual
 groups for longer series and starts a new sparse chunk when its signed timestamp span would
 overflow. The shared manifest flag covers all nonconstant numeric columns, with matching row
 geometry and CRC-protected frames.

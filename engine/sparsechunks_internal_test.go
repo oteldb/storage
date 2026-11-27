@@ -128,24 +128,38 @@ func TestSparseChunkMergeSharedFrames(t *testing.T) {
 	be := backend.Memory()
 	e := New(Config{Backend: be, MetricSeriesChunks: true})
 	t.Cleanup(func() { require.NoError(t, e.Close(ctx)) })
-	series := sparseChunkFixture(2 * sparseMetricChunkRows)
+	const dense = sparseMetricChunkRows
+	series := sparseChunkFixture(2*sparseMetricChunkRows + 1)
 	for pass := range 2 {
 		for i, s := range series {
-			_, err := e.Append(s, int64(pass*100+i), float64(pass*100+i))
+			ts := int64(i)
+			if i == dense {
+				ts += int64(pass * 100)
+				_, err := e.Append(s, ts, float64(ts))
+				require.NoError(t, err)
+				ts++
+			}
+			_, err := e.Append(s, ts, float64(pass*100+i))
 			require.NoError(t, err)
 		}
 		require.NoError(t, e.Flush(ctx))
 	}
 	require.Len(t, e.parts, 2)
-	for _, p := range e.parts {
-		require.True(t, p.sharedChunks)
-		_, _, eligible := encodedColumnDescs(p)
-		require.True(t, eligible)
-	}
-
 	require.NoError(t, e.MergeWith(ctx, MergeOptions{Force: true}))
 	require.Len(t, e.parts, 1)
-	require.False(t, e.parts[0].sharedChunks)
+	part := e.parts[0]
+	require.True(t, part.sharedChunks)
+	col, err := part.reader.Column(ctx, colTs)
+	require.NoError(t, err)
+	dec, err := col.BlockDecoder()
+	require.NoError(t, err)
+	widths := make([]int, 0, dec.NumBlocks())
+	for b := range dec.NumBlocks() {
+		lo, hi := dec.BlockSpan(b)
+		widths = append(widths, hi-lo)
+	}
+	// The dense series uses the independently copied source chunks between packed blocks.
+	require.Equal(t, []int{32, 2, 2, 32}, widths)
 	it, err := e.Fetch(ctx, fetch.Request{Start: 0, End: 200})
 	require.NoError(t, err)
 	all, err := fetch.Drain(ctx, it)
@@ -153,8 +167,13 @@ func TestSparseChunkMergeSharedFrames(t *testing.T) {
 	require.Len(t, all, len(series))
 	for i, batch := range all {
 		require.Equal(t, series[i].Hash(), batch.ID)
-		require.Equal(t, []int64{int64(i), int64(100 + i)}, batch.Timestamps)
-		require.Equal(t, []float64{float64(i), float64(100 + i)}, batch.Values)
+		if i == dense {
+			require.Equal(t, []int64{32, 33, 132, 133}, batch.Timestamps)
+			require.Equal(t, []float64{32, 32, 132, 132}, batch.Values)
+		} else {
+			require.Equal(t, []int64{int64(i)}, batch.Timestamps)
+			require.Equal(t, []float64{float64(100 + i)}, batch.Values)
+		}
 	}
 }
 

@@ -51,7 +51,6 @@ type partStreamWriter struct {
 	withStats    bool
 	floatGroups  bool
 	seriesChunks bool
-	blockRows    int
 	sparseLimit  int
 	sparseRows   int
 	sparseMin    int64
@@ -104,7 +103,7 @@ func newPartStreamWriterAt(
 
 	opts := append(partOptions(blockRows, comp, rollup), extra...)
 	if e.cfg.MetricSeriesChunks {
-		opts = append(opts, block.WithIndependentGroups())
+		opts = append(opts, block.WithIndependentGroups(), block.WithSharedRowGroups())
 	}
 	if prefix == "" {
 		prefix = e.newPartPrefix()
@@ -161,8 +160,10 @@ func newPartStreamWriterAt(
 		buffered:         !backend.StreamsWrites(e.cfg.Backend),
 		floatGroups:      grouped,
 		seriesChunks:     e.cfg.MetricSeriesChunks,
-		blockRows:        blockRows,
 		streamIdentities: streamIdentities, identityWriterBytes: identityBytes,
+	}
+	if out.seriesChunks {
+		out.sparseLimit = min(sparseMetricChunkRows, blockRows)
 	}
 	out.sidecarWriterBytes, _ = out.sidecarWorkspace()
 	if e.cfg.SeparateSeries && out.sidecarWriterBytes > 0 {

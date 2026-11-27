@@ -182,25 +182,18 @@ func (b *headPartBuilder) prepareWriter() error {
 		return nil
 	}
 	var err error
-	var opts []block.PartOption
-	if b.e.cfg.MetricSeriesChunks {
-		opts = append(opts, block.WithSharedRowGroups())
-	}
 	if b.input != nil {
 		id, ok := b.input.names.Next()
 		if !ok {
 			return errors.New("engine: pressure generation part ID space exhausted")
 		}
 		b.writer, err = newPartStreamWriterAt(b.ctx, b.e, b.e.cfg.Prefix+"/"+id.String(),
-			compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{}, opts...)
+			compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
 	} else {
-		b.writer, err = newPartStreamWriter(b.ctx, b.e, compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{}, opts...)
+		b.writer, err = newPartStreamWriter(b.ctx, b.e, compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
 	}
 	if err != nil {
 		return err
-	}
-	if len(opts) > 0 {
-		b.writer.sparseLimit = min(sparseMetricChunkRows, b.writer.blockRows)
 	}
 	b.writer.buildScratch = &b.buildScratch
 	b.writer.sharedIdentitiesReady = b.sharedIdentitiesReady

@@ -110,6 +110,7 @@ func (p *encodedMergePlan) prepare(streams []*partStream, ranges []rowRange, sta
 	p.reset(streams)
 	var previous int64
 	havePrevious := false
+	retainedRows := 0
 	for i := p.next(); i >= 0; i = p.next() {
 		r := &p.runs[i]
 		g, err := streams[r.source].decoders[0].EncodedGranule(r.at)
@@ -120,10 +121,14 @@ func (p *encodedMergePlan) prepare(streams []*partStream, ranges []rowRange, sta
 			return false, nil
 		}
 		previous, havePrevious = g.MaxTime, true
+		if g.MaxTime >= start {
+			retainedRows = min(2, retainedRows+g.Rows)
+		}
 		p.advance(i, streams)
 	}
 	p.reset(streams)
-	return true, nil
+	// A surviving singleton can share a chunk with its neighbors after decoding.
+	return retainedRows != 1, nil
 }
 
 func encodedSourceRun(s *partStream, r rowRange, start int64, maxRows int) (encodedMergeRun, bool, error) {
@@ -307,6 +312,7 @@ func (p *partStreamWriter) beginEncodedSeries(item *mergeIdentityItem) error {
 	if err := p.w.EndGroup(); err != nil {
 		return err
 	}
+	p.sparseRows = 0
 	if p.e.cfg.DiskSeries {
 		return p.addMergedDiskIdentity(item.id, item.identity, item.positions)
 	}
