@@ -154,7 +154,10 @@ func (h *head) seriesState(id signal.SeriesID) headSeriesState {
 			if !ok {
 				entry, _ = h.disk.cache.get(id)
 			}
-			return headSeriesState{newest: entry.newest, seen: entry.exists, historical: entry.exists, descriptorPublished: entry.descriptorPublished}
+			return headSeriesState{
+				newest: entry.newest, seen: entry.exists, historical: entry.exists,
+				descriptorPublished: entry.descriptorPublished,
+			}
 		}
 		return headSeriesState{}
 	}

@@ -86,7 +86,8 @@ func (c *diskSeriesCache) lookup(s *diskCacheShard, hash uint64, id signal.Serie
 		return nil, -1
 	}
 	b = &s.buckets[diskCacheSecond(hash, first, len(s.buckets))]
-	return b, b.position(id)
+	pos := b.position(id)
+	return b, pos
 }
 
 func (c *diskSeriesCache) get(id signal.SeriesID) (diskHeadEntry, bool) {

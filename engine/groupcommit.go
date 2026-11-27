@@ -125,14 +125,13 @@ func (e *Engine) writePreparedGroup(group []*preparedBatch, size int) error {
 	if h := e.parallel.hooks; h != nil && h.beforeWAL != nil {
 		h.beforeWAL()
 	}
-	if err := e.cfg.WAL.WriteFrames(frames); err != nil {
-		return err
-	}
 	references := 0
 	for _, p := range group {
 		references += p.batch.loggedReferences
 	}
-	e.cfg.Obs.WAL.References(references)
+	if err := e.cfg.WAL.WritePreparedFrames(frames, references); err != nil {
+		return err
+	}
 	if h := e.parallel.hooks; h != nil && h.beforePublish != nil {
 		h.beforePublish()
 	}

@@ -343,7 +343,10 @@ func openPagedIndex(
 
 	_, viewer := b.(backend.Viewer)
 
-	p := &pagedIndex{be: b, key: key, n: n, crc: [4]byte(data[len(data)-4:]), maxRows: maxRows, total: total, keep: !viewer, offset: int64(len(data) - 4 - len(ents))}
+	p := &pagedIndex{
+		be: b, key: key, n: n, maxRows: maxRows, total: total, keep: !viewer,
+		crc: [4]byte(data[len(data)-4:]), offset: int64(len(data) - 4 - len(ents)),
+	}
 	if n > 0 {
 		p.first, p.last = sidxEntryID(ents, 0), sidxEntryID(ents, n-1)
 		p.bounded = true

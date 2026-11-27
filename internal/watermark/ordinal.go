@@ -16,7 +16,9 @@ import (
 // OrdinalMagic identifies a watermark sidecar whose IDs come from the associated SIDX.
 const OrdinalMagic = 0x534d414f // SMAO.
 
-func openOrdinal(ctx context.Context, b backend.Backend, key string, count int, size int64, binding [32]byte, header []byte) (*Reader, error) {
+func openOrdinal(
+	ctx context.Context, b backend.Backend, key string, count int, size int64, binding [32]byte, header []byte,
+) (*Reader, error) {
 	const overhead = 4 + sidecar.OrdinalFooterBytes
 	if count < 0 || uint64(count) > (math.MaxInt64-overhead)/8 || size != int64(count)*8+overhead {
 		return nil, errors.Wrap(ErrCorrupt, "ordinal length")

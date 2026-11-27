@@ -200,24 +200,7 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 
 		return h.OnSeries(id, s)
 	case recordSamples, recordSamplesRef:
-		if typ == recordSamples && h.OnSamples == nil {
-			return nil
-		}
-
-		id, ts, values, err := parseSamples(payload)
-		if err != nil {
-			return decodeError{err}
-		}
-
-		if typ == recordSamplesRef {
-			if err := resolveDescriptor(h, id); err != nil {
-				return err
-			}
-		}
-		if h.OnSamples != nil {
-			return h.OnSamples(id, ts, values)
-		}
-		return nil
+		return dispatchSamples(typ == recordSamplesRef, payload, h)
 	case recordSamplesSF, recordSamplesSFRef:
 		id, ts, values, sf, err := parseSamplesSF(payload)
 		if err != nil {
@@ -260,6 +243,27 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 	default:
 		return nil // unknown record type: skip for forward compatibility
 	}
+}
+
+func dispatchSamples(referenced bool, payload []byte, h Handlers) error {
+	if !referenced && h.OnSamples == nil {
+		return nil
+	}
+
+	id, ts, values, err := parseSamples(payload)
+	if err != nil {
+		return decodeError{err}
+	}
+
+	if referenced {
+		if err := resolveDescriptor(h, id); err != nil {
+			return err
+		}
+	}
+	if h.OnSamples != nil {
+		return h.OnSamples(id, ts, values)
+	}
+	return nil
 }
 
 func resolveDescriptor(h Handlers, id signal.SeriesID) error {

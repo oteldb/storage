@@ -408,6 +408,17 @@ func (sw *SegmentWriter) WriteFrames(p []byte) error {
 	return sw.afterWrite(err)
 }
 
+// WritePreparedFrames writes a metric batch and counts its descriptor references on success.
+func (sw *SegmentWriter) WritePreparedFrames(p []byte, references int) error {
+	if err := sw.WriteFrames(p); err != nil {
+		return err
+	}
+	if sw.metrics != nil {
+		sw.metrics.References(references)
+	}
+	return nil
+}
+
 // WriteSide logs an opaque engine-encoded side-store delta.
 func (sw *SegmentWriter) WriteSide(payload []byte) error {
 	if err := sw.prepare(); err != nil {

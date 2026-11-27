@@ -60,8 +60,8 @@ func TestReturningIDHeadReadsAndReplays(t *testing.T) {
 	}))
 	require.Zero(t, descriptors)
 	require.Equal(t, 1, references)
-	require.ErrorIs(t, wal.Replay(data, New(Config{}).replayHandlers(t.Context())), wal.ErrCorrupt)
-	require.NoError(t, wal.Replay(data, reopened.replayHandlers(t.Context())))
+	require.ErrorIs(t, wal.Replay(data, New(Config{}).replayHandlers()), wal.ErrCorrupt)
+	require.NoError(t, wal.Replay(data, reopened.salvageHandlers(t.Context(), "")))
 	require.Equal(t, []int64{200, 201}, headTS(reopened.head, s))
 	require.NoError(t, reopened.CloseWAL())
 

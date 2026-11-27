@@ -230,11 +230,7 @@ func (e *Engine) encodeWriteBatch(b *walBatch, everySeries bool) error {
 	if e.cfg.WAL == nil {
 		return nil
 	}
-	if err := e.cfg.WAL.WriteFrames(b.frames.Bytes()); err != nil {
-		return err
-	}
-	e.cfg.Obs.WAL.References(b.loggedReferences)
-	return nil
+	return e.cfg.WAL.WritePreparedFrames(b.frames.Bytes(), b.loggedReferences)
 }
 
 func (b *walBatch) encodingView(h *head, everySeries bool) series.View {
