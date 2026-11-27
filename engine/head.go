@@ -27,6 +27,7 @@ var (
 // concurrent use; the [Engine] holds the lock.
 type head struct {
 	frozen                       *head
+	retiring                     *retiredWatermarks
 	buildRetained                int64
 	disk                         *diskHeadState
 	sym                          *symbols.Table
@@ -131,6 +132,12 @@ func (h *head) identityBytes() int64 {
 
 func (h *head) residentIdentityBytes() int64 {
 	n := h.ownedIdentityBytes()
+	if h.retiring != nil {
+		n += h.retiring.bytes
+		if h.retiring.cache != h.disk.cache {
+			n += h.retiring.cache.sizeBytes()
+		}
+	}
 	if h.frozen != nil {
 		n += h.frozen.residentIdentityBytes()
 	}

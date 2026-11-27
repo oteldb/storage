@@ -248,7 +248,7 @@ func (e *Engine) preloadDiskSeriesOffState(ids []signal.SeriesID) error {
 			s.pending[id] = diskHeadEntry{newest: entry.newest, exists: true}
 			continue
 		}
-		if hit, ok := s.cache.get(id); ok {
+		if hit, ok := e.head.historicalState(id); ok {
 			s.pending[id] = hit
 			continue
 		}

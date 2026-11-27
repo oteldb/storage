@@ -140,13 +140,10 @@ func (e *Engine) runPressureGenerations(ctx context.Context, force bool) (rows i
 	wake := e.generationWake()
 	results := make(chan generationResult, 2)
 	running := 0
+	var warming <-chan struct{}
 	defer func() {
 		cancel()
-		for running > 0 {
-			r := <-results
-			running--
-			e.finishGenerationBuild(r)
-		}
+		e.joinPressureWorkers(results, running, warming)
 	}()
 	for {
 		if err == nil {
@@ -157,13 +154,14 @@ func (e *Engine) runPressureGenerations(ctx context.Context, force bool) (rows i
 			}
 			err = startErr
 		}
-		if err == nil {
-			n, bytes, publishErr := e.publishReadyGenerations(ctx)
+		if err == nil && warming == nil {
+			var n int
+			var bytes int64
+			n, bytes, warming, err = e.publishReadyGenerations(ctx)
 			rows += n
 			written += bytes
-			err = publishErr
 		}
-		if running == 0 {
+		if running == 0 && warming == nil {
 			if stopErr := errors.Join(err, ctx.Err()); stopErr != nil {
 				return rows, written, stopErr
 			}
@@ -187,12 +185,23 @@ func (e *Engine) runPressureGenerations(ctx context.Context, force bool) (rows i
 				err = r.err
 			}
 		case <-wake:
+		case <-warming:
+			warming = nil
 		case <-ctx.Done():
 			if err == nil {
 				err = ctx.Err()
 			}
 			return rows, written, err
 		}
+	}
+}
+
+func (e *Engine) joinPressureWorkers(results <-chan generationResult, running int, warming <-chan struct{}) {
+	for range running {
+		e.finishGenerationBuild(<-results)
+	}
+	if warming != nil {
+		<-warming
 	}
 }
 
@@ -308,11 +317,13 @@ func (e *Engine) launchGenerationBuildsLocked(ctx context.Context, results chan<
 	return started
 }
 
-func (e *Engine) publishReadyGenerations(ctx context.Context) (rows int, written int64, err error) {
+func (e *Engine) publishReadyGenerations(
+	ctx context.Context,
+) (rows int, written int64, warming <-chan struct{}, err error) {
 	for len(e.pressureGenerations) > 0 && e.pressureGenerations[0].ready {
 		g := e.pressureGenerations[0]
 		n, bytes := g.rows, partsBytes(g.parts)
-		err = e.publishPressureGeneration(ctx, g)
+		warming, err = e.publishPressureGeneration(ctx, g)
 		if len(e.pressureGenerations) == 0 || e.pressureGenerations[0] != g {
 			rows += n
 			written += bytes
@@ -320,11 +331,11 @@ func (e *Engine) publishReadyGenerations(ctx context.Context) (rows int, written
 				e.cfg.Obs.Flush.Record(ctx, metricSignal, time.Since(g.started), int64(n), bytes)
 			}
 		}
-		if err != nil {
-			return rows, written, err
+		if err != nil || warming != nil {
+			return rows, written, warming, err
 		}
 	}
-	return rows, written, nil
+	return rows, written, nil, nil
 }
 
 func generationPartBytes(parts []*part) int64 {
@@ -349,28 +360,36 @@ func (e *Engine) finishGenerationBuild(r generationResult) {
 	g.parts, g.rows, g.ready = r.parts, r.rows, true
 }
 
-func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGeneration) error {
+func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGeneration) (<-chan struct{}, error) {
 	rememberPublished := e.cfg.SeparateSeries && e.fixedHeadRotation()
 	if !rememberPublished {
-		if err := e.rememberGenerationWatermarks(ctx, g.head, 0); err != nil {
-			return err
+		if err := e.rememberGenerationWatermarks(ctx, g.head); err != nil {
+			return nil, err
 		}
 	}
 	var released sampleArena
 	retired := false
+	var catalogAt time.Time
+	var refresh *retiredWatermarks
 	e.mu.Lock()
 	defer func() {
 		e.mu.Unlock()
 		released.release()
 		if retired {
 			e.notifyPressureProgress()
+			if !catalogAt.IsZero() {
+				e.cfg.Obs.Flush.HeadPhase(ctx, "catalog_to_retired", time.Since(catalogAt))
+			}
+		}
+		if refresh != nil {
+			go e.refreshRetiredWatermarks(context.WithoutCancel(ctx), refresh)
 		}
 	}()
 	if err := e.fenceLocked(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := e.tenureLocked(g.term); err != nil {
-		return err
+		return nil, err
 	}
 	next := e.parts
 	for _, p := range g.parts {
@@ -379,18 +398,19 @@ func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGener
 	e.sortPressureParts(next)
 	err := e.commitIndexLocked(ctx, next, max(g.epoch, e.flushedEpoch), g.term, nil)
 	if err == nil {
-		e.cfg.Obs.Flush.HeadPhase(ctx, "frozen_to_published", time.Since(g.started))
+		catalogAt = time.Now()
+		e.cfg.Obs.Flush.HeadPhase(ctx, "frozen_to_published", catalogAt.Sub(g.started))
 	}
 	if rememberPublished {
-		// Leave the old head attached while admitting writes during the cache update.
-		// Only a confirmed catalog can authorize descriptor references.
-		var lineage uint64
 		if err == nil && e.compactMetricMetadata {
-			lineage = e.seriesTable.membershipLineage()
+			refresh = newRetiredWatermarks(e.head.disk.cache, g.head, e.seriesTable.membershipLineage())
+			e.head.retiring = refresh
+		} else {
+			// Preserve the frozen watermark on an ambiguous catalog commit.
+			_ = e.mu.WithWriters(func() error {
+				return e.rememberGenerationWatermarks(context.WithoutCancel(ctx), g.head)
+			})
 		}
-		_ = e.mu.WithWriters(func() error {
-			return e.rememberGenerationWatermarks(context.WithoutCancel(ctx), g.head, lineage)
-		})
 	}
 	// Keep ambiguous candidates queryable and retain WAL exactly as the single-generation path does.
 	e.parts, e.flushedEpoch = next, max(g.epoch, e.flushedEpoch)
@@ -415,7 +435,10 @@ func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGener
 	if err == nil {
 		err = e.checkpointLocked(g.sequence)
 	}
-	return err
+	if refresh != nil {
+		return refresh.done, err
+	}
+	return nil, err
 }
 
 func (e *Engine) releasePressureGenerationsLocked() {

@@ -2207,7 +2207,10 @@ ordinals. The final run encodes the IDs and descriptors once from the frozen vie
 workspace admission and retries if a sibling changed the descriptor snapshot. Two frozen
 generations may build concurrently. In standalone mode the commit owner seals and swaps after a
 generation-specific gate drains prepared tails. The lifecycle gate stays shared across the seal.
-Publication and WAL coverage advance in generation order.
+Publication and WAL coverage advance in generation order. A confirmed standalone catalog commit
+hands sample visibility to immutable parts and frees the frozen slot. One retiring identity view
+remains charged while a shard-local worker warms historical watermarks. Admission consults it
+before the historical cache until the worker finishes and the coordinator can publish again.
 
 A configured standalone rotation target bounds the active generation independently of
 the resident ceiling. Producers can fill the active generation while a frozen build owns

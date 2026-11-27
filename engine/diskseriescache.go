@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/oteldb/storage/internal/memsize"
@@ -25,11 +26,12 @@ type diskCacheBucket struct {
 }
 
 type diskCacheShard struct {
+	mu      sync.Mutex
 	buckets []diskCacheBucket
 	count   int
 }
 
-// diskSeriesCache is advisory state protected by engine writer ownership.
+// diskSeriesCache shards synchronize historical lookup and retirement refresh.
 // Numeric buckets retain no descriptors or registry references and need no GC scanning.
 type diskSeriesCache struct {
 	shards     []diskCacheShard
@@ -97,6 +99,8 @@ func (c *diskSeriesCache) get(id signal.SeriesID) (diskHeadEntry, bool) {
 	}
 	h := diskCacheHash(id)
 	s := &c.shards[h&uint64(len(c.shards)-1)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.buckets) == 0 {
 		return diskHeadEntry{}, false
 	}
@@ -120,6 +124,8 @@ func (c *diskSeriesCache) remember(id signal.SeriesID, newest int64, lineage uin
 	}
 	h := diskCacheHash(id)
 	s := &c.shards[h&uint64(len(c.shards)-1)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.buckets) > 0 {
 		if b, pos := c.lookup(s, h, id); pos >= 0 {
 			entry := &b.entries[pos]
@@ -185,8 +191,13 @@ func (c *diskSeriesCache) clear() {
 	if c == nil {
 		return
 	}
-	clear(c.shards)
-	c.bytes.Store(memsize.Of[diskSeriesCache]() + memsize.Slice(c.shards))
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.mu.Lock()
+		c.bytes.Add(-memsize.Slice(s.buckets))
+		s.buckets, s.count = nil, 0
+		s.mu.Unlock()
+	}
 }
 
 func (c *diskSeriesCache) sizeBytes() int64 {
