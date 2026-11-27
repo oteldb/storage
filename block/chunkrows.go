@@ -176,6 +176,7 @@ func (c *streamColumn) setChunkLayout(desc *ColumnDesc, rows int) {
 	if c.variable {
 		desc.MaxBlockRows = rows
 		desc.TimeBounds = c.timeBounds
+		desc.SharedRows = c.sharedRows
 	}
 }
 
@@ -217,6 +218,12 @@ func (c *ColumnDesc) decodeChunkOptions(r *bitstream.Reader, x byte) error {
 			return errors.Wrap(ErrCorrupt, "invalid chunk time bounds")
 		}
 		c.TimeBounds = true
+	}
+	if x&xSharedRows != 0 {
+		if c.MaxBlockRows == 0 {
+			return errors.Wrap(ErrCorrupt, "shared rows require variable chunks")
+		}
+		c.SharedRows = true
 	}
 	return nil
 }

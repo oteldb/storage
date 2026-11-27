@@ -49,7 +49,9 @@ func (r *seriesBlockReader) rangeBlocks(ctx context.Context, rng rowRange) (int,
 	}
 	lo, _ := r.geometry.BlockSpan(first)
 	_, hi := r.geometry.BlockSpan(last)
-	if lo != rng.start || hi != rng.end {
+	aligned := lo == rng.start && hi == rng.end
+	shared := r.part.sharedChunks && first == last && rng.end-rng.start == 1 && hi-lo <= sparseMetricChunkRows
+	if !aligned && !shared {
 		return 0, 0, errors.Wrap(block.ErrCorrupt, "chunk crosses series boundary")
 	}
 	return first, last, nil
@@ -125,11 +127,15 @@ func (r *seriesBlockReader) variableWindowBlocks(ctx context.Context, ranges []r
 
 func (p *enginePlan) variableDecodeEstimate(ctx context.Context, pt *part, ranges []rowRange, need colNeed) (int64, error) {
 	total := int64(cap(ranges))*16 + memsize.Of[seriesBlockReader]()
-	var selected int64
+	var selected, extra int64
 	for _, r := range ranges {
-		selected += int64(r.end - r.start)
+		rows := r.end - r.start
+		selected += int64(rows)
+		if pt.sharedChunks && rows == 1 {
+			extra += sparseMetricChunkRows - 1
+		}
 	}
-	pinned := selected
+	pinned := min(int64(pt.rows()), selected+extra)
 	columns := []string{colTs}
 	if need.values {
 		columns = append(columns, colValue)
@@ -152,7 +158,7 @@ func (p *enginePlan) variableDecodeEstimate(ctx context.Context, pt *part, range
 	}
 	// One reservation covers metadata discovery and the largest possible touched-block set.
 	// No directory is opened while waiting for another reservation.
-	chunks := pinned
+	chunks := selected
 	descriptors := pt.reader.Manifest().Columns
 	for i := range descriptors {
 		c := &descriptors[i]
@@ -169,14 +175,14 @@ func (p *enginePlan) variableDecodeEstimate(ctx context.Context, pt *part, range
 	return total, nil
 }
 
-func variableMetricSchema(r *block.PartReader) (bool, error) {
-	variable := false
+func variableMetricSchema(r *block.PartReader) (bool, bool, error) {
+	var variable, shared bool
 	descriptors := r.Manifest().Columns
 	for i := range descriptors {
 		variable = variable || descriptors[i].MaxBlockRows > 0
 	}
 	if !variable {
-		return false, nil
+		return false, false, nil
 	}
 	var chunks int64 = -1
 	for _, name := range []string{colTs, colValue, colSF} {
@@ -185,20 +191,20 @@ func variableMetricSchema(r *block.PartReader) (bool, error) {
 			if name == colSF {
 				continue
 			}
-			return false, errors.Wrap(block.ErrCorrupt, "missing variable metric column")
+			return false, false, errors.Wrap(block.ErrCorrupt, "missing variable metric column")
 		}
 		if d.Const {
 			continue
 		}
 		if d.MaxBlockRows == 0 || d.MaxBlockRows != r.Manifest().GranuleSize {
-			return false, errors.Wrap(block.ErrCorrupt, "inconsistent variable metric schema")
+			return false, false, errors.Wrap(block.ErrCorrupt, "inconsistent variable metric schema")
 		}
-		if chunks >= 0 && chunks != d.Sizing.NumGranules {
-			return false, errors.Wrap(block.ErrCorrupt, "numeric chunk counts differ")
+		if chunks >= 0 && (chunks != d.Sizing.NumGranules || shared != d.SharedRows) {
+			return false, false, errors.Wrap(block.ErrCorrupt, "numeric chunk layout differs")
 		}
-		chunks = d.Sizing.NumGranules
+		chunks, shared = d.Sizing.NumGranules, d.SharedRows
 	}
-	return true, nil
+	return true, shared, nil
 }
 
 func (p *enginePlan) fallbackDecodeEstimate(ctx context.Context, pt *part, need colNeed, cols int64) (int64, error) {

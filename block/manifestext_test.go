@@ -138,6 +138,7 @@ func v3Mutations() []struct {
 		{"directory fields on an unframed column", sizing(2, func(s *ColumnSizing) { s.NumGranules = 1 }), false},
 		{"sizing on a const column", func(m *Manifest) { m.Columns[3].HasSizing = true }, false},
 		{"sizing on the legacy blocked layout", func(m *Manifest) { m.Columns[0].Framed = false }, false},
+		{"shared rows on fixed granules", func(m *Manifest) { m.Columns[0].SharedRows = true }, false},
 		{"unknown xflags bit", func(m *Manifest) { m.Columns[0].Sizing.DirLen = -2 }, true},
 	}
 }

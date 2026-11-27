@@ -2180,6 +2180,19 @@ alongside checked output identities. Finalization remaps and merges source posti
 legacy inputs retain label-based construction. Output mappings follow each time-bucket writer, so
 retention, size splitting and overlapping series preserve the output's own canonical reference order.
 
+## Sparse head chunks
+
+`MetricSparseChunks` packs up to 32 adjacent one-point series into each numeric chunk during
+head flush. The builder knows which series has one point before encoding. It preserves individual
+groups for longer series and starts a new sparse chunk when its signed timestamp span would
+overflow. The shared manifest flag covers all nonconstant numeric columns, with matching row
+geometry and CRC-protected frames.
+
+SIDX still selects the exact series row slice. Readers bound partial-chunk reads to a singleton
+in a marked chunk and reserve for all rows of touched chunks. Merge uses its decoded path for
+partial chunks. An older reader reports the unknown manifest flag as an unsupported version,
+which fences the load without opening a repair hole.
+
 ## Separate series table
 
 `SeparateSeries` is an opt-in standalone, fresh-catalog mode requiring `DiskSeries` and

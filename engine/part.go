@@ -372,10 +372,11 @@ type part struct {
 	reader *block.PartReader
 	be     backend.Backend // for lazily loading the aggregate-pushdown stats sidecar
 	// corrupt accounts the lazily loaded sidecars that fail their checks.
-	corrupt *obs.Corruption
-	prefix  string
-	index   partIndex
-	hasSF   bool // the part carries a scale-factor column (sampling occurred); else every weight is 1
+	corrupt      *obs.Corruption
+	prefix       string
+	index        partIndex
+	hasSF        bool // the part carries a scale-factor column (sampling occurred); else every weight is 1
+	sharedChunks bool
 
 	diskBytes int64 // from the manifest; 0 for a part predating the field, see sizeBytes
 
@@ -484,7 +485,7 @@ func openPart(
 	if err != nil {
 		return nil, err
 	}
-	variable, err := variableMetricSchema(r)
+	variable, shared, err := variableMetricSchema(r)
 	if err != nil {
 		return nil, err
 	}
@@ -523,7 +524,7 @@ func openPart(
 		rollup:      rollup,
 		rollupKnown: rollupKnown,
 	}
-	p.variable = variable
+	p.variable, p.sharedChunks = variable, shared
 	p.countRetained, p.countTransient, p.countBounded = r.Int64ScanBound(ctx, colTs)
 
 	if desc, ok := r.ColumnDescByName(colTs); ok && desc.Kind == block.KindInt64 && desc.Const {

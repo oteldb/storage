@@ -182,18 +182,25 @@ func (b *headPartBuilder) prepareWriter() error {
 		return nil
 	}
 	var err error
+	var opts []block.PartOption
+	if b.e.cfg.MetricSeriesChunks && b.e.cfg.MetricSparseChunks {
+		opts = append(opts, block.WithSharedRowGroups())
+	}
 	if b.input != nil {
 		id, ok := b.input.names.Next()
 		if !ok {
 			return errors.New("engine: pressure generation part ID space exhausted")
 		}
 		b.writer, err = newPartStreamWriterAt(b.ctx, b.e, b.e.cfg.Prefix+"/"+id.String(),
-			compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
+			compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{}, opts...)
 	} else {
-		b.writer, err = newPartStreamWriter(b.ctx, b.e, compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{})
+		b.writer, err = newPartStreamWriter(b.ctx, b.e, compressProfile{}, 0, true, b.e.cfg.AggregateStats, &block.Rollup{}, opts...)
 	}
 	if err != nil {
 		return err
+	}
+	if len(opts) > 0 {
+		b.writer.sparseLimit = min(sparseMetricChunkRows, b.writer.blockRows)
 	}
 	b.writer.buildScratch = &b.buildScratch
 	b.writer.sharedIdentitiesReady = b.sharedIdentitiesReady
@@ -433,7 +440,7 @@ func (b *headPartBuilder) append(id chunk.U128, ref uint32, ts []int64, values, 
 			}
 			b.partRefs = append(b.partRefs, ref)
 		}
-		if err := b.writer.appendSeries(id, ts[lo:hi], values[lo:hi], weights, ts[hi-1]); err != nil {
+		if err := b.writer.appendNumericRun(id, ts[lo:hi], values[lo:hi], weights, ts[hi-1], len(ts) == 1); err != nil {
 			return err
 		}
 		resident := buildbudget.Add(b.writer.residentBytes(), b.writer.w.FinishBytes())

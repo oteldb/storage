@@ -560,6 +560,8 @@ slack); `compress.DecodeWorkspace` rounds it to 512 KiB.
   `ErrUnsupportedVersion`, since each gates fields a reader must parse. A writer emits version 3
   only when some column sets a bit and version 2 otherwise, so metric parts stay readable by a
   version-2 reader.
+  - `xSharedRows` marks variable numeric chunks that can span logical row groups. The flag has
+    no extra payload. It fences older readers before they apply group-aligned access rules.
   - `xTrailerDict` → `DictOff, DictLen, DictRaw, DictEntries`. Bounded by subtraction only against
     `Bytes`, and `DictLen` by the largest region a writer produces for `DictRaw` bytes (compression
     never adds more than its flag byte), so no manifest makes a reader request more than ≈64 MiB for

@@ -158,6 +158,7 @@ func (w *StreamWriter) AddColumn(c Column) error {
 
 		granuleSize: w.granuleSize,
 		variable:    w.independentGroups,
+		sharedRows:  w.sharedRows,
 		timeBounds:  w.independentGroups && c.Kind == KindInt64 && c.Name == w.sortKey,
 	}
 
@@ -572,6 +573,7 @@ type streamColumn struct {
 	blocked     bool
 	granuleSize int
 	variable    bool
+	sharedRows  bool
 	timeBounds  bool
 
 	rows int

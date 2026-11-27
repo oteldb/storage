@@ -121,8 +121,9 @@ const (
 	xTimeBounds byte = 1 << 3
 
 	xCompactDir byte = 1 << 4
+	xSharedRows byte = 1 << 5
 
-	xKnown = xTrailerDict | xSizing | xVariable | xTimeBounds | xCompactDir
+	xKnown = xTrailerDict | xSizing | xVariable | xTimeBounds | xCompactDir | xSharedRows
 )
 
 // maxSharedDictRaw is the format ceiling on a shared dictionary's decompressed size. Writers clamp
@@ -172,6 +173,8 @@ type ColumnDesc struct {
 	Blocked bool
 	// MaxBlockRows caps variable numeric chunks; zero selects fixed granules.
 	MaxBlockRows int
+	// SharedRows allows several logical row groups to share one variable numeric chunk.
+	SharedRows bool
 	// TimeBounds records per-chunk int64 bounds in the variable directory.
 	TimeBounds bool
 
@@ -324,6 +327,9 @@ func (c *ColumnDesc) xflags() byte {
 	}
 	if c.TimeBounds {
 		x |= xTimeBounds
+	}
+	if c.SharedRows {
+		x |= xSharedRows
 	}
 	if c.CompactDir {
 		x |= xCompactDir
