@@ -49,8 +49,8 @@ func TestPressureMergePrefixPrecedence(t *testing.T) {
 				<-be.first
 				err = e.MergeWith(t.Context(), MergeOptions{Force: true})
 				if generations == 2 {
-					require.ErrorIs(t, err, errPressureMergeOrder)
-					require.EqualValues(t, 1, metrics.Counter("storage.merge.order_deferred"))
+					require.NoError(t, err, "older merge outputs use the frozen generation's predecessor namespace")
+					require.Zero(t, metrics.Counter("storage.merge.order_deferred"))
 					require.Zero(t, metrics.Counter("storage.merge.deferred"), "ordering waits are not memory refusals")
 				} else {
 					require.NoError(t, err)
@@ -187,11 +187,7 @@ func TestPressureMergeRevalidatesAfterNewerFlush(t *testing.T) {
 				release()
 				synctest.Wait()
 				err = <-done
-				if prefixBeforeFreeze {
-					require.NoError(t, err)
-				} else {
-					require.ErrorIs(t, err, errPressureMergeOrder)
-				}
+				require.NoError(t, err, "the merge's reserved namespace stays older than a later freeze")
 				require.Empty(t, e.retiring, "abandoned outputs release readers and retire without remaining ownership")
 				require.NoError(t, e.LoadParts(t.Context()))
 				it, err := e.Fetch(t.Context(), fetch.Request{Start: 100, End: 100})

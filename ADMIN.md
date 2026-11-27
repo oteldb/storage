@@ -115,6 +115,10 @@ reattaches its frozen ownership and keeps the WAL replayable. The optional recen
 target and waits at the full aggregate target. This overlaps ingestion with one frozen builder
 without multiplying resident/cache targets. It is off by default; cluster, read-only and ephemeral
 modes reject it. Head/flush/queue metrics must qualify the changed batching before capacity claims.
+With `MetricPressureGenerations=2`, set `MetricHeadRotationBytes` to rotate the active generation
+independently of the aggregate resident limit. An active generation above its target waits for
+rotation when both frozen slots are occupied. The option requires a standalone writable engine
+and a target at most half of `MetricResidentHeadBytes`.
 `engine.Stats.SeriesComplete` is false while historical metadata is unavailable; `Series` then
 preserves the last complete count. All live local admission and head publication wait for repair;
 accepted WAL and replica payloads still restore into the head, with checkpoints unchanged.
@@ -698,6 +702,10 @@ Flush workspace metrics distinguish the configured output target from the admitt
 `storage.flush.reservation.bytes` labels `component=reserved|target` and a bounded `phase`;
 `storage.flush.reservation.wait` records admission wait by phase. `storage.flush.output.series`
 counts distinct identities per completed candidate, including candidates not yet catalog-published.
+`storage.flush.generation_starts{signal,concurrency=single|overlapping}` records two-generation
+stream builders starting while zero or one other builder is executing. Finished-but-uncollected
+results are excluded. These are overlapping build lifetimes, including admission waits, not CPU
+utilization; completed output overlap and runtime traces establish useful parallel work.
 `storage.flush.build.workers` and `.jobs` record admitted concurrency and planned jobs per attempt;
 zero jobs identifies legacy sequential planning. `.fallbacks{reason=plan|workspace}` counts retries
 through that planner. Two workers reuse the planner grant and request only a nonblocking aggregate shortfall;
@@ -709,6 +717,10 @@ Held bytes include unused planner credit until the stage ends; job claims exclud
 buffers. Tracked values exclude allocator/GC overhead and transient codec allocations. These are
 not heap/RSS measurements. The total pool, merge allowance and part targets are independent of
 this accounting experiment and remain configured as before.
+
+`storage.series.verification_cache.requests` records shared-series ID membership cache hits and
+misses. A hit confirms that the full series ID is present in an immutable descriptor root in the
+flush snapshot.
 
 `storage.ingest.prepared.attempts{outcome=done|pressure|snapshot|work_limit|error}` counts
 parallel preparation attempts. `storage.ingest.prepared.batches{path,reason}` counts completed

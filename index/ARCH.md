@@ -47,7 +47,9 @@ attribute-name sequences are stored once per schema rather than repeated for eve
 `View.At` materialize only requested identities into reusable caller buffers. The compatibility
 `Snapshot` API materializes entries; pruning uses compact views. `View.AppendCanonical` emits the
 canonical identity from shared context and encoded point symbols without constructing attribute
-values. `EncodedAttributes` borrows those point symbols for encoders and postings builders.
+values. Context pairs hold local resource and scope references and a cached workspace estimate.
+Canonical serialization copies the interned prefix bytes, and sizing counts the encoded symbols
+without writing a descriptor. `EncodedAttributes` borrows point symbols for encoders and postings builders.
 `Index.AddView` copies them into an owned registry, preserving their established canonical ID and
 remapping source symbols; source references never escape into the destination's durable data.
 Metrics flush and merge encode identities one at a time, so their snapshots do not expand the
@@ -82,6 +84,8 @@ Eight consecutive mismatches back off to one comparison per 64 registrations unt
 The inverted index is keyed on interned name/typed-value symbols. `MemPostings` stores canonical
 128-bit IDs; `Dense` stores four-byte local ordinals. The metrics engine resolves its local ordinals
 back to canonical hashes before accessing parts. Local ordinals never appear in durable data or RPCs.
+A packed pair key finds a bucket in fixed-size pages. A per-name directory enumerates only that
+label's buckets for presence, value listing and predicate matches.
 
 Sorted, unique local-ordinal lists that span a contiguous interval use arithmetic iterators with
 constant-time seeks. Gapped lists retain the array iterator and binary-search seek.

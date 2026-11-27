@@ -14,12 +14,14 @@ type pressureJob struct {
 }
 
 type pressurePipeline struct {
-	beforeBuild func(uint64)
-	mu          sync.Mutex
-	job         *pressureJob
-	wake        chan struct{}
-	progress    chan struct{}
-	closed      atomic.Bool
+	generationBuilds atomic.Int32
+	beforeBuild      func(uint64)
+	mu               sync.Mutex
+	job              *pressureJob
+	wake             chan struct{}
+	progress         chan struct{}
+	rotation         chan struct{}
+	closed           atomic.Bool
 }
 
 func (e *Engine) pressurePipelineEnabled() bool {
@@ -35,6 +37,8 @@ func (e *Engine) pipelineResidentPressure() error {
 		e.mu.RLock()
 		used := e.head.residentIdentityBytes() + e.head.inFlightBytes() + e.parallel.pending.Load()
 		active := e.head.bytes > 0 || len(e.pressureGenerations) > 0
+		rotate := e.pressureRotationPendingLocked()
+		blocked := e.headPressureLocked(used)
 		e.mu.RUnlock()
 		if !active || used < e.pressureRotationBytes() {
 			return nil
@@ -43,7 +47,13 @@ func (e *Engine) pipelineResidentPressure() error {
 		if job == nil {
 			return os.ErrClosed
 		}
-		if used < e.cfg.ResidentHeadBytes {
+		if rotate {
+			if err := e.waitPressureRotation(job); err != nil {
+				return err
+			}
+			continue
+		}
+		if !blocked {
 			return nil
 		}
 		changed := e.pressureProgress()
@@ -51,10 +61,10 @@ func (e *Engine) pipelineResidentPressure() error {
 			return os.ErrClosed
 		}
 		e.mu.RLock()
-		used = e.head.residentIdentityBytes() + e.head.inFlightBytes() + e.parallel.pending.Load()
+		blocked = e.headPressureLocked(e.head.residentIdentityBytes() + e.head.inFlightBytes() + e.parallel.pending.Load())
 		active = e.head.bytes > 0 || len(e.pressureGenerations) > 0
 		e.mu.RUnlock()
-		if !active || used < e.cfg.ResidentHeadBytes {
+		if !active || !blocked {
 			continue
 		}
 		select {
@@ -90,8 +100,11 @@ func (e *Engine) schedulePressureFlush() {
 		return
 	}
 	e.mu.RLock()
-	needed := (e.head.bytes > 0 || len(e.pressureGenerations) > 0) &&
-		e.head.residentIdentityBytes()+e.head.inFlightBytes()+e.parallel.pending.Load() >= e.pressureRotationBytes()
+	needed := e.head.bytes > 0 && e.head.ownedIdentityBytes()+e.head.bytes >= e.pressureRotationBytes()
+	if !e.fixedHeadRotation() {
+		needed = (e.head.bytes > 0 || len(e.pressureGenerations) > 0) &&
+			e.head.residentIdentityBytes()+e.head.inFlightBytes()+e.parallel.pending.Load() >= e.pressureRotationBytes()
+	}
 	e.mu.RUnlock()
 	if needed {
 		e.startPressureJob()
@@ -159,6 +172,7 @@ func (e *Engine) stopPressurePipeline(ctx context.Context, abort bool) error {
 	job := e.pressure.job
 	e.pressure.mu.Unlock()
 	e.notifyPressureProgress()
+	e.notifyPressureRotation()
 	if job == nil {
 		return nil
 	}
@@ -172,4 +186,43 @@ func (e *Engine) stopPressurePipeline(ctx context.Context, abort bool) error {
 		job.cancel()
 		return ctx.Err()
 	}
+}
+
+func (e *Engine) pressureRotationPendingLocked() bool {
+	n := len(e.pressureGenerations)
+	return e.twoPressureGenerations() && (n == 0 || n == 1 && e.fixedHeadRotation()) &&
+		e.head.bytes > 0 && e.head.ownedIdentityBytes()+e.head.bytes >= e.pressureRotationBytes()
+}
+
+func (e *Engine) waitPressureRotation(job *pressureJob) error {
+	e.pressure.mu.Lock()
+	if e.pressure.rotation == nil {
+		e.pressure.rotation = make(chan struct{})
+	}
+	changed := e.pressure.rotation
+	e.pressure.mu.Unlock()
+	if e.pressure.closed.Load() {
+		return os.ErrClosed
+	}
+	e.mu.RLock()
+	needed := e.pressureRotationPendingLocked()
+	e.mu.RUnlock()
+	if !needed {
+		return nil
+	}
+	select {
+	case <-changed:
+		return nil
+	case <-job.done:
+		return job.err
+	}
+}
+
+func (e *Engine) notifyPressureRotation() {
+	e.pressure.mu.Lock()
+	if e.pressure.rotation != nil {
+		close(e.pressure.rotation)
+		e.pressure.rotation = nil
+	}
+	e.pressure.mu.Unlock()
 }

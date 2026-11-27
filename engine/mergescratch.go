@@ -7,10 +7,21 @@ import (
 
 func mergeSeriesScratchBound(src []*part, tiers []DownsampleTier) int64 {
 	var rows, ranges int64
+	plain := false
+	if plainMergeInputs(src, tiers) {
+		var largest int64
+		for _, p := range src {
+			largest = buildbudget.Add(largest, mergeMaximumSeriesRows(p))
+		}
+		plain = largest > mergeSmallSeries
+	}
 	tierCount := int64(len(tiers))
 	weights, tagged := false, false
 	for _, p := range src {
 		n := mergeMaximumSeriesRows(p)
+		if plain {
+			n = min(n, mergeSmallSeries)
+		}
 		rows = buildbudget.Add(rows, n)
 		rangeRow := memsize.Of[int64]() + memsize.Of[float64]()
 		if p.hasSF {
@@ -38,6 +49,11 @@ func mergeSeriesScratchBound(src []*part, tiers []DownsampleTier) int64 {
 	header := 2 * (memsize.Of[tsRun]() + memsize.Of[[]DownsampleTier]())
 	bound = buildbudget.Add(bound, buildbudget.Mul(int64(len(src)), header+memsize.Of[rangeBuf]()))
 	bound = buildbudget.Add(bound, buildbudget.Mul(tierCount, 4*memsize.Of[DownsampleTier]()))
+	if plain {
+		window := int64(mergeSeriesWindow) * (memsize.Of[int64]() + memsize.Of[float64]())
+		perInput := window + memsize.Of[mergeWindowSource]() + memsize.Of[int]()
+		return buildbudget.Add(bound, buildbudget.Add(window, buildbudget.Mul(int64(len(src)), perInput)))
+	}
 	if !tagged && !activeTiers(tiers) {
 		return bound
 	}

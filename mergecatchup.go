@@ -5,6 +5,8 @@ import (
 	"sort"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/internal/parallel"
 	"github.com/oteldb/storage/recordengine"
@@ -58,8 +60,9 @@ type mergeTask struct {
 }
 
 type mergeTaskKey struct {
-	tenant signal.TenantID
-	signal signal.Signal
+	tenant     signal.TenantID
+	signal     signal.Signal
+	descriptor bool
 }
 
 type mergeTurn struct {
@@ -90,6 +93,10 @@ func refreshMergeTasks(pending, fresh []mergeTask) []mergeTask {
 func runMergeTasks(tasks []mergeTask, limit int) []mergeTask {
 	n := min(len(tasks), max(limit, 1))
 	for i := range n {
+		if tasks[i].key.descriptor != tasks[0].key.descriptor {
+			n = i
+			break
+		}
 		if tasks[i].deferred {
 			n = max(i, 1)
 			break
@@ -122,16 +129,18 @@ func (s *Storage) mergeCatchupTasks(ctx context.Context) []mergeTask {
 		if !s.claimsShard(tid) || s.metricShape(tid, eng, s.sizeCutoffFor(ctx, tenantOfShard(tid))).Candidates == 0 {
 			continue
 		}
-		tasks = append(tasks, mergeTask{key: mergeTaskKey{tid, signal.Metric}, deferred: eng.MergeDeferred(), run: func() mergeTurn {
-			return s.catchupMetrics(ctx, tid, eng)
-		}})
+		tasks = append(tasks, mergeTask{
+			key:      mergeTaskKey{tenant: tid, signal: signal.Metric},
+			deferred: eng.MergeDeferred(),
+			run:      func() mergeTurn { return s.catchupMetrics(ctx, tid, eng) },
+		})
 	}
 	add := func(engines map[signal.TenantID]*recordengine.Engine, sig signal.Signal, prefix string) {
 		for tid, eng := range engines {
 			if !s.claimsShard(tid) || s.recordShape(sig, tid, eng, s.sizeCutoffFor(ctx, tenantOfShard(tid))).Candidates == 0 {
 				continue
 			}
-			tasks = append(tasks, mergeTask{key: mergeTaskKey{tid, sig}, deferred: eng.MergeDeferred(), run: func() mergeTurn {
+			tasks = append(tasks, mergeTask{key: mergeTaskKey{tenant: tid, signal: sig}, deferred: eng.MergeDeferred(), run: func() mergeTurn {
 				return s.catchupRecords(ctx, tid, eng, sig, prefix)
 			}})
 		}
@@ -144,6 +153,29 @@ func (s *Storage) mergeCatchupTasks(ctx context.Context) []mergeTask {
 	return tasks
 }
 
+func (s *Storage) descriptorMergeTasks(ctx context.Context) []mergeTask {
+	var tasks []mergeTask
+	for tid, eng := range s.engineSnapshotByTenant() {
+		if !eng.NeedsSeriesCompaction() || !s.claimsShard(tid) {
+			continue
+		}
+		tasks = append(tasks, mergeTask{
+			key: mergeTaskKey{tenant: tid, signal: signal.Metric, descriptor: true},
+			run: func() mergeTurn {
+				if !s.claimsShard(tid) {
+					return mergeTurn{}
+				}
+				changed, err := eng.MergeSeriesStep(ctx, true)
+				if err != nil {
+					s.obs.Logger(ctx).Warn("merge metric descriptors", zap.String("tenant", string(tid)), zap.Error(err))
+				}
+				return mergeTurn{progress: changed}
+			},
+		})
+	}
+	return tasks
+}
+
 func (s *Storage) catchupMetrics(ctx context.Context, tid signal.TenantID, eng *engine.Engine) mergeTurn {
 	if !s.claimsShard(tid) {
 		return mergeTurn{}
@@ -153,7 +185,7 @@ func (s *Storage) catchupMetrics(ctx context.Context, tid signal.TenantID, eng *
 	if eng.MergeShapeWith(opts).Candidates == 0 {
 		return mergeTurn{}
 	}
-	changed, err := eng.MergeStep(ctx, opts)
+	changed, err := eng.MergeSamplesStep(ctx, opts)
 	if err != nil {
 		return mergeTurn{}
 	}

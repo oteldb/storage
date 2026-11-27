@@ -74,8 +74,12 @@ does not extend a writer's memory wait after frozen inputs are released. WAL che
 is unchanged.
 
 `Options.MetricPressureGenerations=2` / `Config.PressureGenerations=2` opt in to two frozen
-owners under the same aggregate resident target and half-target rotation size. The default remains
-one. Each owner retains its arena, identity index, WAL epoch and sealed sequence; builders use a
+owners under the same aggregate resident target. At half the target, admission waits for the
+initial detach/seal event, not its build, so scheduling delay cannot consume the next owner's
+allowance. Already-admitted batch overshoot retains its existing bound. With one
+unfinished frozen owner, aggregate usage reaching seven eighths can rotate an active owner of at
+least one quarter, leaving room for pending/metadata overhead without tiny generations. The default
+remains one. Each owner retains its arena, identity index, WAL epoch and sealed sequence; builders use a
 private dense ordering workspace. Finished outputs remain charged while waiting behind an earlier
 generation. Queries copy both frozen windows under the state lock; labels/counts inspect both.
 
@@ -89,12 +93,23 @@ Part names use a generation-local ULID sequence with a reserved logical millisec
 creation order across independently scheduled builders and retries without changing the part format.
 Each sequence keeps the full random entropy; exhaustion fails instead of reusing names. Reservations
 can advance the logical clock beyond wall time, conservatively delaying orphan eligibility.
+Each frozen generation also reserves an earlier merge namespace. A merge leases that predecessor
+or reserves its own namespace with the source snapshot, before future freezes. Its fresh attempt
+floor follows earlier outputs from a reused namespace; all outputs precede its timestamp ceiling.
+The lease retains only names and bounds, so generation retirement releases its head normally.
+Overlapping pending raw rows still block rollup publication: representatives combine values rather
+than using prefix precedence, so their closure cannot be replaced by an older output namespace.
 In this opt-in mode, merge admission and catalog guards defer outputs that would override newer
 excluded or frozen data. Disjoint timestamp windows or validated canonical-ID ranges still overlap.
 Manual merges report an overlap error; background merges record deferral. Completed outputs are
 revalidated after off-lock work and catalog rebases, with rejected readers retired. Live/candidate
 part ordering matches the prefix order reconstructed at reopen. Conservative bounds can postpone
 compaction, so workload qualification must check sustained merge debt as well as ingestion rate.
+
+An ordering-vetoed size-tier seed triggers a bounded search of newest-ended chronological tails
+within compatible ladder buckets. Memory and watermark repricing retain the newest anchor while
+removing older inputs. Disk caps, rollup closure and pending-generation/catalog guards still apply;
+a genuinely blocked generation reports deferral rather than hiding it as an empty selection.
 
 Disk-series flush detach transfers symbols, registry, postings and watermark slots to one frozen
 identity owner and installs an empty active owner. New registrations use only the active registry;
@@ -1466,9 +1481,9 @@ the EC wrapper, a minimal embedder backend — where each ranged read would itse
 `s3.ObjectStore` without `RangeObjectStore` claims `ReaderAt` yet answers every range with a whole GET,
 so a merge over it re-reads each column once per window.
 
-**The merge unit is still one whole series.** `decodeRange` holds a series' range per source and
-`collect` materializes the merged series before downsampling, so a part of few series with many samples
-each holds O(one series × parts), and one hot series can approach a whole part.
+**Series with more than 4,096 raw, unweighted rows** use 512-row input and output windows.
+The timestamp heap preserves original source order on ties, even when duplicates span input
+windows. Other series retain the existing whole-series fallback, including weighted rollups.
 
 **The write side.** Streaming the output decouples granularity from memory: the row cap sets part
 size only, where buffering the output would also make it the peak-memory knob (`capRows × 32 B`, 512
@@ -1476,8 +1491,9 @@ MiB at the default), so a cap raised to widen parts would raise merge RSS with i
 streaming costs 3.7–5.4× less total allocation and 2.9–3.8× less peak heap than buffering, the wider
 margin on counter-shaped data.
 
-Sidecars stream with it: series index, identities and aggregate stats come from the same per-series
-calls, each run- or series-shaped, so they cost O(distinct series), not O(rows). Encoding decisions
+Sidecars stream with it. Native shared-series writers spill watermarks and aggregates after
+32,768 series into a checked private stream. The sealed part keeps the existing sidecar format.
+The ID run list and frame directories still scale with the output cardinality. Encoding decisions
 must be fixed before the first row — compression profile, precision budget, whether a weight column
 exists — so `mergeEncoding` derives them from the sources up front; its doc has why that is equivalent.
 
@@ -2170,6 +2186,32 @@ retention, size splitting and overlapping series preserve the output's own canon
 numeric parts carry SIDX, coverage watermarks and aggregate statistics, with a manifest-bound
 `series-ref` marker instead of identities/postings. Numeric compaction never rebuilds descriptors.
 
+Flush planning checks descriptors by bounded series-ID ranges before launching parallel numeric
+builders. Native descriptor builders borrow the pinned series view and spill sorted postings from
+oversized batches. A bounded fan-in combines contiguous ordinal ranges into one immutable run,
+so temporary spills do not add catalog roots. A metadata writer serializes final bindings after
+workspace admission and retries if a sibling changed the descriptor snapshot. Two frozen
+generations may build concurrently. In standalone mode the commit owner seals and swaps after a
+generation-specific gate drains prepared tails. The lifecycle gate stays shared across the seal.
+Publication and WAL coverage advance in generation order.
+
+A configured standalone rotation target bounds the active generation independently of
+the resident ceiling. Producers can fill the active generation while a frozen build owns
+the previous one. Prepared batches hold their generation leases through acknowledgement
+and use a bounded atomic handoff to the WAL group owner. Publication still uses the
+engine state lock. With enough combined workspace, numeric builders can finish private
+outputs while descriptor preflight runs. They bind shared roots only after preflight
+succeeds. Catalog publication keeps the same generation order and WAL coverage checks.
+
+
+With a fixed rotation target, prepared writes for returning IDs append a numeric slot and
+keep the canonical bytes from their self-contained WAL registration. This head row needs
+no compact label registry insertion or eager postings. Head matching scans encoded rows with reusable scratch and keeps typed, repeated-label
+and absent-label semantics.
+Numeric planning and sorting use the same local ordinal space for both row layouts.
+Descriptor builders can copy the retained canonical bytes if a shared descriptor is missing.
+The WAL layout and replay format are identical for both kinds of head row.
+
 Catalog v9 names metadata roots independently of sample entries and publishes their union with
 numeric parts and the WAL checkpoint in one CAS. Runs sync before publication; failed commits
 retain pending roots through retries and reloads. A missing or invalid root fences loading.
@@ -2179,8 +2221,11 @@ Existing operations retain old root leases, and pending numeric outputs retain t
 leases through failed commits. Numeric membership, never
 metadata-run cardinality, determines active series and coverage; descriptors survive retention.
 
-Metadata compaction streams at most eight roots through bounded output builders under ordinary merge
-admission. Catalog v10 carries exact retired root bindings, preventing stale-writer rebases from
+Metadata compaction has its own background maintenance turns under shared merge admission.
+It scans up to eight roots by canonical ID, compares raw bytes for duplicate IDs and streams winners
+from mapped ordinals into the native output index. Existing postings are remapped and merged.
+A bounded history skips exact input groups that produced no reduction at the same allowance.
+Buffered backends retain the rebuilding fallback. Catalog v10 carries exact retired root bindings, preventing stale-writer rebases from
 resurrecting compacted roots; uncompacted stores retain v9 encoding. Retirement records are retained
 and charged as identity metadata; compaction stops at 4096 records. Source objects are not deleted,
 so descriptor garbage collection remains unavailable.
@@ -2194,15 +2239,18 @@ Validation never substitutes sample timestamps for missing coverage. Byte-based 
 numeric parts only; retained metadata source objects require separate disk-capacity monitoring.
 
 Separate metadata reserves one eighth of `SeriesCacheBytes` for a bounded
-LRU of validated, sorted `SeriesID` arrays. Exact binary search returns a descriptor ordinal or a
-negative result without decoding prefix-coded keys. A second eighth holds exact canonical byte
-proofs for one immutable catalog generation; the remaining three quarters hold historical
-watermarks. Proofs are checked once per input identity before walking metadata roots. Catalog
-changes force fresh verification, and a full proof cache stops admitting entries rather than
-churning allocations for every miss. `VerifiedIdentityCacheStats` reports actual hit/miss counts;
-a fitting component benchmark does not establish that the whole host workload fits. Pending arrays count against the cache limit
-before allocation and become readable only after full run validation; eviction falls back to the
-existing bounded disk reader. Cached IDs never determine active cardinality or sample coverage.
+cache of routing filters and validated, sorted `SeriesID` arrays. Per-run filters use the low 64
+bits to reject absent IDs without seeking prefix-coded keys. They take at most half of this
+budget and remain charged until all readers of the run drain. Exact ID arrays use the remaining
+space and can bypass a disk ID seek on a hit. Flush checks the full content ID in the immutable index
+without reading or re-encoding its descriptor. A second eighth holds positive membership proofs
+keyed by the low word with a high-word check and a collision map. Entries name an immutable root
+by token and are usable only while the checking snapshot contains that root. Adding unrelated roots
+preserves cached membership. The remaining three quarters hold historical watermarks.
+`VerifiedIdentityCacheStats` reports positive membership hit/miss counts. Pending arrays count against the cache limit
+before allocation and become readable after validating the run binding and ID stream. Reopened runs
+also validate descriptor payloads. Eviction falls back to the existing bounded disk reader. Cached IDs
+never determine active cardinality or sample coverage.
 
 Shared-part ingestion metadata probes reuse the SIDX ordinal and read SMAX through an
 operation-local 32-KiB window. The scratch window is reset and reused across parts; coverage opens

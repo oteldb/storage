@@ -1,26 +1,28 @@
 package engine
 
 import (
-	"bytes"
 	"sync"
-
-	"github.com/go-faster/errors"
 
 	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/signal"
 )
 
-// Entries prove exact canonical bytes in one immutable catalog generation, never ID existence alone.
-// A full generation stops admitting entries instead of allocating on every miss during a large scrape.
+type verifiedID struct {
+	high uint64
+	root uint64
+}
+
+// A cache entry proves full-ID membership in one pinned immutable root. Using
+// a token keeps retired run handles out of the cache's object graph.
 type verifiedIdentityCache struct {
 	mu           sync.Mutex
-	generation   uint64
 	limit, used  int64
-	entries      map[signal.SeriesID][]byte
+	entries      map[uint64]verifiedID
+	collisions   map[signal.SeriesID]uint64
 	hits, misses uint64
 }
 
-// VerifiedIdentityStats reports canonical verification reuse, separate from page-cache hits.
+// VerifiedIdentityStats reports positive ID cache reuse, separate from page-cache hits.
 type VerifiedIdentityStats struct {
 	Bytes        int64
 	Hits, Misses uint64
@@ -42,7 +44,7 @@ func newVerifiedIdentityCache(limit int64) *verifiedIdentityCache {
 	if limit < base {
 		return nil
 	}
-	return &verifiedIdentityCache{limit: limit, used: base, entries: make(map[signal.SeriesID][]byte)}
+	return &verifiedIdentityCache{limit: limit, used: base, entries: make(map[uint64]verifiedID)}
 }
 
 func (c *verifiedIdentityCache) sizeBytes() int64 {
@@ -54,88 +56,104 @@ func (c *verifiedIdentityCache) sizeBytes() int64 {
 	return c.used
 }
 
-func (c *verifiedIdentityCache) clearLocked() {
-	c.entries = make(map[signal.SeriesID][]byte)
-	c.used = memsize.Of[verifiedIdentityCache]() + memsize.MapBase
-}
-
 func (c *verifiedIdentityCache) clear() {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.clearLocked()
+	c.entries = make(map[uint64]verifiedID)
+	c.collisions = nil
+	c.used = memsize.Of[verifiedIdentityCache]() + memsize.MapBase
 }
 
-func (c *verifiedIdentityCache) get(generation uint64, id signal.SeriesID) ([]byte, bool) {
+func (c *verifiedIdentityCache) match(snapshot *seriesSnapshot, entries identitySnapshot, known []bool) (hits int) {
 	if c == nil {
-		return nil, false
+		return 0
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.generation != generation {
-		return nil, false
+	if len(c.entries) == 0 {
+		c.misses += uint64(len(known))
+		return 0
 	}
-	raw, ok := c.entries[id]
-	return raw, ok
-}
-
-func (c *verifiedIdentityCache) match(generation uint64, entries identitySnapshot, known []bool) (hits int, err error) {
-	if c == nil {
-		return 0, nil
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	defer func() { c.hits += uint64(hits); c.misses += uint64(len(known) - hits) }()
-	if c.generation != generation {
-		return 0, nil
-	}
-	var canonical []byte
 	for i, ref := range entries.refs {
-		if raw, ok := c.entries[entries.view.ID(int(ref))]; ok {
-			canonical = entries.view.AppendCanonical(canonical[:0], int(ref))
-			if !bytes.Equal(raw, canonical) {
-				return 0, errors.New("engine: shared series canonical identity conflict")
-			}
+		id := entries.view.ID(int(ref))
+		entry, ok := c.entries[id.Lo]
+		if !ok {
+			continue
+		}
+		root := entry.root
+		if entry.high != id.Hi {
+			root = c.collisions[id]
+		}
+		if _, live := snapshot.tokens[root]; live {
 			known[i] = true
 			hits++
 		}
 	}
-	return hits, nil
+	c.hits += uint64(hits)
+	c.misses += uint64(len(known) - hits)
+	return hits
 }
 
-func (c *verifiedIdentityCache) canAdmit(generation uint64) bool {
+func (c *verifiedIdentityCache) seed(root uint64, entries identitySnapshot, known []bool) {
 	if c == nil {
-		return false
+		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.generation != generation || c.limit-c.used > 2*memsize.MapEntry[signal.SeriesID, []byte]()
+	for i, ref := range entries.refs {
+		if !known[i] && !c.putLocked(root, entries.view.ID(int(ref))) {
+			return
+		}
+	}
 }
 
-func (c *verifiedIdentityCache) put(generation uint64, id signal.SeriesID, raw []byte) bool {
-	if c == nil {
-		return false
+func (c *verifiedIdentityCache) putIDs(root uint64, ids []signal.SeriesID) {
+	if c == nil || len(ids) == 0 {
+		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if generation < c.generation {
-		return false
+	for _, id := range ids {
+		c.putLocked(root, id)
 	}
-	if c.generation != generation {
-		c.clearLocked()
-		c.generation = generation
-	}
-	if _, ok := c.entries[id]; ok {
+}
+
+func (c *verifiedIdentityCache) putLocked(root uint64, id signal.SeriesID) bool {
+	entry, ok := c.entries[id.Lo]
+	if !ok {
+		charge := 2 * memsize.MapEntry[uint64, verifiedID]()
+		if charge > c.limit-c.used {
+			return false
+		}
+		c.entries[id.Lo] = verifiedID{high: id.Hi, root: root}
+		c.used += charge
 		return true
 	}
-	// Charge map growth slack as well as the owned byte payload before allocating.
-	charge := 2*memsize.MapEntry[signal.SeriesID, []byte]() + int64(len(raw))
+	// A slow lookup from an older snapshot must not overwrite a newer root.
+	if entry.high == id.Hi {
+		if root > entry.root {
+			c.entries[id.Lo] = verifiedID{high: id.Hi, root: root}
+		}
+		return true
+	}
+	if cached, exists := c.collisions[id]; exists {
+		c.collisions[id] = max(root, cached)
+		return true
+	}
+	charge := 2 * memsize.MapEntry[signal.SeriesID, uint64]()
+	if c.collisions == nil {
+		charge += memsize.MapBase
+	}
 	if charge > c.limit-c.used {
 		return false
 	}
-	c.entries[id] = append([]byte(nil), raw...)
+	if c.collisions == nil {
+		c.collisions = make(map[signal.SeriesID]uint64)
+	}
+	c.collisions[id] = root
 	c.used += charge
 	return true
 }

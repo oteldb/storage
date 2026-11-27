@@ -37,6 +37,7 @@ func TestIndexAddEntry(t *testing.T) {
 					input.Attributes[i].Key = append(input.Attributes[i].Key[:0], "changed"...)
 				}
 				require.Equal(t, want, ix.View().AppendCanonical(nil, 0))
+				require.Equal(t, len(want), ix.View().CanonicalBytes(0))
 				require.Equal(t, entry.ID, ix.View().ID(0))
 				copied := New()
 				copied.AddView(ix.View(), 0)

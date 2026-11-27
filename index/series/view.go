@@ -9,7 +9,10 @@ import (
 // View is an immutable snapshot, safe to read while its index receives additions.
 type View struct {
 	rows      []row
+	encoded   []byte
 	contexts  []identityContext
+	resources []indexedResource
+	scopes    []indexedScope
 	keys      [][]symbols.ID
 	values    []symbols.ID
 	symbols   [][]byte
@@ -18,7 +21,10 @@ type View struct {
 
 // View captures the append-only arenas without materializing identities.
 func (ix *Index) View() View {
-	return View{rows: ix.rows, contexts: ix.contexts, keys: ix.keys, values: ix.values, symbols: ix.sym.Snapshot(), templates: ix.templateRows}
+	return View{
+		rows: ix.rows, encoded: ix.encoded, contexts: ix.contexts, resources: ix.resources, scopes: ix.scopes,
+		keys: ix.keys, values: ix.values, symbols: ix.sym.Snapshot(), templates: ix.templateRows,
+	}
 }
 
 // Len returns the number of identities captured by v.
@@ -29,9 +35,12 @@ func (v View) ID(i int) signal.SeriesID { return v.rows[i].id }
 
 // EncodingBytes bounds the series-record bytes, including repeated resource/scope references.
 func (v View) EncodingBytes(i int) int64 {
+	if raw := v.EncodedDescriptor(i); raw != nil {
+		return int64(len(raw))
+	}
 	r := v.rows[i]
 	c := v.contexts[r.context]
-	attrs := len(c.resource.Attributes) + len(c.scope.Attributes)
+	attrs := len(v.resources[c.resource].value.Attributes) + len(v.scopes[c.scope].value.Attributes)
 	attrs += v.AttributeCount(i)
 	// A symbol ID is uint32 (at most five varint bytes); every attribute stores two IDs.
 	return buildbudget.Add(80, buildbudget.Mul(int64(attrs), 10))
@@ -48,15 +57,16 @@ func (v View) EncodingWorkspace() int64 {
 	}
 	// Resource/scope values are interned in memory but get type-tagged encodings on disk.
 	for i := range v.contexts {
-		c := &v.contexts[i]
-		n = buildbudget.Add(n, buildbudget.Mul(buildbudget.Attributes(c.resource.Attributes), 4))
-		n = buildbudget.Add(n, buildbudget.Mul(buildbudget.Attributes(c.scope.Attributes), 4))
+		n = buildbudget.Add(n, buildbudget.Mul(v.contexts[i].attributeWorkspace, 4))
 	}
 	return n
 }
 
 // MaterializationBytes bounds a decoded point-attribute slice, including nested values.
 func (v View) MaterializationBytes(i int) int64 {
+	if raw := v.EncodedDescriptor(i); raw != nil {
+		return buildbudget.Mul(int64(len(raw)), 128)
+	}
 	n := buildbudget.Mul(int64(v.AttributeCount(i)), 160)
 	v.EncodedAttributes(i, func(_, data []byte) {
 		if len(data) > 0 && (signal.ValueKind(data[0]) == signal.KindSlice || signal.ValueKind(data[0]) == signal.KindMap) {
@@ -68,15 +78,20 @@ func (v View) MaterializationBytes(i int) int64 {
 
 // At materializes identity i, reusing dst for its point attributes.
 func (v View) At(i int, dst signal.Attributes) signal.Series {
+	if raw := v.EncodedDescriptor(i); raw != nil {
+		decoded := signal.Series{Attributes: dst}
+		decodeEncodedDescriptor(&decoded, raw)
+		return decoded
+	}
 	r := v.rows[i]
-	c := v.contexts[r.context]
+	resource, scope := v.Context(i)
 	if r.keys == 0 {
-		return signal.Series{Resource: c.resource, Scope: c.scope}
+		return signal.Series{Resource: resource, Scope: scope}
 	}
 	if r.keys&templateFlag != 0 {
 		t := v.templates[r.keys&^templateFlag]
 		dst = t.attributes(v, r, dst[:0])
-		return signal.Series{Resource: c.resource, Scope: c.scope, Attributes: dst}
+		return signal.Series{Resource: resource, Scope: scope, Attributes: dst}
 	}
 	keys := v.keys[r.keys]
 	if dst == nil {
@@ -90,5 +105,5 @@ func (v View) At(i int, dst signal.Attributes) signal.Series {
 		}
 		dst = append(dst, signal.KeyValue{Key: v.symbols[key], Value: value})
 	}
-	return signal.Series{Resource: c.resource, Scope: c.scope, Attributes: dst}
+	return signal.Series{Resource: resource, Scope: scope, Attributes: dst}
 }

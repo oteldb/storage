@@ -8,13 +8,14 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
-// IDCache retains byte-bounded, validated ID arrays; descriptors stay on disk.
+// IDCache retains byte-bounded routing filters and validated ID arrays.
 type IDCache struct {
-	mu          sync.Mutex
-	limit, used int64
-	mapSlots    int
-	runs        map[*Run]*cachedIDs
-	ready       list.List
+	mu                      sync.Mutex
+	limit, used             int64
+	filterLimit, filterUsed int64
+	mapSlots                int
+	runs                    map[*Run]*cachedIDs
+	ready                   list.List
 }
 
 type cachedIDs struct {
@@ -27,21 +28,55 @@ type cachedIDs struct {
 
 // NewIDCache creates an empty cache; a nonpositive limit disables retention.
 func NewIDCache(limit int64) *IDCache {
+	return newIDCache(limit, limit/2)
+}
+
+func newIDCache(limit, filterLimit int64) *IDCache {
 	base := memsize.Of[IDCache]() + memsize.MapBase
 	if limit < base {
 		return nil
 	}
-	return &IDCache{limit: limit, used: base, runs: make(map[*Run]*cachedIDs)}
+	filterLimit = min(filterLimit, limit-base)
+	return &IDCache{limit: limit, used: base, filterLimit: filterLimit, runs: make(map[*Run]*cachedIDs)}
 }
 
-// SizeBytes includes retained arrays, pending construction and cache bookkeeping.
+// SizeBytes includes filters, arrays, pending construction and cache bookkeeping.
 func (c *IDCache) SizeBytes() int64 {
 	if c == nil {
 		return 0
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.used
+	return c.used + c.filterUsed
+}
+
+// Filters keep their share even when an exact array is evicted. Arrays can use any spare bytes.
+func (c *IDCache) reserveFilter(count uint32) *idRoutingFilter {
+	if c == nil || c.filterLimit == 0 {
+		return nil
+	}
+	words := routingFilterWords(count)
+	charge := memsize.Of[idRoutingFilter]() + int64(words)*8
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if charge > c.filterLimit-c.filterUsed {
+		return nil
+	}
+	for c.used+c.filterUsed+charge > c.limit {
+		if !c.evictOldestLocked() {
+			return nil
+		}
+	}
+	c.filterUsed += charge
+	return &idRoutingFilter{words: make([]uint64, words)}
+}
+
+func (c *IDCache) releaseFilter(filter *idRoutingFilter) {
+	if filter != nil {
+		c.mu.Lock()
+		c.filterUsed -= memsize.Of[idRoutingFilter]() + memsize.Slice(filter.words)
+		c.mu.Unlock()
+	}
 }
 
 func (c *IDCache) reserve(r *Run) *cachedIDs {
@@ -54,7 +89,7 @@ func (c *IDCache) reserve(r *Run) *cachedIDs {
 	if c.runs[r] != nil {
 		return nil
 	}
-	if charge > c.limit-memsize.Of[IDCache]()-memsize.MapBase {
+	if charge > c.limit-c.filterUsed-memsize.Of[IDCache]()-memsize.MapBase {
 		return nil
 	}
 	mapCharge := func() int64 {
@@ -63,15 +98,10 @@ func (c *IDCache) reserve(r *Run) *cachedIDs {
 		}
 		return 0
 	}
-	for c.used+charge+mapCharge() > c.limit {
-		oldest := c.ready.Back()
-		for oldest != nil && oldest.Value.(*cachedIDs).pins > 0 {
-			oldest = oldest.Prev()
-		}
-		if oldest == nil {
+	for c.used+c.filterUsed+charge+mapCharge() > c.limit {
+		if !c.evictOldestLocked() {
 			return nil
 		}
-		c.removeLocked(oldest.Value.(*cachedIDs).owner)
 	}
 	if extra := mapCharge(); extra > 0 {
 		c.used += extra
@@ -102,6 +132,16 @@ func (c *IDCache) remove(r *Run) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.removeLocked(r)
+}
+
+func (c *IDCache) evictOldestLocked() bool {
+	for elem := c.ready.Back(); elem != nil; elem = elem.Prev() {
+		if entry := elem.Value.(*cachedIDs); entry.pins == 0 {
+			c.removeLocked(entry.owner)
+			return true
+		}
+	}
+	return false
 }
 
 func (c *IDCache) removeLocked(r *Run) {

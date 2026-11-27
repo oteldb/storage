@@ -99,7 +99,7 @@ func (e *Engine) captureDiskHead(
 		return nil, err
 	}
 	// Head matcher iterators and the growing result slice are transient metadata workspace.
-	workspace := buildbudget.Mul(int64(e.head.identityCount()), buildbudget.Mul(int64(len(r.Matchers))+1, 256))
+	workspace := e.head.matcherWorkspace(r.Matchers)
 	if err := budget.Reserve(workspace); err != nil {
 		e.mu.RUnlock()
 		return nil, err

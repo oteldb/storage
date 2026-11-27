@@ -22,12 +22,14 @@ var ErrClosed = errors.New("seriestable: closed run")
 
 // Run retains immutable metadata only. The engine owns catalog and object reclamation.
 type Run struct {
-	idCache *IDCache
-	part    *block.PartReader
-	index   *seriesindex.Index
-	mu      sync.Mutex
-	refs    int
-	closed  bool
+	maxCanonicalBytes int64
+	idCache           *IDCache
+	idFilter          *idRoutingFilter
+	part              *block.PartReader
+	index             *seriesindex.Index
+	mu                sync.Mutex
+	refs              int
+	closed            bool
 }
 
 // Open validates a run and optionally checks its catalog-bound manifest digest.
@@ -36,7 +38,14 @@ func Open(ctx context.Context, be backend.Backend, prefix string, expected ...[3
 }
 
 // OpenWithIDCache retains validated IDs within cache's separate memory budget.
-func OpenWithIDCache(ctx context.Context, be backend.Backend, prefix string, cache *IDCache, expected ...[32]byte) (_ *Run, err error) {
+func OpenWithIDCache(ctx context.Context, be backend.Backend, prefix string, cache *IDCache, expected ...[32]byte) (*Run, error) {
+	return openRun(ctx, be, prefix, cache, 0, expected...)
+}
+
+// A positive writtenMax comes from the writer of this private prefix.
+func openRun(ctx context.Context, be backend.Backend, prefix string, cache *IDCache, writtenMax int64,
+	expected ...[32]byte,
+) (_ *Run, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -83,7 +92,7 @@ func OpenWithIDCache(ctx context.Context, be backend.Backend, prefix string, cac
 		return nil, errors.Wrap(ErrCorrupt, "index manifest binding")
 	}
 	r := &Run{part: p, index: idx, idCache: cache}
-	if err := r.validate(ctx, be, prefix+"/c/0", c); err != nil {
+	if err := r.validate(ctx, be, prefix+"/c/0", c, writtenMax); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -105,6 +114,12 @@ func requireObject(ctx context.Context, be backend.Backend, key string, limit in
 
 // Count is descriptor cardinality, not active sample cardinality.
 func (r *Run) Count() uint32 { return r.index.Count() }
+
+// MaxCanonicalBytes is the maximum canonical record size.
+func (r *Run) MaxCanonicalBytes() int64 { return r.maxCanonicalBytes }
+
+// PostingIndex exposes the immutable index while the caller pins the run.
+func (r *Run) PostingIndex() *seriesindex.Index { return r.index }
 
 // Digest is the catalog binding for this run.
 func (r *Run) Digest() [32]byte { return r.part.ManifestDigest() }
@@ -129,7 +144,7 @@ func (r *Run) Close() error {
 	closePart := r.refs == 0
 	r.mu.Unlock()
 	if closePart {
-		r.idCache.remove(r)
+		r.removeCachedIDs()
 		return r.part.Close()
 	}
 	return nil
@@ -153,7 +168,13 @@ func (r *Run) release() {
 	closePart := r.closed && r.refs == 0
 	r.mu.Unlock()
 	if closePart {
-		r.idCache.remove(r)
+		r.removeCachedIDs()
 		_ = r.part.Close()
 	}
+}
+
+func (r *Run) removeCachedIDs() {
+	r.idCache.remove(r)
+	r.idCache.releaseFilter(r.idFilter)
+	r.idFilter = nil
 }

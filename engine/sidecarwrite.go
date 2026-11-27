@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
+	"io"
 	"math"
 
 	"github.com/go-faster/errors"
@@ -62,6 +64,9 @@ func (p *partStreamWriter) writeSeriesSidecars(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	if p.meta != nil {
+		return p.writeSpoolSidecars(ctx, scratch[:0])
+	}
 	if err := watermark.WriteEntries(ctx, p.e.cfg.Backend, watermark.Key(p.prefix), len(p.runs), p.watermarkAt); err != nil {
 		return err
 	}
@@ -70,16 +75,52 @@ func (p *partStreamWriter) writeSeriesSidecars(ctx context.Context) error {
 		header = binary.AppendUvarint(header, uint64(len(p.runs)))
 		return sidecar.Write(ctx, p.e.cfg.Backend, statsKey(p.prefix), header, len(p.runs),
 			16+binary.MaxVarintLen64+3*8, func(dst []byte, i int) []byte {
-				r, a := p.runs[i], p.stats[i]
-				dst = binary.BigEndian.AppendUint64(dst, r.Value.Hi)
-				dst = binary.BigEndian.AppendUint64(dst, r.Value.Lo)
-				dst = binary.AppendVarint(dst, int64(a.Count))
-				dst = binary.BigEndian.AppendUint64(dst, math.Float64bits(a.Sum))
-				dst = binary.BigEndian.AppendUint64(dst, math.Float64bits(a.Min))
-				return binary.BigEndian.AppendUint64(dst, math.Float64bits(a.Max))
+				return appendSeriesStats(dst, p.runs[i].Value, p.stats[i])
 			})
 	}
 	return nil
+}
+
+func (p *partStreamWriter) writeSpoolSidecars(ctx context.Context, scratch []byte) error {
+	r, err := p.openSeriesMetadata(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = r.Close() }()
+	buf := bufio.NewReaderSize(r, metadataSpoolBuffer)
+	if err := watermark.WriteCheckedEntries(ctx, p.e.cfg.Backend, watermark.Key(p.prefix), len(p.runs),
+		func(i int) (watermark.Entry, error) {
+			covered, _, err := readSeriesMetadata(buf)
+			return watermark.Entry{ID: u128ToID(p.runs[i].Value), Max: covered}, err
+		}); err != nil {
+		return err
+	}
+	if !p.withStats || p.sampled {
+		return nil
+	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	buf.Reset(r)
+	header := binary.BigEndian.AppendUint32(scratch, statsMagic)
+	header = binary.AppendUvarint(header, uint64(len(p.runs)))
+	return sidecar.WriteChecked(ctx, p.e.cfg.Backend, statsKey(p.prefix), header, len(p.runs),
+		16+binary.MaxVarintLen64+3*8, func(dst []byte, i int) ([]byte, error) {
+			_, agg, err := readSeriesMetadata(buf)
+			if err != nil {
+				return nil, err
+			}
+			return appendSeriesStats(dst, p.runs[i].Value, agg), nil
+		})
+}
+
+func appendSeriesStats(dst []byte, id chunk.U128, a SeriesAgg) []byte {
+	dst = binary.BigEndian.AppendUint64(dst, id.Hi)
+	dst = binary.BigEndian.AppendUint64(dst, id.Lo)
+	dst = binary.AppendVarint(dst, int64(a.Count))
+	dst = binary.BigEndian.AppendUint64(dst, math.Float64bits(a.Sum))
+	dst = binary.BigEndian.AppendUint64(dst, math.Float64bits(a.Min))
+	return binary.BigEndian.AppendUint64(dst, math.Float64bits(a.Max))
 }
 
 func (p *partStreamWriter) watermarkAt(i int) watermark.Entry {

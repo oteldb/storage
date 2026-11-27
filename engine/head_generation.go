@@ -21,6 +21,8 @@ func (h *head) swapGenerationIdentity(other *head) {
 	h.post, other.post = other.post, h.post
 	h.nonStringLabels, other.nonStringLabels = other.nonStringLabels, h.nonStringLabels
 	h.valueScratch, other.valueScratch = other.valueScratch, h.valueScratch
+	h.encodedRefs, other.encodedRefs = other.encodedRefs, h.encodedRefs
+	h.maxEncodedDescriptor, other.maxEncodedDescriptor = other.maxEncodedDescriptor, h.maxEncodedDescriptor
 	h.stateRefs, other.stateRefs = other.stateRefs, h.stateRefs
 	h.slots, other.slots = other.slots, h.slots
 }

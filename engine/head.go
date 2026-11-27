@@ -9,6 +9,7 @@ import (
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/index/symbols"
 	"github.com/oteldb/storage/internal/memsize"
+	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 )
@@ -33,6 +34,8 @@ type head struct {
 	post                         *postings.Dense
 	nonStringLabels              map[uint32]struct{}
 	valueScratch                 []byte
+	encodedRefs                  []uint32
+	maxEncodedDescriptor         int
 	samples                      map[signal.SeriesID]*sampleBuf
 	newest                       int64 // newest timestamp across every series (reported as Inspect.MaxTime)
 	bufferedMin, detachedMin     int64
@@ -135,7 +138,7 @@ func (h *head) residentIdentityBytes() int64 {
 
 func (h *head) ownedIdentityBytes() int64 {
 	n := h.buildRetained + h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
-		memsize.Slice(h.stateRefs) + h.slots.sizeBytes() + memsize.Slice(h.valueScratch)
+		memsize.Slice(h.stateRefs) + memsize.Slice(h.encodedRefs) + h.slots.sizeBytes() + memsize.Slice(h.valueScratch)
 	if h.nonStringLabels != nil {
 		n += memsize.Map(h.nonStringLabels)
 	}
@@ -224,6 +227,7 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 	h.sym, h.series, h.post = rebuilt.sym, rebuilt.series, rebuilt.post
 	h.nonStringLabels = rebuilt.nonStringLabels
 	h.valueScratch = rebuilt.valueScratch
+	h.encodedRefs, h.maxEncodedDescriptor = nil, 0
 	h.stateRefs = rebuilt.stateRefs
 }
 
@@ -245,6 +249,14 @@ func (h *head) register(entry series.Entry) {
 			h.slots.set(h.stateRefs[ref], historical.newest)
 		}
 	}
+}
+
+// Returning identities already count toward historical cardinality.
+func (h *head) registerEncoded(id signal.SeriesID, raw []byte) {
+	ref := h.series.AddEncoded(id, raw)
+	h.encodedRefs = append(h.encodedRefs, ref)
+	h.maxEncodedDescriptor = max(h.maxEncodedDescriptor, len(raw))
+	h.stateRefs = append(h.stateRefs, h.slots.alloc())
 }
 
 func (h *head) registerIndex(entry series.Entry) {
@@ -594,6 +606,29 @@ func (h *head) ensureIndexSorted() {
 // absence satisfies it (a negation or an is-unset matcher does). Such a matcher unions the value
 // scan with the series lacking the label ([postings.Dense.WithoutName]).
 func (h *head) resolveLocal(matchers []fetch.Matcher) []signal.SeriesID {
+	ids := h.resolvePostings(matchers)
+	if len(h.encodedRefs) == 0 {
+		return ids
+	}
+	view := h.series.View()
+	var identity signal.Series
+	for _, ref := range h.encodedRefs {
+		if len(matchers) != 0 {
+			raw := view.EncodedDescriptor(int(ref))
+			if _, err := signal.DecodeSeriesInto(&identity, raw); err != nil {
+				panic("engine: invalid owned WAL descriptor")
+			}
+			if !seriesindex.MatchesSeries(identity, matchers) {
+				continue
+			}
+		}
+		ids = append(ids, view.ID(int(ref)))
+	}
+	slices.SortFunc(ids, signal.SeriesID.Compare)
+	return ids
+}
+
+func (h *head) resolvePostings(matchers []fetch.Matcher) []signal.SeriesID {
 	if len(matchers) == 0 {
 		return h.canonicalIDs(drain(h.post.All()))
 	}

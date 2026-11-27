@@ -6,7 +6,9 @@ sample liveness, compaction, retention and object reclamation; this package owns
 
 Opening checks the catalog digest, nonce, schema and index binding, then streams the ID column
 and descriptors together. Fixed-size ranged reads validate IDs, row count, CRC and canonical
-payloads without materializing the run. Native sizing and ranged reads are required.
+payloads without materializing the run. Fresh writes take the maximum descriptor size from the
+index writer and validate the manifest, ID column and ID keys. Descriptor pages are checked when
+read. Native sizing and ranged reads are required.
 
 Readers and iterators reserve operation-local page scratch and pin retained file handles.
 Returned descriptors are borrowed until the next cursor operation. Closing a run rejects new

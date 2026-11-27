@@ -228,6 +228,9 @@ type Options struct {
 	// MetricResidentHeadBytes is the disk-index mode's resident-head pressure target. Zero uses 128 MiB.
 	// One atomic append may exceed the target; pressure flushes happen before subsequent writes.
 	MetricResidentHeadBytes int64
+	// MetricHeadRotationBytes sets a separate active head target for two standalone frozen generations.
+	// Zero keeps the target at half the resident limit.
+	MetricHeadRotationBytes int64
 	// MetricSeriesCacheBytes bounds the historical ID/watermark cache per metric engine.
 	// Separate metadata mode shares this budget with retained sorted identity IDs.
 	// Zero uses 512 MiB, allocated on demand; negative disables the cache.
@@ -563,8 +566,8 @@ func (o *Options) validate() error {
 	if o.MetricPressureGenerations < 0 || o.MetricPressureGenerations > 2 {
 		return errOptionInvalid("MetricPressureGenerations must be zero, one or two")
 	}
-	if o.MetricPressureGenerations == 2 && (!o.MetricAsyncPressureFlush || o.MetricSeparateSeries) {
-		return errOptionInvalid("MetricPressureGenerations=2 requires MetricAsyncPressureFlush without MetricSeparateSeries")
+	if o.MetricPressureGenerations == 2 && !o.MetricAsyncPressureFlush {
+		return errOptionInvalid("MetricPressureGenerations=2 requires MetricAsyncPressureFlush")
 	}
 	if o.MetricSeparateSeries && (!o.MetricDiskSeries || !o.MetricSeriesChunks || o.Cluster != nil) {
 		return errOptionInvalid("MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks without Cluster")
@@ -575,6 +578,19 @@ func (o *Options) validate() error {
 	}
 	if o.MetricResidentHeadBytes < 0 {
 		return errOptionInvalid("MetricResidentHeadBytes must not be negative")
+	}
+
+	if o.MetricHeadRotationBytes < 0 {
+		return errOptionInvalid("MetricHeadRotationBytes must not be negative")
+	}
+	if o.MetricHeadRotationBytes > 0 {
+		resident := o.MetricResidentHeadBytes
+		if resident == 0 {
+			resident = 128 << 20
+		}
+		if o.MetricPressureGenerations != 2 || o.MetricHeadRotationBytes > resident/2 {
+			return errOptionInvalid("MetricHeadRotationBytes requires two generations and at most half the resident limit")
+		}
 	}
 
 	if o.Durability == DurabilityEphemeral && o.WALDir != "" {

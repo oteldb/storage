@@ -18,7 +18,6 @@ import (
 const defaultFlushMemoryBytes = 64 << 20
 
 type headRunEntry struct {
-	id      signal.SeriesID
 	buf     *sampleBuf
 	ref     uint32
 	ordered bool
@@ -41,17 +40,19 @@ type headPartBuilder struct {
 	sorting      int64
 	runRows      int64
 
-	target, reserved int64
-	reservationFloor int64
-	release          func()
-	writer           *partStreamWriter
-	writerRows       int
-	partRefs         []uint32
-	parts            []*part
-	rows             int
-	orderWorkspace   int64
-	buildScratch     block.StreamBuildScratch
-	closedBloomBytes int64
+	target, reserved      int64
+	reservationFloor      int64
+	release               func()
+	writer                *partStreamWriter
+	writerRows            int
+	partRefs              []uint32
+	parts                 []*part
+	rows                  int
+	orderWorkspace        int64
+	buildScratch          block.StreamBuildScratch
+	closedBloomBytes      int64
+	sharedIdentitiesReady bool
+	deferSharedBinding    bool
 }
 
 func (e *Engine) flushMemoryBytes() int64 {
@@ -62,7 +63,7 @@ func (e *Engine) flushMemoryBytes() int64 {
 }
 
 func (e *Engine) streamHead(ctx context.Context, samples map[signal.SeriesID]*sampleBuf, input ...*headBuildInput) ([]*part, int, error) {
-	if e.cfg.FlushAdmission != nil && e.cfg.TryFlushAdmission != nil && backend.StreamsWrites(e.cfg.Backend) && !e.cfg.SeparateSeries {
+	if e.cfg.FlushAdmission != nil && e.cfg.TryFlushAdmission != nil && backend.StreamsWrites(e.cfg.Backend) {
 		parts, rows, err := e.streamHeadParallel(ctx, samples, input...)
 		if !errors.Is(err, errHeadPlanUnavailable) && !errors.Is(err, errHeadJobBudget) {
 			return parts, rows, err
@@ -134,7 +135,7 @@ func (e *Engine) streamHeadSerial(
 			if buf == nil || len(buf.ts) == 0 {
 				return nil
 			}
-			return b.add(id, ref, buf)
+			return b.add(ref, buf)
 		})
 	}
 	if err == nil {
@@ -165,7 +166,7 @@ func (b *headPartBuilder) baseBytes() int64 {
 		n = buildbudget.Add(n, b.closedBloomBytes)
 	}
 	if b.writer != nil {
-		n = buildbudget.Add(n, max(b.writer.identityWriterBytes, b.writer.sidecarWriterBytes))
+		n = buildbudget.Add(n, max(b.writer.identityWriterBytes, b.writer.sidecarWriterBytes)+b.writer.metaWorkspace)
 	}
 	if b.fixedLimit == 0 {
 		n = buildbudget.Add(n, memsize.Slice(b.entries))
@@ -195,6 +196,8 @@ func (b *headPartBuilder) prepareWriter() error {
 		return err
 	}
 	b.writer.buildScratch = &b.buildScratch
+	b.writer.sharedIdentitiesReady = b.sharedIdentitiesReady
+	b.writer.deferSharedBinding = b.deferSharedBinding
 	if err := b.writer.reserveSeries(len(b.entries)); err != nil {
 		return err
 	}
@@ -231,7 +234,12 @@ func (b *headPartBuilder) reservePhase(bytes int64, phase string) error {
 		return b.reservePlan(bytes, phase)
 	}
 	if phase == "metadata" && bytes > b.reserved {
-		bytes = max(bytes, b.reserved+max(b.reserved/2, 1<<20))
+		rounded := max(bytes, buildbudget.Add(b.reserved, max(b.reserved/2, 1<<20)))
+		if b.e.cfg.TryFlushAdmission == nil {
+			bytes = rounded
+		} else if b.release != nil && b.tryMetadataGrowth(rounded, bytes) {
+			return nil
+		}
 	}
 	if b.release != nil {
 		b.release()
@@ -252,7 +260,26 @@ func (b *headPartBuilder) reservePhase(bytes int64, phase string) error {
 	return nil
 }
 
-func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) error {
+func (b *headPartBuilder) tryMetadataGrowth(rounded, exact int64) bool {
+	for _, want := range [2]int64{rounded, exact} {
+		if release, ok := b.e.cfg.TryFlushAdmission(want - b.reserved); ok {
+			prior := b.release
+			b.release = func() {
+				release()
+				prior()
+			}
+			b.reserved = want
+			b.e.cfg.Obs.Flush.Reservation(b.ctx, "metadata", want, b.target, 0)
+			return true
+		}
+		if want == exact {
+			break
+		}
+	}
+	return false
+}
+
+func (b *headPartBuilder) add(ref uint32, buf *sampleBuf) error {
 	if len(b.entries) == cap(b.entries) {
 		if err := b.flushRun(); err != nil {
 			return err
@@ -262,14 +289,17 @@ func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) er
 		return err
 	}
 	ordered := ascendingInt64(buf.ts)
-	encoded := b.view.EncodingBytes(int(ref))
-	materialized := b.view.MaterializationBytes(int(ref))
+	var encoded, materialized, identityWorkspace int64
+	if b.view.EncodedDescriptor(int(ref)) == nil {
+		encoded = b.view.EncodingBytes(int(ref))
+		materialized = b.view.MaterializationBytes(int(ref))
+		identityWorkspace = b.view.IdentityWorkspace(int(ref))
+	}
 	var sorting int64
 	if !ordered {
 		// sortedWindow retains its tuple scratch and up to three owned numeric columns.
 		sorting = buildbudget.Mul(int64(len(buf.ts)), 48)
 	}
-	identityWorkspace := b.view.IdentityWorkspace(int(ref))
 	single := buildbudget.Add(b.baseBytes(), identityWorkspace)
 	single = buildbudget.Add(single, materialized)
 	single = buildbudget.Add(single, sorting)
@@ -314,7 +344,7 @@ func (b *headPartBuilder) add(id signal.SeriesID, ref uint32, buf *sampleBuf) er
 	if b.plan != nil {
 		work = headEntryWork(encoded, materialized, sorting, identityWorkspace, int64(len(buf.ts)))
 	}
-	b.entries = append(b.entries, headRunEntry{id: id, buf: buf, ref: ref, ordered: ordered, work: work})
+	b.entries = append(b.entries, headRunEntry{buf: buf, ref: ref, ordered: ordered, work: work})
 	return nil
 }
 
@@ -356,15 +386,20 @@ func (b *headPartBuilder) flushRun() error {
 		if !entry.ordered {
 			ts, values, sf = sortedWindow(buf, minInt64, maxInt64, nil)
 		}
-		if err := b.append(idToU128(entry.id), entry.ref, ts, values, sf); err != nil {
+		if err := b.append(idToU128(b.view.ID(int(entry.ref))), entry.ref, ts, values, sf); err != nil {
 			return err
 		}
 	}
 	if err := b.finish(); err != nil {
 		return err
 	}
-	clear(b.entries)
-	b.entries = b.entries[:0]
+	if b.fixedLimit == 0 {
+		clear(b.entries)
+		b.entries = b.entries[:0]
+	} else {
+		// Numeric workers borrow the plan's entries. Descriptor preflight can still read them.
+		b.entries = nil
+	}
 	b.identities.Reset()
 	b.fixedIdentityBytes = 0
 	b.encoded, b.materialized, b.sorting, b.runRows = 0, 0, 0, 0
@@ -435,7 +470,7 @@ func (b *headPartBuilder) finish() error {
 			}
 		}
 	}
-	if b.e.cfg.SeparateSeries {
+	if b.e.cfg.SeparateSeries && !b.sharedIdentitiesReady {
 		b.writer.reserveSeriesMetadata = func(bytes int64) error {
 			numeric := buildbudget.Add(b.baseBytes(), buildbudget.Add(b.writer.residentBytes(), b.writer.w.FinishBytes()))
 			needed := buildbudget.Add(numeric, bytes)

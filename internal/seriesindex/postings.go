@@ -34,7 +34,8 @@ func (r *Index) Resolve(ctx context.Context, matchers []fetch.Matcher) (postings
 
 func (r *Index) selectMatcher(ctx context.Context, m fetch.Matcher) (postings.Postings, error) {
 	absent := m.Match(signal.EmptyValue())
-	key := appendEscaped([]byte{'n'}, m.Name)
+	var keyScratch [128]byte
+	key := appendLabelKey(keyScratch[:0], 'n', m.Name)
 	c := r.table.Cursor(ctx)
 	if !c.Seek(key) {
 		if c.Err() != nil {
@@ -60,7 +61,8 @@ func (r *Index) selectMatcher(ctx context.Context, m fetch.Matcher) (postings.Po
 		for i := range selected {
 			selected[i] = ^uint64(0)
 		}
-		if err := r.markPrefix(ctx, appendEscaped([]byte{'h'}, m.Name), selected, false); err != nil {
+		key[0] = 'h'
+		if err := r.markPrefix(ctx, key, selected, false); err != nil {
 			return nil, err
 		}
 	}
@@ -69,13 +71,16 @@ func (r *Index) selectMatcher(ctx context.Context, m fetch.Matcher) (postings.Po
 		values = [][]byte{[]byte(m.Spec.Value)}
 	}
 	if !nonString && len(values) > 0 {
+		key[0] = 'p'
+		var valueScratch [128]byte
+		encoded, prefix := valueScratch[:0], key
 		for _, value := range values {
 			v := signal.StringValue(value)
 			if !m.Match(v) {
 				continue
 			}
-			prefix := appendEscaped([]byte{'p'}, m.Name)
-			prefix = appendEscaped(prefix, signal.AppendValue(nil, v))
+			encoded = signal.AppendValue(encoded[:0], v)
+			prefix = appendEscaped(prefix[:len(key)], encoded)
 			if err := r.markPrefix(ctx, prefix, selected, true); err != nil {
 				return nil, err
 			}
@@ -111,7 +116,8 @@ func prefixEnd(prefix []byte) []byte {
 }
 
 func (r *Index) markValues(ctx context.Context, m fetch.Matcher, selected []uint64) error {
-	prefix := appendEscaped([]byte{'p'}, m.Name)
+	var keyScratch [128]byte
+	prefix := appendLabelKey(keyScratch[:0], 'p', m.Name)
 	c := r.table.Cursor(ctx)
 	ok := c.Seek(prefix)
 	var encoded, group []byte
@@ -217,6 +223,18 @@ func (r *Index) IDs(ctx context.Context) postings.Postings {
 	return &idPostings{index: r, cursor: r.table.Cursor(ctx)}
 }
 
+// VisitIDs scans the sequential ID section with its checked ordinal and inline metadata.
+func (r *Index) VisitIDs(ctx context.Context, visit func(signal.SeriesID, uint32, Metadata) error) error {
+	p := idPostings{index: r, cursor: r.table.Cursor(ctx)}
+	p.cursor.streaming = true
+	for p.Next() {
+		if err := visit(p.id, p.ref, p.meta); err != nil {
+			return err
+		}
+	}
+	return p.Err()
+}
+
 type idPostings struct {
 	index   *Index
 	seen    uint32
@@ -225,6 +243,8 @@ type idPostings struct {
 	started bool
 	done    bool
 	id      signal.SeriesID
+	ref     uint32
+	meta    Metadata
 }
 
 func (p *idPostings) Next() bool {
@@ -238,6 +258,7 @@ func (p *idPostings) Next() bool {
 	}
 	return p.current(p.cursor.Next())
 }
+
 func (p *idPostings) Seek(id signal.SeriesID) bool {
 	if p.done {
 		return false
@@ -275,7 +296,8 @@ func (r *Index) Names(ctx context.Context, visit func([]byte) error) error {
 
 // Values visits a label's distinct typed values using borrowed scratch.
 func (r *Index) Values(ctx context.Context, name []byte, visit func(signal.Value) error) error {
-	prefix := appendEscaped([]byte{'p'}, name)
+	var keyScratch [128]byte
+	prefix := appendLabelKey(keyScratch[:0], 'p', name)
 	c := r.table.Cursor(ctx)
 	var data, group []byte
 	for ok := c.Seek(prefix); ok && bytes.HasPrefix(c.Key(), prefix); ok = c.Seek(prefixEnd(group)) {
@@ -332,7 +354,7 @@ func (p *idPostings) current(ok bool) bool {
 		p.cursor.err = errors.Wrap(ErrCorrupt, "canonical ID entry")
 		return false
 	}
-	ref, _, _, err := decodeIDValue(p.cursor.Value())
+	ref, meta, _, err := decodeIDValue(p.cursor.Value())
 	if err != nil {
 		p.cursor.err = err
 		return false
@@ -345,6 +367,7 @@ func (p *idPostings) current(ok bool) bool {
 		p.seen++
 	}
 	p.id = signal.SeriesID{Hi: binary.BigEndian.Uint64(p.cursor.Key()[1:]), Lo: binary.BigEndian.Uint64(p.cursor.Key()[9:])}
+	p.ref, p.meta = ref, meta
 	return true
 }
 

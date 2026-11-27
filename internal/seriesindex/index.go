@@ -42,33 +42,39 @@ type record struct {
 
 type namePosting struct {
 	refs      []uint32
+	values    map[string]*valuePosting
+	keyBytes  int
 	nonString bool
 }
 
 type valuePosting struct {
-	key  string
-	refs []uint32
+	refs     []uint32
+	keyBytes int
 }
 
 // Builder owns one output part's metadata. Callers include Bytes in their build admission.
 type Builder struct {
 	registry                         *series.Index
+	borrowed                         *series.View
+	borrowedRefs                     []uint32
 	records                          []record
 	names                            map[string]*namePosting
-	values                           map[string]*valuePosting
 	bytes                            int64
-	canonicalScratch                 []byte
-	valueScratch, postingScratch     []byte
+	valueScratch                     []byte
 	parentDigest                     [32]byte
 	encodedRaw, encodedRecords       int64
+	maxKeyBytes, maxCanonicalBytes   int
 	mergedPostings                   *PostingMerge
 	fallbackBytes                    int64
 	mergeCanonicalBytes, mergeLabels int64
 }
 
+// NewBorrowedBuilder borrows a pinned registry view. Use AddBorrowed to append references.
+func NewBorrowedBuilder(view series.View) Builder { return Builder{borrowed: &view} }
+
 // Bytes bounds retained metadata and sorting/directory scratch during writing.
 func (b *Builder) Bytes() int64 {
-	n := b.bytes + int64(cap(b.canonicalScratch)) + int64(cap(b.valueScratch)) + int64(cap(b.postingScratch))
+	n := b.bytes + memsize.Slice(b.borrowedRefs) + int64(cap(b.valueScratch))
 	if b.registry != nil {
 		n += b.registry.SizeBytes()
 	}
@@ -82,6 +88,40 @@ func (b *Builder) EncodedBound() int64 {
 	return buildbudget.Add(buildbudget.Add(buildbudget.Mul(raw, 2), buildbudget.Mul(records, 45)), footerSize)
 }
 
+// StreamingDirectoryBytes prices the page keys, page records and final sparse directory.
+// The caller separately prices page compression and the largest record.
+func (b *Builder) StreamingDirectoryBytes() int64 {
+	// Each pair of consecutive pages spans at least a target page in full-key
+	// bytes. EncodedBound includes full keys before prefix compression.
+	full := b.EncodedBound()
+	pages := 2 + full/(pageSize/2)
+	keys := min(full, buildbudget.Mul(pages, int64(max(b.maxKeyBytes, 17))))
+	return buildbudget.Add(buildbudget.Mul(keys, 3),
+		buildbudget.Mul(pages, 4*memsize.Of[pageInfo]()+directorySize))
+}
+
+// AddBorrowed appends an ordered reference into the borrowed view.
+func (b *Builder) AddBorrowed(i int, meta Metadata) error {
+	if b.borrowed == nil || i < 0 || i >= b.borrowed.Len() || uint64(i) > math.MaxUint32 {
+		return errors.New("seriesindex: identity reference outside view")
+	}
+	view := *b.borrowed
+	id := view.ID(i)
+	if err := b.checkID(id); err != nil {
+		return err
+	}
+	ref := b.appendRecord(id, meta, view.CanonicalBytes(i))
+	b.borrowedRefs = append(b.borrowedRefs, uint32(i))
+	b.addViewLabels(view, i, ref)
+	return nil
+}
+
+// ID returns the canonical ID of the ordered output reference i.
+func (b *Builder) ID(i int) signal.SeriesID { return b.records[i].id }
+
+// MaxCanonicalBytes returns the largest descriptor emitted by the builder.
+func (b *Builder) MaxCanonicalBytes() int { return b.maxCanonicalBytes }
+
 // BindParent binds the index to the raw parent manifest digest.
 func (b *Builder) BindParent(digest [32]byte) { b.parentDigest = digest }
 
@@ -90,6 +130,9 @@ func (b *Builder) Count() int { return len(b.records) }
 
 // Entry materializes one identity, reusing the caller's attribute headers.
 func (b *Builder) Entry(i int, attrs signal.Attributes) series.Entry {
+	if b.borrowed != nil {
+		return series.Entry{ID: b.records[i].id, Series: b.borrowed.At(int(b.borrowedRefs[i]), attrs)}
+	}
 	return series.Entry{ID: b.records[i].id, Series: b.registry.View().At(i, attrs)}
 }
 
@@ -124,17 +167,12 @@ func (b *Builder) AddView(view series.View, i int, meta Metadata) error {
 	if err := b.checkID(id); err != nil {
 		return err
 	}
-	b.canonicalScratch = view.AppendCanonical(b.canonicalScratch[:0], i)
 	if b.registry == nil {
 		b.registry = series.New()
 	}
 	b.registry.AddView(view, i)
-	ref := b.appendRecord(id, meta, len(b.canonicalScratch))
-	resource, scope := view.Context(i)
-	visitLabels(signal.Series{Resource: resource, Scope: scope}, func(name []byte, value signal.Value) {
-		b.addLabel(ref, name, value)
-	})
-	view.EncodedAttributes(i, func(name, encoded []byte) { b.addEncodedLabel(ref, name, encoded) })
+	ref := b.appendRecord(id, meta, view.CanonicalBytes(i))
+	b.addViewLabels(view, i, ref)
 	return nil
 }
 
@@ -201,6 +239,10 @@ func visitLabels(s signal.Series, visit func([]byte, signal.Value)) {
 	}
 }
 
+func appendLabelKey(dst []byte, section byte, name []byte) []byte {
+	return appendEscaped(append(dst, section), name)
+}
+
 func appendEscaped(dst, src []byte) []byte {
 	for _, b := range src {
 		dst = append(dst, b)
@@ -245,6 +287,8 @@ func (b *Builder) Write(dst io.Writer) error {
 	if err := b.prepareMergedPostings(); err != nil {
 		return err
 	}
+	// The table writer requires ascending keys across all sections.
+	// Separate key prefixes let readers seek to one section independently.
 	w := NewTableWriter(dst)
 	w.seriesCount = uint32(len(b.records))
 	w.parentDigest = b.parentDigest
@@ -264,11 +308,15 @@ func (b *Builder) Write(dst io.Writer) error {
 			return err
 		}
 	}
+	var labelKey [128]byte
+	keyScratch := labelKey[:0]
 	for _, name := range names {
-		if err := postings.write(appendEscaped([]byte{'h'}, []byte(name)), b.names[name].refs); err != nil {
+		keyScratch = appendLabelKey(keyScratch[:0], 'h', []byte(name))
+		if err := postings.write(keyScratch, b.names[name].refs); err != nil {
 			return err
 		}
 	}
+	// ID lookups use inline metadata and the ordinal shared by postings and descriptors.
 	var idKeyBuffer [17]byte
 	idKeyBuffer[0] = 'i'
 	var idValueBuffer [45]byte
@@ -292,25 +340,21 @@ func (b *Builder) Write(dst io.Writer) error {
 		if b.names[name].nonString {
 			value = 1
 		}
-		if err := w.Append(appendEscaped([]byte{'n'}, []byte(name)), []byte{value}); err != nil {
+		keyScratch = appendLabelKey(keyScratch[:0], 'n', []byte(name))
+		if err := w.Append(keyScratch, []byte{value}); err != nil {
 			return err
 		}
 	}
-	values := make([]string, 0, len(b.values))
-	for key := range b.values {
-		values = append(values, key)
-	}
-	slices.Sort(values)
 	if b.mergedPostings != nil {
 		if err := b.writeMergedPostings(w, 'p'); err != nil {
 			return err
 		}
 	}
-	for _, key := range values {
-		if err := postings.write([]byte(key), b.values[key].refs); err != nil {
-			return err
-		}
+	if err := b.writeValuePostings(&postings, names, keyScratch); err != nil {
+		return err
 	}
+	// Descriptor records store the canonical bytes under the local ordinal.
+	// Borrowed builders translate that ordinal back to a row in the source view.
 	var value []byte
 	view := b.View()
 	var recordKeyBuffer [5]byte
@@ -319,7 +363,13 @@ func (b *Builder) Write(dst io.Writer) error {
 		value = binary.BigEndian.AppendUint64(value[:0], r.id.Hi)
 		value = binary.BigEndian.AppendUint64(value, r.id.Lo)
 		value = appendMetadata(value, r.meta)
-		value = view.AppendCanonical(value, i)
+		start := len(value)
+		if b.borrowed != nil {
+			value = b.borrowed.AppendCanonical(value, int(b.borrowedRefs[i]))
+		} else {
+			value = view.AppendCanonical(value, i)
+		}
+		b.maxCanonicalBytes = max(b.maxCanonicalBytes, len(value)-start)
 		binary.BigEndian.PutUint32(recordKeyBuffer[1:], uint32(i))
 		if err := w.Append(recordKeyBuffer[:], value); err != nil {
 			return err
@@ -339,6 +389,36 @@ func (b *Builder) WriteObject(ctx context.Context, dst backend.Backend, key stri
 		return err
 	}
 	return w.Commit(ctx)
+}
+
+func (b *Builder) writeValuePostings(w *postingsWriter, names []string, key []byte) error {
+	var values []string
+	for _, name := range names {
+		n := b.names[name]
+		values = slices.Grow(values[:0], len(n.values))
+		for value := range n.values {
+			values = append(values, value)
+		}
+		// Escaping preserves byte order, including a prefix sorting before its extensions.
+		slices.Sort(values)
+		key = appendLabelKey(key[:0], 'p', []byte(name))
+		nameBytes := len(key)
+		for _, value := range values {
+			key = appendEscaped(key[:nameBytes], []byte(value))
+			if err := w.write(key, n.values[value].refs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (b *Builder) addViewLabels(view series.View, i int, ref uint32) {
+	resource, scope := view.Context(i)
+	visitLabels(signal.Series{Resource: resource, Scope: scope}, func(name []byte, value signal.Value) {
+		b.addLabel(ref, name, value)
+	})
+	view.EncodedAttributes(i, func(name, encoded []byte) { b.addEncodedLabel(ref, name, encoded) })
 }
 
 func (b *Builder) checkID(id signal.SeriesID) error {
@@ -463,8 +543,8 @@ func decodeRecord(data []byte) (signal.SeriesID, []byte, Metadata, error) {
 
 func (b *Builder) initPostings() {
 	if b.names == nil {
-		b.names, b.values = make(map[string]*namePosting), make(map[string]*valuePosting)
-		b.bytes += 2 * memsize.MapBase
+		b.names = make(map[string]*namePosting)
+		b.bytes += memsize.MapBase
 	}
 }
 
@@ -477,9 +557,9 @@ func (b *Builder) addEncodedLabel(ref uint32, name, encoded []byte) {
 	b.initPostings()
 	n := b.names[string(name)]
 	if n == nil {
-		n = &namePosting{}
+		n = &namePosting{values: make(map[string]*valuePosting), keyBytes: 3 + len(name) + bytes.Count(name, []byte{0})}
 		b.names[string(name)] = n
-		b.bytes += int64(len(name)) + memsize.MapEntry[string, *namePosting]() + memsize.Of[namePosting]()
+		b.bytes += int64(len(name)) + memsize.MapEntry[string, *namePosting]() + memsize.Of[namePosting]() + memsize.MapBase
 	}
 	n.nonString = n.nonString || signal.ValueKind(encoded[0]) != signal.KindStr
 	if len(n.refs) == 0 || n.refs[len(n.refs)-1] != ref {
@@ -487,19 +567,16 @@ func (b *Builder) addEncodedLabel(ref uint32, name, encoded []byte) {
 		n.refs = append(n.refs, ref)
 		b.bytes += int64(cap(n.refs)-prior) * 4
 	}
-	b.postingScratch = append(b.postingScratch[:0], 'p')
-	b.postingScratch = appendEscaped(b.postingScratch, name)
-	nameBytes := len(b.postingScratch)
-	b.postingScratch = appendEscaped(b.postingScratch, encoded)
-	b.encodedRaw = buildbudget.Add(b.encodedRaw, 2*int64(nameBytes)+int64(len(b.postingScratch))+129)
-	b.encodedRecords = buildbudget.Add(b.encodedRecords, 3)
-	// Keep the lookup conversion temporary; only newly stored keys own a copy.
-	p := b.values[string(b.postingScratch)]
+	// Only a new key takes ownership of encoded bytes.
+	p := n.values[string(encoded)]
 	if p == nil {
-		p = &valuePosting{key: string(b.postingScratch)}
-		b.values[p.key] = p
-		b.bytes += int64(len(b.postingScratch)) + memsize.MapEntry[string, *valuePosting]() + memsize.Of[valuePosting]()
+		p = &valuePosting{keyBytes: n.keyBytes + 2 + len(encoded) + bytes.Count(encoded, []byte{0})}
+		n.values[string(encoded)] = p
+		b.maxKeyBytes = max(b.maxKeyBytes, p.keyBytes+4)
+		b.bytes += int64(len(encoded)) + memsize.MapEntry[string, *valuePosting]() + memsize.Of[valuePosting]()
 	}
+	b.encodedRaw = buildbudget.Add(b.encodedRaw, 2*int64(n.keyBytes)+int64(p.keyBytes)+129)
+	b.encodedRecords = buildbudget.Add(b.encodedRecords, 3)
 	if len(p.refs) > 0 && p.refs[len(p.refs)-1] == ref {
 		return
 	}

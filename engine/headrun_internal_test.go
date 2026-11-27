@@ -39,7 +39,7 @@ func TestHeadRunCancellationBeforeFinish(t *testing.T) {
 				slices.Reverse(ts)
 			}
 			original := slices.Clone(ts)
-			require.NoError(t, b.add(s.Hash(), ref, &sampleBuf{ts: ts, values: []float64{1, 2, 3, 4}}))
+			require.NoError(t, b.add(ref, &sampleBuf{ts: ts, values: []float64{1, 2, 3, 4}}))
 			cancel()
 			require.ErrorIs(t, b.flushRun(), context.Canceled)
 			require.Empty(t, b.parts)
@@ -86,7 +86,7 @@ func TestHeadRunSealsAtCapacityAndClearsPointers(t *testing.T) {
 		id := series[i].Hash()
 		ref, ok := e.head.series.Ref(id)
 		require.True(t, ok)
-		require.NoError(t, b.add(id, ref, buf))
+		require.NoError(t, b.add(ref, buf))
 		require.Equal(t, 1, cap(b.entries))
 		require.Equal(t, 1, cap(b.partRefs))
 	}
@@ -122,7 +122,7 @@ func TestHeadRunResetRetainsBufferReservation(t *testing.T) {
 		entries: make([]headRunEntry, 0, 1), partRefs: make([]uint32, 0, 1)}
 	require.NoError(t, b.reserve(b.baseBytes()))
 	defer func() { b.release() }()
-	require.NoError(t, b.add(s.Hash(), ref, &sampleBuf{ts: []int64{1}, values: []float64{2}}))
+	require.NoError(t, b.add(ref, &sampleBuf{ts: []int64{1}, values: []float64{2}}))
 	require.NoError(t, b.flushRun())
 	require.GreaterOrEqual(t, b.reserved, b.baseBytes()+b.identities.Bytes())
 }

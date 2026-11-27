@@ -28,10 +28,12 @@ type parallelHeadHooks struct {
 }
 
 type parallelHead struct {
+	generation    sync.RWMutex
 	ownership     seriesOwnership
 	admission     sync.Mutex
 	pendingSeries atomic.Int64
 	commits       commitQueue
+	ready         readyCommitQueue
 	pending       atomic.Int64
 	preparations  *batchPreparations
 	hooks         *parallelHeadHooks
@@ -48,6 +50,10 @@ func (e *Engine) appendKnownPrepared(
 	e.mu.RLockWriter()
 	defer e.mu.RUnlockWriter()
 	ph := e.parallel
+	if e.commitOwnedRotation() {
+		ph.generation.RLock()
+		defer ph.generation.RUnlock()
+	}
 	p.prepareOwnership()
 	var conflict func()
 	if ph.hooks != nil {
@@ -71,8 +77,7 @@ func (e *Engine) appendKnownPrepared(
 	}
 	ph.admission.Lock()
 	e.mu.RLock()
-	if e.cfg.DiskSeries && e.head.bytes > 0 &&
-		e.head.residentIdentityBytes()+e.head.inFlightBytes()+ph.pending.Load() >= e.cfg.ResidentHeadBytes {
+	if e.cfg.DiskSeries && e.head.bytes > 0 && e.headPressureLocked(e.head.residentIdentityBytes()+e.head.inFlightBytes()+ph.pending.Load()) {
 		e.mu.RUnlock()
 		ph.admission.Unlock()
 		return AppendResult{}, preparedPressure, nil
@@ -217,13 +222,9 @@ func (p *preparedBatch) parallelWorkFits(view series.View) bool {
 			work = buildbudget.Add(work, buildbudget.Mul(int64(needed), 16))
 		}
 		if a.register {
-			n := buildbudget.Attributes(a.series.Attributes)
-			n = buildbudget.Add(n, buildbudget.Attributes(a.series.Resource.Attributes))
-			n = buildbudget.Add(n, buildbudget.Attributes(a.series.Scope.Attributes))
-			n = buildbudget.Add(n, int64(len(a.series.Resource.SchemaURL)+len(a.series.Scope.SchemaURL)))
-			n = buildbudget.Add(n, int64(len(a.series.Scope.Name)+len(a.series.Scope.Version)))
+			n, encoded := buildbudget.SeriesWorkspace(a.series)
 			work = buildbudget.Add(work, n)
-			work = buildbudget.Add(work, walIdentityWork(buildbudget.SeriesEncoding(a.series)))
+			work = buildbudget.Add(work, walIdentityWork(encoded))
 		} else if a.isNew {
 			work = buildbudget.Add(work, view.MaterializationBytes(int(a.identityRef)))
 			resource, scope := view.Context(int(a.identityRef))
@@ -317,9 +318,7 @@ func (p *preparedBatch) publishTails(h *head) {
 	minTS := int64(math.MaxInt64)
 	for i, id := range p.batch.order {
 		a := &p.batch.accs[i]
-		if a.register && !h.series.Has(id) {
-			h.register(series.Entry{ID: id, Series: a.series})
-		}
+		p.batch.registerIdentity(h, id, a)
 		if !a.knownRef {
 			a.identityRef, a.knownRef = h.series.Ref(id)
 		}

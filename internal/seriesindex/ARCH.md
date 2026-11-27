@@ -11,6 +11,7 @@ encoded point attributes. Public `Add` still checks externally supplied identiti
 IDs through one checked registry insertion, reusing its canonical length for bounds. Postings consume typed encoded bytes; descriptor and legacy identity writers read compact
 views directly, avoiding repeated materialization and rehashing. Each output registry owns its
 symbols and resource/scope context; source-local ordinals are remapped, never persisted or borrowed.
+The builder groups typed values under their label names and escapes keys when writing the table.
 
 ## Table framing
 

@@ -31,28 +31,24 @@ func (r *RawReader) Lookup(id signal.SeriesID) ([]byte, Metadata, bool, error) {
 
 // LookupRef also returns the checked descriptor ordinal.
 func (r *RawReader) LookupRef(id signal.SeriesID) (uint32, []byte, Metadata, bool, error) {
-	r.idKey[0] = 'i'
-	binary.BigEndian.PutUint64(r.idKey[1:9], id.Hi)
-	binary.BigEndian.PutUint64(r.idKey[9:], id.Lo)
-	key := r.idKey[:]
-	if !r.ids.Seek(key) {
-		return 0, nil, Metadata{}, false, r.ids.Err()
+	entry, found, err := r.lookupID(id)
+	if err != nil || !found {
+		return 0, nil, Metadata{}, false, err
 	}
-	if !bytes.Equal(r.ids.Key(), key) {
-		return 0, nil, Metadata{}, false, nil
-	}
-	ref, inlineMeta, inline, err := decodeIDValue(r.ids.Value())
+	got, raw, meta, err := r.records.At(entry.ref)
 	if err != nil {
 		return 0, nil, Metadata{}, false, err
 	}
-	got, raw, meta, err := r.records.At(ref)
-	if err != nil {
-		return 0, nil, Metadata{}, false, err
-	}
-	if got != id || inline && !equalMetadata(inlineMeta, meta) {
+	if got != id || entry.inline && !equalMetadata(entry.meta, meta) {
 		return 0, nil, Metadata{}, false, errors.Wrap(ErrCorrupt, "raw descriptor reference mismatch")
 	}
-	return ref, raw, meta, true, nil
+	return entry.ref, raw, meta, true, nil
+}
+
+// HasID checks the exact canonical ID using only the index key section.
+func (r *RawReader) HasID(id signal.SeriesID) (bool, error) {
+	_, found, err := r.lookupID(id)
+	return found, err
 }
 
 // LookupOrdinal reads a descriptor after a validated ID array has resolved its ordinal.
@@ -71,4 +67,31 @@ func (r *RawReader) LookupOrdinal(id signal.SeriesID, ref uint32) ([]byte, Metad
 func (r *RawReader) StreamPages() {
 	r.ids.streaming = true
 	r.records.cursor.streaming = true
+}
+
+type idReference struct {
+	ref    uint32
+	meta   Metadata
+	inline bool
+}
+
+func (r *RawReader) lookupID(id signal.SeriesID) (idReference, bool, error) {
+	r.idKey[0] = 'i'
+	binary.BigEndian.PutUint64(r.idKey[1:9], id.Hi)
+	binary.BigEndian.PutUint64(r.idKey[9:], id.Lo)
+	key := r.idKey[:]
+	if !r.ids.Seek(key) {
+		return idReference{}, false, r.ids.Err()
+	}
+	if !bytes.Equal(r.ids.Key(), key) {
+		return idReference{}, false, nil
+	}
+	ref, meta, inline, err := decodeIDValue(r.ids.Value())
+	if err != nil {
+		return idReference{}, false, err
+	}
+	if ref >= r.index.count {
+		return idReference{}, false, errors.Wrap(ErrCorrupt, "ID reference out of range")
+	}
+	return idReference{ref: ref, meta: meta, inline: inline}, true, nil
 }

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"maps"
+	"math"
 	"slices"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/internal/buildbudget"
@@ -40,7 +42,17 @@ func (e *Engine) MergeWith(ctx context.Context, opts MergeOptions) error {
 
 // MergeStep is [Engine.MergeWith], reporting whether a successful pass compacted or retired parts.
 // Retention may change parts even when compaction is deferred.
-func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool, err error) {
+func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (bool, error) {
+	samplesChanged, err := e.MergeSamplesStep(ctx, opts)
+	if err != nil {
+		return false, err
+	}
+	seriesChanged, err := e.MergeSeriesStep(ctx, opts.Background)
+	return samplesChanged || seriesChanged, err
+}
+
+// MergeSamplesStep compacts numeric parts without scheduling descriptor compaction.
+func (e *Engine) MergeSamplesStep(ctx context.Context, opts MergeOptions) (changed bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -105,11 +117,7 @@ func (e *Engine) MergeStep(ctx context.Context, opts MergeOptions) (changed bool
 		log.Debug("merge no-op (nothing to compact)", zap.String("prefix", e.cfg.Prefix))
 	}
 
-	seriesChanged, err := e.compactSeriesRuns(ctx, opts.Background)
-	if err != nil {
-		return res.parts > 0, err
-	}
-	return res.parts > 0 || seriesChanged, nil
+	return res.parts > 0, nil
 }
 
 // merge compacts a bounded, size-tiered group of the engine's parts per opts and returns the number
@@ -120,6 +128,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	opts = e.retentionOptions(opts)
 	unlock := e.lockMerge()
 	defer unlock()
+	defer func() { e.mergeNames = nil }()
 
 	// The tenure the inputs were chosen under: a merge that outlives it commits nothing.
 	stamp := e.term()
@@ -128,7 +137,7 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	// at a time, as the parts are written.
 	e.mu.Lock()
 
-	if err := e.establishTenureLocked(ctx); err != nil {
+	if err := e.prepareMergeSnapshotLocked(ctx); err != nil {
 		e.mu.Unlock()
 
 		return mergeResult{}, err
@@ -203,6 +212,19 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		return mergeResult{}, err
 	}
 
+	// A background merge may still make progress while a flush owns pool space.
+	if !admitted && opts.Background && allowance < math.MaxInt64 && allowance >= 128<<20 &&
+		backend.StreamsWrites(e.cfg.Backend) {
+		var smaller boundedMergeSelection
+		var deferred bool
+		smaller, release, deferred, err = e.trySmallerMerge(ctx, cohorts, readable, opts, capBytes, turn, allowance/2)
+		if err != nil || deferred {
+			return mergeResult{deferred: deferred, parts: dropped}, err
+		}
+		if release != nil {
+			selection, allowance, admitted = smaller, smaller.allowance, true
+		}
+	}
 	if !admitted {
 		e.recordMergePlan(ctx, selection.plan, "pool_busy")
 		// Remembered so the facade can order this engine first next cycle. Without it the task
@@ -304,6 +326,27 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	e.recordMergePlan(ctx, selection.plan, "completed")
 	e.cfg.Obs.Merge.Outputs(ctx, metricSignal, int64(len(newParts)))
 	return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, nil
+}
+
+// trySmallerMerge replans before admitting the reduced allowance.
+func (e *Engine) trySmallerMerge(ctx context.Context, cohorts []mergeCohort, readable []*part,
+	opts MergeOptions, capBytes int64, turn uint64, allowance int64,
+) (boundedMergeSelection, func(), bool, error) {
+	selection, err := e.selectBoundedMergeWithAllowance(ctx, cohorts, readable, opts, capBytes, e.mergeIdle(opts), turn, allowance)
+	if errors.Is(err, errMergeInputMemory) {
+		return boundedMergeSelection{}, nil, false, nil
+	}
+	if err != nil || len(selection.parts) == 0 {
+		return boundedMergeSelection{}, nil, false, err
+	}
+	if deferred, err := e.admitPressureMerge(ctx, selection.parts, true); deferred {
+		return boundedMergeSelection{}, nil, true, err
+	}
+	release, admitted, err := e.admitMergeBytes(ctx, true, allowance)
+	if err != nil || !admitted {
+		return boundedMergeSelection{}, nil, false, err
+	}
+	return selection, release, false, nil
 }
 
 // errRollupConflict aborts a merge whose commit would put a layout in the index that does not nest
@@ -485,7 +528,10 @@ func (e *Engine) writeMergedPart(
 	if e.cfg.MetricSeriesChunks || e.cfg.MetricFloatGroups && (precision == 0 || precision >= 64) {
 		return e.writeGroupedColumns(ctx, cols, mergeProfile(opts.Recompress, maxT, len(cols.ts)), precision, rollup)
 	}
-	prefix := e.newPartPrefix()
+	prefix, err := e.newMergePartPrefix()
+	if err != nil {
+		return nil, err
+	}
 	// The merged part's identities come from the resident index, which spans every live series —
 	// snapshotted here (a brief read lock, off the flush path) because the write itself is off-lock.
 	idents := e.identitiesForColumn(cols.series)
@@ -694,7 +740,7 @@ func (e *Engine) compactStreamWithInputs(
 
 	router := timebucket.Router[*partStreamWriter]{
 		Open: func(int64) (*partStreamWriter, error) {
-			w, err := newPartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker, coders.options()...)
+			w, err := newMergePartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker, coders.options()...)
 			if err != nil {
 				return nil, err
 			}
@@ -731,6 +777,8 @@ func (e *Engine) compactStreamWithInputs(
 	var m sampleMerge
 	var item mergeIdentityItem
 	encoded := e.newEncodedMergePlan(precision, withSF, plan.tiers)
+	var windows mergeSeriesWindows
+	plain := plainMergeInputs(src, plan.tiers)
 	reached := func(w *partStreamWriter) bool {
 		return budget.Reached(w.encodedBytes(), buildbudget.Add(held, w.mergeResidentBytes()))
 	}
@@ -747,6 +795,20 @@ func (e *Engine) compactStreamWithInputs(
 			return nil, err
 		}
 		if copied {
+			continue
+		}
+		if plain && largeMergeSeries(item.ranges) {
+			err := windows.merge(ctx, streams, item.ranges, start, item.covered, func(ts []int64, values []float64, covered int64) error {
+				return router.Append(ts[0], func(w *partStreamWriter) (bool, error) {
+					if err := item.appendTo(w, ts, values, nil, covered); err != nil {
+						return false, err
+					}
+					return reached(w), nil
+				})
+			})
+			if err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if err := mergeStreamedSeries(&m, src, streams, scratch, item.ranges, start); err != nil {

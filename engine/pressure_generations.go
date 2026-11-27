@@ -19,6 +19,7 @@ type headBuildInput struct {
 }
 
 type pressureGeneration struct {
+	mergeNames      *partid.Sequence
 	names           *partid.Sequence
 	prefixFloor     string
 	started         time.Time
@@ -39,10 +40,28 @@ type generationResult struct {
 }
 
 func (e *Engine) twoPressureGenerations() bool {
-	return e.cfg.PressureGenerations == 2 && e.pressurePipelineEnabled() && !e.cfg.SeparateSeries
+	return e.cfg.PressureGenerations == 2 && e.pressurePipelineEnabled()
 }
 
-func (e *Engine) pressureRotationBytes() int64 { return e.cfg.ResidentHeadBytes / 2 }
+func (e *Engine) pressureRotationBytes() int64 {
+	limit := e.cfg.ResidentHeadBytes / 2
+	if e.fixedHeadRotation() {
+		return min(limit, e.cfg.HeadRotationBytes)
+	}
+	return limit
+}
+
+// headPressureLocked caps both aggregate ownership and the active generation.
+func (e *Engine) headPressureLocked(used int64) bool {
+	if used >= e.cfg.ResidentHeadBytes {
+		return true
+	}
+	return e.fixedHeadRotation() && e.head.ownedIdentityBytes()+e.head.bytes >= e.pressureRotationBytes()
+}
+
+func (e *Engine) fixedHeadRotation() bool {
+	return e.cfg.HeadRotationBytes > 0 && e.commitOwnedRotation()
+}
 
 // freezePressureGenerationLocked seals before transferring ownership, so seal failure leaves active state intact.
 func (e *Engine) freezePressureGenerationLocked(ctx context.Context) (*pressureGeneration, error) {
@@ -78,11 +97,16 @@ func (e *Engine) freezePressureGenerationLocked(ctx context.Context) (*pressureG
 	h.detachedBytes += h.bytes
 	h.bytes, h.since, h.bufferedKnown = 0, time.Time{}, false
 	h.detachedKnown = false
-	g := &pressureGeneration{started: time.Now(), names: partid.NewSequence(), head: frozen, epoch: epoch, sequence: sequence, term: term}
+	mergeNames := partid.NewSequence()
+	g := &pressureGeneration{
+		mergeNames: mergeNames, names: partid.NewSequence(), started: time.Now(),
+		head: frozen, epoch: epoch, sequence: sequence, term: term,
+	}
 	floor, _ := g.names.Next()
 	g.prefixFloor = e.cfg.Prefix + "/" + floor.String()
 	e.pressureGenerations = append(e.pressureGenerations, g)
 	e.updateGenerationBuffersLocked()
+	e.notifyPressureRotation()
 	return g, nil
 }
 
@@ -168,6 +192,22 @@ func (e *Engine) runPressureGenerations(ctx context.Context, force bool) (rows i
 func (e *Engine) startGenerationBuilds(
 	ctx context.Context, force, pressureMode bool, results chan<- generationResult,
 ) (started int, froze bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	if e.commitOwnedRotation() {
+		return e.startCommitOwnedGenerationBuilds(ctx, force, pressureMode, results)
+	}
+	e.mu.RLock()
+	needed := len(e.pressureGenerations) < 2 && e.generationRotationNeededLocked(force, pressureMode)
+	for _, g := range e.pressureGenerations {
+		needed = needed || !g.building && !g.ready
+	}
+	e.mu.RUnlock()
+	if !needed {
+		return 0, false, nil
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -179,29 +219,86 @@ func (e *Engine) startGenerationBuilds(
 		}
 		froze = true
 	}
-	if err == nil && ctx.Err() == nil {
-		for _, g := range e.pressureGenerations {
-			if g.building || g.ready {
-				continue
-			}
-			g.building = true
-			started++
-			go func() {
-				if e.pressure.beforeBuild != nil {
-					e.pressure.beforeBuild(g.epoch)
-				}
-				input := &headBuildInput{names: g.names, index: g.head.series, retain: func(parts []*part) {
-					e.mu.LockState()
-					g.head.buildRetained = generationPartBytes(parts)
-					e.mu.UnlockState()
-				}}
-				parts, n, buildErr := e.streamHead(ctx, g.head.samples, input)
-				results <- generationResult{generation: g, parts: parts, rows: n, err: buildErr}
-			}()
-		}
+	if err == nil {
+		started = e.launchGenerationBuildsLocked(ctx, results)
 	}
 
 	return started, froze, err
+}
+
+// commitOwnedRotation is scoped to the standalone two-generation pipeline.
+func (e *Engine) commitOwnedRotation() bool {
+	return e.twoPressureGenerations() && e.cfg.Term == nil && e.cfg.WriterID == ""
+}
+
+func (e *Engine) startCommitOwnedGenerationBuilds(ctx context.Context, force, pressureMode bool,
+	results chan<- generationResult,
+) (int, bool, error) {
+	e.mu.RLock()
+	rotate := len(e.pressureGenerations) < 2 && e.generationRotationNeededLocked(force, pressureMode)
+	needsBuilder := false
+	for _, g := range e.pressureGenerations {
+		needsBuilder = needsBuilder || !g.building && !g.ready
+	}
+	e.mu.RUnlock()
+	if !rotate && !needsBuilder {
+		return 0, false, nil
+	}
+	var froze bool
+	if rotate {
+		var err error
+		froze, err = e.rotateWithCommitOwner(ctx, force, pressureMode)
+		if err != nil {
+			return 0, false, err
+		}
+	}
+	e.mu.LockState()
+	defer e.mu.UnlockState()
+	return e.launchGenerationBuildsLocked(ctx, results), froze, ctx.Err()
+}
+
+func (e *Engine) rotateWithCommitOwner(ctx context.Context, force, pressureMode bool) (bool, error) {
+	// Lifetime stays pinned, while the narrower generation gate prevents new
+	// preparations and drains the old ones through publication before WAL seal.
+	e.mu.RLockWriter()
+	defer e.mu.RUnlockWriter()
+	ph := e.parallel
+	ph.generation.Lock()
+	defer ph.generation.Unlock()
+	var froze bool
+	err := ph.commits.control(func() (err error) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		e.mu.Publish(func() {
+			if len(e.pressureGenerations) < 2 && e.generationRotationNeededLocked(force, pressureMode) {
+				_, err = e.freezePressureGenerationLocked(ctx)
+				froze = err == nil
+			}
+		})
+		return err
+	})
+	return froze, err
+}
+
+func (e *Engine) launchGenerationBuildsLocked(ctx context.Context, results chan<- generationResult) (started int) {
+	if ctx.Err() != nil {
+		return 0
+	}
+	for _, g := range e.pressureGenerations {
+		if g.building || g.ready {
+			continue
+		}
+		g.building = true
+		started++
+		go func() {
+			if e.pressure.beforeBuild != nil {
+				e.pressure.beforeBuild(g.epoch)
+			}
+			results <- e.buildFrozenGeneration(ctx, g)
+		}()
+	}
+	return started
 }
 
 func (e *Engine) publishReadyGenerations(ctx context.Context) (rows int, written int64, err error) {
@@ -310,7 +407,41 @@ func (e *Engine) releasePressureGenerationsLocked() {
 }
 
 func (e *Engine) generationRotationNeededLocked(force, pressureMode bool) bool {
-	return e.head.bytes > 0 && (force || pressureMode && e.head.ownedIdentityBytes()+e.head.bytes >= e.pressureRotationBytes())
+	if e.head.bytes == 0 {
+		return false
+	}
+	if force {
+		return true
+	}
+	if !pressureMode {
+		return false
+	}
+	active := e.head.ownedIdentityBytes() + e.head.bytes
+	if active >= e.pressureRotationBytes() {
+		return true
+	}
+	if e.fixedHeadRotation() || len(e.pressureGenerations) != 1 || e.pressureGenerations[0].ready {
+		return false
+	}
+	used := e.head.residentIdentityBytes() + e.head.inFlightBytes() + e.parallel.pending.Load()
+	return secondPressureRotationNeeded(active, used, e.cfg.ResidentHeadBytes)
+}
+
+func secondPressureRotationNeeded(active, used, limit int64) bool {
+	return active >= max(limit/4, 1) && used >= limit-limit/8
+}
+
+func (e *Engine) buildFrozenGeneration(ctx context.Context, g *pressureGeneration) generationResult {
+	active := e.pressure.generationBuilds.Add(1)
+	defer e.pressure.generationBuilds.Add(-1)
+	e.cfg.Obs.Flush.GenerationStarted(ctx, metricSignal, active > 1)
+	input := &headBuildInput{names: g.names, index: g.head.series, retain: func(parts []*part) {
+		e.mu.LockState()
+		g.head.buildRetained = generationPartBytes(parts)
+		e.mu.UnlockState()
+	}}
+	parts, rows, err := e.streamHead(ctx, g.head.samples, input)
+	return generationResult{generation: g, parts: parts, rows: rows, err: err}
 }
 
 func (e *Engine) generationWake() <-chan struct{} {

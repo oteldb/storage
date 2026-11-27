@@ -14,6 +14,7 @@ import (
 	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/internal/partid"
 	"github.com/oteldb/storage/internal/seriestable"
+	"github.com/oteldb/storage/signal"
 )
 
 func seriesReferenceKey(prefix string) string { return prefix + "/series-ref" }
@@ -68,6 +69,20 @@ func (e *Engine) prepareSharedPart(ctx context.Context, p *part) error {
 }
 
 func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySnapshot, reserve func(int64) error) error {
+	for {
+		err := e.writeSeriesDelta(ctx, entries, reserve)
+		if !errors.Is(err, errSeriesSnapshotChanged) {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+}
+
+var errSeriesSnapshotChanged = errors.New("engine: shared series snapshot changed during planning")
+
+func (e *Engine) writeSeriesDelta(ctx context.Context, entries identitySnapshot, reserve func(int64) error) error {
 	e.mu.RLock()
 	snapshot := e.seriesTable
 	snapshot.acquire()
@@ -91,7 +106,10 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 		return err
 	}
 
-	var builder seriestable.Builder
+	if backend.StreamsWrites(e.cfg.Backend) {
+		return e.writeNativeSeriesDelta(ctx, entries, known, snapshot, base, reserve)
+	}
+	builder := seriestable.NewBorrowedBuilder(entries.view)
 	var largest int64
 	for i, ref := range entries.refs {
 		if known[i] {
@@ -107,7 +125,7 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 				return err
 			}
 		}
-		if err := builder.AddView(entries.view, int(ref)); err != nil {
+		if err := builder.AddBorrowed(int(ref)); err != nil {
 			return err
 		}
 	}
@@ -116,10 +134,7 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 		return nil
 	}
 	prefix := e.cfg.Prefix + "/s-" + partid.New().String()
-	writerBytes, priced := backend.WriterMemory(e.cfg.Backend, prefix+"/series-index")
-	if backend.StreamsWrites(e.cfg.Backend) && !priced {
-		return errors.New("engine: separate series requires bounded writer memory")
-	}
+	writerBytes, _ := backend.WriterMemory(e.cfg.Backend, prefix+"/series-index")
 	needed := buildbudget.Add(base, buildbudget.Add(builder.Bytes(), buildbudget.Mul(builder.EncodedBound(), 4)))
 	needed = buildbudget.Add(needed, buildbudget.Add(buildbudget.Mul(writerBytes, 4), buildbudget.Mul(max(64<<10, largest), 160)))
 	if reserve != nil {
@@ -127,7 +142,25 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 			return err
 		}
 	}
-	run, err := seriestable.WriteWithIDCache(ctx, e.cfg.Backend, prefix, &builder, e.seriesIDs)
+	return e.installSeriesDelta(entries, snapshot, known, prefix, func() (*seriestable.Run, error) {
+		return seriestable.WriteWithIDCache(ctx, e.cfg.Backend, prefix, &builder, e.seriesIDs)
+	})
+}
+
+func (e *Engine) installSeriesDelta(
+	entries identitySnapshot, snapshot *seriesSnapshot, known []bool, prefix string, write func() (*seriestable.Run, error),
+) error {
+	// No workspace acquisition while owning the writer. A sibling may have added the
+	// same descriptors while we planned off-lock.
+	e.seriesBuildMu.Lock()
+	defer e.seriesBuildMu.Unlock()
+	e.mu.RLock()
+	stale := snapshot != e.seriesTable
+	e.mu.RUnlock()
+	if stale {
+		return errSeriesSnapshotChanged
+	}
+	run, err := write()
 	if err != nil {
 		return errors.Wrap(err, "write shared series delta")
 	}
@@ -137,23 +170,15 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 	if e.seriesTable != nil {
 		roots = append(roots, e.seriesTable.roots...)
 	}
-	roots = append(roots, &seriesRootHandle{binding: binding, run: run})
+	root := &seriesRootHandle{binding: binding, run: run}
+	roots = append(roots, root)
 	next := newSeriesSnapshot(roots)
 	next.retired = len(e.seriesRetired)
 	old := e.seriesTable
 	e.seriesTable = next
 	old.release()
 	e.mu.Unlock()
-	var canonical []byte
-	for i, ref := range entries.refs {
-		if !e.verifiedIdentities.canAdmit(next.generation) {
-			break
-		}
-		if !known[i] {
-			canonical = entries.view.AppendCanonical(canonical[:0], int(ref))
-			e.verifiedIdentities.put(next.generation, entries.view.ID(int(ref)), canonical)
-		}
-	}
+	e.verifiedIdentities.seed(root.token.Load(), entries, known)
 	return nil
 }
 
@@ -169,16 +194,13 @@ func (s *seriesSnapshot) knownIdentities(ctx context.Context, entries identitySn
 	if len(caches) > 0 {
 		cache = caches[0]
 	}
-	hits, err := cache.match(s.generation, entries, known)
-	if err != nil {
-		return nil, err
-	}
+	hits := cache.match(s, entries, known)
 	remaining := len(known) - hits
 	for _, h := range s.roots {
 		if remaining == 0 {
 			break
 		}
-		found, err := checkRootIdentitiesCached(ctx, h.run, entries, known, cache, s.generation)
+		found, err := checkRootIdentitiesCached(ctx, h, entries, known, cache)
 		if err != nil {
 			return nil, err
 		}
@@ -187,8 +209,8 @@ func (s *seriesSnapshot) knownIdentities(ctx context.Context, entries identitySn
 	return known, nil
 }
 
-func checkRootIdentitiesCached(ctx context.Context, run *seriestable.Run, entries identitySnapshot,
-	known []bool, cache *verifiedIdentityCache, generation uint64,
+func checkRootIdentitiesCached(ctx context.Context, root *seriesRootHandle, entries identitySnapshot,
+	known []bool, cache *verifiedIdentityCache,
 ) (found int, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -199,38 +221,40 @@ func checkRootIdentitiesCached(ctx context.Context, run *seriestable.Run, entrie
 			_ = r.Close()
 		}
 	}()
-	var canonical []byte
-	remember := cache.canAdmit(generation)
+	token := root.token.Load()
+	var pending [128]signal.SeriesID
+	batch := pending[:0]
 	for i, ref := range entries.refs {
 		if known[i] {
 			continue
 		}
 		if r == nil {
 			var err error
-			r, err = run.NewReader(ctx)
+			r, err = root.run.NewReader(ctx)
 			if err != nil {
 				return 0, err
 			}
 			r.StreamPages()
 		}
 		id := entries.view.ID(int(ref))
-		raw, ok, err := r.LookupRaw(id)
+		ok, err := r.HasID(id)
 		if err != nil {
 			return 0, err
 		}
 		if !ok {
 			continue
 		}
-		canonical = entries.view.AppendCanonical(canonical[:0], int(ref))
-		if !bytes.Equal(raw, canonical) {
-			return 0, errors.New("engine: shared series canonical identity conflict")
-		}
 		known[i] = true
 		found++
-		if remember {
-			remember = cache.put(generation, id, raw)
+		if cache != nil {
+			batch = append(batch, id)
+			if len(batch) == cap(batch) {
+				cache.putIDs(token, batch)
+				batch = batch[:0]
+			}
 		}
 	}
+	cache.putIDs(token, batch)
 	return found, nil
 }
 

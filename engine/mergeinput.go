@@ -31,6 +31,7 @@ func (b *mergeInputBound) bytes() int64 { return buildbudget.Add(b.resident, b.t
 
 type boundedMergeSelection struct {
 	parts              []*part
+	orderAnchor        *part
 	tiers, conflicting []DownsampleTier
 	inputBytes         int64
 	allowance          int64
@@ -53,6 +54,12 @@ func (e *Engine) selectBoundedMergeWithAllowance(ctx context.Context, cohorts []
 func (e *Engine) selectMergeInputsWithWatermarks(ctx context.Context, cohorts []mergeCohort, readable []*part,
 	opts MergeOptions, capBytes int64, idle int, turn uint64, limit int64, fallback map[*part]bool,
 ) (boundedMergeSelection, error) {
+	return e.selectMergeInputsWithAnchor(ctx, cohorts, readable, opts, capBytes, idle, turn, limit, fallback, nil)
+}
+
+func (e *Engine) selectMergeInputsWithAnchor(ctx context.Context, cohorts []mergeCohort, readable []*part,
+	opts MergeOptions, capBytes int64, idle int, turn uint64, limit int64, fallback map[*part]bool, anchor *part,
+) (boundedMergeSelection, error) {
 	maxInputs := maxMergeParts
 	prices := make(map[mergeInputKey]mergeInputBound)
 	var candidates, attempts int
@@ -61,7 +68,8 @@ func (e *Engine) selectMergeInputsWithWatermarks(ctx context.Context, cohorts []
 		start = opts.RetainFrom
 	}
 	for {
-		selection := cohortRunPlanLimited(cohorts, readable, opts, capBytes, idle, turn, maxInputs)
+		selection := e.pressureMergePlan(cohorts, readable, opts, capBytes, idle, turn, maxInputs, anchor)
+		anchor = selection.orderAnchor
 		selection.allowance = limit
 		parts, tiers := selection.parts, selection.tiers
 		candidates = max(candidates, len(parts))

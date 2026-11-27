@@ -35,6 +35,7 @@ var cpuFixtureModes = [...]string{"idle", "user", "system", "iowait", "irq", "so
 type cpuFixtureOptions struct {
 	hosts, generations, points int
 	flushMemoryBytes           int64
+	seriesCacheBytes           int64
 	readCache                  bool
 	disk, sync, reopen         bool
 	separate                   bool
@@ -123,6 +124,7 @@ func newCPUFixture(tb testing.TB, ctx context.Context, options cpuFixtureOptions
 		Backend: source, WAL: w, Prefix: "cpu", DiskSeries: options.disk, SeparateSeries: options.separate,
 		MetricSeriesChunks: true, MetricBlockRows: 1024, AggregateStats: true,
 		DecodeCacheBytes: 16 << 20, DecodeMemoryBytes: 256 << 20, FlushMemoryBytes: flushBytes,
+		SeriesCacheBytes: options.seriesCacheBytes,
 	})
 	tb.Cleanup(func() {
 		if f.engine != nil {

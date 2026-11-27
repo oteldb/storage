@@ -192,7 +192,9 @@ func TestAttributeTemplatesTypedValues(t *testing.T) {
 			require.Equal(t, flat.Add(s), id)
 			ref, _ := ix.Ref(id)
 			v := ix.View()
-			require.Equal(t, s.AppendHashInput(nil), v.AppendCanonical(nil, int(ref)))
+			raw := s.AppendHashInput(nil)
+			require.Equal(t, raw, v.AppendCanonical(nil, int(ref)))
+			require.Equal(t, len(raw), v.CanonicalBytes(int(ref)))
 			require.Equal(t, s.AppendHashInput(nil), v.At(int(ref), nil).AppendHashInput(nil))
 			var budget EncodingBudget
 			budget.Add(v, int(ref))

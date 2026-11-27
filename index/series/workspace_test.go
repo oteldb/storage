@@ -56,3 +56,28 @@ func TestSelectedEncodingBudgetSharedContext(t *testing.T) {
 	assert.Greater(t, first, int64(1<<16))
 	assert.Less(t, budget.Bytes()-first, int64(1024), "adding a series must not repeat its context payload")
 }
+
+func TestDenseEncodingBudget(t *testing.T) {
+	t.Parallel()
+	ix := New()
+	ix.Add(signal.Series{Attributes: signal.NewAttributes(signal.KeyValue{
+		Key: []byte("name"), Value: signal.StringValue([]byte("value")),
+	})})
+	view := ix.View()
+	require.Zero(t, view.DenseBudgetBytes(1))
+	bytes := view.DenseBudgetBytes(1024)
+	require.Positive(t, bytes)
+	var dense, sparse EncodingBudget
+	dense.UseDenseSymbols(bytes)
+	dense.Add(view, 0)
+	sparse.Add(view, 0)
+	first := dense.Bytes()
+	require.Equal(t, sparse.Bytes()+bytes, first)
+	dense.Add(view, 0)
+	require.Equal(t, first, dense.Bytes())
+	dense.Reset()
+	empty := dense.Bytes()
+	require.GreaterOrEqual(t, empty, bytes)
+	dense.Add(view, 0)
+	require.Greater(t, dense.Bytes(), empty)
+}

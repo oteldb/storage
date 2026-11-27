@@ -185,8 +185,11 @@ type Config struct {
 	// ResidentHeadBytes flushes disk-indexed heads under memory pressure. Zero uses 128 MiB.
 	// One atomic caller batch may exceed the target and flushes before the next write.
 	ResidentHeadBytes int64
+	// HeadRotationBytes sets the active generation target in the standalone two-generation pipeline.
+	// Zero derives the target from ResidentHeadBytes.
+	HeadRotationBytes int64
 	// SeriesCacheBytes bounds historical ID/watermark cache memory per disk-indexed engine.
-	// SeparateSeries reserves one eighth each for sorted IDs and verified canonical bytes;
+	// SeparateSeries reserves one eighth each for sorted IDs and verified ID membership;
 	// the rest holds watermarks.
 	// Zero uses 512 MiB, allocated on demand; negative disables the cache.
 	SeriesCacheBytes int64
@@ -231,9 +234,12 @@ type Engine struct {
 	activeBuilds       atomic.Int32
 	flushRun           sync.Mutex
 	mergeRun           sync.Mutex
+	mergeNames         *mergePartNames // Owned by mergeRun; flush builders use their own namespaces.
 	head               *head
 	parts              []*part
 	seriesTable        *seriesSnapshot
+	seriesBuildMu      sync.Mutex
+	seriesNoGain       descriptorMergeHistory // Owned by mergeRun.
 	seriesRetired      []bucketindex.SeriesRoot
 	seriesIDs          *seriestable.IDCache
 	verifiedIdentities *verifiedIdentityCache
@@ -2257,6 +2263,7 @@ func bufHasInWindow(buf *sampleBuf, start, end int64) bool {
 // each series and appending its samples (plain or scale-factor-carrying) verbatim. Shared by the
 // durable-restart [Engine.Replay] and the trusting [Engine.ApplyReplicated]. The caller holds e.mu.
 func (e *Engine) replayHandlers() wal.Handlers {
+	var encoded []byte
 	return wal.Handlers{
 		OnSeries: func(id signal.SeriesID, s signal.Series) error {
 			if e.cfg.DiskSeries {
@@ -2265,7 +2272,16 @@ func (e *Engine) replayHandlers() wal.Handlers {
 				}
 				e.preloadAuthoritativeSeriesLocked(id)
 			}
-			e.head.registerSeries(s)
+			if e.cfg.SeparateSeries && e.fixedHeadRotation() && !e.head.series.Has(id) && e.head.seriesState(id).historical {
+				encoded = s.AppendHashInput(encoded[:0])
+				if signal.HashBytes(encoded) == id {
+					e.head.registerEncoded(id, encoded)
+				} else {
+					e.head.registerSeries(s)
+				}
+			} else {
+				e.head.registerSeries(s)
+			}
 			e.clearDiskPendingLocked()
 
 			return nil

@@ -49,15 +49,19 @@ func benchmarkIngestionContention(b *testing.B, input nodeExporterInput, rounds,
 	b.Logf("hosts=%d series=%d rounds=%d samples/op=%d native files, WAL sync=false, no merges",
 		len(input.ids)/len(cpuFixtureModes), len(input.ids), rounds, rows)
 	var flushes, parts, remaining, walAppends int64
+	var overlapping, fallback, builders int64
+	var buildPlans uint64
 	var parallelRows, orderedRows, orderedBatches, pressureMisses, snapshotMisses, retried, workLimit int64
+	separate := os.Getenv("OTELDB_BENCH_INGEST_SEPARATE_SERIES") == "true"
+	cold := mode == "pressure" && os.Getenv("OTELDB_BENCH_INGEST_COLD") == "true"
 	for b.Loop() {
 		b.StopTimer()
-		f := newCPUFixture(b, b.Context(), cpuFixtureOptions{disk: true, flushMemoryBytes: 32 << 20})
+		f := newCPUFixture(b, b.Context(), cpuFixtureOptions{disk: true, separate: separate, flushMemoryBytes: 32 << 20})
 		pool := memlimit.NewPool(128 << 20)
 		e := f.engine
 		e.cfg.FlushAdmission, e.cfg.TryFlushAdmission = pool.Acquire, pool.TryAcquire
 		e.cfg.ResidentHeadBytes = math.MaxInt64
-		for off := 0; off < len(input.ids); off += 4096 {
+		for off := 0; !cold && off < len(input.ids); off += 4096 {
 			end := min(off+4096, len(input.ids))
 			result, err := e.AppendBatch(input.ids[off:end], input.ts[off:end], input.values[off:end], nil,
 				func(i int) signal.Series { return input.series[off+i] }, AppendLimits{})
@@ -114,6 +118,10 @@ func benchmarkIngestionContention(b *testing.B, input nodeExporterInput, rounds,
 		retried += metrics.Counter("storage.ingest.prepared.batches", "path", "parallel", "reason", "retry_snapshot")
 		walAppends += metrics.Counter("storage.wal.appends")
 		flushes += metrics.Counter("storage.flush.total")
+		overlapping += metrics.Counter("storage.flush.generation_starts", "concurrency", "overlapping")
+		fallback += metrics.Counter("storage.flush.build.fallbacks")
+		sum, count := metrics.IntHistogram("storage.flush.build.workers")
+		builders, buildPlans = builders+sum, buildPlans+count
 		parts += int64(e.PartCount() - initialParts)
 		remaining += int64(e.HeadSampleCount())
 		if e.SeriesCount() != len(input.ids) {
@@ -127,6 +135,11 @@ func benchmarkIngestionContention(b *testing.B, input nodeExporterInput, rounds,
 	b.ReportMetric(float64(rows)*float64(b.N)/b.Elapsed().Seconds(), "samples/s")
 	b.ReportMetric(float64(rows), "samples/op")
 	b.ReportMetric(float64(flushes)/float64(b.N), "flushes/op")
+	b.ReportMetric(float64(overlapping)/float64(b.N), "overlapping-generations/op")
+	b.ReportMetric(float64(fallback)/float64(b.N), "build-fallbacks/op")
+	if buildPlans != 0 {
+		b.ReportMetric(float64(builders)/float64(buildPlans), "builders/plan")
+	}
 	b.ReportMetric(float64(parts)/float64(b.N), "parts/op")
 	b.ReportMetric(float64(remaining)/float64(b.N), "head-samples/op")
 	b.ReportMetric(float64(parallelRows)/float64(b.N), "parallel-samples/op")

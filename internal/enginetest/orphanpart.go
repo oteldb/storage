@@ -182,12 +182,15 @@ func sweepSparesFutureDatedPart(t *testing.T, k Kind) {
 	ctx := context.Background()
 	be := faultbackend.Wrap(backend.Memory())
 	orphan := k.failOrphanFlush(ctx, t, k.open(t, be), be)
+	id, err := partid.Parse(orphan)
+	require.NoError(t, err)
+	mintedAt := id.Time()
 
-	behind := func() time.Time { return time.Now().Add(-time.Hour) }
+	behind := func() time.Time { return mintedAt.Add(-time.Millisecond) }
 	require.NoError(t, k.Open(t, Config{Backend: be, OrphanGrace: time.Nanosecond, Now: behind}).LoadParts(ctx))
 	require.NotEmpty(t, k.partKeys(ctx, t, be, orphan), "a future-dated part is never swept")
 
-	ahead := func() time.Time { return time.Now().Add(time.Millisecond) }
+	ahead := func() time.Time { return mintedAt.Add(time.Millisecond) }
 	require.NoError(t, k.Open(t, Config{Backend: be, OrphanGrace: time.Nanosecond, Now: ahead}).LoadParts(ctx))
 	require.Empty(t, k.partKeys(ctx, t, be, orphan), "the configured grace, not the default, decides")
 }

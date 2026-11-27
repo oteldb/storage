@@ -25,12 +25,17 @@ type generationGateBackend struct {
 	first, resume chan struct{}
 	secondResume  chan struct{}
 	identities    atomic.Int32
+	markerSuffix  string
 	firstErr      error
 	commitFail    atomic.Bool
 }
 
 func (b *generationGateBackend) Write(ctx context.Context, key string, data []byte) error {
-	if strings.HasSuffix(key, "/identity") {
+	suffix := b.markerSuffix
+	if suffix == "" {
+		suffix = "/identity"
+	}
+	if strings.HasSuffix(key, suffix) {
 		n := b.identities.Add(1)
 		if n == 2 && b.secondResume != nil {
 			select {
@@ -53,6 +58,36 @@ func (b *generationGateBackend) Write(ctx context.Context, key string, data []by
 		}
 	}
 	return b.Backend.Write(ctx, key, data)
+}
+
+func TestSharedSeriesGenerationsBuildAheadWithoutCheckpointGap(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		e, fs, _, resume, job := blockedGenerationPair(t, nil, func(e *Engine, b *generationGateBackend) {
+			e.cfg.SeparateSeries, e.cfg.MetricSeriesChunks = true, true
+			b.markerSuffix = "/series-ref"
+		})
+		require.True(t, e.pressureGenerations[1].ready)
+		require.Len(t, e.seriesTable.roots, 1, "a later generation must reuse the earlier descriptors")
+		require.Zero(t, e.flushedEpoch)
+		for _, buf := range replayedHead(t, fs).samples {
+			require.Equal(t, []int64{100, 200}, buf.ts)
+		}
+		resume()
+		synctest.Wait()
+		require.NoError(t, job.err)
+		require.NoError(t, e.LoadParts(t.Context()))
+		it, err := e.Fetch(t.Context(), fetch.Request{Start: 100, End: 200})
+		require.NoError(t, err)
+		batches, err := fetch.Drain(t.Context(), it)
+		require.NoError(t, err)
+		require.Len(t, batches, 64)
+		for _, batch := range batches {
+			require.Equal(t, []int64{100, 200}, batch.Timestamps)
+			require.Equal(t, []float64{1, 2}, batch.Values)
+		}
+		require.NoError(t, e.Close(t.Context()))
+	})
 }
 
 func TestPressureGenerationsBuildAheadWithoutCheckpointGap(t *testing.T) {
@@ -102,6 +137,7 @@ func blockedGenerationPair(
 	e.cfg.ResidentHeadBytes = target
 	require.NoError(t, e.flushResidentHead())
 	<-be.first
+	synctest.Wait()
 	e.cfg.ResidentHeadBytes = 1 << 30
 	for i := range 64 {
 		_, err := e.Append(benchSeries(i), 200, 2)
@@ -296,6 +332,7 @@ func TestPressureGenerationsDuplicatePrecedenceIgnoresBuildOrder(t *testing.T) {
 		e.cfg.ResidentHeadBytes = target
 		require.NoError(t, e.flushResidentHead())
 		<-entered
+		synctest.Wait()
 		e.cfg.ResidentHeadBytes = 1 << 30
 		for i := range 64 {
 			_, err := e.Append(benchSeries(i), 100, 2)

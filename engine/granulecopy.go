@@ -251,6 +251,9 @@ func (p *partStreamWriter) appendEncodedGranule(item *mergeIdentityItem, ts bloc
 ) error {
 	sameSeries := len(p.runs) > 0 && p.runs[len(p.runs)-1].Value == idToU128(item.id)
 	if !sameSeries {
+		if err := p.nextSeriesMetadata(); err != nil {
+			return err
+		}
 		if err := p.beginEncodedSeries(item); err != nil {
 			return err
 		}

@@ -20,6 +20,16 @@ const IDColumn = "series"
 // Builder owns sorted, distinct canonical identities; it carries no sample metadata.
 type Builder struct{ index seriesindex.Builder }
 
+// NewBorrowedBuilder builds postings while borrowing descriptors from a pinned view.
+func NewBorrowedBuilder(view series.View) Builder {
+	return Builder{index: seriesindex.NewBorrowedBuilder(view)}
+}
+
+// AddBorrowed appends an ordered descriptor reference from the pinned view.
+func (b *Builder) AddBorrowed(ref int) error {
+	return b.index.AddBorrowed(ref, seriesindex.Metadata{})
+}
+
 // Add copies a checked identity in strictly increasing canonical-ID order.
 func (b *Builder) Add(id signal.SeriesID, s signal.Series) error {
 	return b.index.Add(id, s, seriesindex.Metadata{})
@@ -39,6 +49,14 @@ func (b *Builder) Count() int { return b.index.Count() }
 // Bytes bounds builder and ID-column construction workspace.
 func (b *Builder) Bytes() int64 { return b.index.Bytes() + int64(b.Count())*128 }
 
+// StreamingDirectoryBytes bounds the index directory when pages are streamed.
+func (b *Builder) StreamingDirectoryBytes() int64 { return b.index.StreamingDirectoryBytes() }
+
+// WriteIndex writes only an unbound index for a private postings spill.
+func (b *Builder) WriteIndex(ctx context.Context, be backend.Backend, key string) error {
+	return b.index.WriteObject(ctx, be, key)
+}
+
 // EncodedBound bounds buffered output before compression.
 func (b *Builder) EncodedBound() int64 { return b.index.EncodedBound() + int64(b.Count())*32 + 4096 }
 
@@ -52,17 +70,47 @@ func WriteWithIDCache(ctx context.Context, be backend.Backend, prefix string, b 
 	if b == nil || b.Count() == 0 {
 		return nil, errors.New("seriestable: empty run")
 	}
+	return writeRun(ctx, be, prefix, b.Count(), b.index.ID, func(key string, digest [32]byte) (int, error) {
+		b.index.BindParent(digest)
+		if err := b.index.WriteObject(ctx, be, key); err != nil {
+			return 0, err
+		}
+		return b.index.MaxCanonicalBytes(), nil
+	}, cache)
+}
+
+// WriteContiguous writes one immutable run from bounded, private postings spills.
+func WriteContiguous(ctx context.Context, be backend.Backend, prefix string, view series.View, refs []uint32,
+	inputs []*seriesindex.Index, cache *IDCache,
+) (*Run, error) {
+	return writeRun(ctx, be, prefix, len(refs), func(i int) signal.SeriesID { return view.ID(int(refs[i])) },
+		func(key string, digest [32]byte) (int, error) {
+			return seriesindex.WriteContiguous(ctx, be, key, digest, view, refs, inputs)
+		}, cache)
+}
+
+// WriteOrdinalMerge writes a descriptor run from pinned source ordinals.
+func WriteOrdinalMerge(ctx context.Context, be backend.Backend, prefix string, count int,
+	merge *seriesindex.PostingMerge, idAt func(int) signal.SeriesID, rawAt func(int) ([]byte, error), cache *IDCache,
+) (*Run, error) {
+	return writeRun(ctx, be, prefix, count, idAt, func(key string, digest [32]byte) (int, error) {
+		return seriesindex.WriteOrdinalMerge(ctx, be, key, digest, count, merge, idAt, rawAt)
+	}, cache)
+}
+
+func writeRun(ctx context.Context, be backend.Backend, prefix string, count int, idAt func(int) signal.SeriesID,
+	writeIndex func(string, [32]byte) (int, error), cache *IDCache,
+) (*Run, error) {
 	w := block.NewStreamWriterTo(ctx, be, prefix, block.WithSizingStats())
 	defer w.Abort()
 	if err := w.AddColumn(block.Column{Name: IDColumn, Kind: block.KindInt128}); err != nil {
 		return nil, err
 	}
-	view := b.index.View()
-	for i := range b.Count() {
+	for i := range count {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		id := view.ID(i)
+		id := idAt(i)
 		if err := w.AppendU128Run(0, chunk.U128(id), 1); err != nil {
 			return nil, err
 		}
@@ -74,12 +122,12 @@ func WriteWithIDCache(ctx context.Context, be backend.Backend, prefix string, b 
 	if err != nil {
 		return nil, err
 	}
-	b.index.BindParent(digest)
-	if err := b.index.WriteObject(ctx, be, prefix+"/series-index"); err != nil {
+	maxCanonicalBytes, err := writeIndex(prefix+"/series-index", digest)
+	if err != nil {
 		return nil, err
 	}
 	if err := backend.SyncPrefix(ctx, be, prefix); err != nil {
 		return nil, err
 	}
-	return OpenWithIDCache(ctx, be, prefix, cache, digest)
+	return openRun(ctx, be, prefix, cache, int64(maxCanonicalBytes), digest)
 }

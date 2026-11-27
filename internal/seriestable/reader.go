@@ -49,6 +49,9 @@ func (r *Reader) LookupRaw(id signal.SeriesID) ([]byte, bool, error) {
 	if err := r.ctx.Err(); err != nil {
 		return nil, false, err
 	}
+	if filter := r.run.idFilter; filter != nil && !filter.mayContain(id.Lo) {
+		return nil, false, nil
+	}
 	var ref int
 	var found bool
 	var raw []byte
@@ -70,6 +73,47 @@ func (r *Reader) LookupRaw(id signal.SeriesID) ([]byte, bool, error) {
 		return nil, false, errors.Wrap(ErrCorrupt, "descriptor sample metadata")
 	}
 	return raw, found, nil
+}
+
+// HasID tests exact membership without touching any descriptor record.
+func (r *Reader) HasID(id signal.SeriesID) (bool, error) {
+	if r.run == nil {
+		return false, ErrClosed
+	}
+	if err := r.ctx.Err(); err != nil {
+		return false, err
+	}
+	if filter := r.run.idFilter; filter != nil && !filter.mayContain(id.Lo) {
+		return false, nil
+	}
+	if r.ids != nil {
+		_, found := slices.BinarySearchFunc(r.ids.ids, id, signal.SeriesID.Compare)
+		return found, nil
+	}
+	return r.rawReader().HasID(id)
+}
+
+// IDs returns a sorted ID cursor valid while this reader pins the immutable run.
+func (r *Reader) IDs(ctx context.Context) postings.Postings {
+	if r.ids != nil {
+		return postings.FromSlice(r.ids.ids)
+	}
+	return r.run.index.IDs(r.run.ReaderContext(ctx))
+}
+
+// LookupOrdinal reads a descriptor at a known position and checks its full ID.
+func (r *Reader) LookupOrdinal(id signal.SeriesID, ordinal uint32) ([]byte, error) {
+	if r.run == nil {
+		return nil, ErrClosed
+	}
+	if err := r.ctx.Err(); err != nil {
+		return nil, err
+	}
+	raw, meta, err := r.rawReader().LookupOrdinal(id, ordinal)
+	if err == nil && meta != (seriesindex.Metadata{}) {
+		err = errors.Wrap(ErrCorrupt, "descriptor sample metadata")
+	}
+	return raw, err
 }
 
 // Close releases owned scratch and its run pin.

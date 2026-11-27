@@ -30,7 +30,7 @@ func cachedRun(t *testing.T, be backend.Backend, prefix string, cache *IDCache) 
 func TestIDCacheLookup(t *testing.T) {
 	t.Parallel()
 	be := backendtest.NewByteCounter(backend.Memory())
-	cache := NewIDCache(1 << 20)
+	cache := newIDCache(1<<20, 0)
 	r := cachedRun(t, be, "retained", cache)
 	cache.publish(r)
 	require.Nil(t, cache.reserve(r))
@@ -61,12 +61,12 @@ func TestIDCacheLookup(t *testing.T) {
 func TestIDCacheEvictionAndClose(t *testing.T) {
 	t.Parallel()
 	be := backend.Memory()
-	probe := NewIDCache(1 << 20)
+	probe := newIDCache(1<<20, 0)
 	first := cachedRun(t, be, "probe", probe)
 	unit := probe.SizeBytes()
 	require.NoError(t, first.Close())
 	base := probe.SizeBytes()
-	cache := NewIDCache(base + 2*(unit-base))
+	cache := newIDCache(base+2*(unit-base), 0)
 	a := cachedRun(t, be, "a", cache)
 	b := cachedRun(t, be, "b", cache)
 	retained := retainedForTest(cache, a)
@@ -100,12 +100,12 @@ func TestIDCacheDisabledAndPending(t *testing.T) {
 	}
 	be := backend.Memory()
 	noCache := cachedRun(t, be, "no-cache", nil)
-	tiny := NewIDCache(256)
+	tiny := newIDCache(256, 0)
 	oversized, err := OpenWithIDCache(t.Context(), be, "no-cache", tiny, noCache.Digest())
 	require.NoError(t, err)
 	defer func() { require.NoError(t, oversized.Close()) }()
 	require.Empty(t, tiny.runs)
-	cache := NewIDCache(1 << 20)
+	cache := newIDCache(1<<20, 0)
 	slot := cache.reserve(noCache)
 	require.NotNil(t, slot)
 	retained := retainedForTest(cache, noCache)
@@ -125,7 +125,7 @@ func TestIDCacheDisabledAndPending(t *testing.T) {
 
 func TestIDCacheConcurrentEviction(t *testing.T) {
 	t.Parallel()
-	cache := NewIDCache(640)
+	cache := newIDCache(640, 0)
 	be := backend.Memory()
 	r := cachedRun(t, be, "race", cache)
 	var workers sync.WaitGroup
@@ -172,7 +172,7 @@ func retainedForTest(cache *IDCache, run *Run) bool {
 
 func TestIDCachePinnedBudget(t *testing.T) {
 	t.Parallel()
-	cache := NewIDCache(640)
+	cache := newIDCache(640, 0)
 	run := cachedRun(t, backend.Memory(), "pinned", cache)
 	reader, err := run.NewReader(t.Context())
 	require.NoError(t, err)
@@ -182,4 +182,100 @@ func TestIDCachePinnedBudget(t *testing.T) {
 	require.NoError(t, reader.Close())
 	require.NotNil(t, cache.reserve(other))
 	cache.remove(other)
+}
+
+func TestRunRoutesLow64WithExactLookup(t *testing.T) {
+	t.Parallel()
+	be := backendtest.NewByteCounter(backend.Memory())
+	cache := newIDCache(256, 128)
+	written := cachedRun(t, be, "routing", cache)
+	digest := written.Digest()
+	require.NoError(t, written.Close())
+	base := cache.SizeBytes()
+
+	run, err := OpenWithIDCache(t.Context(), be, "routing", cache, digest)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, run.Close()) }()
+	require.NotNil(t, run.idFilter)
+	require.Greater(t, cache.SizeBytes(), base)
+	require.LessOrEqual(t, cache.SizeBytes(), int64(1024))
+
+	r, err := run.NewReader(t.Context())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, r.Close()) }()
+	require.Nil(t, r.ids)
+	absent := signal.SeriesID{Lo: 1}
+	for run.idFilter.mayContain(absent.Lo) {
+		absent.Lo++
+	}
+	be.Reset()
+	_, found, err := r.LookupRaw(absent)
+	require.NoError(t, err)
+	require.False(t, found)
+	require.Zero(t, be.Reads())
+	require.Nil(t, r.raw)
+
+	data := descriptors(16)
+	collision := data[0].Hash()
+	collision.Hi ^= 1
+	require.True(t, run.idFilter.mayContain(collision.Lo))
+	_, found, err = r.LookupRaw(collision)
+	require.NoError(t, err)
+	require.False(t, found)
+	require.NotNil(t, r.raw)
+	for _, descriptor := range data {
+		raw, found, err := r.LookupRaw(descriptor.Hash())
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, descriptor.AppendHashInput(nil), raw)
+	}
+
+	require.NoError(t, run.Close())
+	require.Greater(t, cache.SizeBytes(), base, "the active reader still owns the routing filter")
+	require.NoError(t, r.Close())
+	require.Equal(t, base, cache.SizeBytes())
+}
+
+func TestRoutingFilterBudgetAndValidation(t *testing.T) {
+	t.Parallel()
+	be := backend.Memory()
+	probe := NewIDCache(1 << 20)
+	first := cachedRun(t, be, "first", probe)
+	require.NotNil(t, first.idFilter)
+	cache := newIDCache(1024, probe.filterUsed)
+	a, err := OpenWithIDCache(t.Context(), be, "first", cache, first.Digest())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, a.Close()) }()
+	require.NotNil(t, a.idFilter)
+	b := cachedRun(t, be, "second", cache)
+	require.Nil(t, b.idFilter, "the run falls back to the exact lookup when the filter budget is full")
+	require.NotNil(t, a.idFilter)
+	require.NoError(t, a.Close())
+	require.Zero(t, cache.filterUsed)
+
+	raw, err := be.Read(t.Context(), "second/c/0")
+	require.NoError(t, err)
+	corrupt := bytes.Clone(raw)
+	corrupt[len(corrupt)-1] ^= 1
+	require.NoError(t, be.Write(t.Context(), "second/c/0", corrupt))
+	_, err = OpenWithIDCache(t.Context(), be, "second", cache)
+	require.Error(t, err)
+	require.Zero(t, cache.filterUsed, "failed validation releases the filter charge")
+}
+
+func TestHasIDChecksBothWordsWithoutRetainedIDs(t *testing.T) {
+	t.Parallel()
+	run := cachedRun(t, backend.Memory(), "has-id", nil)
+	reader, err := run.NewReader(t.Context())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reader.Close()) }()
+	reader.StreamPages()
+	id := descriptors(16)[0].Hash()
+	collision := signal.SeriesID{Hi: id.Hi ^ 1, Lo: id.Lo}
+	found, err := reader.HasID(collision)
+	require.NoError(t, err)
+	require.False(t, found)
+	found, err = reader.HasID(id)
+	require.NoError(t, err)
+	require.True(t, found)
 }

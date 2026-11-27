@@ -11,6 +11,7 @@ import (
 	"github.com/go-faster/sdk/zctx"
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/internal/partid"
@@ -19,6 +20,21 @@ import (
 )
 
 const maxSeriesRetirements = 4096
+
+// NeedsSeriesCompaction reports whether a shared-series engine has enough roots for a background turn.
+func (e *Engine) NeedsSeriesCompaction() bool {
+	if !e.cfg.SeparateSeries {
+		return false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.seriesTable != nil && len(e.seriesTable.roots) >= 4 && len(e.seriesRetired) <= maxSeriesRetirements-2
+}
+
+// MergeSeriesStep compacts descriptors without reading or rewriting numeric parts.
+func (e *Engine) MergeSeriesStep(ctx context.Context, background bool) (bool, error) {
+	return e.compactSeriesRuns(ctx, background)
+}
 
 // compactSeriesRuns shares the maintenance admission and serializes with ordinary compaction.
 func (e *Engine) compactSeriesRuns(ctx context.Context, background bool) (bool, error) {
@@ -36,11 +52,10 @@ func (e *Engine) compactSeriesRuns(ctx context.Context, background bool) (bool, 
 	if snapshot == nil || len(snapshot.roots) < 2 || remaining < 2 || background && len(snapshot.roots) < 4 {
 		return false, nil
 	}
-	sources := slices.Clone(snapshot.roots)
-	slices.SortFunc(sources, func(a, b *seriesRootHandle) int { return cmp.Compare(a.run.Count(), b.run.Count()) })
-	sources = sources[:min(len(sources), remaining, 8)]
+	candidates := slices.Clone(snapshot.roots)
+	slices.SortFunc(candidates, func(a, b *seriesRootHandle) int { return cmp.Compare(a.run.Count(), b.run.Count()) })
 	allowance := e.mergeMemoryBudgetBytes()
-	sources, scratch := boundedSeriesSources(sources, allowance)
+	sources, scratch, attempt := e.pickDescriptorMerge(candidates, remaining, allowance)
 	if len(sources) < 2 {
 		return false, nil
 	}
@@ -55,6 +70,7 @@ func (e *Engine) compactSeriesRuns(ctx context.Context, background bool) (bool, 
 		return false, err
 	}
 	if len(outputs) >= len(sources) {
+		e.seriesNoGain.remember(attempt)
 		e.discardSeriesOutputs(ctx, outputs)
 		return false, nil
 	}
@@ -110,6 +126,9 @@ func (e *Engine) compactSeriesRuns(ctx context.Context, background bool) (bool, 
 }
 
 func (e *Engine) buildSeriesMerge(ctx context.Context, sources []*seriesRootHandle, allowance int64) (_ []*seriesRootHandle, err error) {
+	if backend.StreamsWrites(e.cfg.Backend) && len(sources) <= maxDescriptorMergeInputs {
+		return e.buildRawSeriesMerge(ctx, sources, allowance)
+	}
 	iterators := make([]*seriestable.Iterator, len(sources))
 	live := make([]bool, len(sources))
 	defer func() {
