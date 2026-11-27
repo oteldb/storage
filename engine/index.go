@@ -125,6 +125,7 @@ func (e *Engine) commitOnceLocked(ctx context.Context, parts []*part, epoch uint
 	}
 
 	e.indexVersion = version
+	e.compactMetricMetadata = ix.CompactMetricMetadata
 	// Only a commit that landed discharges a want: the obligation is dropped from the engine's own
 	// list here, never while building an index that may not be written.
 	e.wants = ix.Wanted
@@ -173,6 +174,7 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 	}
 
 	e.indexVersion = version
+	e.compactMetricMetadata = ix.CompactMetricMetadata
 	if ix.Generation.Compare(e.generation) > 0 {
 		e.generation = ix.Generation
 	}
@@ -330,11 +332,12 @@ func (e *Engine) nextIndexLocked(ctx context.Context, parts []*part, epoch uint6
 		// through untouched: they count flushes of WALs this engine has never seen, and a commit
 		// that stamped its own number over one of them would make that node replay records its
 		// parts already hold, or skip records it still holds only in memory (#397).
-		FlushedEpoch:       e.anonEpoch,
-		Epochs:             slices.Clone(e.epochs),
-		Generation:         e.generation,
-		SeriesRoots:        e.seriesTable.bindings(),
-		RetiredSeriesRoots: slices.Clone(e.seriesRetired),
+		FlushedEpoch:          e.anonEpoch,
+		Epochs:                slices.Clone(e.epochs),
+		Generation:            e.generation,
+		SeriesRoots:           e.seriesTable.bindings(),
+		CompactMetricMetadata: e.compactMetricMetadata || (e.cfg.SeparateSeries && e.fixedHeadRotation()),
+		RetiredSeriesRoots:    slices.Clone(e.seriesRetired),
 	}
 	ix.SetWriterEpoch(e.cfg.WriterID, epoch, e.generation)
 	ix.Epochs = bucketindex.TrimWriters(ix.Epochs, e.cfg.WriterID, bucketindex.MaxWriters)
@@ -652,7 +655,7 @@ func (e *Engine) validateSeriesCatalog(ix *bucketindex.Index) error {
 	if err := e.validateSeparateSeries(); err != nil {
 		return err
 	}
-	if (len(ix.SeriesRoots) > 0 || len(ix.RetiredSeriesRoots) > 0) && !e.cfg.SeparateSeries {
+	if (ix.CompactMetricMetadata || len(ix.SeriesRoots) > 0 || len(ix.RetiredSeriesRoots) > 0) && !e.cfg.SeparateSeries {
 		return errors.New("engine: separate series catalog requires SeparateSeries")
 	}
 	if e.cfg.SeparateSeries && len(ix.SeriesRoots) == 0 && len(ix.Entries) > 0 {
@@ -821,6 +824,7 @@ func (e *Engine) adoptLoadLocked(l *indexLoad) {
 	// names, so nothing is foreign any more. The adopted handles' objects belong to their writer and
 	// are not deleted here.
 	e.indexVersion = l.version
+	e.compactMetricMetadata = l.ix.CompactMetricMetadata
 	e.foreign, e.foreignParts = nil, nil
 
 	e.holes, e.lostParts, e.allocated = l.holes, l.ix.LostParts, l.ix.AllocatedBlocks

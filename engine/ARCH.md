@@ -2205,12 +2205,17 @@ succeeds. Catalog publication keeps the same generation order and WAL coverage c
 
 
 With a fixed rotation target, prepared writes for returning IDs append a numeric slot and
-keep the canonical bytes from their self-contained WAL registration. This head row needs
+keep the canonical descriptor bytes for matching and recovery. This head row needs
 no compact label registry insertion or eager postings. Head matching scans encoded rows with reusable scratch and keeps typed, repeated-label
 and absent-label semantics.
 Numeric planning and sorting use the same local ordinal space for both row layouts.
 Descriptor builders can copy the retained canonical bytes if a shared descriptor is missing.
-The WAL layout and replay format are identical for both kinds of head row.
+Catalog v11 fences older readers before fixed-rotation writes can use ordinal numeric
+sidecars or WAL references. Coverage and optional stats stream to their final objects with
+checksummed, manifest-bound SIDX ordinals. Legacy v9 and v10 sidecars remain readable.
+The engine can omit the first sample's full descriptor only when its exact ID was seen in
+a confirmed published generation. Replay resolves the descriptor from published roots
+and fails if it is unavailable. New IDs retain self-contained registrations.
 
 Catalog v9 names metadata roots independently of sample entries and publishes their union with
 numeric parts and the WAL checkpoint in one CAS. Runs sync before publication; failed commits
@@ -2231,7 +2236,7 @@ and charged as identity metadata; compaction stops at 4096 records. Source objec
 so descriptor garbage collection remains unavailable.
 Clustered engines, replica refresh, unclaimed loading and Reset reject this mode. Existing sample
 catalogs require migration and are rejected; readers without the option reject v9 roots before
-mutating the catalog or sweeping objects. This mode does not change canonical IDs or WAL records.
+mutating the catalog or sweeping objects. Canonical IDs and replicated frames are unchanged.
 
 Strict merge coverage uses a checked SMAX cursor with one 32 KiB window per input. SIDX and
 SMAX ordinals must name identical canonical IDs; known merge positions bypass repeated ID seeks.

@@ -64,6 +64,9 @@ func (p *partStreamWriter) writeSeriesSidecars(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	if p.ordinal != nil {
+		return p.finishOrdinalMetadata(ctx)
+	}
 	if p.meta != nil {
 		return p.writeSpoolSidecars(ctx, scratch[:0])
 	}
@@ -117,6 +120,10 @@ func (p *partStreamWriter) writeSpoolSidecars(ctx context.Context, scratch []byt
 func appendSeriesStats(dst []byte, id chunk.U128, a SeriesAgg) []byte {
 	dst = binary.BigEndian.AppendUint64(dst, id.Hi)
 	dst = binary.BigEndian.AppendUint64(dst, id.Lo)
+	return appendStatsValues(dst, a)
+}
+
+func appendStatsValues(dst []byte, a SeriesAgg) []byte {
 	dst = binary.AppendVarint(dst, int64(a.Count))
 	dst = binary.BigEndian.AppendUint64(dst, math.Float64bits(a.Sum))
 	dst = binary.BigEndian.AppendUint64(dst, math.Float64bits(a.Min))

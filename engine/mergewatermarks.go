@@ -23,9 +23,12 @@ func (p *part) mergeSeriesWatermark(ctx context.Context, id signal.SeriesID) (in
 
 func (p *part) validateSharedMergeWatermarks(ctx context.Context) error {
 	ctx = p.reader.ReaderContext(ctx)
-	reader, err := watermark.OpenReader(ctx, p.be, watermark.Key(p.prefix), p.index.seriesCount())
+	reader, err := p.sharedWatermarkReader(ctx)
 	if err != nil {
 		return err
+	}
+	if reader.Ordinal() {
+		return nil // Bound to the same immutable manifest as the numeric part.
 	}
 	cursor := reader.Cursor(ctx)
 	ids := p.diskRowIDs(ctx)

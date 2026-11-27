@@ -6,6 +6,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/oteldb/storage/internal/obs"
+	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
 )
 
@@ -13,6 +14,7 @@ import (
 // and skipped, so the engine opens with the records that survive instead of refusing to.
 func (e *Engine) salvageHandlers(ctx context.Context, dir string) wal.Handlers {
 	h := e.replayHandlers()
+	h.OnDescriptorReference = func(id signal.SeriesID) error { return e.replayDescriptorReference(ctx, id) }
 	h.OnDamage = func(d wal.Damage) error {
 		ctx := e.cfg.Obs.Base(ctx)
 		e.cfg.Obs.Corruption.Detected(ctx, "wal", obs.CorruptTolerated)

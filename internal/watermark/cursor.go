@@ -35,24 +35,40 @@ func (c *Cursor) Reset(ctx context.Context, r *Reader) {
 
 // At reads an ordinal, retaining its page for subsequent ordinals.
 func (c *Cursor) At(index int) (Entry, error) {
+	if c.reader.ordinal {
+		return Entry{}, errors.Wrap(ErrCorrupt, "ordinal cursor requires SIDX ID")
+	}
+	return c.AtSeries(index, signal.SeriesID{})
+}
+
+// AtSeries reads a watermark at the ordinal of id in the bound SIDX.
+func (c *Cursor) AtSeries(index int, id signal.SeriesID) (Entry, error) {
 	if index < 0 || index >= c.reader.count {
 		return Entry{}, errors.Wrap(ErrCorrupt, "watermark ordinal out of range")
 	}
-	first := index / cursorEntries * cursorEntries
+	width := entryWidth
+	if c.reader.ordinal {
+		width = 8
+	}
+	windowEntries := readerWindowBytes / width
+	first := index / windowEntries * windowEntries
 	if c.first != first {
-		count := min(cursorEntries, c.reader.count-first)
+		count := min(windowEntries, c.reader.count-first)
 		c.first = -1
 		data, err := backend.ReadAtAppend(c.ctx, c.reader.be, c.data[:0], c.reader.key,
-			c.reader.offset+int64(first*entryWidth), int64(count*entryWidth))
+			c.reader.offset+int64(first*width), int64(count*width))
 		if err != nil {
 			return Entry{}, err
 		}
-		if len(data) != count*entryWidth {
+		if len(data) != count*width {
 			return Entry{}, errors.Wrap(ErrCorrupt, "short watermark window")
 		}
 		c.data, c.first = data, first
 	}
-	raw := c.data[(index-c.first)*entryWidth:]
+	raw := c.data[(index-c.first)*width:]
+	if c.reader.ordinal {
+		return Entry{ID: id, Max: int64(binary.BigEndian.Uint64(raw))}, nil
+	}
 	return Entry{
 		ID:  signal.SeriesID{Hi: binary.BigEndian.Uint64(raw), Lo: binary.BigEndian.Uint64(raw[8:])},
 		Max: int64(binary.BigEndian.Uint64(raw[16:])),

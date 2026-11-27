@@ -302,6 +302,7 @@ func (p *preparedBatch) admit(
 			}
 			acc.register, acc.series = true, materialize()
 			acc.encodedHead = p.encodedReturning && state.historical
+			acc.descriptorRef = acc.encodedHead && state.descriptorPublished
 		}
 	}
 	k = len(b.order)

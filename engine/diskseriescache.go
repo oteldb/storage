@@ -17,9 +17,10 @@ type diskCacheEntry struct {
 }
 
 type diskCacheBucket struct {
-	entries [diskCacheWays]diskCacheEntry
-	used    uint8
-	next    uint8
+	entries   [diskCacheWays]diskCacheEntry
+	published uint16 // One confirmed-descriptor bit per way, within the bucket padding.
+	used      uint8
+	next      uint8
 }
 
 type diskCacheShard struct {
@@ -66,24 +67,27 @@ func diskCacheSecond(hash uint64, first, n int) int {
 	return second
 }
 
-func (b *diskCacheBucket) lookup(id signal.SeriesID) *diskCacheEntry {
+func (b *diskCacheBucket) position(id signal.SeriesID) int {
 	for i := range int(b.used) {
 		if b.entries[i].id == id {
-			return &b.entries[i]
+			return i
 		}
 	}
-	return nil
+	return -1
 }
 
-func (c *diskSeriesCache) lookup(s *diskCacheShard, hash uint64, id signal.SeriesID) *diskCacheEntry {
+func (c *diskSeriesCache) lookup(s *diskCacheShard, hash uint64, id signal.SeriesID) (*diskCacheBucket, int) {
 	first := int((hash / uint64(len(c.shards))) % uint64(len(s.buckets)))
-	if entry := s.buckets[first].lookup(id); entry != nil {
-		return entry
+	b := &s.buckets[first]
+	if pos := b.position(id); pos >= 0 {
+		return b, pos
 	}
 	if len(s.buckets) == 1 {
-		return nil
+		return nil, -1
 	}
-	return s.buckets[diskCacheSecond(hash, first, len(s.buckets))].lookup(id)
+	b = &s.buckets[diskCacheSecond(hash, first, len(s.buckets))]
+	pos := b.position(id)
+	return b, pos
 }
 
 func (c *diskSeriesCache) get(id signal.SeriesID) (diskHeadEntry, bool) {
@@ -95,32 +99,40 @@ func (c *diskSeriesCache) get(id signal.SeriesID) (diskHeadEntry, bool) {
 	if len(s.buckets) == 0 {
 		return diskHeadEntry{}, false
 	}
-	if entry := c.lookup(s, h, id); entry != nil {
-		return diskHeadEntry{newest: entry.newest, exists: true}, true
+	if b, pos := c.lookup(s, h, id); pos >= 0 {
+		return diskHeadEntry{newest: b.entries[pos].newest, descriptorPublished: b.published>>pos&1 != 0, exists: true}, true
 	}
 	return diskHeadEntry{}, false
 }
 
 func (c *diskSeriesCache) put(id signal.SeriesID, newest int64) {
+	c.remember(id, newest, false)
+}
+
+func (c *diskSeriesCache) remember(id signal.SeriesID, newest int64, published bool) {
 	if c == nil {
 		return
 	}
 	h := diskCacheHash(id)
 	s := &c.shards[h&uint64(len(c.shards)-1)]
 	if len(s.buckets) > 0 {
-		if entry := c.lookup(s, h, id); entry != nil {
+		if b, pos := c.lookup(s, h, id); pos >= 0 {
+			entry := &b.entries[pos]
 			entry.newest = max(entry.newest, newest)
+			if published {
+				b.published |= 1 << pos
+			}
 			return
 		}
 	}
 	if len(s.buckets) == 0 || (s.count >= len(s.buckets)*diskCacheWays*3/4 && len(s.buckets) < c.maxBuckets) {
 		c.grow(s)
 	}
-	c.insert(s, id, newest)
+	c.insert(s, diskCacheEntry{id: id, newest: newest}, published)
 }
 
-func (c *diskSeriesCache) insert(s *diskCacheShard, id signal.SeriesID, newest int64) {
-	hash := diskCacheHash(id)
+func (c *diskSeriesCache) insert(s *diskCacheShard, entry diskCacheEntry, published bool) {
+	hash := diskCacheHash(entry.id)
 	first := int((hash / uint64(len(c.shards))) % uint64(len(s.buckets)))
 	b, second := &s.buckets[first], &s.buckets[diskCacheSecond(hash, first, len(s.buckets))]
 	if second.used < b.used {
@@ -134,7 +146,11 @@ func (c *diskSeriesCache) insert(s *diskCacheShard, id signal.SeriesID, newest i
 	} else {
 		b.next = (b.next + 1) % diskCacheWays
 	}
-	b.entries[pos] = diskCacheEntry{id: id, newest: newest}
+	b.entries[pos] = entry
+	b.published &^= 1 << pos
+	if published {
+		b.published |= 1 << pos
+	}
 }
 
 func (c *diskSeriesCache) grow(s *diskCacheShard) {
@@ -145,7 +161,7 @@ func (c *diskSeriesCache) grow(s *diskCacheShard) {
 	for i := range old {
 		for j := range int(old[i].used) {
 			entry := old[i].entries[j]
-			c.insert(s, entry.id, entry.newest)
+			c.insert(s, entry, old[i].published>>j&1 != 0)
 		}
 	}
 }

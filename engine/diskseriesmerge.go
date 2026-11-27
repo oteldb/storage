@@ -39,7 +39,7 @@ func (e *Engine) openMetricMergeStreams(ctx context.Context, src []*part) ([]*pa
 	for i, p := range src {
 		stream, err := newPartStream(ctx, p, e.mergeReadWindow)
 		if err == nil && e.cfg.SeparateSeries {
-			covered, openErr := watermark.OpenReader(p.reader.ReaderContext(ctx), p.be, watermark.Key(p.prefix), p.index.seriesCount())
+			covered, openErr := p.sharedWatermarkReader(p.reader.ReaderContext(ctx))
 			err = openErr
 			if err == nil {
 				metadata[i] = &diskMergeSource{covered: covered.Cursor(p.reader.ReaderContext(ctx))}
@@ -264,7 +264,7 @@ func (p *partStreamWriter) initMergePostings(ctx context.Context, sources []*ser
 func streamedCovered(id signal.SeriesID, positions []mergestream.Position, sources []*diskMergeSource) (int64, error) {
 	newest := minInt64
 	for _, pos := range positions {
-		ent, err := sources[pos.Source].covered.At(pos.Index)
+		ent, err := sources[pos.Source].covered.AtSeries(pos.Index, id)
 		if err != nil {
 			return 0, err
 		}

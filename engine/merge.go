@@ -281,33 +281,13 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 		}
 	}()
 
-	var single *flushColumns
-
 	plan, err := e.planRollup(ctx, selected, start, opts.Downsample)
 	if err != nil {
 		return mergeResult{parts: dropped}, err
 	}
 
-	if len(selected) == 1 && !splitsOutput(selected, start) && !e.cfg.DiskSeries {
-		// A single forced part: decode it (bounded — one part) and apply retention/downsample.
-		if single, err = e.compactParts(ctx, selected, start, plan.tiers); err != nil {
-			return mergeResult{parts: dropped}, err
-		}
-
-		// A Sum, Avg or Count rollup lands at its bucket start, which can precede the part's day; only
-		// the streamed path cuts on days.
-		if lo, hi := colsTimeRange(single); !timebucket.Fits(lo, hi, timebucket.Top()) {
-			single = nil
-		}
-	}
-
-	if single != nil {
-		if newParts, err = e.writeColumns(ctx, single, rowCapFor(selected[0], capBytes), opts, plan.marker); err != nil {
-			return mergeResult{parts: dropped}, err
-		}
-	} else if newParts, err = e.compactStreamWithInputs(
-		ctx, selected, start, capBytes, plan, opts, selection.inputBytes, allowance,
-	); err != nil {
+	newParts, err = e.buildMergeOutputs(ctx, selected, start, capBytes, plan, opts, selection.inputBytes, allowance)
+	if err != nil {
 		return mergeResult{parts: dropped}, err
 	}
 
@@ -326,6 +306,24 @@ func (e *Engine) merge(ctx context.Context, opts MergeOptions) (mergeResult, err
 	e.recordMergePlan(ctx, selection.plan, "completed")
 	e.cfg.Obs.Merge.Outputs(ctx, metricSignal, int64(len(newParts)))
 	return mergeResult{parts: dropped + len(selected), bytesIn: bytesIn, bytesOut: partsBytes(newParts)}, nil
+}
+
+func (e *Engine) buildMergeOutputs(
+	ctx context.Context, selected []*part, start, capBytes int64, plan rollupPlan, opts MergeOptions, inputBytes, allowance int64,
+) ([]*part, error) {
+	if len(selected) == 1 && !splitsOutput(selected, start) && !e.cfg.DiskSeries {
+		single, err := e.compactParts(ctx, selected, start, plan.tiers)
+		if err != nil {
+			return nil, err
+		}
+
+		// A rollup can land before the part's day. Use the stream's day partitioning in that case.
+		if lo, hi := colsTimeRange(single); timebucket.Fits(lo, hi, timebucket.Top()) {
+			return e.writeColumns(ctx, single, rowCapFor(selected[0], capBytes), opts, plan.marker)
+		}
+	}
+
+	return e.compactStreamWithInputs(ctx, selected, start, capBytes, plan, opts, inputBytes, allowance)
 }
 
 // trySmallerMerge replans before admitting the reduced allowance.
@@ -779,6 +777,8 @@ func (e *Engine) compactStreamWithInputs(
 	encoded := e.newEncodedMergePlan(precision, withSF, plan.tiers)
 	var windows mergeSeriesWindows
 	plain := plainMergeInputs(src, plan.tiers)
+	// Check encoded bytes for disk capacity and resident bytes for per-series sidecars.
+	// A series that exceeds a limit is split at the next run.
 	reached := func(w *partStreamWriter) bool {
 		return budget.Reached(w.encodedBytes(), buildbudget.Add(held, w.mergeResidentBytes()))
 	}
@@ -790,25 +790,11 @@ func (e *Engine) compactStreamWithInputs(
 		if !ok {
 			break
 		}
-		copied, err := encoded.copySeries(&item, streams, &router, start, reached)
+		handled, err := item.tryStreamSamples(ctx, &encoded, &windows, streams, &router, start, plain, reached)
 		if err != nil {
 			return nil, err
 		}
-		if copied {
-			continue
-		}
-		if plain && largeMergeSeries(item.ranges) {
-			err := windows.merge(ctx, streams, item.ranges, start, item.covered, func(ts []int64, values []float64, covered int64) error {
-				return router.Append(ts[0], func(w *partStreamWriter) (bool, error) {
-					if err := item.appendTo(w, ts, values, nil, covered); err != nil {
-						return false, err
-					}
-					return reached(w), nil
-				})
-			})
-			if err != nil {
-				return nil, err
-			}
+		if handled {
 			continue
 		}
 		if err := mergeStreamedSeries(&m, src, streams, scratch, item.ranges, start); err != nil {
@@ -819,22 +805,8 @@ func (e *Engine) compactStreamWithInputs(
 		rs.ts, rs.values, rs.sf, rs.covered = output.roll(&m, plan.tiers)
 
 		err = timebucket.Runs(rs.ts, func(lo, hi int) error {
-			return router.Append(rs.ts[lo], func(w *partStreamWriter) (bool, error) {
-				ts, values, sf, watermark := rs.run(lo, hi)
-				if err := item.appendTo(w, ts, values, sf, watermark); err != nil {
-					return false, err
-				}
-
-				// Sealing on what has actually been written, rather than on rows times an assumed
-				// bytes-per-row, is what makes the cap comparable to the free space it comes from.
-				// A series overshooting the cap is split at the next run — parts are independent,
-				// and the read seam merges a series spanning two.
-				//
-				// The second bound is the part's resident footprint, which is not a function of
-				// its size on disk: the per-series sidecars grow with distinct series, so a merge
-				// of very short series reaches the memory budget long before the disk cap.
-				return budget.Reached(w.encodedBytes(), buildbudget.Add(held, w.mergeResidentBytes())), nil
-			})
+			ts, values, sf, watermark := rs.run(lo, hi)
+			return item.routeSamples(&router, ts, values, sf, watermark, reached)
 		})
 		if err != nil {
 			return nil, err
@@ -852,6 +824,34 @@ func (e *Engine) compactStreamWithInputs(
 
 	completed = true
 	return newParts, nil
+}
+
+func (item *mergeIdentityItem) tryStreamSamples(
+	ctx context.Context, encoded *encodedMergePlan, windows *mergeSeriesWindows, streams []*partStream,
+	router *timebucket.Router[*partStreamWriter], start int64, plain bool, reached func(*partStreamWriter) bool,
+) (bool, error) {
+	copied, err := encoded.copySeries(item, streams, router, start, reached)
+	if err != nil || copied {
+		return copied, err
+	}
+	if !plain || !largeMergeSeries(item.ranges) {
+		return false, nil
+	}
+	return true, windows.merge(ctx, streams, item.ranges, start, item.covered, func(ts []int64, values []float64, covered int64) error {
+		return item.routeSamples(router, ts, values, nil, covered, reached)
+	})
+}
+
+func (item *mergeIdentityItem) routeSamples(
+	router *timebucket.Router[*partStreamWriter], ts []int64, values, sf []float64, covered int64,
+	reached func(*partStreamWriter) bool,
+) error {
+	return router.Append(ts[0], func(w *partStreamWriter) (bool, error) {
+		if err := item.appendTo(w, ts, values, sf, covered); err != nil {
+			return false, err
+		}
+		return reached(w), nil
+	})
 }
 
 // mergeEncoding fixes what a streamed merge's output parts are encoded under. The decisions must be

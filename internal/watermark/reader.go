@@ -17,14 +17,24 @@ var ErrUnbounded = errors.New("watermark: bounded reads unavailable")
 
 // Reader retains validated framing, without retaining per-series entries.
 type Reader struct {
-	be     backend.Backend
-	key    string
-	offset int64
-	count  int
+	ordinal bool
+	be      backend.Backend
+	key     string
+	offset  int64
+	count   int
 }
 
 // OpenReader validates the checksum and sorted IDs with at most 32 KiB of scratch.
 func OpenReader(ctx context.Context, b backend.Backend, key string, count int) (*Reader, error) {
+	return openReader(ctx, b, key, count, nil)
+}
+
+// OpenBoundReader accepts both legacy watermarks and manifest-bound SIDX ordinals.
+func OpenBoundReader(ctx context.Context, b backend.Backend, key string, count int, binding [32]byte) (*Reader, error) {
+	return openReader(ctx, b, key, count, &binding)
+}
+
+func openReader(ctx context.Context, b backend.Backend, key string, count int, binding *[32]byte) (*Reader, error) {
 	size, known, err := backend.NativeSizeOf(ctx, b, key)
 	if err != nil {
 		return nil, err
@@ -35,6 +45,9 @@ func OpenReader(ctx context.Context, b backend.Backend, key string, count int) (
 	header, err := backend.ReadAt(ctx, b, key, 0, 4+binary.MaxVarintLen64)
 	if err != nil {
 		return nil, err
+	}
+	if binding != nil && len(header) >= 4 && binary.BigEndian.Uint32(header) == OrdinalMagic {
+		return openOrdinal(ctx, b, key, count, size, *binding, header[:4])
 	}
 	if len(header) < 9 || binary.BigEndian.Uint32(header) != magic {
 		return nil, errors.Wrap(ErrCorrupt, "header")
@@ -82,6 +95,9 @@ func OpenReader(ctx context.Context, b backend.Backend, key string, count int) (
 
 // Lookup reads one series' covered timestamp without decoding other entries.
 func (r *Reader) Lookup(ctx context.Context, id signal.SeriesID) (int64, bool, error) {
+	if r.ordinal {
+		return 0, false, errors.Wrap(ErrCorrupt, "ordinal lookup requires SIDX position")
+	}
 	lo, hi := 0, r.count
 	var data []byte
 	for lo < hi {

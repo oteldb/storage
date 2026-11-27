@@ -337,6 +337,9 @@ func (sw *SegmentWriter) Write(p []byte) (int, error) {
 	good := sw.size
 
 	n, err := sw.f.Write(p)
+	if sw.metrics != nil && n > 0 {
+		sw.metrics.Written(n)
+	}
 	if err == nil {
 		sw.size += n
 
@@ -403,6 +406,17 @@ func (sw *SegmentWriter) WriteFrames(p []byte) error {
 	_, err := sw.Write(p)
 
 	return sw.afterWrite(err)
+}
+
+// WritePreparedFrames writes a metric batch and counts its descriptor references on success.
+func (sw *SegmentWriter) WritePreparedFrames(p []byte, references int) error {
+	if err := sw.WriteFrames(p); err != nil {
+		return err
+	}
+	if sw.metrics != nil {
+		sw.metrics.References(references)
+	}
+	return nil
 }
 
 // WriteSide logs an opaque engine-encoded side-store delta.

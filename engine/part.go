@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/binary"
 	"slices"
 	"sort"
 	"sync"
@@ -551,7 +552,7 @@ func (p *part) seriesStat(ctx context.Context, id signal.SeriesID) (SeriesAgg, b
 			return // absent ⇒ fall back to decode
 		}
 
-		m, err := decodeSeriesStats(data)
+		m, err := p.decodePartStats(p.reader.ReaderContext(ctx), data)
 		if err != nil {
 			p.corrupt.Detected(ctx, "series_stats", obs.CorruptTolerated)
 
@@ -675,6 +676,9 @@ func (p *part) sidecarWatermarks(ctx context.Context) ([]watermark.Entry, bool) 
 		return nil, false
 	}
 
+	if len(data) >= 4 && binary.BigEndian.Uint32(data) == watermark.OrdinalMagic {
+		return p.decodeOrdinalWatermarks(ctx, data)
+	}
 	ents, err := watermark.Decode(data)
 	if err != nil || len(ents) != p.index.seriesCount() {
 		return nil, false

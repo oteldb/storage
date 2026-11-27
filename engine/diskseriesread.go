@@ -143,7 +143,7 @@ func (p *part) visitLegacyDiskSeries(
 	var stats map[signal.SeriesID]SeriesAgg
 	if !p.hasSF {
 		if raw, err := backend.ReadUncached(ctx, p.be, statsKey(p.prefix)); err == nil {
-			stats, _ = decodeSeriesStats(raw)
+			stats, _ = p.decodePartStats(ctx, raw)
 		}
 	}
 	count := 0
@@ -515,7 +515,7 @@ func (p *part) visitSharedDiskMetadata(ctx context.Context, ids []signal.SeriesI
 			cursor.Reset(ctx, r)
 			bound = true
 		}
-		entry, err := cursor.At(pos)
+		entry, err := cursor.AtSeries(pos, id)
 		if err != nil {
 			return err
 		}

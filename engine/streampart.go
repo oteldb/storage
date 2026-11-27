@@ -43,6 +43,7 @@ type partStreamWriter struct {
 	// covered is aligned with the writer-owned runs.
 	covered       []int64
 	meta          *seriesMetadataSpool
+	ordinal       *ordinalMetadata
 	metaWorkspace int64
 	metaCtx       context.Context //nolint:containedctx // Appends are scoped to the part writer.
 
@@ -159,7 +160,10 @@ func newPartStreamWriterAt(
 	}
 	out.sidecarWriterBytes, _ = out.sidecarWorkspace()
 	if e.cfg.SeparateSeries && out.sidecarWriterBytes > 0 {
-		if bytes, ok := backend.ReaderMemory(e.cfg.Backend, prefix+"/.series-meta"); ok {
+		if bytes, ok := out.ordinalWorkspace(); ok && e.fixedHeadRotation() {
+			out.ordinal = &ordinalMetadata{}
+			out.metaWorkspace, out.metaCtx = bytes, ctx
+		} else if bytes, ok := backend.ReaderMemory(e.cfg.Backend, prefix+"/.series-meta"); ok {
 			out.metaWorkspace, out.metaCtx = bytes+metadataSpoolBuffer+out.sidecarWriterBytes, ctx
 		}
 	}
@@ -245,7 +249,9 @@ func (p *partStreamWriter) encodedBytes() int64 { return p.w.EncodedBytes() }
 
 func (p *partStreamWriter) reserveSeries(n int) error {
 	sidecars := n
-	if p.metaWorkspace > 0 {
+	if p.ordinal != nil {
+		sidecars = min(sidecars, 1)
+	} else if p.metaWorkspace > 0 {
 		sidecars = min(sidecars, seriesMetadataMemoryLimit)
 	}
 	p.covered = slices.Grow(p.covered, max(sidecars-len(p.covered), 0))

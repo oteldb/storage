@@ -30,6 +30,9 @@ type seriesMetadataSpool struct {
 }
 
 func (p *partStreamWriter) nextSeriesMetadata() error {
+	if p.ordinal != nil {
+		return p.appendOrdinalMetadata()
+	}
 	if p.metaWorkspace == 0 {
 		return nil
 	}
@@ -104,6 +107,15 @@ func (p *partStreamWriter) openSeriesMetadata(ctx context.Context) (backend.Obje
 }
 
 func (p *partStreamWriter) dropSeriesMetadata(ctx context.Context) {
+	if m := p.ordinal; m != nil {
+		p.ordinal = nil
+		if m.covered != nil {
+			m.covered.Abort()
+		}
+		if m.stats != nil {
+			m.stats.Abort()
+		}
+	}
 	if s := p.meta; s != nil {
 		p.meta = nil
 		s.writer.Abort()

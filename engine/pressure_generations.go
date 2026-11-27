@@ -64,19 +64,19 @@ func (e *Engine) fixedHeadRotation() bool {
 }
 
 // freezePressureGenerationLocked seals before transferring ownership, so seal failure leaves active state intact.
-func (e *Engine) freezePressureGenerationLocked(ctx context.Context) (*pressureGeneration, error) {
+func (e *Engine) freezePressureGenerationLocked(ctx context.Context) error {
 	if err := e.establishTenureLocked(ctx); err != nil {
-		return nil, err
+		return err
 	}
 	if err := e.checkDiskAdmissionLocked(); err != nil {
-		return nil, err
+		return err
 	}
 	if err := e.fenceLocked(); err != nil {
-		return nil, err
+		return err
 	}
 	term := e.term()
 	if err := e.tenureLocked(term); err != nil {
-		return nil, err
+		return err
 	}
 	epoch := max(e.flushedEpoch+1, e.cfg.WAL.Epoch())
 	sequence := -1
@@ -84,7 +84,7 @@ func (e *Engine) freezePressureGenerationLocked(ctx context.Context) (*pressureG
 		sequence, err = e.cfg.WAL.Seal(epoch + 1)
 		return err
 	}); err != nil {
-		return nil, errors.Wrap(err, "seal wal")
+		return errors.Wrap(err, "seal wal")
 	}
 	h := e.head
 	frozen := newHeadWithContexts(e.cfg.SeriesContexts, e.cfg.SeriesTemplates)
@@ -107,7 +107,7 @@ func (e *Engine) freezePressureGenerationLocked(ctx context.Context) (*pressureG
 	e.pressureGenerations = append(e.pressureGenerations, g)
 	e.updateGenerationBuffersLocked()
 	e.notifyPressureRotation()
-	return g, nil
+	return nil
 }
 
 func (e *Engine) updateGenerationBuffersLocked() {
@@ -214,7 +214,7 @@ func (e *Engine) startGenerationBuilds(
 		return 0, false, err
 	}
 	if len(e.pressureGenerations) < 2 && e.generationRotationNeededLocked(force, pressureMode) {
-		if _, err := e.freezePressureGenerationLocked(ctx); err != nil {
+		if err := e.freezePressureGenerationLocked(ctx); err != nil {
 			return 0, false, err
 		}
 		froze = true
@@ -272,7 +272,7 @@ func (e *Engine) rotateWithCommitOwner(ctx context.Context, force, pressureMode 
 		}
 		e.mu.Publish(func() {
 			if len(e.pressureGenerations) < 2 && e.generationRotationNeededLocked(force, pressureMode) {
-				_, err = e.freezePressureGenerationLocked(ctx)
+				err = e.freezePressureGenerationLocked(ctx)
 				froze = err == nil
 			}
 		})
@@ -343,8 +343,11 @@ func (e *Engine) finishGenerationBuild(r generationResult) {
 }
 
 func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGeneration) error {
-	if err := e.rememberGenerationWatermarks(ctx, g.head); err != nil {
-		return err
+	rememberPublished := e.cfg.SeparateSeries && e.fixedHeadRotation()
+	if !rememberPublished {
+		if err := e.rememberGenerationWatermarks(ctx, g.head, false); err != nil {
+			return err
+		}
 	}
 	var released sampleArena
 	retired := false
@@ -368,6 +371,14 @@ func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGener
 	}
 	e.sortPressureParts(next)
 	err := e.commitIndexLocked(ctx, next, max(g.epoch, e.flushedEpoch), g.term, nil)
+	if rememberPublished {
+		// Leave the old head attached while admitting writes during the cache update.
+		// Only a confirmed catalog can authorize descriptor references.
+		published := err == nil && e.compactMetricMetadata
+		_ = e.mu.WithWriters(func() error {
+			return e.rememberGenerationWatermarks(context.WithoutCancel(ctx), g.head, published)
+		})
+	}
 	// Keep ambiguous candidates queryable and retain WAL exactly as the single-generation path does.
 	e.parts, e.flushedEpoch = next, max(g.epoch, e.flushedEpoch)
 	if e.recentEnabled() {

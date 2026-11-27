@@ -107,6 +107,8 @@ type Index struct {
 	// SeriesRoots names immutable identity-only runs, independent of sample lineage.
 	// Roots are kept sorted by prefix; retired roots are excluded.
 	SeriesRoots []SeriesRoot
+	// CompactMetricMetadata fences readers that predate ordinal sidecars and descriptor WAL references.
+	CompactMetricMetadata bool
 	// RetiredSeriesRoots prevents stale catalog rebases from resurrecting compacted runs.
 	RetiredSeriesRoots []SeriesRoot
 }
@@ -175,7 +177,7 @@ const (
 	// Reading is backward compatible; writing is not. [Decode] rejects any version above this one,
 	// so a node on pre-v5 code cannot read an index this one writes: every node that reads a given
 	// index must be upgraded together. See backend/ARCH.md for the blast radius per deployment.
-	version = 10
+	version = 11
 )
 
 // AppendBinary appends the versioned binary encoding of the index to dst (append-style for
@@ -186,7 +188,10 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 		ver = 9
 	}
 	if len(ix.RetiredSeriesRoots) > 0 {
-		ver = version
+		ver = 10
+	}
+	if ix.CompactMetricMetadata {
+		ver = 11
 	}
 	dst = append(dst, magic0, magic1, ver)
 	dst = binary.AppendUvarint(dst, uint64(len(ix.Entries)))
@@ -281,7 +286,7 @@ func Decode(data []byte) (*Index, error) {
 		return nil, err
 	}
 
-	ix := &Index{Entries: entries}
+	ix := &Index{Entries: entries, CompactMetricMetadata: ver >= 11}
 
 	// v2+ appends the flush-epoch watermark; v1 has none (it stays 0).
 	if ver >= 2 {

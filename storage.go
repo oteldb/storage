@@ -1766,15 +1766,6 @@ func (s *Storage) maintainWith(ctx context.Context, background bool) {
 
 		return refs
 	}
-	coldRecord := func(eng *recordengine.Engine) []ecPartRef {
-		ps := eng.Parts()
-		refs := make([]ecPartRef, len(ps))
-		for i, p := range ps {
-			refs[i] = ecPartRef{prefix: p.ID, maxTime: p.MaxTime}
-		}
-
-		return refs
-	}
 
 	// Each engine is an independent shard (per tenant, per signal) with its own lock, so flush/merge
 	// across engines parallelizes freely. Build one flat work list and fan out under a bound — a
@@ -1836,52 +1827,10 @@ func (s *Storage) maintainWith(ctx context.Context, background bool) {
 		}})
 	}
 
-	// mergeRecords / refreshRecords mirror the metric pair: the prune follows whatever changed the
-	// part set, since that is the only thing that kills a stream identity. A replica reaches it
-	// only through the refresh — it never merges.
-	mergeRecords := func(tid signal.TenantID, eng *recordengine.Engine, sig signal.Signal) error {
-		decision := s.retentionFor(tid, sig, sizeCutoffs[tid].at(sig))
-		opts := recordengine.MergeOptions{
-			RetainFrom: decision.cutoff, RetentionBoundBy: decision.bound,
-			Background: true, // see mergeMetrics: this loop skips rather than waits
-		}
-
-		if err := eng.MergeWith(ctx, opts); err != nil {
-			return err
-		}
-
-		_, err := eng.PruneIdentities(ctx)
-
-		return err
-	}
-
-	refreshRecords := func(eng *recordengine.Engine) error {
-		if err := eng.RefreshReplica(ctx); err != nil {
-			return err
-		}
-
-		_, err := eng.PruneIdentities(ctx)
-
-		return err
-	}
-
-	addRecord := func(engines map[signal.TenantID]*recordengine.Engine, sig signal.Signal, signalPrefix string) {
-		for tid, eng := range engines {
-			tasks = append(tasks, maintTask{pressure: eng.HeadBytes(), deferred: eng.MergeDeferred(), run: func() {
-				maintainEngine(tid, signalPrefix, func() error { return eng.Flush(ctx) },
-					func() error { return mergeRecords(tid, eng, sig) },
-					func() error { return refreshRecords(eng) },
-					func() error { return eng.ReloadFenced(ctx) },
-					eng.AdoptWants,
-					func() []ecPartRef { return coldRecord(eng) })
-			}})
-		}
-	}
-
-	addRecord(logEngines, signal.Log, logsPrefix)
-	addRecord(traceEngines, signal.Trace, tracesPrefix)
-	addRecord(profileEngines, signal.Profile, profilesPrefix)
-	addRecord(exemplarEngines, signal.Exemplar, exemplarsPrefix)
+	tasks = s.appendRecordMaintTasks(ctx, tasks, logEngines, signal.Log, logsPrefix, owned, sizeCutoffs)
+	tasks = s.appendRecordMaintTasks(ctx, tasks, traceEngines, signal.Trace, tracesPrefix, owned, sizeCutoffs)
+	tasks = s.appendRecordMaintTasks(ctx, tasks, profileEngines, signal.Profile, profilesPrefix, owned, sizeCutoffs)
+	tasks = s.appendRecordMaintTasks(ctx, tasks, exemplarEngines, signal.Exemplar, exemplarsPrefix, owned, sizeCutoffs)
 
 	s.maintStats.lastTasks.Store(int64(len(tasks)))
 	runMaintTasks(tasks, s.maintenanceConcurrency())

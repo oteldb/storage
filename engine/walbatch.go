@@ -32,21 +32,24 @@ type walBatch struct {
 
 	// samples is the admitted sample count and registered counts globally new identities; both
 	// are what [head.appendByID] would have added to the head's in-flight bytes and series count.
-	samples    int
-	registered int
-	relog      bool
+	samples          int
+	registered       int
+	loggedReferences int
+	relog            bool
 
 	// first is when the write staged its first sample: the head's age starts there if the write is the
 	// first to fill it, as it would had the sample been applied on admission, not once the log returns.
 	first time.Time
 
-	frames bytes.Buffer
-	fw     *wal.Writer
+	descriptors []byte // Canonical descriptors for first samples referring to the catalog.
+	frames      bytes.Buffer
+	fw          *wal.Writer
 }
 
 type walSeriesAcc struct {
 	historical        bool
 	encodedHead       bool
+	descriptorRef     bool
 	rawStart, rawSize int
 	isNew             bool // the series starts a buffer, so its identity record is logged
 	register          bool // the identity is not in the head's index yet
@@ -227,7 +230,7 @@ func (e *Engine) encodeWriteBatch(b *walBatch, everySeries bool) error {
 	if e.cfg.WAL == nil {
 		return nil
 	}
-	return e.cfg.WAL.WriteFrames(b.frames.Bytes())
+	return e.cfg.WAL.WritePreparedFrames(b.frames.Bytes(), b.loggedReferences)
 }
 
 func (b *walBatch) encodingView(h *head, everySeries bool) series.View {
@@ -250,11 +253,18 @@ func (b *walBatch) encodingView(h *head, everySeries bool) series.View {
 // replica whose head may not hold the identity the primary's does.
 func (b *walBatch) encode(view series.View, everySeries bool) error {
 	b.frames.Reset()
+	b.descriptors = b.descriptors[:0]
+	b.loggedReferences = 0
 
 	for k, id := range b.order {
 		a := &b.accs[k]
 
+		reference := a.descriptorRef && !everySeries
 		switch {
+		case reference:
+			a.rawStart = len(b.descriptors)
+			b.descriptors = a.series.AppendHashInput(b.descriptors)
+			a.rawSize = len(b.descriptors) - a.rawStart
 		case a.isNew:
 			s := a.series
 			if !a.register {
@@ -279,6 +289,13 @@ func (b *walBatch) encode(view series.View, everySeries bool) error {
 
 		// Only spend the per-sample sf bytes when sampling actually weighted this series; the common
 		// unsampled path stays on the original (no-sf) samples frame.
+		if reference {
+			b.loggedReferences++
+			if err := b.fw.WriteReferencedSamples(id, a.ts, a.values, a.sf, a.sampled); err != nil {
+				return err
+			}
+			continue
+		}
 		if a.sampled {
 			if err := b.fw.WriteSamplesSF(id, a.ts, a.values, a.sf); err != nil {
 				return err
@@ -345,7 +362,11 @@ func (b *walBatch) registerIdentity(h *head, id signal.SeriesID, a *walSeriesAcc
 		return
 	}
 	if a.rawSize != 0 {
-		h.registerEncoded(id, b.frames.Bytes()[a.rawStart:a.rawStart+a.rawSize])
+		raw := b.frames.Bytes()
+		if a.descriptorRef && len(b.descriptors) > 0 {
+			raw = b.descriptors
+		}
+		h.registerEncoded(id, raw[a.rawStart:a.rawStart+a.rawSize])
 		return
 	}
 	h.register(series.Entry{ID: id, Series: a.series})
@@ -353,6 +374,7 @@ func (b *walBatch) registerIdentity(h *head, id signal.SeriesID, a *walSeriesAcc
 
 func (b *walBatch) reset() {
 	b.lookupErr = nil
+	b.descriptors = b.descriptors[:0]
 	clear(b.attrs[:cap(b.attrs)])
 	if cap(b.attrs) > maxWALIdentityAttributes {
 		b.attrs = nil

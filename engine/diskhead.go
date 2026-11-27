@@ -27,8 +27,9 @@ const (
 var ErrReplicaHeadFull = errors.New("engine: replica resident head is full; retry after primary part publication")
 
 type diskHeadEntry struct {
-	newest int64
-	exists bool
+	newest              int64
+	descriptorPublished bool
+	exists              bool
 }
 
 type diskHeadState struct {
