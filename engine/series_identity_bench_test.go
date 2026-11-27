@@ -71,7 +71,7 @@ func benchmarkSharedIdentityMisses(b *testing.B, roots int, budget int64) {
 	counter.Reset()
 	b.ReportAllocs()
 	for b.Loop() {
-		known, err := snapshot.knownIdentities(b.Context(), input)
+		known, _, err := snapshot.knownIdentities(b.Context(), input)
 		if err != nil {
 			b.Fatal(err)
 		}

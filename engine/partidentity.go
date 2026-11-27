@@ -41,8 +41,9 @@ type identitySet struct {
 }
 
 type identitySnapshot struct {
-	view series.View
-	refs []uint32
+	view   series.View
+	refs   []uint32
+	proofs descriptorProofs
 }
 
 // entriesFor returns the identity records for the distinct series of a part's (sorted) series

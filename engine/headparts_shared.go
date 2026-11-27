@@ -123,7 +123,7 @@ func (p *headPartPlan) prepareSharedIdentities(ctx context.Context, planner *hea
 		for i, entry := range j.entries {
 			refs[i] = entry.ref
 		}
-		ids := identitySnapshot{view: planner.view, refs: refs[:len(j.entries)]}
+		ids := planner.identitySnapshot(refs[:len(j.entries)])
 		if err := prepareSharedHeadJob(ctx, e, ids, budget, references); err != nil {
 			return err
 		}

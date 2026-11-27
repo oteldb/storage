@@ -202,7 +202,7 @@ func (e *Engine) parallelSnapshots(p *preparedBatch, lookupErr error) (series.Vi
 		} else if e.cfg.DiskSeries {
 			entry := p.lookup.pending[id]
 			state.historical, state.seen, state.newest = entry.exists, entry.exists, entry.newest
-			state.descriptorPublished = entry.descriptorPublished
+			state.descriptorLineage = entry.descriptorLineage
 		}
 		p.snapshots[i] = state
 	}

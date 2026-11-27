@@ -52,6 +52,7 @@ type walSeriesAcc struct {
 	historical        bool
 	encodedHead       bool
 	descriptorRef     bool
+	descriptorLineage uint64
 	rawInDescriptors  bool
 	rawStart, rawSize int
 	isNew             bool // the series starts a buffer, so its identity record is logged
@@ -432,6 +433,9 @@ func (b *walBatch) registerIdentity(h *head, id signal.SeriesID, a *walSeriesAcc
 			raw = b.descriptors
 		}
 		a.identityRef, a.knownRef = h.registerEncoded(id, raw[a.rawStart:a.rawStart+a.rawSize]), true
+		if a.descriptorLineage != 0 {
+			h.descriptorProofs.add(a.identityRef, a.descriptorLineage)
+		}
 		return
 	}
 	if !h.series.Has(id) {

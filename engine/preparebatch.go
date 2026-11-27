@@ -87,6 +87,7 @@ type preparedGroup struct {
 }
 
 type preparedBatch struct {
+	descriptorLineage                     uint64
 	memory                                sampleArena
 	batch                                 *walBatch
 	positions                             []int
@@ -258,6 +259,7 @@ func (e *Engine) stagePreparedRows(
 	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series,
 	limits AppendLimits, p *preparedBatch,
 ) AppendResult {
+	p.descriptorLineage = e.seriesTable.membershipLineage()
 	var bi int
 	mat := func() signal.Series { return materialize(bi) }
 	var res AppendResult
@@ -322,7 +324,10 @@ func (p *preparedBatch) admit(
 			}
 			acc.register, acc.series = true, materialize()
 			acc.encodedHead = p.encodedReturning && state.historical
-			acc.descriptorRef = acc.encodedHead && state.descriptorPublished
+			if acc.encodedHead && state.descriptorLineage == p.descriptorLineage {
+				acc.descriptorLineage = state.descriptorLineage
+				acc.descriptorRef = acc.descriptorLineage != 0
+			}
 		}
 	}
 	k = len(b.order)

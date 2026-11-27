@@ -115,6 +115,8 @@ func (e *Engine) compactSeriesRuns(ctx context.Context, background bool) (bool, 
 	next := newSeriesSnapshot(roots)
 	next.retired = len(removed)
 	old := e.seriesTable
+	// Descriptor compaction replaces the selected roots with their full union.
+	next.lineage = old.lineage
 	e.seriesTable, e.seriesRetired = next, removed
 	keep = true
 	old.release()

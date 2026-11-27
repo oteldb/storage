@@ -35,6 +35,7 @@ type head struct {
 	nonStringLabels              map[uint32]struct{}
 	valueScratch                 []byte
 	encodedRefs                  []uint32
+	descriptorProofs             descriptorProofs
 	maxEncodedDescriptor         int
 	samples                      map[signal.SeriesID]*sampleBuf
 	newest                       int64 // newest timestamp across every series (reported as Inspect.MaxTime)
@@ -138,7 +139,8 @@ func (h *head) residentIdentityBytes() int64 {
 
 func (h *head) ownedIdentityBytes() int64 {
 	n := h.buildRetained + h.sym.SizeBytes() + h.series.SizeBytes() + h.post.SizeBytes() +
-		memsize.Slice(h.stateRefs) + memsize.Slice(h.encodedRefs) + h.slots.sizeBytes() + memsize.Slice(h.valueScratch)
+		memsize.Slice(h.stateRefs) + memsize.Slice(h.encodedRefs) + memsize.Slice(h.descriptorProofs.bits) +
+		h.slots.sizeBytes() + memsize.Slice(h.valueScratch)
 	if h.nonStringLabels != nil {
 		n += memsize.Map(h.nonStringLabels)
 	}
@@ -228,6 +230,7 @@ func (h *head) swapIdentity(rebuilt *head, snap, tail series.View, dead []int32)
 	h.nonStringLabels = rebuilt.nonStringLabels
 	h.valueScratch = rebuilt.valueScratch
 	h.encodedRefs, h.maxEncodedDescriptor = nil, 0
+	h.descriptorProofs = descriptorProofs{}
 	h.stateRefs = rebuilt.stateRefs
 }
 

@@ -2271,7 +2271,9 @@ space and can bypass a disk ID seek on a hit. Flush checks the full content ID i
 without reading or re-encoding its descriptor. A second eighth holds positive membership proofs
 keyed by the low word with a high-word check and a collision map. Entries name an immutable root
 by token and are usable only while the checking snapshot contains that root. Adding unrelated roots
-preserves cached membership. The remaining three quarters hold historical watermarks.
+preserves cached membership. Fixed-rotation heads also carry ordinal bits confirmed by an earlier
+catalog commit. A descriptor lineage survives additive roots and union compaction. A catalog
+replacement gets a fresh lineage, so older bits fall back to normal membership checks. The remaining three quarters hold historical watermarks.
 `VerifiedIdentityCacheStats` reports positive membership hit/miss counts. Pending arrays count against the cache limit
 before allocation and become readable after validating the run binding and ID stream. Reopened runs
 also validate descriptor payloads. Eviction falls back to the existing bounded disk reader. Cached IDs

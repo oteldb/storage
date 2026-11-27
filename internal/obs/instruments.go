@@ -133,6 +133,13 @@ func (f *Flush) VerificationCache(ctx context.Context, hits, misses int64) {
 	f.verified.Add(ctx, misses, metric.WithAttributes(attribute.String("result", "miss")))
 }
 
+// HeadMembership counts verification probes satisfied by a confirmed head proof.
+func (f *Flush) HeadMembership(ctx context.Context, count int64) {
+	if count != 0 {
+		f.verified.Add(ctx, count, metric.WithAttributes(attribute.String("result", "confirmed_head")))
+	}
+}
+
 // DescriptorPlanRetry records a delta plan invalidated before installing its root.
 func (f *Flush) DescriptorPlanRetry(ctx context.Context) { f.descriptorRetries.Add(ctx, 1) }
 
@@ -667,7 +674,7 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 		buildFallbacks: b.counter("storage.flush.build.fallbacks", "parallel plans retried sequentially", "{attempt}"),
 		buildMemory: b.i64hist("storage.flush.build.memory.bytes", "planned and checked flush working sets", "By",
 			1<<20, 8<<20, 16<<20, 32<<20, 64<<20, 128<<20, 256<<20, 512<<20, 1<<30),
-		verified:          b.counter("storage.series.verification_cache.requests", "shared-series ID membership cache probes", "{identity}"),
+		verified:          b.counter("storage.series.verification_cache.requests", "shared-series ID membership verification", "{identity}"),
 		descriptorRetries: b.counter("storage.series.descriptor_plan_retries", "stale descriptor delta plans", "{retry}"),
 		total:             b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
 		duration:          b.f64hist("storage.flush.duration", "flush wall time"),

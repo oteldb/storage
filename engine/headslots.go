@@ -134,13 +134,13 @@ func (s *headBuffers) sizeBytes() int64 {
 }
 
 type headSeriesState struct {
-	descriptorPublished bool
-	historical          bool
-	buffer              *sampleBuf
-	newest              int64
-	ref                 uint32
-	seen                bool
-	known               bool
+	descriptorLineage uint64
+	historical        bool
+	buffer            *sampleBuf
+	newest            int64
+	ref               uint32
+	seen              bool
+	known             bool
 }
 
 func (h *head) seriesState(id signal.SeriesID) headSeriesState {
@@ -156,7 +156,7 @@ func (h *head) seriesState(id signal.SeriesID) headSeriesState {
 			}
 			return headSeriesState{
 				newest: entry.newest, seen: entry.exists, historical: entry.exists,
-				descriptorPublished: entry.descriptorPublished,
+				descriptorLineage: entry.descriptorLineage,
 			}
 		}
 		return headSeriesState{}

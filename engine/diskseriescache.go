@@ -18,7 +18,8 @@ type diskCacheEntry struct {
 
 type diskCacheBucket struct {
 	entries   [diskCacheWays]diskCacheEntry
-	published uint16 // One confirmed-descriptor bit per way, within the bucket padding.
+	lineage   uint64
+	published uint16 // One confirmed membership bit per way for lineage.
 	used      uint8
 	next      uint8
 }
@@ -100,16 +101,20 @@ func (c *diskSeriesCache) get(id signal.SeriesID) (diskHeadEntry, bool) {
 		return diskHeadEntry{}, false
 	}
 	if b, pos := c.lookup(s, h, id); pos >= 0 {
-		return diskHeadEntry{newest: b.entries[pos].newest, descriptorPublished: b.published>>pos&1 != 0, exists: true}, true
+		var proof uint64
+		if b.published>>pos&1 != 0 {
+			proof = b.lineage
+		}
+		return diskHeadEntry{newest: b.entries[pos].newest, descriptorLineage: proof, exists: true}, true
 	}
 	return diskHeadEntry{}, false
 }
 
 func (c *diskSeriesCache) put(id signal.SeriesID, newest int64) {
-	c.remember(id, newest, false)
+	c.remember(id, newest, 0)
 }
 
-func (c *diskSeriesCache) remember(id signal.SeriesID, newest int64, published bool) {
+func (c *diskSeriesCache) remember(id signal.SeriesID, newest int64, lineage uint64) {
 	if c == nil {
 		return
 	}
@@ -119,19 +124,17 @@ func (c *diskSeriesCache) remember(id signal.SeriesID, newest int64, published b
 		if b, pos := c.lookup(s, h, id); pos >= 0 {
 			entry := &b.entries[pos]
 			entry.newest = max(entry.newest, newest)
-			if published {
-				b.published |= 1 << pos
-			}
+			b.certify(pos, lineage)
 			return
 		}
 	}
 	if len(s.buckets) == 0 || (s.count >= len(s.buckets)*diskCacheWays*3/4 && len(s.buckets) < c.maxBuckets) {
 		c.grow(s)
 	}
-	c.insert(s, diskCacheEntry{id: id, newest: newest}, published)
+	c.insert(s, diskCacheEntry{id: id, newest: newest}, lineage)
 }
 
-func (c *diskSeriesCache) insert(s *diskCacheShard, entry diskCacheEntry, published bool) {
+func (c *diskSeriesCache) insert(s *diskCacheShard, entry diskCacheEntry, lineage uint64) {
 	hash := diskCacheHash(entry.id)
 	first := int((hash / uint64(len(c.shards))) % uint64(len(s.buckets)))
 	b, second := &s.buckets[first], &s.buckets[diskCacheSecond(hash, first, len(s.buckets))]
@@ -148,9 +151,17 @@ func (c *diskSeriesCache) insert(s *diskCacheShard, entry diskCacheEntry, publis
 	}
 	b.entries[pos] = entry
 	b.published &^= 1 << pos
-	if published {
-		b.published |= 1 << pos
+	b.certify(int(pos), lineage)
+}
+
+func (b *diskCacheBucket) certify(pos int, lineage uint64) {
+	if lineage == 0 || lineage < b.lineage {
+		return
 	}
+	if lineage > b.lineage {
+		b.lineage, b.published = lineage, 0
+	}
+	b.published |= 1 << pos
 }
 
 func (c *diskSeriesCache) grow(s *diskCacheShard) {
@@ -161,7 +172,11 @@ func (c *diskSeriesCache) grow(s *diskCacheShard) {
 	for i := range old {
 		for j := range int(old[i].used) {
 			entry := old[i].entries[j]
-			c.insert(s, entry, old[i].published>>j&1 != 0)
+			var proof uint64
+			if old[i].published>>j&1 != 0 {
+				proof = old[i].lineage
+			}
+			c.insert(s, entry, proof)
 		}
 	}
 }

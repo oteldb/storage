@@ -54,7 +54,7 @@ func testConcurrentSeriesDeltas(t *testing.T, be backend.Backend) {
 		require.NoError(t, <-done)
 	}
 	require.Len(t, e.seriesTable.roots, 1)
-	known, err := e.seriesTable.knownIdentities(t.Context(), entries)
+	known, _, err := e.seriesTable.knownIdentities(t.Context(), entries)
 	require.NoError(t, err)
 	require.Len(t, known, len(entries.refs))
 	require.NotContains(t, known, false)

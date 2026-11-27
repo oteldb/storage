@@ -733,7 +733,8 @@ this accounting experiment and remain configured as before.
 
 `storage.series.verification_cache.requests` records shared-series ID membership cache hits and
 misses. A hit confirms that the full series ID is present in an immutable descriptor root in the
-flush snapshot. `storage.series.descriptor_plan_retries` counts plans invalidated by a newer descriptor
+flush snapshot. The `confirmed_head` result counts IDs verified using the frozen head's catalog
+lineage. `storage.series.descriptor_plan_retries` counts plans invalidated by a newer descriptor
 snapshot. Postings spill bytes use the `descriptor_delta` phase for initial files and
 `descriptor_spill_reduce` for intermediate files.
 

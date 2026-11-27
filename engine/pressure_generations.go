@@ -15,6 +15,7 @@ import (
 type headBuildInput struct {
 	names  *partid.Sequence
 	index  *series.Index
+	proofs descriptorProofs
 	retain func([]*part)
 }
 
@@ -351,7 +352,7 @@ func (e *Engine) finishGenerationBuild(r generationResult) {
 func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGeneration) error {
 	rememberPublished := e.cfg.SeparateSeries && e.fixedHeadRotation()
 	if !rememberPublished {
-		if err := e.rememberGenerationWatermarks(ctx, g.head, false); err != nil {
+		if err := e.rememberGenerationWatermarks(ctx, g.head, 0); err != nil {
 			return err
 		}
 	}
@@ -383,9 +384,12 @@ func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGener
 	if rememberPublished {
 		// Leave the old head attached while admitting writes during the cache update.
 		// Only a confirmed catalog can authorize descriptor references.
-		published := err == nil && e.compactMetricMetadata
+		var lineage uint64
+		if err == nil && e.compactMetricMetadata {
+			lineage = e.seriesTable.membershipLineage()
+		}
 		_ = e.mu.WithWriters(func() error {
-			return e.rememberGenerationWatermarks(context.WithoutCancel(ctx), g.head, published)
+			return e.rememberGenerationWatermarks(context.WithoutCancel(ctx), g.head, lineage)
 		})
 	}
 	// Keep ambiguous candidates queryable and retain WAL exactly as the single-generation path does.
@@ -455,7 +459,7 @@ func (e *Engine) buildFrozenGeneration(ctx context.Context, g *pressureGeneratio
 	active := e.pressure.generationBuilds.Add(1)
 	defer e.pressure.generationBuilds.Add(-1)
 	e.cfg.Obs.Flush.GenerationStarted(ctx, metricSignal, active > 1)
-	input := &headBuildInput{names: g.names, index: g.head.series, retain: func(parts []*part) {
+	input := &headBuildInput{names: g.names, index: g.head.series, proofs: g.head.descriptorProofs, retain: func(parts []*part) {
 		e.mu.LockState()
 		g.head.buildRetained = generationPartBytes(parts)
 		e.mu.UnlockState()

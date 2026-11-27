@@ -44,7 +44,7 @@ func testSharedSeriesPostingSpill(t *testing.T, count int, target int64) {
 	for _, key := range objects {
 		require.NotContains(t, key, ".postings")
 	}
-	known, err := e.seriesTable.knownIdentities(t.Context(), entries)
+	known, _, err := e.seriesTable.knownIdentities(t.Context(), entries)
 	require.NoError(t, err)
 	require.NotContains(t, known, false)
 	for _, matchers := range [][]fetch.Matcher{nil, {{Name: []byte("instance"), Match: func(v signal.Value) bool { return v.Kind() == signal.KindStr }}}} {
