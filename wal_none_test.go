@@ -83,3 +83,18 @@ func TestWALNoneRequiresDrainedJournal(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, s.Close(ctx))
 }
+
+func TestPackedWALRequiresJournal(t *testing.T) {
+	t.Parallel()
+
+	be, err := file.New(t.TempDir())
+	require.NoError(t, err)
+	opts := Options{
+		Backend: be, WALDir: t.TempDir(), WALSync: WALNone,
+		MetricDiskSeries: true, MetricSeriesChunks: true, MetricSeparateSeries: true,
+		MetricAsyncPressureFlush: true, MetricPressureGenerations: 2, MetricHeadRotationBytes: 16 << 10,
+		MetricPackedWAL: true,
+	}
+	_, err = Open(t.Context(), opts)
+	require.ErrorContains(t, err, "MetricPackedWAL requires standalone separate series, fixed pressure rotation and an enabled WAL")
+}

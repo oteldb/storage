@@ -228,6 +228,9 @@ type Options struct {
 	// MetricSeparateSeries stores descriptors/postings in independent immutable runs.
 	// Requires MetricDiskSeries and MetricSeriesChunks; standalone fresh catalogs only.
 	MetricSeparateSeries bool
+	// MetricPackedWAL packs singleton references to confirmed descriptors in the local WAL.
+	// Requires a standalone separate-series engine with fixed pressure rotation and a WAL.
+	MetricPackedWAL bool
 	// MetricResidentHeadBytes is the disk-index mode's resident-head pressure target. Zero uses 128 MiB.
 	// One atomic append may exceed the target; pressure flushes happen before subsequent writes.
 	MetricResidentHeadBytes int64
@@ -583,6 +586,10 @@ func (o *Options) validate() error {
 	if o.MetricSeparateSeries && (!o.MetricDiskSeries || !o.MetricSeriesChunks || o.Cluster != nil) {
 		return errOptionInvalid("MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks without Cluster")
 	}
+	if o.MetricPackedWAL && (!o.MetricSeparateSeries || o.MetricHeadRotationBytes <= 0 ||
+		!o.MetricAsyncPressureFlush || !o.walEnabled()) {
+		return errOptionInvalid("MetricPackedWAL requires standalone separate series, fixed pressure rotation and an enabled WAL")
+	}
 	if o.MetricAsyncPressureFlush && (!o.MetricDiskSeries || (o.WALDir == "" && o.WALSync != WALNone) || o.Cluster != nil || o.ReadOnly ||
 		o.Backend == nil || o.Backend.IsEphemeral()) {
 		return errOptionInvalid("MetricAsyncPressureFlush requires standalone writable disk series with a WALDir or WALNone")
@@ -715,6 +722,9 @@ func WithMetricAsyncPressureFlush() Option {
 
 // WithMetricSeparateSeries enables independent metric descriptor runs on a fresh standalone store.
 func WithMetricSeparateSeries() Option { return func(o *Options) { o.MetricSeparateSeries = true } }
+
+// WithMetricPackedWAL enables bounded blocks of singleton references in the standalone metric WAL.
+func WithMetricPackedWAL() Option { return func(o *Options) { o.MetricPackedWAL = true } }
 
 // WithRejectOutOfRetention enables retention-age admission for all writes.
 func WithRejectOutOfRetention() Option { return func(o *Options) { o.RejectOutOfRetention = true } }

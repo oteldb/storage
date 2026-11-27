@@ -410,11 +410,17 @@ func (sw *SegmentWriter) WriteFrames(p []byte) error {
 
 // WritePreparedFrames writes a metric batch and counts its descriptor references on success.
 func (sw *SegmentWriter) WritePreparedFrames(p []byte, references int) error {
+	return sw.WritePackedMetricFrames(p, references, 0)
+}
+
+// WritePackedMetricFrames writes pre-encoded metric frames and accounts for their references and packed blocks.
+func (sw *SegmentWriter) WritePackedMetricFrames(p []byte, references, packedBlocks int) error {
 	if err := sw.WriteFrames(p); err != nil {
 		return err
 	}
 	if sw.metrics != nil {
 		sw.metrics.References(references)
+		sw.metrics.PackedBlocks(packedBlocks)
 	}
 	return nil
 }

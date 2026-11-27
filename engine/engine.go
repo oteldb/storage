@@ -204,6 +204,8 @@ type Config struct {
 	// SeparateSeries stores immutable identity/postings deltas separately from numeric parts.
 	// Opt-in standalone disk-series mode; metadata reclamation and clustered use are unsupported.
 	SeparateSeries bool
+	// PackedWAL packs references to durable series into local WAL blocks.
+	PackedWAL bool
 	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
 	// still has it, and says whether the part is gone from every owner. The cluster layer supplies
 	// it over its transport; a single-node store supplies one that fetches nothing and answers for
@@ -242,6 +244,7 @@ type Engine struct {
 	seriesTable   *seriesSnapshot
 	// Confirmed only by a landed CAS or a loaded catalog, under state ownership.
 	compactMetricMetadata bool
+	metricFeatures        bucketindex.MetricFeature
 	seriesBuildMu         sync.Mutex
 	seriesNoGain          descriptorMergeHistory // Owned by mergeRun.
 	seriesRetired         []bucketindex.SeriesRoot

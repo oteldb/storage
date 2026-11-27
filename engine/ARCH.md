@@ -2231,6 +2231,12 @@ The engine can omit the first sample's full descriptor only when its exact ID wa
 a confirmed published generation. Replay resolves the descriptor from published roots
 and fails if it is unavailable. New IDs retain self-contained registrations.
 
+Packed WAL blocks require a confirmed v12 catalog capability before the writer emits them.
+Older readers reject v12 before replay because unknown WAL record tags otherwise get skipped.
+The capability survives later catalog publications and remains readable with packing disabled.
+The standalone writer packs consecutive unweighted singleton references while preparing the batch.
+The commit owner retains the same WAL append, publication, and acknowledgment ordering.
+
 Catalog v9 names metadata roots independently of sample entries and publishes their union with
 numeric parts and the WAL checkpoint in one CAS. Runs sync before publication; failed commits
 retain pending roots through retries and reloads. A missing or invalid root fences loading.

@@ -144,9 +144,10 @@ func (e *Engine) writePreparedWAL(group []*preparedBatch, size int) error {
 	if h := e.parallel.hooks; h != nil && h.beforeWAL != nil {
 		h.beforeWAL()
 	}
-	references := 0
+	references, packedBlocks := 0, 0
 	for _, p := range group {
 		references += p.batch.loggedReferences
+		packedBlocks += p.batch.loggedPackedBlocks
 	}
-	return e.cfg.WAL.WritePreparedFrames(frames, references)
+	return e.cfg.WAL.WritePackedMetricFrames(frames, references, packedBlocks)
 }

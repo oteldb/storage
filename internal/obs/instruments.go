@@ -444,21 +444,29 @@ func newBackend(m metric.Meter) (*Backend, error) {
 // WAL instruments the write-ahead log. The recording methods use a background context (the WAL
 // writer carries none) and are called at append/fsync/rotation granularity, never per sample.
 type WAL struct {
-	references metric.Int64Counter
-	written    metric.Int64Counter
-	appends    metric.Int64Counter
-	fsyncs     metric.Int64Counter
-	rotations  metric.Int64Counter
-	segments   metric.Int64Gauge
-	bytes      metric.Int64Gauge
-	syncFails  metric.Int64Counter
-	failing    metric.Int64Gauge
+	references   metric.Int64Counter
+	packedBlocks metric.Int64Counter
+	written      metric.Int64Counter
+	appends      metric.Int64Counter
+	fsyncs       metric.Int64Counter
+	rotations    metric.Int64Counter
+	segments     metric.Int64Gauge
+	bytes        metric.Int64Gauge
+	syncFails    metric.Int64Counter
+	failing      metric.Int64Gauge
 }
 
-// References accounts for first-sample WAL frames using published descriptors.
+// References accounts for first-sample series references to published descriptors.
 func (w *WAL) References(n int) {
 	if n > 0 {
 		w.references.Add(context.Background(), int64(n))
+	}
+}
+
+// PackedBlocks accounts for frames carrying multiple WAL references.
+func (w *WAL) PackedBlocks(n int) {
+	if n > 0 {
+		w.packedBlocks.Add(context.Background(), int64(n))
 	}
 }
 
@@ -487,14 +495,15 @@ func (w *WAL) SyncFailed(ctx context.Context, n int64, failing bool) {
 func newWAL(m metric.Meter) (*WAL, error) {
 	b := &imb{m: m}
 	w := &WAL{
-		references: b.counter("storage.wal.descriptor_references", "WAL frames referencing a durable metric descriptor", "{frame}"),
-		written:    b.counter("storage.wal.written", "bytes written to WAL files before checkpointing", "By"),
-		appends:    b.counter("storage.wal.appends", "WAL record-batch appends", "{append}"),
-		fsyncs:     b.counter("storage.wal.fsyncs", "WAL fsyncs", "{fsync}"),
-		rotations:  b.counter("storage.wal.rotations", "WAL segment rotations", "{rotation}"),
-		segments:   b.gauge("storage.wal.segments", "WAL segments on disk", "{segment}"),
-		bytes:      b.gauge("storage.wal.bytes", "bytes the WAL segments hold", "By"),
-		syncFails:  b.counter("storage.wal.sync_failures", "background WAL fsyncs that failed", "{fsync}"),
+		references:   b.counter("storage.wal.descriptor_references", "WAL series references to durable metric descriptors", "{frame}"),
+		packedBlocks: b.counter("storage.wal.packed_blocks", "WAL frames carrying packed singleton references", "{frame}"),
+		written:      b.counter("storage.wal.written", "bytes written to WAL files before checkpointing", "By"),
+		appends:      b.counter("storage.wal.appends", "WAL record-batch appends", "{append}"),
+		fsyncs:       b.counter("storage.wal.fsyncs", "WAL fsyncs", "{fsync}"),
+		rotations:    b.counter("storage.wal.rotations", "WAL segment rotations", "{rotation}"),
+		segments:     b.gauge("storage.wal.segments", "WAL segments on disk", "{segment}"),
+		bytes:        b.gauge("storage.wal.bytes", "bytes the WAL segments hold", "By"),
+		syncFails:    b.counter("storage.wal.sync_failures", "background WAL fsyncs that failed", "{fsync}"),
 		failing: b.gauge("storage.wal.sync_failing",
 			"1 while background WAL fsyncs are failing", "{node}"),
 	}

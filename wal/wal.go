@@ -14,13 +14,14 @@ import (
 // Record type tags. New types may be appended; unknown types are skipped on replay so
 // an old reader tolerates a newer log.
 const (
-	recordSeries       byte = 1
-	recordSamples      byte = 2
-	recordRecords      byte = 3 // generic, engine-encoded record payload (logs, traces, …)
-	recordSide         byte = 4 // opaque, engine-encoded side-store delta (profiles symbol store)
-	recordSamplesSF    byte = 5 // samples that also carry a per-sample lossy-sampling scale factor
-	recordSamplesRef   byte = 6
-	recordSamplesSFRef byte = 7
+	recordSeries           byte = 1
+	recordSamples          byte = 2
+	recordRecords          byte = 3 // generic, engine-encoded record payload (logs, traces, …)
+	recordSide             byte = 4 // opaque, engine-encoded side-store delta (profiles symbol store)
+	recordSamplesSF        byte = 5 // samples that also carry a per-sample lossy-sampling scale factor
+	recordSamplesRef       byte = 6
+	recordSamplesSFRef     byte = 7
+	recordPackedReferences byte = 8
 )
 
 // seriesIDLen is the fixed 16-byte big-endian width of a [signal.SeriesID] on the wire.
@@ -36,14 +37,14 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 type Handlers struct {
 	OnSeries  func(id signal.SeriesID, s signal.Series) error
 	OnSamples func(id signal.SeriesID, ts []int64, values []float64) error
-	// OnSamplesSF receives samples that carry per-sample lossy-sampling scale factors (len(sf) ==
-	// len(ts)). If unset, such records fall back to OnSamples (the weights are dropped, i.e. read as
-	// 1) so a reader that does not care about sampling still recovers the samples.
+	// OnSamplesSF receives per-sample weights. When unset, OnSamples receives unit weights.
+	OnSamplesSF func(id signal.SeriesID, ts []int64, values, sf []float64) error
 	// OnDescriptorReference resolves the catalog identity before applying the first samples.
 	OnDescriptorReference func(signal.SeriesID) error
-	OnSamplesSF           func(id signal.SeriesID, ts []int64, values, sf []float64) error
-	OnRecords             func(id signal.SeriesID, payload []byte) error
-	OnSide                func(payload []byte) error
+	// OnPackedReference resolves the durable descriptor and replays an exact singleton sample.
+	OnPackedReference func(id signal.SeriesID, ts int64, value float64) error
+	OnRecords         func(id signal.SeriesID, payload []byte) error
+	OnSide            func(payload []byte) error
 	// OnDamage, when set, makes directory replay ([ReplayDirFrom]) salvage a damaged log: each region
 	// it cannot read is reported here and skipped, and replay goes on with the next valid frame and
 	// every later segment. Returning an error stops replay with it. When nil, damage fails replay with
@@ -223,6 +224,8 @@ func dispatch(typ byte, payload []byte, h Handlers) error {
 		default:
 			return nil
 		}
+	case recordPackedReferences:
+		return dispatchPackedReferences(payload, h)
 	case recordRecords:
 		if h.OnRecords == nil {
 			return nil
@@ -281,9 +284,11 @@ func appendFrame(dst []byte, typ byte, payload []byte) []byte {
 	dst = binary.AppendUvarint(dst, uint64(1+len(payload)))
 	dst = append(dst, typ)
 	dst = append(dst, payload...)
-	crc := crc32.Checksum(dst[start:], castagnoli)
+	return finishFrame(dst, start)
+}
 
-	return binary.BigEndian.AppendUint32(dst, crc)
+func finishFrame(dst []byte, start int) []byte {
+	return binary.BigEndian.AppendUint32(dst, crc32.Checksum(dst[start:], castagnoli))
 }
 
 // readFrame reads one frame from the front of src. It returns io.EOF when src is empty

@@ -37,7 +37,7 @@ func BenchmarkPreparedWALIdentityRelog(b *testing.B) {
 							b.Fatal("registered sample rejected")
 						}
 					}
-					if err := p.batch.encode(view, false); err != nil {
+					if err := p.batch.encode(view, false, false); err != nil {
 						b.Fatal(err)
 					}
 					pool.release(p)

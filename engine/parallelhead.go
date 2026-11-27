@@ -82,6 +82,7 @@ func (e *Engine) appendKnownPrepared(
 		ph.admission.Unlock()
 		return AppendResult{}, preparedPressure, nil
 	}
+	packedWAL := e.packedWALEnabled()
 	p.otherPendingBytes, p.otherPendingSeries = ph.pending.Load(), ph.pendingSeries.Load()
 	p.warm = true
 	res := e.stagePreparedRows(ids, ts, values, sf, func(i int) signal.Series {
@@ -117,7 +118,7 @@ func (e *Engine) appendKnownPrepared(
 		return AppendResult{}, preparedWorkLimit, nil
 	}
 	p.prepareTails()
-	if err := e.encodeBatch(p.batch, view, false); err != nil {
+	if err := e.encodeBatch(p.batch, view, false, packedWAL); err != nil {
 		return AppendResult{}, preparedDone, err
 	}
 	if ph.hooks != nil && ph.hooks.prepared != nil {

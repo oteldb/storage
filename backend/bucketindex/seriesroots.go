@@ -138,6 +138,9 @@ func MergeSeriesCatalog(roots, retired, incoming, incomingRetired []SeriesRoot) 
 }
 
 func validateSeriesCatalog(ix *Index) error {
+	if err := validateMetricFeatures(ix); err != nil {
+		return err
+	}
 	if err := validateSeriesRoots(ix.SeriesRoots); err != nil {
 		return err
 	}
@@ -165,12 +168,18 @@ func decodeSeriesCatalogTail(ix *Index, buf []byte, ver uint8) error {
 		if err != nil {
 			return err
 		}
-		if err := validateSeriesCatalog(ix); err != nil {
+	}
+	if ver >= 12 {
+		buf, err = decodeMetricFeatures(ix, buf)
+		if err != nil {
 			return err
 		}
 	}
 	if len(buf) != 0 {
 		return errors.Wrap(ErrCorrupt, "trailing series roots data")
+	}
+	if ver >= 10 {
+		return validateSeriesCatalog(ix)
 	}
 	return nil
 }

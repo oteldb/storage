@@ -109,6 +109,8 @@ type Index struct {
 	SeriesRoots []SeriesRoot
 	// CompactMetricMetadata fences readers that predate ordinal sidecars and descriptor WAL references.
 	CompactMetricMetadata bool
+	// MetricFeatures records features that require catalog-aware readers.
+	MetricFeatures MetricFeature
 	// RetiredSeriesRoots prevents stale catalog rebases from resurrecting compacted runs.
 	RetiredSeriesRoots []SeriesRoot
 }
@@ -177,7 +179,7 @@ const (
 	// Reading is backward compatible; writing is not. [Decode] rejects any version above this one,
 	// so a node on pre-v5 code cannot read an index this one writes: every node that reads a given
 	// index must be upgraded together. See backend/ARCH.md for the blast radius per deployment.
-	version = 11
+	version = 12
 )
 
 // AppendBinary appends the versioned binary encoding of the index to dst (append-style for
@@ -192,6 +194,9 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 	}
 	if ix.CompactMetricMetadata {
 		ver = 11
+	}
+	if ix.MetricFeatures != 0 {
+		ver = 12
 	}
 	dst = append(dst, magic0, magic1, ver)
 	dst = binary.AppendUvarint(dst, uint64(len(ix.Entries)))
@@ -263,6 +268,9 @@ func (ix *Index) AppendBinary(dst []byte) []byte {
 	if ver >= 10 {
 		dst = appendSeriesRoots(dst, ix.RetiredSeriesRoots)
 	}
+	if ver >= 12 {
+		dst = appendMetricFeatures(dst, ix)
+	}
 	return dst
 }
 
@@ -286,7 +294,7 @@ func Decode(data []byte) (*Index, error) {
 		return nil, err
 	}
 
-	ix := &Index{Entries: entries, CompactMetricMetadata: ver >= 11}
+	ix := &Index{Entries: entries, CompactMetricMetadata: ver == 11}
 
 	// v2+ appends the flush-epoch watermark; v1 has none (it stays 0).
 	if ver >= 2 {

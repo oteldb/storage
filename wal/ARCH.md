@@ -13,8 +13,15 @@ Record types (additive — an old reader **skips** an unknown type):
 | samples | metric samples |
 | scale-factor samples | metric samples carrying per-sample lossy-sampling weights (written only when sampling occurred) |
 | referenced samples | samples or weighted samples whose first descriptor is resolved from a confirmed v11 metric catalog |
+| packed references | up to 1,024 unweighted singleton references to durable descriptors in a standalone v12 catalog |
 | records | opaque record-engine payload (logs/traces/profiles) |
 | side | opaque content-addressed side-store delta (the profile symbol store) |
+
+Packed records share one checksum and carry exact 128-bit IDs and float bits. Timestamps reuse
+a common timestamp, use signed deltas from one base, or use fixed-width values, whichever fits
+in fewer bytes. Preparation workers pack consecutive eligible rows in admission order. Replay
+validates the entire packed record before applying its first sample because salvage can skip a
+malformed record. A descriptor-resolution error stops recovery.
 
 Replay surfaces a bad-CRC *complete* record as corruption and stitches segments in order.
 

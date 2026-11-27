@@ -6,8 +6,11 @@ in one conditional write. Sample block lineage applies only to `Entries` and `Wa
 `SeriesRoots` binds identity-only run prefixes to SHA-256 manifest digests. Roots carry no
 sample times, coverage, statistics or ancestry. Missing roots must never become sample holes.
 
-Readers accept v1 through v9. Writers preserve the exact v8 layout without roots; v9 appends
-a root count and sorted records of prefix length, prefix bytes and the 32-byte manifest digest.
+Readers accept v1 through v12. Without later features, writers preserve v8 or append sorted
+series roots in v9. V10 adds retirements, and v11 fences ordinal sidecars and descriptor WAL
+references. V12 persists metric capability bits, including the v11 compact-metadata flag. An
+engine enables packed WAL only after the capability is confirmed by publication or catalog load.
+Unrecognized flags fail closed.
 Malformed paths, missing bindings, duplicate prefixes and conflicting bindings fail closed.
 
 Use `MergeSeriesRoots` during adoption/rebase and include pending roots in every retry.
