@@ -574,6 +574,36 @@ func (o *Options) validate() error {
 	if o.BuildMemoryBytes < 0 || o.MetricFlushMemoryBytes < 0 {
 		return errOptionInvalid("BuildMemoryBytes and MetricFlushMemoryBytes must not be negative")
 	}
+	if err := o.validateMetricLayout(); err != nil {
+		return err
+	}
+
+	if o.Durability == DurabilityEphemeral && o.WALDir != "" {
+		return errOptionInvalid("WALDir must be empty when Durability is Ephemeral")
+	}
+
+	if err := o.validateReadOnly(); err != nil {
+		return err
+	}
+
+	if err := o.validateWALPlacement(); err != nil {
+		return err
+	}
+
+	// A clustered node answers reads as a ring owner as soon as [Open] returns, and the read path
+	// treats one owner's answer as complete. On a durable backend without a WAL, recovery restores
+	// only the flushed parts: the node would serve everything written since its last flush as
+	// missing, indistinguishable from real absence to the caller. Requiring the WAL keeps the head
+	// recoverable, so the node is complete before it serves.
+	if o.Cluster != nil && o.Backend != nil && !o.Backend.IsEphemeral() && !o.walEnabled() {
+		return errOptionInvalid("an enabled WALDir is required in cluster mode on a durable backend: " +
+			"without it a restarted node serves reads with its unflushed head missing")
+	}
+
+	return nil
+}
+
+func (o *Options) validateMetricLayout() error {
 	if o.MetricPressureGenerations < 0 || o.MetricPressureGenerations > 2 {
 		return errOptionInvalid("MetricPressureGenerations must be zero, one or two")
 	}
@@ -610,29 +640,6 @@ func (o *Options) validate() error {
 			return errOptionInvalid("MetricHeadRotationBytes requires two generations and at most half the resident limit")
 		}
 	}
-
-	if o.Durability == DurabilityEphemeral && o.WALDir != "" {
-		return errOptionInvalid("WALDir must be empty when Durability is Ephemeral")
-	}
-
-	if err := o.validateReadOnly(); err != nil {
-		return err
-	}
-
-	if err := o.validateWALPlacement(); err != nil {
-		return err
-	}
-
-	// A clustered node answers reads as a ring owner as soon as [Open] returns, and the read path
-	// treats one owner's answer as complete. On a durable backend without a WAL, recovery restores
-	// only the flushed parts: the node would serve everything written since its last flush as
-	// missing, indistinguishable from real absence to the caller. Requiring the WAL keeps the head
-	// recoverable, so the node is complete before it serves.
-	if o.Cluster != nil && o.Backend != nil && !o.Backend.IsEphemeral() && !o.walEnabled() {
-		return errOptionInvalid("an enabled WALDir is required in cluster mode on a durable backend: " +
-			"without it a restarted node serves reads with its unflushed head missing")
-	}
-
 	return nil
 }
 

@@ -567,19 +567,7 @@ func (e *Engine) AppendBatch(
 	eligible := (e.cfg.WAL != nil || e.parallel != nil) && (limits.Overflow == nil || limits.MaxSeriesSoft <= 0) &&
 		len(ids) >= minPreparedBatchSamples && len(ids) <= maxPreparedBatchSamples
 	if eligible && e.parallel != nil {
-		preparations := e.preparationPool()
-		p := preparations.acquireWaiting()
-		defer preparations.release(p)
-		if err := e.flushResidentHead(); err != nil {
-			return AppendResult{}, err
-		}
-		p.unlogged = e.cfg.WAL == nil
-		p.prepare(ids)
-		res, err := e.appendPrepared(ids, ts, values, sf, materialize, limits, p)
-		if err == nil {
-			e.schedulePressureFlush()
-		}
-		return res, err
+		return e.appendParallelPrepared(ids, ts, values, sf, materialize, limits)
 	}
 	if !eligible || !e.mu.TryLockWriter() {
 		if eligible {

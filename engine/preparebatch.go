@@ -107,6 +107,24 @@ type preparedBatch struct {
 	otherPendingBytes, otherPendingSeries int64
 }
 
+func (e *Engine) appendParallelPrepared(
+	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(int) signal.Series, limits AppendLimits,
+) (AppendResult, error) {
+	preparations := e.preparationPool()
+	p := preparations.acquireWaiting()
+	defer preparations.release(p)
+	if err := e.flushResidentHead(); err != nil {
+		return AppendResult{}, err
+	}
+	p.unlogged = e.cfg.WAL == nil
+	p.prepare(ids)
+	res, err := e.appendPrepared(ids, ts, values, sf, materialize, limits, p)
+	if err == nil {
+		e.schedulePressureFlush()
+	}
+	return res, err
+}
+
 func (p *preparedBatch) prepare(ids []signal.SeriesID) {
 	p.positions = resize(p.positions, len(ids))
 	p.groups = p.groups[:0]
