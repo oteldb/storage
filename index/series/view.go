@@ -9,7 +9,7 @@ import (
 // View is an immutable snapshot, safe to read while its index receives additions.
 type View struct {
 	rows      []row
-	encoded   []byte
+	encoded   [][]byte
 	contexts  []identityContext
 	resources []indexedResource
 	scopes    []indexedScope

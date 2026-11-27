@@ -423,7 +423,7 @@ func (b *walBatch) apply(h *head) {
 }
 
 func (b *walBatch) registerIdentity(h *head, id signal.SeriesID, a *walSeriesAcc) {
-	if !a.register || h.series.Has(id) {
+	if !a.register {
 		return
 	}
 	if a.rawSize != 0 {
@@ -431,10 +431,12 @@ func (b *walBatch) registerIdentity(h *head, id signal.SeriesID, a *walSeriesAcc
 		if a.rawInDescriptors {
 			raw = b.descriptors
 		}
-		h.registerEncoded(id, raw[a.rawStart:a.rawStart+a.rawSize])
+		a.identityRef, a.knownRef = h.registerEncoded(id, raw[a.rawStart:a.rawStart+a.rawSize]), true
 		return
 	}
-	h.register(series.Entry{ID: id, Series: a.series})
+	if !h.series.Has(id) {
+		h.register(series.Entry{ID: id, Series: a.series})
+	}
 }
 
 func (b *walBatch) reset() {

@@ -252,11 +252,15 @@ func (h *head) register(entry series.Entry) {
 }
 
 // Returning identities already count toward historical cardinality.
-func (h *head) registerEncoded(id signal.SeriesID, raw []byte) {
-	ref := h.series.AddEncoded(id, raw)
+func (h *head) registerEncoded(id signal.SeriesID, raw []byte) uint32 {
+	ref, inserted := h.series.InternEncoded(id, raw)
+	if !inserted {
+		return ref
+	}
 	h.encodedRefs = append(h.encodedRefs, ref)
 	h.maxEncodedDescriptor = max(h.maxEncodedDescriptor, len(raw))
 	h.stateRefs = append(h.stateRefs, h.slots.alloc())
+	return ref
 }
 
 func (h *head) registerIndex(entry series.Entry) {
