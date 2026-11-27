@@ -316,18 +316,16 @@ func (p *preparedBatch) admit(
 		buffer: state.buffer, priorNewest: newest, hadNewest: seen,
 		identityRef: state.ref, knownRef: state.known, historical: state.historical,
 	}
-	if acc.buffer == nil {
-		acc.isNew = true
-		if !acc.knownRef {
-			if !state.historical && limits.MaxSeries > 0 && h.cardinality()+p.otherPendingSeries+int64(b.registered) >= limits.MaxSeries {
-				return rejectCardinality
-			}
-			acc.register, acc.series = true, materialize()
-			acc.encodedHead = p.encodedReturning && state.historical
-			if acc.encodedHead && state.descriptorLineage == p.descriptorLineage {
-				acc.descriptorLineage = state.descriptorLineage
-				acc.descriptorRef = acc.descriptorLineage != 0
-			}
+	acc.isNew = acc.buffer == nil
+	if acc.isNew && !acc.knownRef {
+		if !state.historical && limits.MaxSeries > 0 && h.cardinality()+p.otherPendingSeries+int64(b.registered) >= limits.MaxSeries {
+			return rejectCardinality
+		}
+		acc.register, acc.series = true, materialize()
+		acc.encodedHead = p.encodedReturning && state.historical
+		if acc.encodedHead && state.descriptorLineage == p.descriptorLineage {
+			acc.descriptorLineage = state.descriptorLineage
+			acc.descriptorRef = acc.descriptorLineage != 0
 		}
 	}
 	k = len(b.order)

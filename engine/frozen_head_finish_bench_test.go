@@ -179,7 +179,10 @@ func buildBenchmarkGeneration(b *testing.B, ctx context.Context, e *Engine, g *p
 
 func publishBenchmarkGeneration(b *testing.B, ctx context.Context, e *Engine, want int) {
 	b.Helper()
-	rows, _, err := e.publishReadyGenerations(ctx)
+	rows, _, warming, err := e.publishReadyGenerations(ctx)
+	if warming != nil {
+		<-warming
+	}
 	if err != nil || rows != want || len(e.pressureGenerations) != 0 {
 		b.Fatalf("publish frozen generation: rows=%d want=%d pending=%d error=%v", rows, want, len(e.pressureGenerations), err)
 	}

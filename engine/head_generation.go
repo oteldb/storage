@@ -142,10 +142,10 @@ func (e *Engine) rememberFrozenWatermarks(ctx context.Context) error {
 	e.mu.RLock()
 	frozen := e.head.frozen
 	e.mu.RUnlock()
-	return e.rememberGenerationWatermarks(ctx, frozen, 0)
+	return e.rememberGenerationWatermarks(ctx, frozen)
 }
 
-func (e *Engine) rememberGenerationWatermarks(ctx context.Context, frozen *head, lineage uint64) error {
+func (e *Engine) rememberGenerationWatermarks(ctx context.Context, frozen *head) error {
 	e.mu.RLock()
 	enabled := frozen != nil && e.head.disk.cache != nil
 	e.mu.RUnlock()
@@ -165,15 +165,7 @@ func (e *Engine) rememberGenerationWatermarks(ctx context.Context, frozen *head,
 		}
 		for i := off; i < min(off+256, view.Len()); i++ {
 			if ts, seen := frozen.slots.get(frozen.stateRefs[i]); seen {
-				if lineage != 0 {
-					id := view.ID(i)
-					if current, seen := e.head.watermark(id); seen {
-						ts = max(ts, current)
-					}
-					e.head.disk.cache.remember(id, ts, lineage)
-				} else {
-					e.head.rememberHistorical(view.ID(i), ts)
-				}
+				e.head.rememberHistorical(view.ID(i), ts)
 			}
 		}
 		if e.parallel != nil {

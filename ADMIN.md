@@ -711,6 +711,8 @@ Flush workspace metrics distinguish the configured output target from the admitt
 counts distinct identities per completed candidate, including candidates not yet catalog-published.
 `storage.flush.head_phase` records seconds per event for rotation waits, resident head waits,
 admission waits, publication, and successful frozen-to-published lifetimes.
+`catalog_to_retired` measures from successful catalog publication to frozen-slot release.
+`watermark_refresh` measures the subsequent shard-local cache warming pass.
 `storage.backend.object_write_bytes` counts payload bytes by object kind, operation phase, and
 outcome (`ok`, `aborted`, `error`, or `conflict`). Streamed bytes are attributed at commit or
 abort. Whole-object writes count attempted payload bytes. These counters describe backend
