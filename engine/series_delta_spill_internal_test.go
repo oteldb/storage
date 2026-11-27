@@ -12,12 +12,30 @@ import (
 
 func TestSharedSeriesPostingSpillsPublishOneRoot(t *testing.T) {
 	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		count  int
+		target int64
+	}{
+		{name: "no-spill", count: 17, target: 64 << 20},
+		{name: "single-level", count: seriesSpillFanIn, target: 1},
+		{name: "multi-level", count: seriesSpillFanIn*2 + 1, target: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			testSharedSeriesPostingSpill(t, tc.count, tc.target)
+		})
+	}
+}
+
+func testSharedSeriesPostingSpill(t *testing.T, count int, target int64) {
+	t.Helper()
 	files, err := backendfile.New(t.TempDir())
 	require.NoError(t, err)
 	e := separateCatalogEngine(files)
 	t.Cleanup(func() { require.NoError(t, e.CloseWAL()) })
-	e.cfg.FlushMemoryBytes = 1 // Every new ID spills, forcing a hierarchical reduction.
-	entries := identityCacheInput(seriesSpillFanIn*2 + 1)
+	e.cfg.FlushMemoryBytes = target
+	entries := identityCacheInput(count)
 	require.NoError(t, e.ensureSeriesIdentities(t.Context(), entries, nil))
 	require.Len(t, e.seriesTable.roots, 1)
 	root := e.seriesTable.roots[0]

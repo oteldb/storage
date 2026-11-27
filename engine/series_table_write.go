@@ -75,6 +75,7 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 		if !errors.Is(err, errSeriesSnapshotChanged) {
 			return err
 		}
+		e.cfg.Obs.Flush.DescriptorPlanRetry(ctx)
 		if err := ctx.Err(); err != nil {
 			return err
 		}

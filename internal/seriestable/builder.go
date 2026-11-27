@@ -52,9 +52,9 @@ func (b *Builder) Bytes() int64 { return b.index.Bytes() + int64(b.Count())*128 
 // StreamingDirectoryBytes bounds the index directory when pages are streamed.
 func (b *Builder) StreamingDirectoryBytes() int64 { return b.index.StreamingDirectoryBytes() }
 
-// WriteIndex writes only an unbound index for a private postings spill.
-func (b *Builder) WriteIndex(ctx context.Context, be backend.Backend, key string) error {
-	return b.index.WriteObject(ctx, be, key)
+// WritePostingsSpill writes the postings for a private, contiguous spill.
+func (b *Builder) WritePostingsSpill(ctx context.Context, be backend.Backend, key string) error {
+	return b.index.WritePostingsSpill(ctx, be, key)
 }
 
 // EncodedBound bounds buffered output before compression.
@@ -81,7 +81,7 @@ func WriteWithIDCache(ctx context.Context, be backend.Backend, prefix string, b 
 
 // WriteContiguous writes one immutable run from bounded, private postings spills.
 func WriteContiguous(ctx context.Context, be backend.Backend, prefix string, view series.View, refs []uint32,
-	inputs []*seriesindex.Index, cache *IDCache,
+	inputs []*seriesindex.PostingsSpill, cache *IDCache,
 ) (*Run, error) {
 	return writeRun(ctx, be, prefix, len(refs), func(i int) signal.SeriesID { return view.ID(int(refs[i])) },
 		func(key string, digest [32]byte) (int, error) {

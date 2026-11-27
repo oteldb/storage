@@ -16,7 +16,8 @@ import (
 type referencePair struct{ source, output uint32 }
 
 type mergePostingSource struct {
-	index      *Index
+	table      *Table
+	count      uint32
 	pairs      []referencePair
 	dense      []uint32
 	denseStart uint32
@@ -42,7 +43,8 @@ type PostingMerge struct {
 func NewPostingMerge(ctx context.Context, indexes []*Index) *PostingMerge {
 	m := &PostingMerge{ctx: ctx, sources: make([]mergePostingSource, len(indexes)), selectedSource: -1}
 	for i, index := range indexes {
-		m.sources[i].index = index
+		m.sources[i].table = index.table
+		m.sources[i].count = index.count
 		m.count += uint64(index.count)
 		m.postingRecords = buildbudget.Add(m.postingRecords, int64(index.table.count)-2*int64(index.count)-1)
 	}
@@ -51,7 +53,7 @@ func NewPostingMerge(ctx context.Context, indexes []*Index) *PostingMerge {
 
 // Append maps a contributing source reference to the output's distinct-series reference.
 func (m *PostingMerge) Append(source int, ref, output uint32) error {
-	if source < 0 || source >= len(m.sources) || ref >= m.sources[source].index.count {
+	if source < 0 || source >= len(m.sources) || ref >= m.sources[source].count {
 		return errors.Wrap(ErrCorrupt, "merge reference bounds")
 	}
 	s := &m.sources[source]
@@ -70,7 +72,7 @@ func (m *PostingMerge) Bytes() int64 {
 	n := int64(cap(m.sources))*memsize.Of[mergePostingSource]() + 64<<10 + int64(cap(m.names))*16 + m.nameBytes
 	for _, s := range m.sources {
 		n = buildbudget.Add(n, int64(cap(s.pairs))*memsize.Of[referencePair]())
-		n = buildbudget.Add(n, 2*s.index.MaxPageBytes()+int64(postingChunk)*16)
+		n = buildbudget.Add(n, 2*s.table.MaxPageBytes()+int64(postingChunk)*16)
 		n = buildbudget.Add(n, 4*int64(max(cap(s.dense), s.denseLength())))
 	}
 	return n
@@ -83,7 +85,7 @@ func (m *PostingMerge) selectCovering(count int) {
 		if len(m.sources[i].pairs) != count {
 			continue
 		}
-		if m.selectedSource < 0 || m.sources[i].index.table.count < m.sources[m.selectedSource].index.table.count {
+		if m.selectedSource < 0 || m.sources[i].table.count < m.sources[m.selectedSource].table.count {
 			m.selectedSource = i
 		}
 	}
@@ -92,7 +94,7 @@ func (m *PostingMerge) selectCovering(count int) {
 func (m *PostingMerge) dense() bool {
 	if m.selectedSource >= 0 {
 		s := &m.sources[m.selectedSource]
-		return uint64(len(s.pairs))*4 >= uint64(s.index.count)
+		return uint64(len(s.pairs))*4 >= uint64(s.count)
 	}
 	var selected uint64
 	for _, s := range m.sources {
@@ -122,7 +124,7 @@ func (b *Builder) writeMergedPostings(w *TableWriter, prefix byte) error {
 	cursors := make([]mergePostingCursor, len(sources))
 	for i := range cursors {
 		cursors[i].source = &sources[i]
-		cursors[i].cursor = sources[i].index.table.Cursor(m.ctx)
+		cursors[i].cursor = sources[i].table.Cursor(m.ctx)
 		if err := cursors[i].start(prefix); err != nil {
 			return err
 		}
@@ -335,7 +337,7 @@ func (c *mergePostingCursor) remap(data []byte, last uint32) error {
 	ref := uint64(0)
 	for i := range n {
 		delta, k := binary.Uvarint(data)
-		if k <= 0 || (i > 0 && delta == 0) || delta > uint64(c.source.index.count) || ref+delta >= uint64(c.source.index.count) {
+		if k <= 0 || (i > 0 && delta == 0) || delta > uint64(c.source.count) || ref+delta >= uint64(c.source.count) {
 			return errors.Wrap(ErrCorrupt, "merge postings reference")
 		}
 		ref += delta

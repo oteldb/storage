@@ -194,16 +194,18 @@ func OpenTable(ctx context.Context, b backend.Backend, key string) (*Table, erro
 		return nil, errors.Wrapf(ErrUnsupportedVersion, "footer flags %x", flags)
 	}
 	dir := binary.BigEndian.Uint64(data[8:])
+	seriesCount, parentDigest := binary.BigEndian.Uint32(data[28:]), [32]byte(data[32:64])
 	pages, count, raw := binary.BigEndian.Uint32(data[16:]), binary.BigEndian.Uint32(data[20:]), binary.BigEndian.Uint32(data[24:])
+	badSeriesCount := parentDigest != postingsSpillDigest && seriesCount != 0 && uint64(seriesCount)*2 >= uint64(count)
 	if dir > uint64(size-footerSize) || uint64(pages)*directorySize != uint64(size-footerSize)-dir ||
 		(pages == 0) != (count == 0) || pages > count || raw > maxPageSize ||
 		(pages == 0 && (raw != 0 || dir != 0)) || (pages > 0 && raw < 3) || uint64(count) > uint64(pages)*uint64(raw/3) ||
-		uint64(binary.BigEndian.Uint32(data[28:]))*2+1 > uint64(count) && binary.BigEndian.Uint32(data[28:]) > 0 {
+		badSeriesCount {
 		return nil, errors.Wrap(ErrCorrupt, "directory bounds")
 	}
 	return &Table{
 		b: b, key: key, dir: int64(dir), pages: pages, count: count, maxRaw: raw,
-		seriesCount: binary.BigEndian.Uint32(data[28:]), parentDigest: [32]byte(data[32:64]),
+		seriesCount: seriesCount, parentDigest: parentDigest,
 		codec: compress.NewCompressor(compress.AlgorithmLZ4, compress.LevelDefault),
 	}, nil
 }

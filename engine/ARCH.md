@@ -2202,8 +2202,8 @@ numeric parts carry SIDX, coverage watermarks and aggregate statistics, with a m
 
 Flush planning checks descriptors by bounded series-ID ranges before launching parallel numeric
 builders. Native descriptor builders borrow the pinned series view and spill sorted postings from
-oversized batches. A bounded fan-in combines contiguous ordinal ranges into one immutable run,
-so temporary spills do not add catalog roots. A metadata writer serializes final bindings after
+oversized batches. Initial spills and bounded fan-in reductions carry only postings with local
+ordinals. The final run encodes the IDs and descriptors once from the frozen view. A metadata writer serializes final bindings after
 workspace admission and retries if a sibling changed the descriptor snapshot. Two frozen
 generations may build concurrently. In standalone mode the commit owner seals and swaps after a
 generation-specific gate drains prepared tails. The lifecycle gate stays shared across the seal.

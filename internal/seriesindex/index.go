@@ -284,6 +284,23 @@ func recordKey(ref uint32) []byte { return binary.BigEndian.AppendUint32([]byte{
 
 // Write emits one complete, range-readable index without taking ownership of dst.
 func (b *Builder) Write(dst io.Writer) error {
+	return b.write(dst, false)
+}
+
+// WriteObject publishes an immutable index object; its enclosing part still needs catalog publication.
+func (b *Builder) WriteObject(ctx context.Context, dst backend.Backend, key string) error {
+	w, err := backend.CreateObjectDeferred(ctx, dst, key)
+	if err != nil {
+		return err
+	}
+	defer w.Abort()
+	if err := b.Write(w); err != nil {
+		return err
+	}
+	return w.Commit(ctx)
+}
+
+func (b *Builder) write(dst io.Writer, spill bool) error {
 	if err := b.prepareMergedPostings(); err != nil {
 		return err
 	}
@@ -292,6 +309,9 @@ func (b *Builder) Write(dst io.Writer) error {
 	w := NewTableWriter(dst)
 	w.seriesCount = uint32(len(b.records))
 	w.parentDigest = b.parentDigest
+	if spill {
+		w.parentDigest = postingsSpillDigest
+	}
 	postings := postingsWriter{table: w}
 	var count [4]byte
 	binary.BigEndian.PutUint32(count[:], uint32(len(b.records)))
@@ -316,17 +336,8 @@ func (b *Builder) Write(dst io.Writer) error {
 			return err
 		}
 	}
-	// ID lookups use inline metadata and the ordinal shared by postings and descriptors.
-	var idKeyBuffer [17]byte
-	idKeyBuffer[0] = 'i'
-	var idValueBuffer [45]byte
-	idValue := idValueBuffer[:0]
-	for i, r := range b.records {
-		idValue = binary.BigEndian.AppendUint32(idValue[:0], uint32(i))
-		idValue = appendMetadata(idValue, r.meta)
-		binary.BigEndian.PutUint64(idKeyBuffer[1:9], r.id.Hi)
-		binary.BigEndian.PutUint64(idKeyBuffer[9:], r.id.Lo)
-		if err := w.Append(idKeyBuffer[:], idValue); err != nil {
+	if !spill {
+		if err := b.writeIDs(w); err != nil {
 			return err
 		}
 	}
@@ -353,6 +364,33 @@ func (b *Builder) Write(dst io.Writer) error {
 	if err := b.writeValuePostings(&postings, names, keyScratch); err != nil {
 		return err
 	}
+	if !spill {
+		if err := b.writeDescriptors(w); err != nil {
+			return err
+		}
+	}
+	return w.Finish()
+}
+
+func (b *Builder) writeIDs(w *TableWriter) error {
+	// ID lookups use inline metadata and the ordinal shared by postings and descriptors.
+	var idKeyBuffer [17]byte
+	idKeyBuffer[0] = 'i'
+	var idValueBuffer [45]byte
+	idValue := idValueBuffer[:0]
+	for i, r := range b.records {
+		idValue = binary.BigEndian.AppendUint32(idValue[:0], uint32(i))
+		idValue = appendMetadata(idValue, r.meta)
+		binary.BigEndian.PutUint64(idKeyBuffer[1:9], r.id.Hi)
+		binary.BigEndian.PutUint64(idKeyBuffer[9:], r.id.Lo)
+		if err := w.Append(idKeyBuffer[:], idValue); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *Builder) writeDescriptors(w *TableWriter) error {
 	// Descriptor records store the canonical bytes under the local ordinal.
 	// Borrowed builders translate that ordinal back to a row in the source view.
 	var value []byte
@@ -375,20 +413,7 @@ func (b *Builder) Write(dst io.Writer) error {
 			return err
 		}
 	}
-	return w.Finish()
-}
-
-// WriteObject publishes an immutable index object; its enclosing part still needs catalog publication.
-func (b *Builder) WriteObject(ctx context.Context, dst backend.Backend, key string) error {
-	w, err := backend.CreateObjectDeferred(ctx, dst, key)
-	if err != nil {
-		return err
-	}
-	defer w.Abort()
-	if err := b.Write(w); err != nil {
-		return err
-	}
-	return w.Commit(ctx)
+	return nil
 }
 
 func (b *Builder) writeValuePostings(w *postingsWriter, names []string, key []byte) error {
@@ -456,7 +481,7 @@ func Open(ctx context.Context, b backend.Backend, key string) (*Index, error) {
 		return nil, err
 	}
 	count := t.seriesCount
-	if uint64(count)*2+1 > uint64(t.count) {
+	if t.parentDigest == postingsSpillDigest || uint64(count)*2+1 > uint64(t.count) {
 		return nil, errors.Wrap(ErrCorrupt, "series count bounds")
 	}
 	return &Index{table: t, count: count}, nil

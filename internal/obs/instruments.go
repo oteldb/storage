@@ -69,20 +69,21 @@ func sigAttr(sig string) metric.MeasurementOption {
 
 // Flush instruments a head→part flush.
 type Flush struct {
-	total            metric.Int64Counter
-	duration         metric.Float64Histogram
-	rows             metric.Int64Histogram
-	bytes            metric.Int64Counter
-	verified         metric.Int64Counter
-	reservation      metric.Int64Histogram
-	reservationWait  metric.Float64Histogram
-	headPhase        metric.Float64Histogram
-	outputSeries     metric.Int64Histogram
-	generationStarts metric.Int64Counter
-	buildWorkers     metric.Int64Histogram
-	buildJobs        metric.Int64Histogram
-	buildFallbacks   metric.Int64Counter
-	buildMemory      metric.Int64Histogram
+	total             metric.Int64Counter
+	duration          metric.Float64Histogram
+	rows              metric.Int64Histogram
+	bytes             metric.Int64Counter
+	verified          metric.Int64Counter
+	descriptorRetries metric.Int64Counter
+	reservation       metric.Int64Histogram
+	reservationWait   metric.Float64Histogram
+	headPhase         metric.Float64Histogram
+	outputSeries      metric.Int64Histogram
+	generationStarts  metric.Int64Counter
+	buildWorkers      metric.Int64Histogram
+	buildJobs         metric.Int64Histogram
+	buildFallbacks    metric.Int64Counter
+	buildMemory       metric.Int64Histogram
 }
 
 // GenerationStarted records overlapping build attempts, including admission waits.
@@ -131,6 +132,9 @@ func (f *Flush) VerificationCache(ctx context.Context, hits, misses int64) {
 	f.verified.Add(ctx, hits, metric.WithAttributes(attribute.String("result", "hit")))
 	f.verified.Add(ctx, misses, metric.WithAttributes(attribute.String("result", "miss")))
 }
+
+// DescriptorPlanRetry records a delta plan invalidated before installing its root.
+func (f *Flush) DescriptorPlanRetry(ctx context.Context) { f.descriptorRetries.Add(ctx, 1) }
 
 // Record accounts one flush: the row count and part bytes written, and the wall time dur, for the
 // given signal. bytes is the ingest side of write amplification — what merges rewrite is measured
@@ -663,11 +667,12 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 		buildFallbacks: b.counter("storage.flush.build.fallbacks", "parallel plans retried sequentially", "{attempt}"),
 		buildMemory: b.i64hist("storage.flush.build.memory.bytes", "planned and checked flush working sets", "By",
 			1<<20, 8<<20, 16<<20, 32<<20, 64<<20, 128<<20, 256<<20, 512<<20, 1<<30),
-		verified: b.counter("storage.series.verification_cache.requests", "shared-series ID membership cache probes", "{identity}"),
-		total:    b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
-		duration: b.f64hist("storage.flush.duration", "flush wall time"),
-		rows:     b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),
-		bytes:    b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
+		verified:          b.counter("storage.series.verification_cache.requests", "shared-series ID membership cache probes", "{identity}"),
+		descriptorRetries: b.counter("storage.series.descriptor_plan_retries", "stale descriptor delta plans", "{retry}"),
+		total:             b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
+		duration:          b.f64hist("storage.flush.duration", "flush wall time"),
+		rows:              b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),
+		bytes:             b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
 	}
 	merge := &Merge{
 		refused:       b.counter("storage.merge.admission_refused", "process-pool merge refusals by pool, across signals", "{attempt}"),
