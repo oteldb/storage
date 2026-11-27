@@ -213,11 +213,8 @@ type Options struct {
 	// MetricFloatGroups enables experimental per-series value compression for new metric parts.
 	// Deploy compatible readers on every replica before enabling it.
 	MetricFloatGroups bool
-	// MetricSeriesChunks writes independently framed chunks for each metric series.
+	// MetricSeriesChunks writes bounded numeric chunks and packs adjacent one-point series at flush.
 	MetricSeriesChunks bool
-	// MetricSparseChunks packs up to 32 one-point series per numeric chunk on head flush.
-	// Requires MetricSeriesChunks and readers that understand shared chunk row ranges.
-	MetricSparseChunks bool
 	// MetricDiskSeries uses part-local on-disk metric identities/postings and bounded resident heads.
 	// Existing part identity objects remain readable; legacy readers retain their historical registry.
 	MetricDiskSeries bool
@@ -610,9 +607,6 @@ func (o *Options) validateMetricLayout() error {
 	if o.MetricPressureGenerations == 2 && !o.MetricAsyncPressureFlush {
 		return errOptionInvalid("MetricPressureGenerations=2 requires MetricAsyncPressureFlush")
 	}
-	if o.MetricSparseChunks && !o.MetricSeriesChunks {
-		return errOptionInvalid("MetricSparseChunks requires MetricSeriesChunks")
-	}
 	if o.MetricSeparateSeries && (!o.MetricDiskSeries || !o.MetricSeriesChunks || o.Cluster != nil) {
 		return errOptionInvalid("MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks without Cluster")
 	}
@@ -713,11 +707,8 @@ var _ = errors.Is
 // WithMetricFloatGroups enables experimental, bit-exact per-series value compression.
 func WithMetricFloatGroups() Option { return func(o *Options) { o.MetricFloatGroups = true } }
 
-// WithMetricSeriesChunks enables independently readable per-series metric chunks.
+// WithMetricSeriesChunks enables bounded metric chunks with sparse-series packing at flush.
 func WithMetricSeriesChunks() Option { return func(o *Options) { o.MetricSeriesChunks = true } }
-
-// WithMetricSparseChunks packs adjacent one-point series in numeric chunks during head flush.
-func WithMetricSparseChunks() Option { return func(o *Options) { o.MetricSparseChunks = true } }
 
 // WithMetricDiskSeries enables part-local disk identities/postings for metric engines.
 func WithMetricDiskSeries() Option { return func(o *Options) { o.MetricDiskSeries = true } }

@@ -178,10 +178,8 @@ type Config struct {
 	MetricBlockRows int
 	// MetricFloatGroups enables exact per-series value segments in newly written parts.
 	MetricFloatGroups bool
-	// MetricSeriesChunks isolates each series in independently framed numeric chunks.
+	// MetricSeriesChunks writes bounded numeric chunks and packs adjacent one-point series at flush.
 	MetricSeriesChunks bool
-	// MetricSparseChunks packs adjacent one-point series when flushing a series-chunk head.
-	MetricSparseChunks bool
 	// DiskSeries stores historical identities/postings in immutable per-part indexes and disables RecentWindow.
 	DiskSeries bool
 	// ResidentHeadBytes flushes disk-indexed heads under memory pressure. Zero uses 128 MiB.

@@ -32,8 +32,8 @@ func TestSparseMetricChunks(t *testing.T) {
 	require.NoError(t, err)
 	cfg := Config{
 		Backend: files, Prefix: "sparse", DiskSeries: true, SeparateSeries: true,
-		MetricSeriesChunks: true, MetricSparseChunks: true,
-		DecodeCacheBytes: 1 << 20, DecodeBudget: NewDecodeBudget(8 << 20),
+		MetricSeriesChunks: true,
+		DecodeCacheBytes:   1 << 20, DecodeBudget: NewDecodeBudget(8 << 20),
 	}
 	e := New(cfg)
 	const target, dense = 4, 35
@@ -75,9 +75,8 @@ func TestSparseMetricChunks(t *testing.T) {
 		require.Equal(t, []int{32, 3, 4, 31}, lengths)
 	}
 
-	// Reopen with packing disabled. The part identifies the read layout.
+	// Reopen and select just one series from the packed part.
 	require.NoError(t, e.Close(ctx))
-	cfg.MetricSparseChunks = false
 	e = New(cfg)
 	require.NoError(t, e.LoadParts(ctx))
 	t.Cleanup(func() { require.NoError(t, e.Close(ctx)) })
@@ -127,7 +126,7 @@ func TestSparseChunkMergeSharedFrames(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	be := backend.Memory()
-	e := New(Config{Backend: be, MetricSeriesChunks: true, MetricSparseChunks: true})
+	e := New(Config{Backend: be, MetricSeriesChunks: true})
 	t.Cleanup(func() { require.NoError(t, e.Close(ctx)) })
 	series := sparseChunkFixture(2 * sparseMetricChunkRows)
 	for pass := range 2 {
@@ -161,35 +160,28 @@ func TestSparseChunkMergeSharedFrames(t *testing.T) {
 
 func BenchmarkSparseMetricChunkFlush(b *testing.B) {
 	points := sparseChunkFixture(4 << 10)
-	for _, tc := range []struct {
-		name   string
-		shared bool
-	}{{"independent", false}, {"shared", true}} {
-		b.Run(tc.name, func(b *testing.B) {
-			b.SetBytes(int64(len(points) * 16))
-			b.ReportAllocs()
-			var numericBytes int64
-			for b.Loop() {
-				b.StopTimer()
-				e := New(Config{Backend: backend.Memory(), MetricSeriesChunks: true, MetricSparseChunks: tc.shared})
-				for i := range points {
-					_, err := e.Append(points[i], 1700000000000000000+int64(i%500)*1_000_000, float64(i%31))
-					require.NoError(b, err)
-				}
-				b.StartTimer()
-				require.NoError(b, e.Flush(b.Context()))
-				b.StopTimer()
-				for _, p := range e.parts {
-					for _, name := range []string{colTs, colValue} {
-						d, ok := p.reader.ColumnDescByName(name)
-						require.True(b, ok)
-						numericBytes += d.Bytes
-					}
-				}
-				require.NoError(b, e.Close(b.Context()))
-				b.StartTimer()
+	b.SetBytes(int64(len(points) * 16))
+	b.ReportAllocs()
+	var numericBytes int64
+	for b.Loop() {
+		b.StopTimer()
+		e := New(Config{Backend: backend.Memory(), MetricSeriesChunks: true})
+		for i := range points {
+			_, err := e.Append(points[i], 1700000000000000000+int64(i%500)*1_000_000, float64(i%31))
+			require.NoError(b, err)
+		}
+		b.StartTimer()
+		require.NoError(b, e.Flush(b.Context()))
+		b.StopTimer()
+		for _, p := range e.parts {
+			for _, name := range []string{colTs, colValue} {
+				d, ok := p.reader.ColumnDescByName(name)
+				require.True(b, ok)
+				numericBytes += d.Bytes
 			}
-			b.ReportMetric(float64(numericBytes)/float64(b.N*len(points)), "numeric-B/point")
-		})
+		}
+		require.NoError(b, e.Close(b.Context()))
+		b.StartTimer()
 	}
+	b.ReportMetric(float64(numericBytes)/float64(b.N*len(points)), "numeric-B/point")
 }

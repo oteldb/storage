@@ -183,7 +183,7 @@ func (b *headPartBuilder) prepareWriter() error {
 	}
 	var err error
 	var opts []block.PartOption
-	if b.e.cfg.MetricSeriesChunks && b.e.cfg.MetricSparseChunks {
+	if b.e.cfg.MetricSeriesChunks {
 		opts = append(opts, block.WithSharedRowGroups())
 	}
 	if b.input != nil {
