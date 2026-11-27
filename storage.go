@@ -144,6 +144,9 @@ func Open(ctx context.Context, o Options, opts ...Option) (*Storage, error) {
 		return nil, err
 	}
 	o.applyDefaults()
+	if err := o.validateDisabledWAL(); err != nil {
+		return nil, err
+	}
 	s := &Storage{
 		opts:            o,
 		backend:         o.Backend,
@@ -1180,9 +1183,9 @@ type partLoader interface {
 // recoverWAL replays each per-tenant WAL directory under [Options.WALDir] into its engine, restoring
 // the unflushed head a crash would otherwise lose. The directory layout mirrors the engine prefixes
 // ({WALDir}/{tenant}/{signal}); creating the engine (via the *EngineFor constructors) re-attaches a
-// fresh resumed WAL before replay. No-op when no WAL directory is configured or present.
+// fresh resumed WAL before replay. A disabled, unset or absent WAL directory is skipped.
 func (s *Storage) recoverWAL(ctx context.Context) error {
-	if s.opts.WALDir == "" {
+	if !s.opts.walEnabled() {
 		return nil
 	}
 
@@ -1364,13 +1367,12 @@ func (s *Storage) engineFor(tid signal.TenantID) (*engine.Engine, error) {
 }
 
 // walFor returns a per-engine durable WAL writer rooted at [Options.WALDir]/prefix, or a nil writer
-// when no WAL directory is configured (the engine then runs without durable head logging — flushed
-// parts are still recovered from the backend). The directory is created on first use and resumed on
-// restart (see [wal.Create]).
+// when logging is disabled or unconfigured. Flushed parts are still recovered from the backend.
+// A configured WAL directory is created on first use and resumed on restart (see [wal.Create]).
 //
 //nolint:nilnil // a nil writer is the documented "no WAL configured" sentinel, checked by the engine
 func (s *Storage) walFor(prefix string) (*wal.SegmentWriter, error) {
-	if s.opts.WALDir == "" || s.backend.IsEphemeral() {
+	if !s.opts.walEnabled() || s.backend.IsEphemeral() {
 		return nil, nil
 	}
 

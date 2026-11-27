@@ -103,6 +103,25 @@ func (q *commitQueue) control(run func() error) error {
 }
 
 func (e *Engine) writePreparedGroup(group []*preparedBatch, size int) error {
+	if e.cfg.WAL != nil {
+		if err := e.writePreparedWAL(group, size); err != nil {
+			return err
+		}
+	}
+	if h := e.parallel.hooks; h != nil && h.beforePublish != nil {
+		h.beforePublish()
+	}
+	e.mu.Publish(func() {
+		for _, p := range group {
+			p.publishTails(e.head)
+			e.parallel.pending.Add(-int64(p.batch.samples) * SampleBytes)
+			e.parallel.pendingSeries.Add(-int64(p.batch.registered))
+		}
+	})
+	return nil
+}
+
+func (e *Engine) writePreparedWAL(group []*preparedBatch, size int) error {
 	frames := group[0].batch.frames.Bytes()
 	var buffer []byte
 	if len(group) > 1 {
@@ -129,18 +148,5 @@ func (e *Engine) writePreparedGroup(group []*preparedBatch, size int) error {
 	for _, p := range group {
 		references += p.batch.loggedReferences
 	}
-	if err := e.cfg.WAL.WritePreparedFrames(frames, references); err != nil {
-		return err
-	}
-	if h := e.parallel.hooks; h != nil && h.beforePublish != nil {
-		h.beforePublish()
-	}
-	e.mu.Publish(func() {
-		for _, p := range group {
-			p.publishTails(e.head)
-			e.parallel.pending.Add(-int64(p.batch.samples) * SampleBytes)
-			e.parallel.pendingSeries.Add(-int64(p.batch.registered))
-		}
-	})
-	return nil
+	return e.cfg.WAL.WritePreparedFrames(frames, references)
 }

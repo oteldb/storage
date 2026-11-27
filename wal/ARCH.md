@@ -198,7 +198,9 @@ concurrent ingest.
 
 ## Durability policy
 
-`Options.WALDir` attaches one writer per (tenant, signal) engine. `Options.WALSync` picks the fsync
+`Options.WALDir` attaches one writer per (tenant, signal) engine. `WALNone` disables the WAL
+and refuses a configured directory with pending segments, so older journaled writes cannot
+be replayed over later unlogged data. A crash loses unflushed writes in this mode. `Options.WALSync` picks the fsync
 policy: `None` (default — page cache), `Always` (per record), `Interval` (background timer).
 
 **The WAL never shares a namespace with parts.** Segments live at `{WALDir}/{tenant}/{signal}/`, and

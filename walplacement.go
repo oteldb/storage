@@ -97,6 +97,33 @@ func (o *Options) validateWALPlacement() error {
 	return nil
 }
 
+// validateDisabledWAL prevents pending segments from being hidden and later replayed over
+// writes accepted while logging was off. Drain them through ordinary recovery and flush.
+func (o *Options) validateDisabledWAL() error {
+	if o.WALSync != WALNone || o.WALDir == "" || o.Backend.IsEphemeral() {
+		return nil
+	}
+	root, err := resolvePath(o.WALDir)
+	if err != nil {
+		return errors.Wrapf(err, "resolve WALDir %q", o.WALDir)
+	}
+	if _, err := os.Stat(root); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return errors.Wrapf(err, "check WALDir %q", root)
+	}
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return errors.Wrapf(err, "inspect disabled WAL directory %q", path)
+		}
+		if !d.IsDir() && strings.HasSuffix(d.Name(), ".wal") {
+			return errOptionInvalid("WALNone requires a drained WAL directory: recover and flush the WAL before disabling it (found " +
+				path + ")")
+		}
+		return nil
+	})
+}
+
 // resolvePath returns p absolute with every symlink on its longest existing ancestor resolved, so
 // two spellings of one directory compare equal before either exists.
 func resolvePath(p string) (string, error) {

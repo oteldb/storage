@@ -117,7 +117,7 @@ func (e *Engine) appendKnownPrepared(
 		return AppendResult{}, preparedWorkLimit, nil
 	}
 	p.prepareTails()
-	if err := p.batch.encode(view, false); err != nil {
+	if err := e.encodeBatch(p.batch, view, false); err != nil {
 		return AppendResult{}, preparedDone, err
 	}
 	if ph.hooks != nil && ph.hooks.prepared != nil {

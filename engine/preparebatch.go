@@ -95,7 +95,7 @@ type preparedBatch struct {
 	values                                []float64
 	sf                                    []float64
 	current                               int
-	warm, encodedReturning                bool
+	warm, encodedReturning, unlogged      bool
 	snapshots                             []headSeriesState
 	next                                  []sampleBuf
 	created                               []*sampleBuf
@@ -132,7 +132,9 @@ func (p *preparedBatch) prepare(ids []signal.SeriesID) {
 	p.sf = resize(p.sf, len(ids))
 	p.batch.order = resize(p.batch.order, len(p.groups))[:0]
 	p.batch.accs = resize(p.batch.accs, len(p.groups))
-	p.batch.frames.Grow(len(ids)*32 + len(p.groups)*64)
+	if !p.unlogged {
+		p.batch.frames.Grow(len(ids)*32 + len(p.groups)*64)
+	}
 	p.materializeAt = resize(p.materializeAt, len(p.groups))
 	for i := range p.materializeAt {
 		p.materializeAt[i] = -1

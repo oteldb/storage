@@ -50,6 +50,7 @@ type walSeriesAcc struct {
 	historical        bool
 	encodedHead       bool
 	descriptorRef     bool
+	rawInDescriptors  bool
 	rawStart, rawSize int
 	isNew             bool // the series starts a buffer, so its identity record is logged
 	register          bool // the identity is not in the head's index yet
@@ -224,13 +225,33 @@ func (e *Engine) encodeWriteBatch(b *walBatch, everySeries bool) error {
 		return b.lookupErr
 	}
 	view := b.encodingView(e.head, everySeries)
-	if err := b.encode(view, everySeries); err != nil {
+	if err := e.encodeBatch(b, view, everySeries); err != nil {
 		return err
 	}
 	if e.cfg.WAL == nil {
 		return nil
 	}
 	return e.cfg.WAL.WritePreparedFrames(b.frames.Bytes(), b.loggedReferences)
+}
+
+// encodeBatch prepares compact head descriptors without framing unlogged writes.
+func (e *Engine) encodeBatch(b *walBatch, view series.View, everySeries bool) error {
+	if e.cfg.WAL != nil || everySeries {
+		return b.encode(view, everySeries)
+	}
+	b.frames.Reset()
+	b.descriptors = b.descriptors[:0]
+	b.loggedReferences = 0
+	for i := range b.order {
+		a := &b.accs[i]
+		if a.encodedHead {
+			a.rawInDescriptors = true
+			a.rawStart = len(b.descriptors)
+			b.descriptors = a.series.AppendHashInput(b.descriptors)
+			a.rawSize = len(b.descriptors) - a.rawStart
+		}
+	}
+	return nil
 }
 
 func (b *walBatch) encodingView(h *head, everySeries bool) series.View {
@@ -363,7 +384,7 @@ func (b *walBatch) registerIdentity(h *head, id signal.SeriesID, a *walSeriesAcc
 	}
 	if a.rawSize != 0 {
 		raw := b.frames.Bytes()
-		if a.descriptorRef && len(b.descriptors) > 0 {
+		if (a.rawInDescriptors || a.descriptorRef) && len(b.descriptors) > 0 {
 			raw = b.descriptors
 		}
 		h.registerEncoded(id, raw[a.rawStart:a.rawStart+a.rawSize])

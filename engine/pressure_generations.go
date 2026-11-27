@@ -78,13 +78,19 @@ func (e *Engine) freezePressureGenerationLocked(ctx context.Context) error {
 	if err := e.tenureLocked(term); err != nil {
 		return err
 	}
-	epoch := max(e.flushedEpoch+1, e.cfg.WAL.Epoch())
+	epoch := e.flushedEpoch + 1
 	sequence := -1
-	if err := e.mu.WithReaders(func() (err error) {
-		sequence, err = e.cfg.WAL.Seal(epoch + 1)
-		return err
-	}); err != nil {
-		return errors.Wrap(err, "seal wal")
+	if e.cfg.WAL != nil {
+		epoch = max(epoch, e.cfg.WAL.Epoch())
+		if err := e.mu.WithReaders(func() (err error) {
+			sequence, err = e.cfg.WAL.Seal(epoch + 1)
+			return err
+		}); err != nil {
+			return errors.Wrap(err, "seal wal")
+		}
+	} else if n := len(e.pressureGenerations); n > 0 {
+		// With no segment to advance the epoch, account for a frozen generation still building.
+		epoch = max(epoch, e.pressureGenerations[n-1].epoch+1)
 	}
 	h := e.head
 	frozen := newHeadWithContexts(e.cfg.SeriesContexts, e.cfg.SeriesTemplates)

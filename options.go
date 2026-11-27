@@ -86,7 +86,7 @@ type Options struct {
 	// side by side instead (e.g. /data/parts and /data/wal).
 	WALDir string
 
-	// WALSync is the WAL fsync policy (default [WALSyncNone]). Ignored without a WAL.
+	// WALSync selects the WAL policy (default [WALSyncNone]). [WALNone] disables the WAL.
 	WALSync WALSyncMode
 
 	// WALSyncInterval is the background fsync period when [WALSync] is [WALSyncInterval]. Zero ⇒
@@ -316,19 +316,20 @@ const (
 	DurabilityEphemeral
 )
 
-// WALSyncMode is the WAL fsync policy (the durability/throughput trade-off). It applies only when a
-// WAL is configured ([Options.WALDir] on a durable backend).
+// WALSyncMode controls the WAL on a durable backend.
 type WALSyncMode uint8
 
 const (
 	// WALSyncNone (default) lets WAL writes settle in the OS page cache: they survive a process
-	// crash (recovery replays them) but not necessarily a power loss. Fastest.
+	// crash (recovery replays them) but not necessarily a power loss.
 	WALSyncNone WALSyncMode = iota
 	// WALSyncAlways fsyncs after every WAL record — power-loss durable, slowest.
 	WALSyncAlways
 	// WALSyncInterval fsyncs every engine's WAL in the background every [Options.WALSyncInterval]:
 	// a bounded power-loss window at a fraction of the cost of WALSyncAlways.
 	WALSyncInterval
+	// WALNone disables the WAL. A crash loses accepted writes that have not been flushed.
+	WALNone
 )
 
 // Option is a functional option applied to [Options] by [Open]/[InMemory].
@@ -362,7 +363,7 @@ func WithReadOnly() Option { return func(o *Options) { o.ReadOnly = true } }
 // WithWALDir sets the WAL directory (file backend + durability).
 func WithWALDir(dir string) Option { return func(o *Options) { o.WALDir = dir } }
 
-// WithWALSync sets the WAL fsync policy ([WALSyncNone]/[WALSyncAlways]/[WALSyncInterval]).
+// WithWALSync sets the WAL policy. [WALNone] disables logging and replay.
 func WithWALSync(m WALSyncMode) Option { return func(o *Options) { o.WALSync = m } }
 
 // WithWALSyncInterval selects background fsync ([WALSyncInterval]) every d.
@@ -558,6 +559,10 @@ func errOptionInvalid(reason string) error {
 	return errors.Errorf("storage: invalid options: %s", reason)
 }
 
+func (o *Options) walEnabled() bool {
+	return o.WALSync != WALNone && o.WALDir != ""
+}
+
 // validate checks the option combination before construction.
 func (o *Options) validate() error {
 	if o.BuildMemoryBytes < 0 || o.MetricFlushMemoryBytes < 0 {
@@ -572,9 +577,9 @@ func (o *Options) validate() error {
 	if o.MetricSeparateSeries && (!o.MetricDiskSeries || !o.MetricSeriesChunks || o.Cluster != nil) {
 		return errOptionInvalid("MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks without Cluster")
 	}
-	if o.MetricAsyncPressureFlush && (!o.MetricDiskSeries || o.WALDir == "" || o.Cluster != nil || o.ReadOnly ||
+	if o.MetricAsyncPressureFlush && (!o.MetricDiskSeries || (o.WALDir == "" && o.WALSync != WALNone) || o.Cluster != nil || o.ReadOnly ||
 		o.Backend == nil || o.Backend.IsEphemeral()) {
-		return errOptionInvalid("MetricAsyncPressureFlush requires standalone writable disk series and WALDir")
+		return errOptionInvalid("MetricAsyncPressureFlush requires standalone writable disk series with a WALDir or WALNone")
 	}
 	if o.MetricResidentHeadBytes < 0 {
 		return errOptionInvalid("MetricResidentHeadBytes must not be negative")
@@ -610,8 +615,8 @@ func (o *Options) validate() error {
 	// only the flushed parts: the node would serve everything written since its last flush as
 	// missing, indistinguishable from real absence to the caller. Requiring the WAL keeps the head
 	// recoverable, so the node is complete before it serves.
-	if o.Cluster != nil && o.WALDir == "" && o.Backend != nil && !o.Backend.IsEphemeral() {
-		return errOptionInvalid("WALDir is required in cluster mode on a durable backend: " +
+	if o.Cluster != nil && o.Backend != nil && !o.Backend.IsEphemeral() && !o.walEnabled() {
+		return errOptionInvalid("an enabled WALDir is required in cluster mode on a durable backend: " +
 			"without it a restarted node serves reads with its unflushed head missing")
 	}
 

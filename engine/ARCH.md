@@ -57,8 +57,9 @@ The estimate charges materialized identities and canonical WAL bytes, including 
 buffer growth. WAL framing does not construct the part encoder's symbol dictionaries; charging
 that workspace here would send ordinary full node-exporter batches back to exclusive ingestion.
 
-`Config.AsyncPressureFlush` / `Options.MetricAsyncPressureFlush` opt in to standalone WAL-backed
-disk-head pipelining. Rotation starts at half the resident target; the other half permits active
+`Config.AsyncPressureFlush` / `Options.MetricAsyncPressureFlush` opt in to standalone
+disk-head pipelining. When WAL logging is disabled, pressure generations still advance the
+catalog epoch in order, including while earlier generations are building. Rotation starts at half the resident target; the other half permits active
 progress while one frozen generation builds. Active/frozen state and pending sample bytes trigger
 backpressure at the original full target, with bounded overshoot from already admitted atomic batches and
 separately bounded preparation scratch. The target is not multiplied per worker. One worker and one

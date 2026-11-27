@@ -111,7 +111,11 @@ this pass as `flush_cache_watermarks`.
 Active and frozen identity owners are both charged to resident pressure until publication;
 retiring the frozen owner preserves the active registry without rebuilding it. A failed flush
 reattaches its frozen ownership and keeps the WAL replayable. The optional recent tier is disabled.
-`MetricAsyncPressureFlush` optionally starts standalone WAL-backed disk-head rotation at half this
+`WALNone` disables WAL writes, syncs, and replay on a standalone store. Only flushed parts survive
+a restart. Drain any segments in the configured WAL directory through ordinary recovery and flush
+before enabling this policy. `WALSyncNone` remains the default and writes the WAL without
+per-append fsync.
+`MetricAsyncPressureFlush` optionally starts standalone disk-head rotation at half this
 target and waits at the full aggregate target. This overlaps ingestion with one frozen builder
 without multiplying resident/cache targets. It is off by default; cluster, read-only and ephemeral
 modes reject it. Head/flush/queue metrics must qualify the changed batching before capacity claims.
