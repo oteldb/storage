@@ -38,7 +38,7 @@ func TestSharedWALIdentityScratch(t *testing.T) {
 				require.NoError(t, writer.WriteSeries(id, s))
 				require.NoError(t, writer.WriteSamples(id, []int64{int64(i)}, []float64{float64(i)}))
 			}
-			require.NoError(t, b.encode(h.series.View(), everySeries))
+			require.NoError(t, b.encode(h.series.View(), everySeries, false))
 			assert.Equal(t, expected.Bytes(), b.frames.Bytes(), "reused identities preserve exact WAL bytes")
 			require.GreaterOrEqual(t, cap(b.attrs), 16)
 			b.reset()

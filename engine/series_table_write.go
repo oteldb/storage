@@ -12,6 +12,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/internal/buildbudget"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/partid"
 	"github.com/oteldb/storage/internal/seriestable"
 	"github.com/oteldb/storage/signal"
@@ -74,6 +75,7 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 		if !errors.Is(err, errSeriesSnapshotChanged) {
 			return err
 		}
+		e.cfg.Obs.Flush.DescriptorPlanRetry(ctx)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -83,6 +85,7 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 var errSeriesSnapshotChanged = errors.New("engine: shared series snapshot changed during planning")
 
 func (e *Engine) writeSeriesDelta(ctx context.Context, entries identitySnapshot, reserve func(int64) error) error {
+	ctx = obs.WithWritePhase(ctx, "descriptor_delta")
 	e.mu.RLock()
 	snapshot := e.seriesTable
 	snapshot.acquire()
@@ -98,10 +101,11 @@ func (e *Engine) writeSeriesDelta(ctx context.Context, entries identitySnapshot,
 		}
 	}
 	beforeVerification := e.VerifiedIdentityCacheStats()
-	known, err := snapshot.knownIdentities(ctx, entries, e.verifiedIdentities)
+	known, proven, err := snapshot.knownIdentities(ctx, entries, e.verifiedIdentities)
 	afterVerification := e.VerifiedIdentityCacheStats()
 	e.cfg.Obs.Flush.VerificationCache(ctx, int64(afterVerification.Hits-beforeVerification.Hits),
 		int64(afterVerification.Misses-beforeVerification.Misses))
+	e.cfg.Obs.Flush.HeadMembership(ctx, int64(proven))
 	if err != nil {
 		return err
 	}
@@ -175,6 +179,9 @@ func (e *Engine) installSeriesDelta(
 	next := newSeriesSnapshot(roots)
 	next.retired = len(e.seriesRetired)
 	old := e.seriesTable
+	if old != nil {
+		next.lineage = old.lineage
+	}
 	e.seriesTable = next
 	old.release()
 	e.mu.Unlock()
@@ -182,31 +189,44 @@ func (e *Engine) installSeriesDelta(
 	return nil
 }
 
-func (s *seriesSnapshot) knownIdentities(ctx context.Context, entries identitySnapshot, caches ...*verifiedIdentityCache) ([]bool, error) {
-	known := make([]bool, len(entries.refs))
+func (s *seriesSnapshot) knownIdentities(
+	ctx context.Context, entries identitySnapshot, caches ...*verifiedIdentityCache,
+) (known []bool, proven int, err error) {
+	known = make([]bool, len(entries.refs))
 	if s == nil {
-		return known, nil
+		return known, proven, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, proven, err
 	}
 	var cache *verifiedIdentityCache
 	if len(caches) > 0 {
 		cache = caches[0]
 	}
-	hits := cache.match(s, entries, known)
-	remaining := len(known) - hits
+	if entries.proofs.lineage == s.lineage && len(entries.proofs.bits) > 0 {
+		for i, ref := range entries.refs {
+			if entries.proofs.has(ref) {
+				known[i] = true
+				proven++
+			}
+		}
+		if proven == len(known) {
+			return known, proven, nil
+		}
+	}
+	hits := cache.match(s, entries, known, proven)
+	remaining := len(known) - proven - hits
 	for _, h := range s.roots {
 		if remaining == 0 {
 			break
 		}
 		found, err := checkRootIdentitiesCached(ctx, h, entries, known, cache)
 		if err != nil {
-			return nil, err
+			return nil, proven, err
 		}
 		remaining -= found
 	}
-	return known, nil
+	return known, proven, nil
 }
 
 func checkRootIdentitiesCached(ctx context.Context, root *seriesRootHandle, entries identitySnapshot,

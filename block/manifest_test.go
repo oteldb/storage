@@ -451,6 +451,13 @@ func FuzzManifestDecodeBody(f *testing.F) {
 	v3 := v3Manifest().Encode(nil)
 	f.Add(v3[:len(v3)-4])
 
+	w := NewStreamWriter(WithIndependentGroups(), WithSharedRowGroups(), WithGranuleSize(32))
+	require.NoError(f, w.AddColumn(Column{Name: "ts", Kind: KindInt64, Block: true}))
+	require.NoError(f, w.AppendInt64(0, []int64{3, 2, 1}))
+	shared, err := w.build()
+	require.NoError(f, err)
+	f.Add(shared.manifest[:len(shared.manifest)-4])
+
 	for _, r := range []*Rollup{{}, sampleRollup()} {
 		m := markedManifest()
 		m.Rollup = r

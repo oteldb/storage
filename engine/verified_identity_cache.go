@@ -67,17 +67,20 @@ func (c *verifiedIdentityCache) clear() {
 	c.used = memsize.Of[verifiedIdentityCache]() + memsize.MapBase
 }
 
-func (c *verifiedIdentityCache) match(snapshot *seriesSnapshot, entries identitySnapshot, known []bool) (hits int) {
+func (c *verifiedIdentityCache) match(snapshot *seriesSnapshot, entries identitySnapshot, known []bool, proven int) (hits int) {
 	if c == nil {
 		return 0
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.entries) == 0 {
-		c.misses += uint64(len(known))
+		c.misses += uint64(len(known) - proven)
 		return 0
 	}
 	for i, ref := range entries.refs {
+		if known[i] {
+			continue
+		}
 		id := entries.view.ID(int(ref))
 		entry, ok := c.entries[id.Lo]
 		if !ok {
@@ -93,7 +96,7 @@ func (c *verifiedIdentityCache) match(snapshot *seriesSnapshot, entries identity
 		}
 	}
 	c.hits += uint64(hits)
-	c.misses += uint64(len(known) - hits)
+	c.misses += uint64(len(known) - proven - hits)
 	return hits
 }
 

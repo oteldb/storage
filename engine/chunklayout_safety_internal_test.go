@@ -147,7 +147,8 @@ func TestSeriesChunkCacheChargesCapacityAndEntries(t *testing.T) {
 	e := New(Config{Backend: backend.Memory(), Prefix: "small-chunks", MetricSeriesChunks: true, DecodeCacheBytes: 1 << 20})
 	e.blockCache.i64Free.put(make([]int64, 1024))
 	e.blockCache.f64Free.put(make([]float64, 1024))
-	for i := range 64 {
+	const points = 2 * sparseMetricChunkRows
+	for i := range points {
 		s := apiSeries()
 		s.Attributes = signal.NewAttributes(append(s.Attributes, signal.KeyValue{Key: []byte("host"), Value: signal.StringValue([]byte(strconv.Itoa(i)))})...)
 		_, err := e.Append(s, int64(i+1), float64(i))
@@ -158,7 +159,7 @@ func TestSeriesChunkCacheChargesCapacityAndEntries(t *testing.T) {
 	require.NoError(t, err)
 	got, err := fetch.Drain(t.Context(), it)
 	require.NoError(t, err)
-	require.Len(t, got, 64)
+	require.Len(t, got, points)
 	var entries int
 	var charged int64
 	for i := range e.blockCache.shards {
@@ -169,15 +170,15 @@ func TestSeriesChunkCacheChargesCapacityAndEntries(t *testing.T) {
 				if key.blk < 0 || key.col == colMarksID {
 					continue
 				}
-				require.Equal(t, 1, cap(entry.i64)+cap(entry.f64))
-				require.GreaterOrEqual(t, entry.bytes, variableChunkEntryOverhead+8)
+				require.Equal(t, sparseMetricChunkRows, cap(entry.i64)+cap(entry.f64))
+				require.GreaterOrEqual(t, entry.bytes, variableChunkEntryOverhead+8*sparseMetricChunkRows)
 				entries++
 				charged += entry.bytes
 			}
 		}
 		shard.mu.Unlock()
 	}
-	require.Equal(t, 128, entries)
+	require.Equal(t, 4, entries) // Two columns and two chunks per column.
 	require.GreaterOrEqual(t, e.blockCache.bytes.Load(), charged)
 	require.LessOrEqual(t, e.blockCache.bytes.Load(), e.blockCache.maxBytes)
 }

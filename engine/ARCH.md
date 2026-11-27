@@ -57,8 +57,9 @@ The estimate charges materialized identities and canonical WAL bytes, including 
 buffer growth. WAL framing does not construct the part encoder's symbol dictionaries; charging
 that workspace here would send ordinary full node-exporter batches back to exclusive ingestion.
 
-`Config.AsyncPressureFlush` / `Options.MetricAsyncPressureFlush` opt in to standalone WAL-backed
-disk-head pipelining. Rotation starts at half the resident target; the other half permits active
+`Config.AsyncPressureFlush` / `Options.MetricAsyncPressureFlush` opt in to standalone
+disk-head pipelining. When WAL logging is disabled, pressure generations still advance the
+catalog epoch in order, including while earlier generations are building. Rotation starts at half the resident target; the other half permits active
 progress while one frozen generation builds. Active/frozen state and pending sample bytes trigger
 backpressure at the original full target, with bounded overshoot from already admitted atomic batches and
 separately bounded preparation scratch. The target is not multiplied per worker. One worker and one
@@ -2179,6 +2180,19 @@ alongside checked output identities. Finalization remaps and merges source posti
 legacy inputs retain label-based construction. Output mappings follow each time-bucket writer, so
 retention, size splitting and overlapping series preserve the output's own canonical reference order.
 
+## Sparse head chunks
+
+`MetricSeriesChunks` packs up to 32 adjacent one-point series into each numeric chunk during
+flush and after merge deduplication, retention, and rollup. It preserves individual
+groups for longer series and starts a new sparse chunk when its signed timestamp span would
+overflow. The shared manifest flag covers all nonconstant numeric columns, with matching row
+geometry and CRC-protected frames.
+
+SIDX still selects the exact series row slice. Readers bound partial-chunk reads to a singleton
+in a marked chunk and reserve for all rows of touched chunks. Merge uses its decoded path for
+partial chunks. An older reader reports the unknown manifest flag as an unsupported version,
+which fences the load without opening a repair hole.
+
 ## Separate series table
 
 `SeparateSeries` is an opt-in standalone, fresh-catalog mode requiring `DiskSeries` and
@@ -2188,8 +2202,8 @@ numeric parts carry SIDX, coverage watermarks and aggregate statistics, with a m
 
 Flush planning checks descriptors by bounded series-ID ranges before launching parallel numeric
 builders. Native descriptor builders borrow the pinned series view and spill sorted postings from
-oversized batches. A bounded fan-in combines contiguous ordinal ranges into one immutable run,
-so temporary spills do not add catalog roots. A metadata writer serializes final bindings after
+oversized batches. Initial spills and bounded fan-in reductions carry only postings with local
+ordinals. The final run encodes the IDs and descriptors once from the frozen view. A metadata writer serializes final bindings after
 workspace admission and retries if a sibling changed the descriptor snapshot. Two frozen
 generations may build concurrently. In standalone mode the commit owner seals and swaps after a
 generation-specific gate drains prepared tails. The lifecycle gate stays shared across the seal.
@@ -2216,6 +2230,12 @@ checksummed, manifest-bound SIDX ordinals. Legacy v9 and v10 sidecars remain rea
 The engine can omit the first sample's full descriptor only when its exact ID was seen in
 a confirmed published generation. Replay resolves the descriptor from published roots
 and fails if it is unavailable. New IDs retain self-contained registrations.
+
+Packed WAL blocks require a confirmed v12 catalog capability before the writer emits them.
+Older readers reject v12 before replay because unknown WAL record tags otherwise get skipped.
+The capability survives later catalog publications and remains readable with packing disabled.
+The standalone writer packs consecutive unweighted singleton references while preparing the batch.
+The commit owner retains the same WAL append, publication, and acknowledgment ordering.
 
 Catalog v9 names metadata roots independently of sample entries and publishes their union with
 numeric parts and the WAL checkpoint in one CAS. Runs sync before publication; failed commits
@@ -2251,7 +2271,9 @@ space and can bypass a disk ID seek on a hit. Flush checks the full content ID i
 without reading or re-encoding its descriptor. A second eighth holds positive membership proofs
 keyed by the low word with a high-word check and a collision map. Entries name an immutable root
 by token and are usable only while the checking snapshot contains that root. Adding unrelated roots
-preserves cached membership. The remaining three quarters hold historical watermarks.
+preserves cached membership. Fixed-rotation heads also carry ordinal bits confirmed by an earlier
+catalog commit. A descriptor lineage survives additive roots and union compaction. A catalog
+replacement gets a fresh lineage, so older bits fall back to normal membership checks. The remaining three quarters hold historical watermarks.
 `VerifiedIdentityCacheStats` reports positive membership hit/miss counts. Pending arrays count against the cache limit
 before allocation and become readable after validating the run binding and ID stream. Reopened runs
 also validate descriptor payloads. Eviction falls back to the existing bounded disk reader. Cached IDs

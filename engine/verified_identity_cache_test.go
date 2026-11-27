@@ -44,12 +44,12 @@ func TestVerifiedIdentityCacheBudgetAndLowWordCollision(t *testing.T) {
 	entries := identitySnapshot{view: registry.View(), refs: []uint32{0, 1, 2}}
 	known := make([]bool, len(entries.refs))
 	snapshot := &seriesSnapshot{tokens: map[uint64]struct{}{1: {}, 2: {}}}
-	require.Equal(t, 2, cache.match(snapshot, entries, known))
+	require.Equal(t, 2, cache.match(snapshot, entries, known, 0))
 	require.Equal(t, []bool{true, true, false}, known, "a low-word hit needs the matching high word")
 
 	clear(known)
 	snapshot = &seriesSnapshot{tokens: map[uint64]struct{}{2: {}}}
-	require.Equal(t, 1, cache.match(snapshot, entries, known))
+	require.Equal(t, 1, cache.match(snapshot, entries, known, 0))
 	require.Equal(t, []bool{false, true, false}, known)
 	require.Nil(t, newVerifiedIdentityCache(0))
 }
@@ -64,7 +64,7 @@ func TestOlderRootCannotReplaceNewerMembership(t *testing.T) {
 	cache.putIDs(1, []signal.SeriesID{id})
 	known := make([]bool, len(entries.refs))
 	snapshot := &seriesSnapshot{tokens: map[uint64]struct{}{2: {}}}
-	require.Equal(t, 1, cache.match(snapshot, entries, known))
+	require.Equal(t, 1, cache.match(snapshot, entries, known, 0))
 	require.Equal(t, []bool{true}, known)
 }
 
@@ -82,7 +82,7 @@ func TestVerifiedIdentityAcrossHeadsAndCatalogChanges(t *testing.T) {
 	require.NoError(t, e.Flush(t.Context()))
 	input := identityCacheInput(32)
 	reads.Reset()
-	known, err := e.seriesTable.knownIdentities(t.Context(), input, e.verifiedIdentities)
+	known, _, err := e.seriesTable.knownIdentities(t.Context(), input, e.verifiedIdentities)
 	require.NoError(t, err)
 	require.NotContains(t, known, false)
 	require.Zero(t, reads.Bytes(), "a completed root write seeds exact ID membership")
@@ -96,7 +96,7 @@ func TestVerifiedIdentityAcrossHeadsAndCatalogChanges(t *testing.T) {
 	other := catalogRoot(t, reads, "other", 99)
 	require.NoError(t, e.installSeriesRootsLocked(t.Context(), []bucketindex.SeriesRoot{other}))
 	reads.Reset()
-	known, err = e.seriesTable.knownIdentities(t.Context(), input, e.verifiedIdentities)
+	known, _, err = e.seriesTable.knownIdentities(t.Context(), input, e.verifiedIdentities)
 	require.NoError(t, err)
 	require.NotContains(t, known, false, "adding an unrelated root preserves the original membership proof")
 	require.Zero(t, reads.Bytes(), "the unchanged root should not be read again")
@@ -104,12 +104,12 @@ func TestVerifiedIdentityAcrossHeadsAndCatalogChanges(t *testing.T) {
 	handle := e.seriesTable.roots[slices.IndexFunc(e.seriesTable.roots, func(h *seriesRootHandle) bool { return h.binding == other })]
 	onlyOther := newSeriesSnapshot([]*seriesRootHandle{handle})
 	defer onlyOther.release()
-	known, err = onlyOther.knownIdentities(t.Context(), input, e.verifiedIdentities)
+	known, _, err = onlyOther.knownIdentities(t.Context(), input, e.verifiedIdentities)
 	require.NoError(t, err)
 	require.NotContains(t, known, true)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, err = e.seriesTable.knownIdentities(ctx, input, e.verifiedIdentities)
+	_, _, err = e.seriesTable.knownIdentities(ctx, input, e.verifiedIdentities)
 	require.ErrorIs(t, err, context.Canceled)
 }
 
@@ -126,7 +126,7 @@ func TestDescriptorMembershipChecksOnlyID(t *testing.T) {
 	registry.AddEntry(series.Entry{ID: s.Hash(), Series: benchSeries(2)})
 	input := identitySnapshot{view: registry.View(), refs: []uint32{0}}
 	for _, cache := range []*verifiedIdentityCache{e.verifiedIdentities, nil} {
-		known, err := e.seriesTable.knownIdentities(t.Context(), input, cache)
+		known, _, err := e.seriesTable.knownIdentities(t.Context(), input, cache)
 		require.NoError(t, err)
 		require.Equal(t, []bool{true}, known)
 	}

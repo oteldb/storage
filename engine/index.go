@@ -126,6 +126,7 @@ func (e *Engine) commitOnceLocked(ctx context.Context, parts []*part, epoch uint
 
 	e.indexVersion = version
 	e.compactMetricMetadata = ix.CompactMetricMetadata
+	e.metricFeatures = ix.MetricFeatures
 	// Only a commit that landed discharges a want: the obligation is dropped from the engine's own
 	// list here, never while building an index that may not be written.
 	e.wants = ix.Wanted
@@ -175,6 +176,7 @@ func (e *Engine) adoptIndexLocked(ctx context.Context) error {
 
 	e.indexVersion = version
 	e.compactMetricMetadata = ix.CompactMetricMetadata
+	e.metricFeatures = ix.MetricFeatures
 	if ix.Generation.Compare(e.generation) > 0 {
 		e.generation = ix.Generation
 	}
@@ -338,6 +340,10 @@ func (e *Engine) nextIndexLocked(ctx context.Context, parts []*part, epoch uint6
 		SeriesRoots:           e.seriesTable.bindings(),
 		CompactMetricMetadata: e.compactMetricMetadata || (e.cfg.SeparateSeries && e.fixedHeadRotation()),
 		RetiredSeriesRoots:    slices.Clone(e.seriesRetired),
+		MetricFeatures:        e.metricFeatures,
+	}
+	if e.cfg.PackedWAL && e.cfg.WAL != nil && e.cfg.SeparateSeries && e.fixedHeadRotation() {
+		ix.MetricFeatures |= bucketindex.MetricFeaturePackedWAL
 	}
 	ix.SetWriterEpoch(e.cfg.WriterID, epoch, e.generation)
 	ix.Epochs = bucketindex.TrimWriters(ix.Epochs, e.cfg.WriterID, bucketindex.MaxWriters)
@@ -825,6 +831,7 @@ func (e *Engine) adoptLoadLocked(l *indexLoad) {
 	// are not deleted here.
 	e.indexVersion = l.version
 	e.compactMetricMetadata = l.ix.CompactMetricMetadata
+	e.metricFeatures = l.ix.MetricFeatures
 	e.foreign, e.foreignParts = nil, nil
 
 	e.holes, e.lostParts, e.allocated = l.holes, l.ix.LostParts, l.ix.AllocatedBlocks

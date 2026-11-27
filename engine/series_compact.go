@@ -14,6 +14,7 @@ import (
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/internal/buildbudget"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/partid"
 	"github.com/oteldb/storage/internal/seriestable"
 	"github.com/oteldb/storage/signal"
@@ -38,6 +39,7 @@ func (e *Engine) MergeSeriesStep(ctx context.Context, background bool) (bool, er
 
 // compactSeriesRuns shares the maintenance admission and serializes with ordinary compaction.
 func (e *Engine) compactSeriesRuns(ctx context.Context, background bool) (bool, error) {
+	ctx = obs.WithWritePhase(ctx, "descriptor_merge")
 	if !e.cfg.SeparateSeries {
 		return false, nil
 	}
@@ -113,6 +115,8 @@ func (e *Engine) compactSeriesRuns(ctx context.Context, background bool) (bool, 
 	next := newSeriesSnapshot(roots)
 	next.retired = len(removed)
 	old := e.seriesTable
+	// Descriptor compaction replaces the selected roots with their full union.
+	next.lineage = old.lineage
 	e.seriesTable, e.seriesRetired = next, removed
 	keep = true
 	old.release()

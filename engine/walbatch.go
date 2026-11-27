@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"time"
 
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
@@ -32,10 +33,11 @@ type walBatch struct {
 
 	// samples is the admitted sample count and registered counts globally new identities; both
 	// are what [head.appendByID] would have added to the head's in-flight bytes and series count.
-	samples          int
-	registered       int
-	loggedReferences int
-	relog            bool
+	samples            int
+	registered         int
+	loggedReferences   int
+	loggedPackedBlocks int
+	relog              bool
 
 	// first is when the write staged its first sample: the head's age starts there if the write is the
 	// first to fill it, as it would had the sample been applied on admission, not once the log returns.
@@ -50,6 +52,8 @@ type walSeriesAcc struct {
 	historical        bool
 	encodedHead       bool
 	descriptorRef     bool
+	descriptorLineage uint64
+	rawInDescriptors  bool
 	rawStart, rawSize int
 	isNew             bool // the series starts a buffer, so its identity record is logged
 	register          bool // the identity is not in the head's index yet
@@ -224,13 +228,30 @@ func (e *Engine) encodeWriteBatch(b *walBatch, everySeries bool) error {
 		return b.lookupErr
 	}
 	view := b.encodingView(e.head, everySeries)
-	if err := b.encode(view, everySeries); err != nil {
+	if err := e.encodeBatch(b, view, everySeries, e.packedWALEnabled()); err != nil {
 		return err
 	}
 	if e.cfg.WAL == nil {
 		return nil
 	}
-	return e.cfg.WAL.WritePreparedFrames(b.frames.Bytes(), b.loggedReferences)
+	return e.cfg.WAL.WritePackedMetricFrames(b.frames.Bytes(), b.loggedReferences, b.loggedPackedBlocks)
+}
+
+// encodeBatch prepares compact head descriptors without framing unlogged writes.
+func (e *Engine) encodeBatch(b *walBatch, view series.View, everySeries, packed bool) error {
+	if e.cfg.WAL != nil || everySeries {
+		return b.encode(view, everySeries, packed)
+	}
+	b.frames.Reset()
+	b.descriptors = b.descriptors[:0]
+	b.loggedReferences, b.loggedPackedBlocks = 0, 0
+	for i := range b.order {
+		a := &b.accs[i]
+		if a.encodedHead {
+			b.stageHeadDescriptor(a)
+		}
+	}
+	return nil
 }
 
 func (b *walBatch) encodingView(h *head, everySeries bool) series.View {
@@ -251,64 +272,109 @@ func (b *walBatch) encodingView(h *head, everySeries bool) series.View {
 // encode frames the staged write into b.frames, one samples frame per series, each preceded by its
 // series record when the series starts a buffer — or always, with everySeries, for frames read by a
 // replica whose head may not hold the identity the primary's does.
-func (b *walBatch) encode(view series.View, everySeries bool) error {
+func (b *walBatch) encode(view series.View, everySeries, packed bool) error {
 	b.frames.Reset()
 	b.descriptors = b.descriptors[:0]
-	b.loggedReferences = 0
+	b.loggedReferences, b.loggedPackedBlocks = 0, 0
 
-	for k, id := range b.order {
-		a := &b.accs[k]
-
-		reference := a.descriptorRef && !everySeries
-		switch {
-		case reference:
-			a.rawStart = len(b.descriptors)
-			b.descriptors = a.series.AppendHashInput(b.descriptors)
-			a.rawSize = len(b.descriptors) - a.rawStart
-		case a.isNew:
-			s := a.series
-			if !a.register {
-				s = b.identity(view, a)
-			}
-			if a.encodedHead {
-				base := b.frames.Len()
-				start, size, err := b.fw.WriteSeriesRange(id, s)
-				if err != nil {
-					return err
-				}
-				a.rawStart, a.rawSize = base+start, size
-			} else if err := b.fw.WriteSeries(id, s); err != nil {
+	for k := 0; k < len(b.order); {
+		end := k + 1
+		if packed && !everySeries && b.accs[k].packedReference() {
+			end = b.packedRunEnd(k)
+			written, err := b.encodePackedReferences(k, end)
+			if err != nil {
 				return err
 			}
-		case everySeries:
-			s := b.identity(view, a)
-			if err := b.fw.WriteSeries(id, s); err != nil {
-				return err
+			if written {
+				k = end
+				continue
 			}
 		}
-
-		// Only spend the per-sample sf bytes when sampling actually weighted this series; the common
-		// unsampled path stays on the original (no-sf) samples frame.
-		if reference {
-			b.loggedReferences++
-			if err := b.fw.WriteReferencedSamples(id, a.ts, a.values, a.sf, a.sampled); err != nil {
+		for ; k < end; k++ {
+			if err := b.encodeSeries(view, everySeries, b.order[k], &b.accs[k]); err != nil {
 				return err
 			}
-			continue
-		}
-		if a.sampled {
-			if err := b.fw.WriteSamplesSF(id, a.ts, a.values, a.sf); err != nil {
-				return err
-			}
-
-			continue
-		}
-
-		if err := b.fw.WriteSamples(id, a.ts, a.values); err != nil {
-			return err
 		}
 	}
+	return nil
+}
 
+func (e *Engine) packedWALEnabled() bool {
+	return e.cfg.PackedWAL && e.cfg.WAL != nil && e.metricFeatures&bucketindex.MetricFeaturePackedWAL != 0
+}
+
+func (a *walSeriesAcc) packedReference() bool {
+	return a.descriptorRef && !a.sampled && len(a.ts) == 1
+}
+
+func (b *walBatch) packedRunEnd(start int) int {
+	end := start + 1
+	maxEnd := min(start+wal.MaxPackedReferences, len(b.order))
+	for end < maxEnd && b.accs[end].packedReference() {
+		end++
+	}
+	return end
+}
+
+func (b *walBatch) encodePackedReferences(start, end int) (bool, error) {
+	written, err := b.fw.WritePackedReferences(b.order[start:end], func(i int) (int64, float64) {
+		a := &b.accs[start+i]
+		return a.ts[0], a.values[0]
+	})
+	if err != nil || !written {
+		return written, err
+	}
+	for i := start; i < end; i++ {
+		b.stageHeadDescriptor(&b.accs[i])
+	}
+	b.loggedReferences += end - start
+	b.loggedPackedBlocks++
+	return true, nil
+}
+
+func (b *walBatch) stageHeadDescriptor(a *walSeriesAcc) {
+	a.rawInDescriptors = true
+	a.rawStart = len(b.descriptors)
+	b.descriptors = a.series.AppendHashInput(b.descriptors)
+	a.rawSize = len(b.descriptors) - a.rawStart
+}
+
+func (b *walBatch) encodeSeries(view series.View, everySeries bool, id signal.SeriesID, a *walSeriesAcc) error {
+	if a.descriptorRef && !everySeries {
+		b.stageHeadDescriptor(a)
+		b.loggedReferences++
+		return b.fw.WriteReferencedSamples(id, a.ts, a.values, a.sf, a.sampled)
+	}
+
+	if err := b.encodeSeriesIdentity(view, everySeries, id, a); err != nil {
+		return err
+	}
+	if a.sampled {
+		return b.fw.WriteSamplesSF(id, a.ts, a.values, a.sf)
+	}
+	return b.fw.WriteSamples(id, a.ts, a.values)
+}
+
+func (b *walBatch) encodeSeriesIdentity(view series.View, everySeries bool, id signal.SeriesID, a *walSeriesAcc) error {
+	if !a.isNew {
+		if everySeries {
+			return b.fw.WriteSeries(id, b.identity(view, a))
+		}
+		return nil
+	}
+	s := a.series
+	if !a.register {
+		s = b.identity(view, a)
+	}
+	if !a.encodedHead {
+		return b.fw.WriteSeries(id, s)
+	}
+	base := b.frames.Len()
+	start, size, err := b.fw.WriteSeriesRange(id, s)
+	if err != nil {
+		return err
+	}
+	a.rawStart, a.rawSize = base+start, size
 	return nil
 }
 
@@ -358,18 +424,23 @@ func (b *walBatch) apply(h *head) {
 }
 
 func (b *walBatch) registerIdentity(h *head, id signal.SeriesID, a *walSeriesAcc) {
-	if !a.register || h.series.Has(id) {
+	if !a.register {
 		return
 	}
 	if a.rawSize != 0 {
 		raw := b.frames.Bytes()
-		if a.descriptorRef && len(b.descriptors) > 0 {
+		if a.rawInDescriptors {
 			raw = b.descriptors
 		}
-		h.registerEncoded(id, raw[a.rawStart:a.rawStart+a.rawSize])
+		a.identityRef, a.knownRef = h.registerEncoded(id, raw[a.rawStart:a.rawStart+a.rawSize]), true
+		if a.descriptorLineage != 0 {
+			h.descriptorProofs.add(a.identityRef, a.descriptorLineage)
+		}
 		return
 	}
-	h.register(series.Entry{ID: id, Series: a.series})
+	if !h.series.Has(id) {
+		h.register(series.Entry{ID: id, Series: a.series})
+	}
 }
 
 func (b *walBatch) reset() {

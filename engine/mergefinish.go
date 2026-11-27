@@ -61,7 +61,7 @@ func (b *mergeIdentityBatch) next(e *Engine, keys *seriesMerge) bool {
 }
 
 func (p *partStreamWriter) appendMergeSeries(view series.View, ref uint32, found bool,
-	id signal.SeriesID, ts []int64, values, sf []float64, covered int64,
+	id signal.SeriesID, ts []int64, values, sf []float64, covered int64, singleton bool,
 ) error {
 	if len(ts) > 0 && found && (len(p.runs) == 0 || p.runs[len(p.runs)-1].Value != idToU128(id)) {
 		if err := p.addDiskSeries(view, ref, id); err != nil {
@@ -69,7 +69,7 @@ func (p *partStreamWriter) appendMergeSeries(view series.View, ref uint32, found
 		}
 		p.mergeFinish.add(view, ref)
 	}
-	return p.appendSeries(idToU128(id), ts, values, sf, covered)
+	return p.appendNumericRun(idToU128(id), ts, values, sf, covered, singleton)
 }
 
 func (b *mergeFinishBudget) bytes() int64 {

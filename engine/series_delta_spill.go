@@ -9,6 +9,7 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/internal/buildbudget"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/partid"
 	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/internal/seriestable"
@@ -18,7 +19,7 @@ const seriesSpillFanIn = 8
 
 type seriesDeltaSpill struct {
 	key            string
-	index          *seriesindex.Index
+	index          *seriesindex.PostingsSpill
 	lo, hi         int
 	directoryBytes int64
 }
@@ -54,15 +55,15 @@ func (s *seriesDeltaSpills) write(ctx context.Context, b *seriestable.Builder, l
 	}
 	key := s.key()
 	s.active[key] = struct{}{}
-	if err := b.WriteIndex(ctx, s.be, key); err != nil {
+	if err := b.WritePostingsSpill(ctx, s.be, key); err != nil {
 		return seriesDeltaSpill{}, err
 	}
-	index, err := seriesindex.Open(ctx, s.be, key)
+	index, err := seriesindex.OpenPostingsSpill(ctx, s.be, key)
 	return seriesDeltaSpill{key: key, index: index, lo: lo, hi: hi, directoryBytes: dir}, err
 }
 
-func (s *seriesDeltaSpills) group(spills []seriesDeltaSpill, final bool) ([]*seriesindex.Index, int64, error) {
-	indexes := make([]*seriesindex.Index, len(spills))
+func (s *seriesDeltaSpills) group(spills []seriesDeltaSpill, final bool) ([]*seriesindex.PostingsSpill, int64, error) {
+	indexes := make([]*seriesindex.PostingsSpill, len(spills))
 	var directory, inputs int64
 	for i, spill := range spills {
 		indexes[i] = spill.index
@@ -78,6 +79,7 @@ func (s *seriesDeltaSpills) group(spills []seriesDeltaSpill, final bool) ([]*ser
 }
 
 func (s *seriesDeltaSpills) reduce(ctx context.Context, spills []seriesDeltaSpill) ([]seriesDeltaSpill, error) {
+	ctx = obs.WithWritePhase(ctx, "descriptor_spill_reduce")
 	for len(spills) > seriesSpillFanIn {
 		var next []seriesDeltaSpill
 		for lo := 0; lo < len(spills); lo += seriesSpillFanIn {
@@ -93,10 +95,10 @@ func (s *seriesDeltaSpills) reduce(ctx context.Context, spills []seriesDeltaSpil
 			start, end := group[0].lo, group[len(group)-1].hi
 			key := s.key()
 			s.active[key] = struct{}{}
-			if _, err := seriesindex.WriteContiguous(ctx, s.be, key, [32]byte{}, s.entries.view, s.entries.refs[start:end], indexes); err != nil {
+			if err := seriesindex.MergePostingsSpills(ctx, s.be, key, end-start, indexes); err != nil {
 				return nil, err
 			}
-			index, err := seriesindex.Open(ctx, s.be, key)
+			index, err := seriesindex.OpenPostingsSpill(ctx, s.be, key)
 			if err != nil {
 				return nil, err
 			}

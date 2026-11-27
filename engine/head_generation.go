@@ -22,6 +22,7 @@ func (h *head) swapGenerationIdentity(other *head) {
 	h.nonStringLabels, other.nonStringLabels = other.nonStringLabels, h.nonStringLabels
 	h.valueScratch, other.valueScratch = other.valueScratch, h.valueScratch
 	h.encodedRefs, other.encodedRefs = other.encodedRefs, h.encodedRefs
+	h.descriptorProofs, other.descriptorProofs = other.descriptorProofs, h.descriptorProofs
 	h.maxEncodedDescriptor, other.maxEncodedDescriptor = other.maxEncodedDescriptor, h.maxEncodedDescriptor
 	h.stateRefs, other.stateRefs = other.stateRefs, h.stateRefs
 	h.slots, other.slots = other.slots, h.slots
@@ -63,7 +64,12 @@ func (h *head) frozenState(id signal.SeriesID) (headSeriesState, bool) {
 		return h.frozen.frozenState(id)
 	}
 	ts, seen := h.frozen.slots.get(h.frozen.stateRefs[ref])
-	return headSeriesState{newest: ts, seen: seen, historical: true}, true
+	state := headSeriesState{newest: ts, seen: seen, historical: true}
+	proofs := h.frozen.descriptorProofs
+	if proofs.has(ref) {
+		state.descriptorLineage = proofs.lineage
+	}
+	return state, true
 }
 
 // A historical lookup can finish after a newer accepted write evicted its cache entry.
@@ -136,10 +142,10 @@ func (e *Engine) rememberFrozenWatermarks(ctx context.Context) error {
 	e.mu.RLock()
 	frozen := e.head.frozen
 	e.mu.RUnlock()
-	return e.rememberGenerationWatermarks(ctx, frozen, false)
+	return e.rememberGenerationWatermarks(ctx, frozen, 0)
 }
 
-func (e *Engine) rememberGenerationWatermarks(ctx context.Context, frozen *head, published bool) error {
+func (e *Engine) rememberGenerationWatermarks(ctx context.Context, frozen *head, lineage uint64) error {
 	e.mu.RLock()
 	enabled := frozen != nil && e.head.disk.cache != nil
 	e.mu.RUnlock()
@@ -159,12 +165,12 @@ func (e *Engine) rememberGenerationWatermarks(ctx context.Context, frozen *head,
 		}
 		for i := off; i < min(off+256, view.Len()); i++ {
 			if ts, seen := frozen.slots.get(frozen.stateRefs[i]); seen {
-				if published {
+				if lineage != 0 {
 					id := view.ID(i)
 					if current, seen := e.head.watermark(id); seen {
 						ts = max(ts, current)
 					}
-					e.head.disk.cache.remember(id, ts, true)
+					e.head.disk.cache.remember(id, ts, lineage)
 				} else {
 					e.head.rememberHistorical(view.ID(i), ts)
 				}

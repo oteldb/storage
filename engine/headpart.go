@@ -55,6 +55,14 @@ type headPartBuilder struct {
 	deferSharedBinding    bool
 }
 
+func (b *headPartBuilder) identitySnapshot(refs []uint32) identitySnapshot {
+	entries := identitySnapshot{view: b.view, refs: refs}
+	if b.input != nil {
+		entries.proofs = b.input.proofs
+	}
+	return entries
+}
+
 func (e *Engine) flushMemoryBytes() int64 {
 	if e.cfg.FlushMemoryBytes > 0 {
 		return e.cfg.FlushMemoryBytes
@@ -433,7 +441,7 @@ func (b *headPartBuilder) append(id chunk.U128, ref uint32, ts []int64, values, 
 			}
 			b.partRefs = append(b.partRefs, ref)
 		}
-		if err := b.writer.appendSeries(id, ts[lo:hi], values[lo:hi], weights, ts[hi-1]); err != nil {
+		if err := b.writer.appendNumericRun(id, ts[lo:hi], values[lo:hi], weights, ts[hi-1], len(ts) == 1); err != nil {
 			return err
 		}
 		resident := buildbudget.Add(b.writer.residentBytes(), b.writer.w.FinishBytes())
@@ -480,7 +488,7 @@ func (b *headPartBuilder) finish() error {
 			return nil
 		}
 	}
-	p, err := b.writer.finishWithIdentities(b.ctx, identitySnapshot{view: b.view, refs: b.partRefs})
+	p, err := b.writer.finishWithIdentities(b.ctx, b.identitySnapshot(b.partRefs))
 	if err != nil {
 		return err
 	}

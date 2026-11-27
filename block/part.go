@@ -43,6 +43,7 @@ type partConfig struct {
 	dictCap           int64
 	sizing            bool
 	independentGroups bool
+	sharedRows        bool
 	rollup            *Rollup
 
 	// given are compressors the caller hands in to share across writers; comps is what this writer
@@ -85,6 +86,11 @@ type PartOption func(*partConfig)
 // Call [StreamWriter.EndGroup] between groups.
 func WithIndependentGroups() PartOption {
 	return func(c *partConfig) { c.independentGroups = true; c.sizing = true }
+}
+
+// WithSharedRowGroups marks variable numeric chunks as covering multiple logical row groups.
+func WithSharedRowGroups() PartOption {
+	return func(c *partConfig) { c.sharedRows = true }
 }
 
 // WithGranuleSize sets the sparse-index granularity in rows (default 8192).

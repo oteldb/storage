@@ -38,7 +38,7 @@ func (b *instrumentedBackend) CreateObject(ctx context.Context, key string) (bac
 		return nil, err
 	}
 
-	return &instrumentedObjectWriter{ObjectWriter: w, b: b, key: key}, nil
+	return &instrumentedObjectWriter{ObjectWriter: w, b: b, key: key, ctx: ctx}, nil
 }
 
 // StreamsWrites answers for the metered backend: metering neither adds streaming nor hides it.
@@ -52,6 +52,8 @@ type instrumentedObjectWriter struct {
 	b       *instrumentedBackend
 	key     string
 	written int64
+	metered bool
+	ctx     context.Context //nolint:containedctx // Abort has no context argument. Use the write phase from creation.
 }
 
 func (w *instrumentedObjectWriter) Write(p []byte) (int, error) {
@@ -65,11 +67,24 @@ func (w *instrumentedObjectWriter) Commit(ctx context.Context) error {
 	start := time.Now()
 	err := w.ObjectWriter.Commit(ctx)
 	w.b.m.Record(ctx, "write", result(err), time.Since(start), w.written)
+	w.recordObject(result(err))
 	zctx.From(ctx).Debug("backend write",
 		zap.String("key", w.key), zap.Int64("bytes", w.written), zap.Bool("streamed", true),
 		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
 
 	return err
+}
+
+func (w *instrumentedObjectWriter) Abort() {
+	w.ObjectWriter.Abort()
+	w.recordObject("aborted")
+}
+
+func (w *instrumentedObjectWriter) recordObject(outcome string) {
+	if !w.metered {
+		w.metered = true
+		w.b.m.ObjectWrite(w.ctx, backendWriteKind(w.key), outcome, w.written)
+	}
 }
 
 func (b *instrumentedBackend) IsEphemeral() bool { return b.inner.IsEphemeral() }
@@ -156,6 +171,7 @@ func (b *instrumentedBackend) Write(ctx context.Context, key string, data []byte
 	start := time.Now()
 	err := b.inner.Write(ctx, key, data)
 	b.m.Record(ctx, "write", result(err), time.Since(start), int64(len(data)))
+	b.m.ObjectWrite(ctx, backendWriteKind(key), result(err), int64(len(data)))
 	zctx.From(ctx).Debug("backend write",
 		zap.String("key", key), zap.Int("bytes", len(data)),
 		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
@@ -167,6 +183,11 @@ func (b *instrumentedBackend) PutIfAbsent(ctx context.Context, key string, data 
 	start := time.Now()
 	ok, err := b.inner.PutIfAbsent(ctx, key, data)
 	b.m.Record(ctx, "cas", result(err), time.Since(start), int64(len(data)))
+	outcome := result(err)
+	if err == nil && !ok {
+		outcome = "conflict"
+	}
+	b.m.ObjectWrite(ctx, backendWriteKind(key), outcome, int64(len(data)))
 	zctx.From(ctx).Debug("backend cas",
 		zap.String("key", key), zap.Int("bytes", len(data)), zap.Bool("stored", ok),
 		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
@@ -180,6 +201,11 @@ func (b *instrumentedBackend) CompareAndSwap(
 	start := time.Now()
 	v, ok, err := b.inner.CompareAndSwap(ctx, key, expected, data)
 	b.m.Record(ctx, "cas", result(err), time.Since(start), int64(len(data)))
+	outcome := result(err)
+	if err == nil && !ok {
+		outcome = "conflict"
+	}
+	b.m.ObjectWrite(ctx, backendWriteKind(key), outcome, int64(len(data)))
 	zctx.From(ctx).Debug("backend cas",
 		zap.String("key", key), zap.Int("bytes", len(data)), zap.Bool("stored", ok),
 		zap.String("expected", string(expected)),
@@ -261,6 +287,7 @@ func (b *instrumentedBackend) WriteDeferred(ctx context.Context, key string, dat
 	start := time.Now()
 	err := backend.WriteDeferred(ctx, b.inner, key, data)
 	b.m.Record(ctx, "write", result(err), time.Since(start), int64(len(data)))
+	b.m.ObjectWrite(ctx, backendWriteKind(key), result(err), int64(len(data)))
 	zctx.From(ctx).Debug("backend write",
 		zap.String("key", key), zap.Int("bytes", len(data)), zap.Bool("deferred", true),
 		zap.String("result", result(err)), zap.Duration("took", time.Since(start)))
@@ -276,7 +303,7 @@ func (b *instrumentedBackend) CreateObjectDeferred(ctx context.Context, key stri
 		return nil, err
 	}
 
-	return &instrumentedObjectWriter{ObjectWriter: w, b: b, key: key}, nil
+	return &instrumentedObjectWriter{ObjectWriter: w, b: b, key: key, ctx: ctx}, nil
 }
 
 // DeleteDeferred forwards the deferred delete, metered as a delete. Implements

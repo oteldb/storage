@@ -27,9 +27,9 @@ const (
 var ErrReplicaHeadFull = errors.New("engine: replica resident head is full; retry after primary part publication")
 
 type diskHeadEntry struct {
-	newest              int64
-	descriptorPublished bool
-	exists              bool
+	newest            int64
+	descriptorLineage uint64
+	exists            bool
 }
 
 type diskHeadState struct {
@@ -343,6 +343,7 @@ func (e *Engine) compactDiskHeadLocked() {
 	h.sym, h.series, h.post = next.sym, next.series, next.post
 	h.nonStringLabels, h.stateRefs, h.slots = next.nonStringLabels, next.stateRefs, next.slots
 	h.valueScratch = next.valueScratch
+	h.descriptorProofs = descriptorProofs{}
 	h.resetBuffers()
 	e.identityOrder.reset()
 }

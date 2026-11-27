@@ -178,7 +178,7 @@ type Config struct {
 	MetricBlockRows int
 	// MetricFloatGroups enables exact per-series value segments in newly written parts.
 	MetricFloatGroups bool
-	// MetricSeriesChunks isolates each series in independently framed numeric chunks.
+	// MetricSeriesChunks writes bounded numeric chunks and packs adjacent one-point series at flush.
 	MetricSeriesChunks bool
 	// DiskSeries stores historical identities/postings in immutable per-part indexes and disables RecentWindow.
 	DiskSeries bool
@@ -202,6 +202,8 @@ type Config struct {
 	// SeparateSeries stores immutable identity/postings deltas separately from numeric parts.
 	// Opt-in standalone disk-series mode; metadata reclamation and clustered use are unsupported.
 	SeparateSeries bool
+	// PackedWAL packs references to durable series into local WAL blocks.
+	PackedWAL bool
 	// Repair pulls a part this engine holds in its index but cannot read back from a peer that
 	// still has it, and says whether the part is gone from every owner. The cluster layer supplies
 	// it over its transport; a single-node store supplies one that fetches nothing and answers for
@@ -240,6 +242,7 @@ type Engine struct {
 	seriesTable   *seriesSnapshot
 	// Confirmed only by a landed CAS or a loaded catalog, under state ownership.
 	compactMetricMetadata bool
+	metricFeatures        bucketindex.MetricFeature
 	seriesBuildMu         sync.Mutex
 	seriesNoGain          descriptorMergeHistory // Owned by mergeRun.
 	seriesRetired         []bucketindex.SeriesRoot
@@ -487,7 +490,7 @@ func New(cfg Config) *Engine {
 		e.recentMin = maxInt64
 	}
 
-	if cfg.WAL != nil && cfg.Term == nil && cfg.WriterID == "" {
+	if (cfg.WAL != nil || cfg.AsyncPressureFlush && cfg.DiskSeries) && cfg.Term == nil && cfg.WriterID == "" {
 		e.parallel = &parallelHead{}
 		e.mu.EnableSharedWriters()
 	}
@@ -559,21 +562,10 @@ func (e *Engine) AppendBatch(
 	if err := e.flushResidentHead(); err != nil {
 		return AppendResult{}, err
 	}
-	eligible := e.cfg.WAL != nil && (limits.Overflow == nil || limits.MaxSeriesSoft <= 0) &&
+	eligible := (e.cfg.WAL != nil || e.parallel != nil) && (limits.Overflow == nil || limits.MaxSeriesSoft <= 0) &&
 		len(ids) >= minPreparedBatchSamples && len(ids) <= maxPreparedBatchSamples
 	if eligible && e.parallel != nil {
-		preparations := e.preparationPool()
-		p := preparations.acquireWaiting()
-		defer preparations.release(p)
-		if err := e.flushResidentHead(); err != nil {
-			return AppendResult{}, err
-		}
-		p.prepare(ids)
-		res, err := e.appendPrepared(ids, ts, values, sf, materialize, limits, p)
-		if err == nil {
-			e.schedulePressureFlush()
-		}
-		return res, err
+		return e.appendParallelPrepared(ids, ts, values, sf, materialize, limits)
 	}
 	if !eligible || !e.mu.TryLockWriter() {
 		if eligible {
@@ -1742,7 +1734,7 @@ func (e *Engine) SeriesCount() int {
 }
 
 func (e *Engine) observeFlush(ctx context.Context, flush func(context.Context) (int, int64, error)) error {
-	ctx = e.cfg.Obs.Base(ctx)
+	ctx = obs.WithWritePhase(e.cfg.Obs.Base(ctx), "flush")
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.flush",
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
 	defer span.End()

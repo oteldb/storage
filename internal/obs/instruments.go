@@ -69,19 +69,21 @@ func sigAttr(sig string) metric.MeasurementOption {
 
 // Flush instruments a head→part flush.
 type Flush struct {
-	total            metric.Int64Counter
-	duration         metric.Float64Histogram
-	rows             metric.Int64Histogram
-	bytes            metric.Int64Counter
-	verified         metric.Int64Counter
-	reservation      metric.Int64Histogram
-	reservationWait  metric.Float64Histogram
-	outputSeries     metric.Int64Histogram
-	generationStarts metric.Int64Counter
-	buildWorkers     metric.Int64Histogram
-	buildJobs        metric.Int64Histogram
-	buildFallbacks   metric.Int64Counter
-	buildMemory      metric.Int64Histogram
+	total             metric.Int64Counter
+	duration          metric.Float64Histogram
+	rows              metric.Int64Histogram
+	bytes             metric.Int64Counter
+	verified          metric.Int64Counter
+	descriptorRetries metric.Int64Counter
+	reservation       metric.Int64Histogram
+	reservationWait   metric.Float64Histogram
+	headPhase         metric.Float64Histogram
+	outputSeries      metric.Int64Histogram
+	generationStarts  metric.Int64Counter
+	buildWorkers      metric.Int64Histogram
+	buildJobs         metric.Int64Histogram
+	buildFallbacks    metric.Int64Counter
+	buildMemory       metric.Int64Histogram
 }
 
 // GenerationStarted records overlapping build attempts, including admission waits.
@@ -117,6 +119,11 @@ func (f *Flush) Reservation(ctx context.Context, phase string, reserved, target 
 	f.reservationWait.Record(ctx, wait.Seconds(), phaseOpt)
 }
 
+// HeadPhase records elapsed time for one bounded phase of metric head ingestion or publication.
+func (f *Flush) HeadPhase(ctx context.Context, phase string, elapsed time.Duration) {
+	f.headPhase.Record(ctx, elapsed.Seconds(), metric.WithAttributes(attribute.String("phase", phase)))
+}
+
 // OutputSeries records distinct series in each published flush candidate.
 func (f *Flush) OutputSeries(ctx context.Context, n int64) { f.outputSeries.Record(ctx, n) }
 
@@ -125,6 +132,16 @@ func (f *Flush) VerificationCache(ctx context.Context, hits, misses int64) {
 	f.verified.Add(ctx, hits, metric.WithAttributes(attribute.String("result", "hit")))
 	f.verified.Add(ctx, misses, metric.WithAttributes(attribute.String("result", "miss")))
 }
+
+// HeadMembership counts verification probes satisfied by a confirmed head proof.
+func (f *Flush) HeadMembership(ctx context.Context, count int64) {
+	if count != 0 {
+		f.verified.Add(ctx, count, metric.WithAttributes(attribute.String("result", "confirmed_head")))
+	}
+}
+
+// DescriptorPlanRetry records a delta plan invalidated before installing its root.
+func (f *Flush) DescriptorPlanRetry(ctx context.Context) { f.descriptorRetries.Add(ctx, 1) }
 
 // Record accounts one flush: the row count and part bytes written, and the wall time dur, for the
 // given signal. bytes is the ingest side of write amplification — what merges rewrite is measured
@@ -346,9 +363,10 @@ func (f *Fetch) Record(ctx context.Context, sig string, dur time.Duration, serie
 
 // Backend instruments the L1 object-store operations.
 type Backend struct {
-	ops     metric.Int64Counter
-	bytes   metric.Int64Counter
-	latency metric.Float64Histogram
+	ops         metric.Int64Counter
+	bytes       metric.Int64Counter
+	objectBytes metric.Int64Counter
+	latency     metric.Float64Histogram
 }
 
 // Record accounts one backend op (read/write/list/delete/cas) with its result (ok/not_found/error),
@@ -360,6 +378,14 @@ func (b *Backend) Record(ctx context.Context, op, result string, dur time.Durati
 
 	if bytes > 0 {
 		b.bytes.Add(ctx, bytes, opAttr)
+	}
+}
+
+// ObjectWrite adds object payload bytes by kind, owning phase, and outcome.
+func (b *Backend) ObjectWrite(ctx context.Context, kind, outcome string, bytes int64) {
+	if bytes > 0 {
+		b.objectBytes.Add(ctx, bytes, metric.WithAttributes(
+			attribute.String("kind", kind), attribute.String("phase", WritePhase(ctx)), attribute.String("result", outcome)))
 	}
 }
 
@@ -433,9 +459,10 @@ func newRPC(m metric.Meter) (*RPC, error) {
 func newBackend(m metric.Meter) (*Backend, error) {
 	b := &imb{m: m}
 	bk := &Backend{
-		ops:     b.counter("storage.backend.ops", "backend object-store operations", "{op}"),
-		bytes:   b.counter("storage.backend.bytes", "bytes read from / written to the backend", "By"),
-		latency: b.f64hist("storage.backend.latency", "backend operation wall time"),
+		ops:         b.counter("storage.backend.ops", "backend object-store operations", "{op}"),
+		objectBytes: b.counter("storage.backend.object_write_bytes", "object write payload bytes by kind, phase and outcome", "By"),
+		bytes:       b.counter("storage.backend.bytes", "bytes read from / written to the backend", "By"),
+		latency:     b.f64hist("storage.backend.latency", "backend operation wall time"),
 	}
 
 	return bk, b.err
@@ -444,21 +471,29 @@ func newBackend(m metric.Meter) (*Backend, error) {
 // WAL instruments the write-ahead log. The recording methods use a background context (the WAL
 // writer carries none) and are called at append/fsync/rotation granularity, never per sample.
 type WAL struct {
-	references metric.Int64Counter
-	written    metric.Int64Counter
-	appends    metric.Int64Counter
-	fsyncs     metric.Int64Counter
-	rotations  metric.Int64Counter
-	segments   metric.Int64Gauge
-	bytes      metric.Int64Gauge
-	syncFails  metric.Int64Counter
-	failing    metric.Int64Gauge
+	references   metric.Int64Counter
+	packedBlocks metric.Int64Counter
+	written      metric.Int64Counter
+	appends      metric.Int64Counter
+	fsyncs       metric.Int64Counter
+	rotations    metric.Int64Counter
+	segments     metric.Int64Gauge
+	bytes        metric.Int64Gauge
+	syncFails    metric.Int64Counter
+	failing      metric.Int64Gauge
 }
 
-// References accounts for first-sample WAL frames using published descriptors.
+// References accounts for first-sample series references to published descriptors.
 func (w *WAL) References(n int) {
 	if n > 0 {
 		w.references.Add(context.Background(), int64(n))
+	}
+}
+
+// PackedBlocks accounts for frames carrying multiple WAL references.
+func (w *WAL) PackedBlocks(n int) {
+	if n > 0 {
+		w.packedBlocks.Add(context.Background(), int64(n))
 	}
 }
 
@@ -487,14 +522,15 @@ func (w *WAL) SyncFailed(ctx context.Context, n int64, failing bool) {
 func newWAL(m metric.Meter) (*WAL, error) {
 	b := &imb{m: m}
 	w := &WAL{
-		references: b.counter("storage.wal.descriptor_references", "WAL frames referencing a durable metric descriptor", "{frame}"),
-		written:    b.counter("storage.wal.written", "bytes written to WAL files before checkpointing", "By"),
-		appends:    b.counter("storage.wal.appends", "WAL record-batch appends", "{append}"),
-		fsyncs:     b.counter("storage.wal.fsyncs", "WAL fsyncs", "{fsync}"),
-		rotations:  b.counter("storage.wal.rotations", "WAL segment rotations", "{rotation}"),
-		segments:   b.gauge("storage.wal.segments", "WAL segments on disk", "{segment}"),
-		bytes:      b.gauge("storage.wal.bytes", "bytes the WAL segments hold", "By"),
-		syncFails:  b.counter("storage.wal.sync_failures", "background WAL fsyncs that failed", "{fsync}"),
+		references:   b.counter("storage.wal.descriptor_references", "WAL series references to durable metric descriptors", "{frame}"),
+		packedBlocks: b.counter("storage.wal.packed_blocks", "WAL frames carrying packed singleton references", "{frame}"),
+		written:      b.counter("storage.wal.written", "bytes written to WAL files before checkpointing", "By"),
+		appends:      b.counter("storage.wal.appends", "WAL record-batch appends", "{append}"),
+		fsyncs:       b.counter("storage.wal.fsyncs", "WAL fsyncs", "{fsync}"),
+		rotations:    b.counter("storage.wal.rotations", "WAL segment rotations", "{rotation}"),
+		segments:     b.gauge("storage.wal.segments", "WAL segments on disk", "{segment}"),
+		bytes:        b.gauge("storage.wal.bytes", "bytes the WAL segments hold", "By"),
+		syncFails:    b.counter("storage.wal.sync_failures", "background WAL fsyncs that failed", "{fsync}"),
 		failing: b.gauge("storage.wal.sync_failing",
 			"1 while background WAL fsyncs are failing", "{node}"),
 	}
@@ -629,6 +665,7 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 			"generation build attempts started alone or overlapping, including admission waits", "{generation}"),
 		reservation: b.i64hist("storage.flush.reservation.bytes", "flush workspace reservation and part target", "By",
 			1<<20, 8<<20, 16<<20, 32<<20, 64<<20, 128<<20, 256<<20, 512<<20, 1<<30, 2<<30),
+		headPhase:       b.f64hist("storage.flush.head_phase", "metric head ingestion or publication phase duration"),
 		reservationWait: b.f64hist("storage.flush.reservation.wait", "flush workspace admission wait"),
 		outputSeries:    b.i64hist("storage.flush.output.series", "distinct series per completed flush candidate", "{series}"),
 		buildWorkers:    b.i64hist("storage.flush.build.workers", "admitted builders per flush attempt", "{worker}", 0, 1, 2),
@@ -637,11 +674,12 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 		buildFallbacks: b.counter("storage.flush.build.fallbacks", "parallel plans retried sequentially", "{attempt}"),
 		buildMemory: b.i64hist("storage.flush.build.memory.bytes", "planned and checked flush working sets", "By",
 			1<<20, 8<<20, 16<<20, 32<<20, 64<<20, 128<<20, 256<<20, 512<<20, 1<<30),
-		verified: b.counter("storage.series.verification_cache.requests", "shared-series ID membership cache probes", "{identity}"),
-		total:    b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
-		duration: b.f64hist("storage.flush.duration", "flush wall time"),
-		rows:     b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),
-		bytes:    b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
+		verified:          b.counter("storage.series.verification_cache.requests", "shared-series ID membership verification", "{identity}"),
+		descriptorRetries: b.counter("storage.series.descriptor_plan_retries", "stale descriptor delta plans", "{retry}"),
+		total:             b.counter("storage.flush.total", "head flushes to a part", "{flush}"),
+		duration:          b.f64hist("storage.flush.duration", "flush wall time"),
+		rows:              b.i64hist("storage.flush.rows", "rows written per flush", "{row}"),
+		bytes:             b.counter("storage.flush.bytes", "part bytes written by flushes", "By"),
 	}
 	merge := &Merge{
 		refused:       b.counter("storage.merge.admission_refused", "process-pool merge refusals by pool, across signals", "{attempt}"),

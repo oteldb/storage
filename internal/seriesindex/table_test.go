@@ -152,9 +152,34 @@ func TestTableSeeksWithoutReadingWholeIndex(t *testing.T) {
 	require.ErrorIs(t, c.Err(), context.Canceled)
 }
 
+func TestPostingsSpillContainsOnlyPostings(t *testing.T) {
+	t.Parallel()
+	data := postingsSpillData(t)
+	be := backend.Memory()
+	require.NoError(t, be.Write(t.Context(), "spill", data))
+	spill, err := OpenPostingsSpill(t.Context(), be, "spill")
+	require.NoError(t, err)
+	c := spill.table.Cursor(t.Context())
+	for c.Next() {
+		require.Contains(t, []byte{'c', 'h', 'n', 'p'}, c.Key()[0])
+	}
+	require.NoError(t, c.Err())
+	_, err = Open(t.Context(), be, "spill")
+	require.ErrorIs(t, err, ErrCorrupt)
+}
+
+func postingsSpillData(tb testing.TB) []byte {
+	tb.Helper()
+	_, builder := buildIndex(tb, indexSeries())
+	var out bytes.Buffer
+	require.NoError(tb, builder.write(&out, true))
+	return out.Bytes()
+}
+
 func FuzzTableRead(f *testing.F) {
 	f.Add(tableData(f, 0, 100), []byte(""))
 	f.Add(tableData(f, 10, 100), []byte("key-00000005"))
+	f.Add(postingsSpillData(f), []byte{'p'})
 	f.Fuzz(func(t *testing.T, data, key []byte) {
 		if len(data) > 1<<20 {
 			t.Skip()

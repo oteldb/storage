@@ -15,6 +15,7 @@ import (
 type headBuildInput struct {
 	names  *partid.Sequence
 	index  *series.Index
+	proofs descriptorProofs
 	retain func([]*part)
 }
 
@@ -78,13 +79,19 @@ func (e *Engine) freezePressureGenerationLocked(ctx context.Context) error {
 	if err := e.tenureLocked(term); err != nil {
 		return err
 	}
-	epoch := max(e.flushedEpoch+1, e.cfg.WAL.Epoch())
+	epoch := e.flushedEpoch + 1
 	sequence := -1
-	if err := e.mu.WithReaders(func() (err error) {
-		sequence, err = e.cfg.WAL.Seal(epoch + 1)
-		return err
-	}); err != nil {
-		return errors.Wrap(err, "seal wal")
+	if e.cfg.WAL != nil {
+		epoch = max(epoch, e.cfg.WAL.Epoch())
+		if err := e.mu.WithReaders(func() (err error) {
+			sequence, err = e.cfg.WAL.Seal(epoch + 1)
+			return err
+		}); err != nil {
+			return errors.Wrap(err, "seal wal")
+		}
+	} else if n := len(e.pressureGenerations); n > 0 {
+		// With no segment to advance the epoch, account for a frozen generation still building.
+		epoch = max(epoch, e.pressureGenerations[n-1].epoch+1)
 	}
 	h := e.head
 	frozen := newHeadWithContexts(e.cfg.SeriesContexts, e.cfg.SeriesTemplates)
@@ -345,7 +352,7 @@ func (e *Engine) finishGenerationBuild(r generationResult) {
 func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGeneration) error {
 	rememberPublished := e.cfg.SeparateSeries && e.fixedHeadRotation()
 	if !rememberPublished {
-		if err := e.rememberGenerationWatermarks(ctx, g.head, false); err != nil {
+		if err := e.rememberGenerationWatermarks(ctx, g.head, 0); err != nil {
 			return err
 		}
 	}
@@ -371,12 +378,18 @@ func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGener
 	}
 	e.sortPressureParts(next)
 	err := e.commitIndexLocked(ctx, next, max(g.epoch, e.flushedEpoch), g.term, nil)
+	if err == nil {
+		e.cfg.Obs.Flush.HeadPhase(ctx, "frozen_to_published", time.Since(g.started))
+	}
 	if rememberPublished {
 		// Leave the old head attached while admitting writes during the cache update.
 		// Only a confirmed catalog can authorize descriptor references.
-		published := err == nil && e.compactMetricMetadata
+		var lineage uint64
+		if err == nil && e.compactMetricMetadata {
+			lineage = e.seriesTable.membershipLineage()
+		}
 		_ = e.mu.WithWriters(func() error {
-			return e.rememberGenerationWatermarks(context.WithoutCancel(ctx), g.head, published)
+			return e.rememberGenerationWatermarks(context.WithoutCancel(ctx), g.head, lineage)
 		})
 	}
 	// Keep ambiguous candidates queryable and retain WAL exactly as the single-generation path does.
@@ -446,7 +459,7 @@ func (e *Engine) buildFrozenGeneration(ctx context.Context, g *pressureGeneratio
 	active := e.pressure.generationBuilds.Add(1)
 	defer e.pressure.generationBuilds.Add(-1)
 	e.cfg.Obs.Flush.GenerationStarted(ctx, metricSignal, active > 1)
-	input := &headBuildInput{names: g.names, index: g.head.series, retain: func(parts []*part) {
+	input := &headBuildInput{names: g.names, index: g.head.series, proofs: g.head.descriptorProofs, retain: func(parts []*part) {
 		e.mu.LockState()
 		g.head.buildRetained = generationPartBytes(parts)
 		e.mu.UnlockState()

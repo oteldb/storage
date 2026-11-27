@@ -45,14 +45,14 @@ func BenchmarkVerifiedIdentities(b *testing.B) {
 				if limit > 0 {
 					cache = newVerifiedIdentityCache(limit)
 				}
-				if _, err := snapshot.knownIdentities(b.Context(), input, cache); err != nil {
+				if _, _, err := snapshot.knownIdentities(b.Context(), input, cache); err != nil {
 					b.Fatal(err)
 				}
 				counter.Reset()
 				b.SetBytes(count * 16)
 				b.ReportAllocs()
 				for b.Loop() {
-					known, err := snapshot.knownIdentities(b.Context(), input, cache)
+					known, _, err := snapshot.knownIdentities(b.Context(), input, cache)
 					if err != nil {
 						b.Fatal(err)
 					}

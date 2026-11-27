@@ -51,6 +51,10 @@ type partStreamWriter struct {
 	withStats    bool
 	floatGroups  bool
 	seriesChunks bool
+	sparseLimit  int
+	sparseRows   int
+	sparseMin    int64
+	sparseMax    int64
 	// sampled decides both whether the weight column survives (OmitConstColumn) and whether the
 	// aggregate sidecar is written — it holds raw values, so a sampled part must fall back to the
 	// weighted decode path.
@@ -99,7 +103,7 @@ func newPartStreamWriterAt(
 
 	opts := append(partOptions(blockRows, comp, rollup), extra...)
 	if e.cfg.MetricSeriesChunks {
-		opts = append(opts, block.WithIndependentGroups())
+		opts = append(opts, block.WithIndependentGroups(), block.WithSharedRowGroups())
 	}
 	if prefix == "" {
 		prefix = e.newPartPrefix()
@@ -158,6 +162,9 @@ func newPartStreamWriterAt(
 		seriesChunks:     e.cfg.MetricSeriesChunks,
 		streamIdentities: streamIdentities, identityWriterBytes: identityBytes,
 	}
+	if out.seriesChunks {
+		out.sparseLimit = min(sparseMetricChunkRows, blockRows)
+	}
 	out.sidecarWriterBytes, _ = out.sidecarWorkspace()
 	if e.cfg.SeparateSeries && out.sidecarWriterBytes > 0 {
 		if bytes, ok := out.ordinalWorkspace(); ok && e.fixedHeadRotation() {
@@ -174,6 +181,10 @@ func newPartStreamWriterAt(
 // timestamp the run covers, the watermark the replica refresh trims through; a rollup can cover past
 // its newest sample.
 func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []float64, covered int64) error {
+	return p.appendNumericRun(id, ts, values, sf, covered, false)
+}
+
+func (p *partStreamWriter) appendNumericRun(id chunk.U128, ts []int64, values, sf []float64, covered int64, singleton bool) error {
 	if len(ts) == 0 {
 		return nil
 	}
@@ -183,13 +194,11 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 			return err
 		}
 	}
-	if p.seriesChunks && len(p.runs) > 0 && !sameSeries {
-		if err := p.w.EndGroup(); err != nil {
-			return err
-		}
+	begin, err := p.beginNumericGroup(sameSeries, singleton && len(ts) == 1 && p.sparseLimit > 1, ts[0])
+	if err != nil {
+		return err
 	}
 
-	var err error
 	p.runs, err = p.w.AppendU128RunView(colSeriesIdx, id, len(ts))
 	if err != nil {
 		return err
@@ -201,7 +210,7 @@ func (p *partStreamWriter) appendSeries(id chunk.U128, ts []int64, values, sf []
 
 	var valueErr error
 	if p.floatGroups {
-		valueErr = p.w.AppendFloat64Group(colValueIdx, values, !sameSeries)
+		valueErr = p.w.AppendFloat64Group(colValueIdx, values, begin)
 	} else {
 		valueErr = p.w.AppendFloat64(colValueIdx, values)
 	}

@@ -56,7 +56,7 @@ func (e *Engine) MergeSamplesStep(ctx context.Context, opts MergeOptions) (chang
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	ctx = e.cfg.Obs.Base(ctx)
+	ctx = obs.WithWritePhase(e.cfg.Obs.Base(ctx), "sample_merge")
 	e.recordRetentionRequest(opts.RetainFrom, opts.RetentionBoundBy)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.merge",
 		trace.WithAttributes(
@@ -806,7 +806,7 @@ func (e *Engine) compactStreamWithInputs(
 
 		err = timebucket.Runs(rs.ts, func(lo, hi int) error {
 			ts, values, sf, watermark := rs.run(lo, hi)
-			return item.routeSamples(&router, ts, values, sf, watermark, reached)
+			return item.routeSamples(&router, ts, values, sf, watermark, len(rs.ts) == 1, reached)
 		})
 		if err != nil {
 			return nil, err
@@ -838,16 +838,16 @@ func (item *mergeIdentityItem) tryStreamSamples(
 		return false, nil
 	}
 	return true, windows.merge(ctx, streams, item.ranges, start, item.covered, func(ts []int64, values []float64, covered int64) error {
-		return item.routeSamples(router, ts, values, nil, covered, reached)
+		return item.routeSamples(router, ts, values, nil, covered, false, reached)
 	})
 }
 
 func (item *mergeIdentityItem) routeSamples(
-	router *timebucket.Router[*partStreamWriter], ts []int64, values, sf []float64, covered int64,
+	router *timebucket.Router[*partStreamWriter], ts []int64, values, sf []float64, covered int64, singleton bool,
 	reached func(*partStreamWriter) bool,
 ) error {
 	return router.Append(ts[0], func(w *partStreamWriter) (bool, error) {
-		if err := item.appendTo(w, ts, values, sf, covered); err != nil {
+		if err := item.appendTo(w, ts, values, sf, covered, singleton); err != nil {
 			return false, err
 		}
 		return reached(w), nil

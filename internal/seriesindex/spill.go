@@ -9,28 +9,101 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/index/series"
+	"github.com/oteldb/storage/internal/buildbudget"
 	"github.com/oteldb/storage/signal"
 )
 
-// WriteContiguous merges postings from disjoint, consecutive ranges of the same
-// sorted view and returns the largest encoded descriptor size.
+// The digest marks private postings data that must never open as a complete series index.
+var postingsSpillDigest = [32]byte{'P', 'O', 'S', 'T', 'I', 'N', 'G', 'S', 1}
+
+// PostingsSpill is a private, immutable table of postings for a contiguous ordinal range.
+type PostingsSpill struct{ table *Table }
+
+// MaxPageBytes bounds one spill cursor's workspace.
+func (s *PostingsSpill) MaxPageBytes() int64 { return s.table.MaxPageBytes() }
+
+// OpenPostingsSpill opens a private postings table without borrowing a descriptor index.
+func OpenPostingsSpill(ctx context.Context, be backend.Backend, key string) (*PostingsSpill, error) {
+	t, err := OpenTable(ctx, be, key)
+	if err != nil {
+		return nil, err
+	}
+	if t.parentDigest != postingsSpillDigest || t.seriesCount == 0 || t.count == 0 {
+		return nil, errors.Wrap(ErrCorrupt, "postings spill header")
+	}
+	return &PostingsSpill{table: t}, nil
+}
+
+// WritePostingsSpill writes only label keys and postings with the local series count.
+func (b *Builder) WritePostingsSpill(ctx context.Context, be backend.Backend, key string) error {
+	w, err := backend.CreateObjectDeferred(ctx, be, key)
+	if err != nil {
+		return err
+	}
+	defer w.Abort()
+	if err := b.write(w, true); err != nil {
+		return err
+	}
+	return w.Commit(ctx)
+}
+
+func contiguousPostingMerge(ctx context.Context, count int, inputs []*PostingsSpill) (*PostingMerge, error) {
+	if count <= 0 || uint64(count) > math.MaxUint32 {
+		return nil, errors.New("seriesindex: invalid postings spill count")
+	}
+	m := &PostingMerge{
+		ctx: ctx, sources: make([]mergePostingSource, len(inputs)),
+		selectedSource: -1, contiguous: true,
+	}
+	for i, input := range inputs {
+		t := input.table
+		m.sources[i] = mergePostingSource{table: t, count: t.seriesCount, contiguous: true, offset: uint32(m.count)}
+		m.count += uint64(t.seriesCount)
+		m.postingRecords = buildbudget.Add(m.postingRecords, int64(t.count)-1)
+	}
+	if m.count != uint64(count) {
+		return nil, errors.New("seriesindex: postings spill count mismatch")
+	}
+	return m, nil
+}
+
+// MergePostingsSpills writes the union of consecutive spills without encoding descriptors.
+func MergePostingsSpills(ctx context.Context, be backend.Backend, key string, count int, inputs []*PostingsSpill) error {
+	merge, err := contiguousPostingMerge(ctx, count, inputs)
+	if err != nil {
+		return err
+	}
+	w, err := backend.CreateObjectDeferred(ctx, be, key)
+	if err != nil {
+		return err
+	}
+	defer w.Abort()
+	table := NewTableWriter(w)
+	table.seriesCount, table.parentDigest = uint32(count), postingsSpillDigest
+	var countBytes [4]byte
+	binary.BigEndian.PutUint32(countBytes[:], table.seriesCount)
+	if err := table.Append([]byte{'c'}, countBytes[:]); err != nil {
+		return err
+	}
+	b := Builder{mergedPostings: merge}
+	for _, prefix := range []byte{'h', 'n', 'p'} {
+		if err := b.writeMergedPostings(table, prefix); err != nil {
+			return err
+		}
+	}
+	if err := table.Finish(); err != nil {
+		return err
+	}
+	return w.Commit(ctx)
+}
+
+// WriteContiguous merges consecutive spills into one complete index of the sorted view.
 func WriteContiguous(ctx context.Context, be backend.Backend, key string, digest [32]byte,
-	view series.View, refs []uint32, inputs []*Index,
+	view series.View, refs []uint32, inputs []*PostingsSpill,
 ) (int, error) {
-	if uint64(len(refs)) > math.MaxUint32 {
-		return 0, errors.New("seriesindex: too many series")
-	}
-	merge := NewPostingMerge(ctx, inputs)
-	merge.contiguous = true
-	var offset uint64
-	for i := range merge.sources {
-		s := &merge.sources[i]
-		s.contiguous = true
-		s.offset = uint32(offset)
-		offset += uint64(s.index.count)
-	}
-	if offset != uint64(len(refs)) {
-		return 0, errors.New("seriesindex: postings spill count mismatch")
+	merge, err := contiguousPostingMerge(ctx, len(refs), inputs)
+	if err != nil {
+		return 0, err
 	}
 	var scratch []byte
 	return writeCanonical(ctx, be, key, digest, len(refs), merge,

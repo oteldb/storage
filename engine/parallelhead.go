@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/buildbudget"
@@ -75,13 +76,17 @@ func (e *Engine) appendKnownPrepared(
 	if err != nil {
 		return AppendResult{}, preparedDone, err
 	}
+	admissionStart := time.Now()
 	ph.admission.Lock()
+	admissionWait := time.Since(admissionStart)
+	defer e.recordAppendPhase("admission_wait", admissionWait)
 	e.mu.RLock()
 	if e.cfg.DiskSeries && e.head.bytes > 0 && e.headPressureLocked(e.head.residentIdentityBytes()+e.head.inFlightBytes()+ph.pending.Load()) {
 		e.mu.RUnlock()
 		ph.admission.Unlock()
 		return AppendResult{}, preparedPressure, nil
 	}
+	packedWAL := e.packedWALEnabled()
 	p.otherPendingBytes, p.otherPendingSeries = ph.pending.Load(), ph.pendingSeries.Load()
 	p.warm = true
 	res := e.stagePreparedRows(ids, ts, values, sf, func(i int) signal.Series {
@@ -117,7 +122,7 @@ func (e *Engine) appendKnownPrepared(
 		return AppendResult{}, preparedWorkLimit, nil
 	}
 	p.prepareTails()
-	if err := p.batch.encode(view, false); err != nil {
+	if err := e.encodeBatch(p.batch, view, false, packedWAL); err != nil {
 		return AppendResult{}, preparedDone, err
 	}
 	if ph.hooks != nil && ph.hooks.prepared != nil {
@@ -197,7 +202,7 @@ func (e *Engine) parallelSnapshots(p *preparedBatch, lookupErr error) (series.Vi
 		} else if e.cfg.DiskSeries {
 			entry := p.lookup.pending[id]
 			state.historical, state.seen, state.newest = entry.exists, entry.exists, entry.newest
-			state.descriptorPublished = entry.descriptorPublished
+			state.descriptorLineage = entry.descriptorLineage
 		}
 		p.snapshots[i] = state
 	}

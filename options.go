@@ -86,7 +86,7 @@ type Options struct {
 	// side by side instead (e.g. /data/parts and /data/wal).
 	WALDir string
 
-	// WALSync is the WAL fsync policy (default [WALSyncNone]). Ignored without a WAL.
+	// WALSync selects the WAL policy (default [WALSyncNone]). [WALNone] disables the WAL.
 	WALSync WALSyncMode
 
 	// WALSyncInterval is the background fsync period when [WALSync] is [WALSyncInterval]. Zero ⇒
@@ -213,7 +213,7 @@ type Options struct {
 	// MetricFloatGroups enables experimental per-series value compression for new metric parts.
 	// Deploy compatible readers on every replica before enabling it.
 	MetricFloatGroups bool
-	// MetricSeriesChunks writes independently framed chunks for each metric series.
+	// MetricSeriesChunks writes bounded numeric chunks and packs adjacent one-point series at flush.
 	MetricSeriesChunks bool
 	// MetricDiskSeries uses part-local on-disk metric identities/postings and bounded resident heads.
 	// Existing part identity objects remain readable; legacy readers retain their historical registry.
@@ -225,6 +225,9 @@ type Options struct {
 	// MetricSeparateSeries stores descriptors/postings in independent immutable runs.
 	// Requires MetricDiskSeries and MetricSeriesChunks; standalone fresh catalogs only.
 	MetricSeparateSeries bool
+	// MetricPackedWAL packs singleton references to confirmed descriptors in the local WAL.
+	// Requires a standalone separate-series engine with fixed pressure rotation and a WAL.
+	MetricPackedWAL bool
 	// MetricResidentHeadBytes is the disk-index mode's resident-head pressure target. Zero uses 128 MiB.
 	// One atomic append may exceed the target; pressure flushes happen before subsequent writes.
 	MetricResidentHeadBytes int64
@@ -316,19 +319,20 @@ const (
 	DurabilityEphemeral
 )
 
-// WALSyncMode is the WAL fsync policy (the durability/throughput trade-off). It applies only when a
-// WAL is configured ([Options.WALDir] on a durable backend).
+// WALSyncMode controls the WAL on a durable backend.
 type WALSyncMode uint8
 
 const (
 	// WALSyncNone (default) lets WAL writes settle in the OS page cache: they survive a process
-	// crash (recovery replays them) but not necessarily a power loss. Fastest.
+	// crash (recovery replays them) but not necessarily a power loss.
 	WALSyncNone WALSyncMode = iota
 	// WALSyncAlways fsyncs after every WAL record — power-loss durable, slowest.
 	WALSyncAlways
 	// WALSyncInterval fsyncs every engine's WAL in the background every [Options.WALSyncInterval]:
 	// a bounded power-loss window at a fraction of the cost of WALSyncAlways.
 	WALSyncInterval
+	// WALNone disables the WAL. A crash loses accepted writes that have not been flushed.
+	WALNone
 )
 
 // Option is a functional option applied to [Options] by [Open]/[InMemory].
@@ -362,7 +366,7 @@ func WithReadOnly() Option { return func(o *Options) { o.ReadOnly = true } }
 // WithWALDir sets the WAL directory (file backend + durability).
 func WithWALDir(dir string) Option { return func(o *Options) { o.WALDir = dir } }
 
-// WithWALSync sets the WAL fsync policy ([WALSyncNone]/[WALSyncAlways]/[WALSyncInterval]).
+// WithWALSync sets the WAL policy. [WALNone] disables logging and replay.
 func WithWALSync(m WALSyncMode) Option { return func(o *Options) { o.WALSync = m } }
 
 // WithWALSyncInterval selects background fsync ([WALSyncInterval]) every d.
@@ -558,39 +562,17 @@ func errOptionInvalid(reason string) error {
 	return errors.Errorf("storage: invalid options: %s", reason)
 }
 
+func (o *Options) walEnabled() bool {
+	return o.WALSync != WALNone && o.WALDir != ""
+}
+
 // validate checks the option combination before construction.
 func (o *Options) validate() error {
 	if o.BuildMemoryBytes < 0 || o.MetricFlushMemoryBytes < 0 {
 		return errOptionInvalid("BuildMemoryBytes and MetricFlushMemoryBytes must not be negative")
 	}
-	if o.MetricPressureGenerations < 0 || o.MetricPressureGenerations > 2 {
-		return errOptionInvalid("MetricPressureGenerations must be zero, one or two")
-	}
-	if o.MetricPressureGenerations == 2 && !o.MetricAsyncPressureFlush {
-		return errOptionInvalid("MetricPressureGenerations=2 requires MetricAsyncPressureFlush")
-	}
-	if o.MetricSeparateSeries && (!o.MetricDiskSeries || !o.MetricSeriesChunks || o.Cluster != nil) {
-		return errOptionInvalid("MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks without Cluster")
-	}
-	if o.MetricAsyncPressureFlush && (!o.MetricDiskSeries || o.WALDir == "" || o.Cluster != nil || o.ReadOnly ||
-		o.Backend == nil || o.Backend.IsEphemeral()) {
-		return errOptionInvalid("MetricAsyncPressureFlush requires standalone writable disk series and WALDir")
-	}
-	if o.MetricResidentHeadBytes < 0 {
-		return errOptionInvalid("MetricResidentHeadBytes must not be negative")
-	}
-
-	if o.MetricHeadRotationBytes < 0 {
-		return errOptionInvalid("MetricHeadRotationBytes must not be negative")
-	}
-	if o.MetricHeadRotationBytes > 0 {
-		resident := o.MetricResidentHeadBytes
-		if resident == 0 {
-			resident = 128 << 20
-		}
-		if o.MetricPressureGenerations != 2 || o.MetricHeadRotationBytes > resident/2 {
-			return errOptionInvalid("MetricHeadRotationBytes requires two generations and at most half the resident limit")
-		}
+	if err := o.validateMetricLayout(); err != nil {
+		return err
 	}
 
 	if o.Durability == DurabilityEphemeral && o.WALDir != "" {
@@ -610,11 +592,48 @@ func (o *Options) validate() error {
 	// only the flushed parts: the node would serve everything written since its last flush as
 	// missing, indistinguishable from real absence to the caller. Requiring the WAL keeps the head
 	// recoverable, so the node is complete before it serves.
-	if o.Cluster != nil && o.WALDir == "" && o.Backend != nil && !o.Backend.IsEphemeral() {
-		return errOptionInvalid("WALDir is required in cluster mode on a durable backend: " +
+	if o.Cluster != nil && o.Backend != nil && !o.Backend.IsEphemeral() && !o.walEnabled() {
+		return errOptionInvalid("an enabled WALDir is required in cluster mode on a durable backend: " +
 			"without it a restarted node serves reads with its unflushed head missing")
 	}
 
+	return nil
+}
+
+func (o *Options) validateMetricLayout() error {
+	if o.MetricPressureGenerations < 0 || o.MetricPressureGenerations > 2 {
+		return errOptionInvalid("MetricPressureGenerations must be zero, one or two")
+	}
+	if o.MetricPressureGenerations == 2 && !o.MetricAsyncPressureFlush {
+		return errOptionInvalid("MetricPressureGenerations=2 requires MetricAsyncPressureFlush")
+	}
+	if o.MetricSeparateSeries && (!o.MetricDiskSeries || !o.MetricSeriesChunks || o.Cluster != nil) {
+		return errOptionInvalid("MetricSeparateSeries requires MetricDiskSeries and MetricSeriesChunks without Cluster")
+	}
+	if o.MetricPackedWAL && (!o.MetricSeparateSeries || o.MetricHeadRotationBytes <= 0 ||
+		!o.MetricAsyncPressureFlush || !o.walEnabled()) {
+		return errOptionInvalid("MetricPackedWAL requires standalone separate series, fixed pressure rotation and an enabled WAL")
+	}
+	if o.MetricAsyncPressureFlush && (!o.MetricDiskSeries || (o.WALDir == "" && o.WALSync != WALNone) || o.Cluster != nil || o.ReadOnly ||
+		o.Backend == nil || o.Backend.IsEphemeral()) {
+		return errOptionInvalid("MetricAsyncPressureFlush requires standalone writable disk series with a WALDir or WALNone")
+	}
+	if o.MetricResidentHeadBytes < 0 {
+		return errOptionInvalid("MetricResidentHeadBytes must not be negative")
+	}
+
+	if o.MetricHeadRotationBytes < 0 {
+		return errOptionInvalid("MetricHeadRotationBytes must not be negative")
+	}
+	if o.MetricHeadRotationBytes > 0 {
+		resident := o.MetricResidentHeadBytes
+		if resident == 0 {
+			resident = 128 << 20
+		}
+		if o.MetricPressureGenerations != 2 || o.MetricHeadRotationBytes > resident/2 {
+			return errOptionInvalid("MetricHeadRotationBytes requires two generations and at most half the resident limit")
+		}
+	}
 	return nil
 }
 
@@ -688,7 +707,7 @@ var _ = errors.Is
 // WithMetricFloatGroups enables experimental, bit-exact per-series value compression.
 func WithMetricFloatGroups() Option { return func(o *Options) { o.MetricFloatGroups = true } }
 
-// WithMetricSeriesChunks enables independently readable per-series metric chunks.
+// WithMetricSeriesChunks enables bounded metric chunks with sparse-series packing at flush.
 func WithMetricSeriesChunks() Option { return func(o *Options) { o.MetricSeriesChunks = true } }
 
 // WithMetricDiskSeries enables part-local disk identities/postings for metric engines.
@@ -701,6 +720,9 @@ func WithMetricAsyncPressureFlush() Option {
 
 // WithMetricSeparateSeries enables independent metric descriptor runs on a fresh standalone store.
 func WithMetricSeparateSeries() Option { return func(o *Options) { o.MetricSeparateSeries = true } }
+
+// WithMetricPackedWAL enables bounded blocks of singleton references in the standalone metric WAL.
+func WithMetricPackedWAL() Option { return func(o *Options) { o.MetricPackedWAL = true } }
 
 // WithRejectOutOfRetention enables retention-age admission for all writes.
 func WithRejectOutOfRetention() Option { return func(o *Options) { o.RejectOutOfRetention = true } }

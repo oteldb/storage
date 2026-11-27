@@ -111,7 +111,11 @@ this pass as `flush_cache_watermarks`.
 Active and frozen identity owners are both charged to resident pressure until publication;
 retiring the frozen owner preserves the active registry without rebuilding it. A failed flush
 reattaches its frozen ownership and keeps the WAL replayable. The optional recent tier is disabled.
-`MetricAsyncPressureFlush` optionally starts standalone WAL-backed disk-head rotation at half this
+`WALNone` disables WAL writes, syncs, and replay on a standalone store. Only flushed parts survive
+a restart. Drain any segments in the configured WAL directory through ordinary recovery and flush
+before enabling this policy. `WALSyncNone` remains the default and writes the WAL without
+per-append fsync.
+`MetricAsyncPressureFlush` optionally starts standalone disk-head rotation at half this
 target and waits at the full aggregate target. This overlaps ingestion with one frozen builder
 without multiplying resident/cache targets. It is off by default; cluster, read-only and ephemeral
 modes reject it. Head/flush/queue metrics must qualify the changed batching before capacity claims.
@@ -347,7 +351,8 @@ Metric instruments (all prefixed `storage.`):
 | `disk.rejected_writes` | `signal` | writes refused because the medium cannot store them, published with the gauge on each flush attempt (the ingest path that counts them carries no context of its own). Rises only while the gauge stands |
 | `wal.appends` / `wal.fsyncs` / `wal.rotations` | — | WAL activity |
 | `wal.written` | By | Cumulative bytes written to WAL files before checkpointing |
-| `wal.descriptor_references` | — | First-sample frames referring to published metric descriptors |
+| `wal.descriptor_references` | — | First-sample series references to published metric descriptors, including references in packed blocks |
+| `wal.packed_blocks` | — | WAL frames carrying multiple singleton references |
 | `wal.sync_failures` / `wal.sync_failing` | — | background fsyncs that failed, and a gauge: 1 while the latest sync pass had a failure (`StoreStats.WALSync`). A non-zero gauge means `WALSyncInterval`'s power-loss bound is not holding; the sync retries every tick, so it clears on its own once the disk recovers |
 | `corruption.detected` | `component`, `disposition` | on-disk artifacts that failed an integrity check. `disposition=fatal` is an operation that failed on one: a corrupt manifest or bucket index (`part`, `bucket_index`) fails the load. These count only errors carrying a corruption sentinel, never a backend that failed to answer. `disposition=wanted` is a part that stayed corrupt over three consecutive loads and was handed to repair as a want (`part`), one count when it is handed over. `disposition=tolerated` is corruption the engine fell back from and served on: a bloom sidecar (`bloom` — the part stops pruning on that column), a part's identity object (`part_identity` — its rows stay unresolvable until a merge rewrites the part), the paged series index or series-stats sidecar (`series_index`, `series_stats` — slower opens and aggregates), marks (`marks` — no granule pruning), an adopted part (`part` — left out of the read set), a record part whose rows are not timestamp-ordered within a stream, or whose stream column is not grouped in stream order (`stream_order` — merged without losing a row from a whole decode, once per merge that reads it, but its windowed reads are already unreliable), a damaged WAL region (`wal` — one count per region replay skipped at `Open`; its records are lost, a Warn log names the segment, offset and bytes, and the segment is copied aside as `{segment}.damaged`, the newest four kept). A tolerated artifact counts at every open or first read that meets it, so a steady rate is one damaged part read repeatedly, not new damage |
 | `index.fenced_loads` | `signal`, `reason` | bucket-index loads that failed and left the engine refusing commits (`SignalStats.IndexFenced`). `reason` is `corrupt` (a damaged index or part; a part that stays so is handed to repair after three loads), `unsupported_version` (a part written by a newer release; never clears until this node is upgraded) or `unavailable` (the backend failed to answer). A fenced engine retries once per maintenance cycle and each failure counts again, so a steady rate is one engine that stays fenced; a single count that stops is a transient failure the next retry cleared. A corrupt artifact behind it also counts in `corruption.detected` with `disposition=fatal` |
@@ -696,7 +701,7 @@ for one part at the cap and its finish, so a merge seals parts at the cap, not b
 deferring, so an operator command never silently does nothing. `Admin.MaintainNow` runs the
 background cycle and therefore defers like it.
 
-For independent metric chunks, `PartsDetailed.Chunks` reports the recorded chunk count;
+For metric chunks, `PartsDetailed.Chunks` reports the recorded chunk count;
 `GranuleSize` is their maximum row count. Decode-cache bytes include retained numeric capacity
 and entry overhead for these chunks, rather than only the number of decoded sample bytes.
 
@@ -704,6 +709,12 @@ Flush workspace metrics distinguish the configured output target from the admitt
 `storage.flush.reservation.bytes` labels `component=reserved|target` and a bounded `phase`;
 `storage.flush.reservation.wait` records admission wait by phase. `storage.flush.output.series`
 counts distinct identities per completed candidate, including candidates not yet catalog-published.
+`storage.flush.head_phase` records seconds per event for rotation waits, resident head waits,
+admission waits, publication, and successful frozen-to-published lifetimes.
+`storage.backend.object_write_bytes` counts payload bytes by object kind, operation phase, and
+outcome (`ok`, `aborted`, `error`, or `conflict`). Streamed bytes are attributed at commit or
+abort. Whole-object writes count attempted payload bytes. These counters describe backend
+operations and omit filesystem metadata and writeback.
 `storage.flush.generation_starts{signal,concurrency=single|overlapping}` records two-generation
 stream builders starting while zero or one other builder is executing. Finished-but-uncollected
 results are excluded. These are overlapping build lifetimes, including admission waits, not CPU
@@ -722,7 +733,10 @@ this accounting experiment and remain configured as before.
 
 `storage.series.verification_cache.requests` records shared-series ID membership cache hits and
 misses. A hit confirms that the full series ID is present in an immutable descriptor root in the
-flush snapshot.
+flush snapshot. The `confirmed_head` result counts IDs verified using the frozen head's catalog
+lineage. `storage.series.descriptor_plan_retries` counts plans invalidated by a newer descriptor
+snapshot. Postings spill bytes use the `descriptor_delta` phase for initial files and
+`descriptor_spill_reduce` for intermediate files.
 
 `storage.ingest.prepared.attempts{outcome=done|pressure|snapshot|work_limit|error}` counts
 parallel preparation attempts. `storage.ingest.prepared.batches{path,reason}` counts completed

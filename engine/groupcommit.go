@@ -2,6 +2,7 @@ package engine
 
 import (
 	"sync"
+	"time"
 
 	"github.com/go-faster/errors"
 )
@@ -103,6 +104,29 @@ func (q *commitQueue) control(run func() error) error {
 }
 
 func (e *Engine) writePreparedGroup(group []*preparedBatch, size int) error {
+	if e.cfg.WAL != nil {
+		if err := e.writePreparedWAL(group, size); err != nil {
+			return err
+		}
+	}
+	if h := e.parallel.hooks; h != nil && h.beforePublish != nil {
+		h.beforePublish()
+	}
+	var publishElapsed time.Duration
+	e.mu.Publish(func() {
+		start := time.Now()
+		for _, p := range group {
+			p.publishTails(e.head)
+			e.parallel.pending.Add(-int64(p.batch.samples) * SampleBytes)
+			e.parallel.pendingSeries.Add(-int64(p.batch.registered))
+		}
+		publishElapsed = time.Since(start)
+	})
+	e.recordAppendPhase("publish", publishElapsed)
+	return nil
+}
+
+func (e *Engine) writePreparedWAL(group []*preparedBatch, size int) error {
 	frames := group[0].batch.frames.Bytes()
 	var buffer []byte
 	if len(group) > 1 {
@@ -125,22 +149,10 @@ func (e *Engine) writePreparedGroup(group []*preparedBatch, size int) error {
 	if h := e.parallel.hooks; h != nil && h.beforeWAL != nil {
 		h.beforeWAL()
 	}
-	references := 0
+	references, packedBlocks := 0, 0
 	for _, p := range group {
 		references += p.batch.loggedReferences
+		packedBlocks += p.batch.loggedPackedBlocks
 	}
-	if err := e.cfg.WAL.WritePreparedFrames(frames, references); err != nil {
-		return err
-	}
-	if h := e.parallel.hooks; h != nil && h.beforePublish != nil {
-		h.beforePublish()
-	}
-	e.mu.Publish(func() {
-		for _, p := range group {
-			p.publishTails(e.head)
-			e.parallel.pending.Add(-int64(p.batch.samples) * SampleBytes)
-			e.parallel.pendingSeries.Add(-int64(p.batch.registered))
-		}
-	})
-	return nil
+	return e.cfg.WAL.WritePackedMetricFrames(frames, references, packedBlocks)
 }

@@ -20,16 +20,18 @@ type Index struct {
 	// Cached empty-context references are offset by one to reserve zero for unknown.
 	emptyResource, emptyScope uint64
 
-	resources []indexedResource
-	scopes    []indexedScope
-	contexts  []identityContext
-	res       map[string]uint32
-	scope     map[string]uint32
-	context   map[contextKey]uint32
-	keys      [][]symbols.ID
-	keysets   map[string]uint32
-	values    []symbols.ID
-	encoded   []byte
+	resources    []indexedResource
+	scopes       []indexedScope
+	contexts     []identityContext
+	res          map[string]uint32
+	scope        map[string]uint32
+	context      map[contextKey]uint32
+	keys         [][]symbols.ID
+	keysets      map[string]uint32
+	values       []symbols.ID
+	encoded      [][]byte
+	encodedUsed  int
+	encodedBytes int64
 
 	buf, kbuf, vbuf []byte
 	bytes           int64
@@ -173,7 +175,7 @@ func (ix *Index) ForEach(fn func(id signal.SeriesID, s signal.Series)) {
 // SizeBytes reports the owned resident structures and interned payloads.
 func (ix *Index) SizeBytes() int64 {
 	return ix.bytes + ix.byID.sizeBytes() + ix.sym.SizeBytes() + memsize.Slice(ix.rows) + memsize.Slice(ix.values) +
-		memsize.Slice(ix.resources) + memsize.Slice(ix.scopes) + memsize.Slice(ix.contexts) + memsize.Slice(ix.encoded) +
+		memsize.Slice(ix.resources) + memsize.Slice(ix.scopes) + memsize.Slice(ix.contexts) + memsize.Slice(ix.encoded) + ix.encodedBytes +
 		memsize.Slice(ix.keys) + memsize.Slice(ix.buf) + memsize.Slice(ix.kbuf) + memsize.Slice(ix.vbuf) +
 		memsize.Slice(ix.templateRows) + memsize.Slice(ix.templateBuf) + memsize.Slice(ix.templateFields)
 }

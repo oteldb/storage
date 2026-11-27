@@ -87,6 +87,7 @@ type preparedGroup struct {
 }
 
 type preparedBatch struct {
+	descriptorLineage                     uint64
 	memory                                sampleArena
 	batch                                 *walBatch
 	positions                             []int
@@ -95,7 +96,7 @@ type preparedBatch struct {
 	values                                []float64
 	sf                                    []float64
 	current                               int
-	warm, encodedReturning                bool
+	warm, encodedReturning, unlogged      bool
 	snapshots                             []headSeriesState
 	next                                  []sampleBuf
 	created                               []*sampleBuf
@@ -105,6 +106,24 @@ type preparedBatch struct {
 	ownerOrder                            []uint32
 	materializeAt                         []int
 	otherPendingBytes, otherPendingSeries int64
+}
+
+func (e *Engine) appendParallelPrepared(
+	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(int) signal.Series, limits AppendLimits,
+) (AppendResult, error) {
+	preparations := e.preparationPool()
+	p := preparations.acquireWaiting()
+	defer preparations.release(p)
+	if err := e.flushResidentHead(); err != nil {
+		return AppendResult{}, err
+	}
+	p.unlogged = e.cfg.WAL == nil
+	p.prepare(ids)
+	res, err := e.appendPrepared(ids, ts, values, sf, materialize, limits, p)
+	if err == nil {
+		e.schedulePressureFlush()
+	}
+	return res, err
 }
 
 func (p *preparedBatch) prepare(ids []signal.SeriesID) {
@@ -132,7 +151,9 @@ func (p *preparedBatch) prepare(ids []signal.SeriesID) {
 	p.sf = resize(p.sf, len(ids))
 	p.batch.order = resize(p.batch.order, len(p.groups))[:0]
 	p.batch.accs = resize(p.batch.accs, len(p.groups))
-	p.batch.frames.Grow(len(ids)*32 + len(p.groups)*64)
+	if !p.unlogged {
+		p.batch.frames.Grow(len(ids)*32 + len(p.groups)*64)
+	}
 	p.materializeAt = resize(p.materializeAt, len(p.groups))
 	for i := range p.materializeAt {
 		p.materializeAt[i] = -1
@@ -238,6 +259,7 @@ func (e *Engine) stagePreparedRows(
 	ids []signal.SeriesID, ts []int64, values, sf []float64, materialize func(i int) signal.Series,
 	limits AppendLimits, p *preparedBatch,
 ) AppendResult {
+	p.descriptorLineage = e.seriesTable.membershipLineage()
 	var bi int
 	mat := func() signal.Series { return materialize(bi) }
 	var res AppendResult
@@ -302,7 +324,10 @@ func (p *preparedBatch) admit(
 			}
 			acc.register, acc.series = true, materialize()
 			acc.encodedHead = p.encodedReturning && state.historical
-			acc.descriptorRef = acc.encodedHead && state.descriptorPublished
+			if acc.encodedHead && state.descriptorLineage == p.descriptorLineage {
+				acc.descriptorLineage = state.descriptorLineage
+				acc.descriptorRef = acc.descriptorLineage != 0
+			}
 		}
 	}
 	k = len(b.order)

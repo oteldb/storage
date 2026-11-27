@@ -5,6 +5,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/signal"
 	"github.com/oteldb/storage/wal"
@@ -15,6 +16,18 @@ import (
 func (e *Engine) salvageHandlers(ctx context.Context, dir string) wal.Handlers {
 	h := e.replayHandlers()
 	h.OnDescriptorReference = func(id signal.SeriesID) error { return e.replayDescriptorReference(ctx, id) }
+	if e.metricFeatures&bucketindex.MetricFeaturePackedWAL != 0 {
+		h.OnPackedReference = func(id signal.SeriesID, ts int64, value float64) error {
+			if err := e.replayDescriptorReference(ctx, id); err != nil {
+				return err
+			}
+			if err := e.replayResidentGuard(1); err != nil {
+				return err
+			}
+			e.head.replaySamples(id, []int64{ts}, []float64{value})
+			return nil
+		}
+	}
 	h.OnDamage = func(d wal.Damage) error {
 		ctx := e.cfg.Obs.Base(ctx)
 		e.cfg.Obs.Corruption.Detected(ctx, "wal", obs.CorruptTolerated)

@@ -35,12 +35,16 @@ type seriesSnapshot struct {
 	refs    atomic.Int32
 	roots   []*seriesRootHandle
 	retired int
+	lineage uint64
 }
 
-var seriesRootToken atomic.Uint64
+var seriesRootToken, seriesLineageToken atomic.Uint64
 
 func newSeriesSnapshot(roots []*seriesRootHandle) *seriesSnapshot {
-	s := &seriesSnapshot{roots: slices.Clone(roots), tokens: make(map[uint64]struct{}, len(roots))}
+	s := &seriesSnapshot{
+		roots: slices.Clone(roots), tokens: make(map[uint64]struct{}, len(roots)),
+		lineage: seriesLineageToken.Add(1),
+	}
 	slices.SortFunc(s.roots, func(a, b *seriesRootHandle) int { return strings.Compare(a.binding.Prefix, b.binding.Prefix) })
 	s.refs.Store(1)
 	for _, h := range s.roots {
@@ -51,6 +55,13 @@ func newSeriesSnapshot(roots []*seriesRootHandle) *seriesSnapshot {
 		h.acquire()
 	}
 	return s
+}
+
+func (s *seriesSnapshot) membershipLineage() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.lineage
 }
 
 func (s *seriesSnapshot) acquire() {

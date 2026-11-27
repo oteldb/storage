@@ -43,7 +43,7 @@ func (l *diskSeriesLookup) capture(e *Engine, ids []signal.SeriesID) {
 			continue
 		}
 		if entry, ok := e.head.frozenState(id); ok {
-			l.pending[id] = diskHeadEntry{newest: entry.newest, exists: true}
+			l.pending[id] = diskHeadEntry{newest: entry.newest, exists: true, descriptorLineage: entry.descriptorLineage}
 			continue
 		}
 		if hit, ok := l.disk.cache.get(id); ok {

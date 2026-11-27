@@ -39,6 +39,19 @@ func TestReturningIDHeadReadsAndReplays(t *testing.T) {
 	require.Len(t, e.head.encodedRefs, 1)
 	require.Equal(t, s.AppendHashInput(nil), e.head.series.View().EncodedDescriptor(int(e.head.encodedRefs[0])))
 	require.Zero(t, e.head.sym.Len(), "returning attachments skip eager label interning")
+	recovered := identitySnapshot{
+		view: e.head.series.View(), refs: e.head.encodedRefs, proofs: e.head.descriptorProofs,
+	}
+	known, proven, err := e.seriesTable.knownIdentities(t.Context(), recovered)
+	require.NoError(t, err)
+	require.Equal(t, []bool{true}, known)
+	require.Equal(t, 1, proven)
+	replacement := newSeriesSnapshot(nil)
+	defer replacement.release()
+	known, proven, err = replacement.knownIdentities(t.Context(), recovered)
+	require.NoError(t, err)
+	require.Equal(t, []bool{false}, known)
+	require.Zero(t, proven, "a replacement catalog needs its own membership proof")
 	cfg := e.cfg
 	cfg.WAL = nil
 	reopened := New(cfg)
@@ -124,7 +137,7 @@ func TestWALDescriptorReferenceRequiresSuccessfulCommit(t *testing.T) {
 	require.ErrorIs(t, e.Flush(t.Context()), context.DeadlineExceeded)
 	entry, present := e.head.disk.cache.get(id)
 	require.True(t, present)
-	require.False(t, entry.descriptorPublished)
+	require.Zero(t, entry.descriptorLineage)
 
 	res, err := e.AppendBatch([]signal.SeriesID{id}, []int64{201}, []float64{3}, nil,
 		func(int) signal.Series { return fresh }, AppendLimits{})
