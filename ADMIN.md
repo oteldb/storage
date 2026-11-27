@@ -709,6 +709,12 @@ Flush workspace metrics distinguish the configured output target from the admitt
 `storage.flush.reservation.bytes` labels `component=reserved|target` and a bounded `phase`;
 `storage.flush.reservation.wait` records admission wait by phase. `storage.flush.output.series`
 counts distinct identities per completed candidate, including candidates not yet catalog-published.
+`storage.flush.head_phase` records seconds per event for rotation waits, resident head waits,
+admission waits, publication, and successful frozen-to-published lifetimes.
+`storage.backend.object_write_bytes` counts payload bytes by object kind, operation phase, and
+outcome (`ok`, `aborted`, `error`, or `conflict`). Streamed bytes are attributed at commit or
+abort. Whole-object writes count attempted payload bytes. These counters describe backend
+operations and omit filesystem metadata and writeback.
 `storage.flush.generation_starts{signal,concurrency=single|overlapping}` records two-generation
 stream builders starting while zero or one other builder is executing. Finished-but-uncollected
 results are excluded. These are overlapping build lifetimes, including admission waits, not CPU

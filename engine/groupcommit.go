@@ -2,6 +2,7 @@ package engine
 
 import (
 	"sync"
+	"time"
 
 	"github.com/go-faster/errors"
 )
@@ -111,13 +112,17 @@ func (e *Engine) writePreparedGroup(group []*preparedBatch, size int) error {
 	if h := e.parallel.hooks; h != nil && h.beforePublish != nil {
 		h.beforePublish()
 	}
+	var publishElapsed time.Duration
 	e.mu.Publish(func() {
+		start := time.Now()
 		for _, p := range group {
 			p.publishTails(e.head)
 			e.parallel.pending.Add(-int64(p.batch.samples) * SampleBytes)
 			e.parallel.pendingSeries.Add(-int64(p.batch.registered))
 		}
+		publishElapsed = time.Since(start)
 	})
+	e.recordAppendPhase("publish", publishElapsed)
 	return nil
 }
 

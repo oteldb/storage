@@ -56,7 +56,7 @@ func (e *Engine) MergeSamplesStep(ctx context.Context, opts MergeOptions) (chang
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	ctx = e.cfg.Obs.Base(ctx)
+	ctx = obs.WithWritePhase(e.cfg.Obs.Base(ctx), "sample_merge")
 	e.recordRetentionRequest(opts.RetainFrom, opts.RetentionBoundBy)
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.merge",
 		trace.WithAttributes(

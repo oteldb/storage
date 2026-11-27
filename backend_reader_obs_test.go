@@ -8,8 +8,39 @@ import (
 
 	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/backend/file"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/obs/obstest"
 )
+
+func TestMeteredObjectWrites(t *testing.T) {
+	t.Parallel()
+	f, err := file.New(t.TempDir())
+	require.NoError(t, err)
+	o, metrics := obstest.New(t)
+	b := instrumentBackend(f, o.Backend)
+	ctx := obs.WithWritePhase(t.Context(), "sample_merge")
+
+	w, err := backend.CreateObjectDeferred(ctx, b, "metric/p-1/c/0")
+	require.NoError(t, err)
+	_, err = w.Write([]byte("abc"))
+	require.NoError(t, err)
+	require.NoError(t, w.Commit(ctx))
+	w.Abort()
+
+	w, err = backend.CreateObjectDeferred(ctx, b, "metric/p-2/c/0")
+	require.NoError(t, err)
+	_, err = w.Write([]byte("defgh"))
+	require.NoError(t, err)
+	w.Abort()
+
+	ctx = obs.WithWritePhase(t.Context(), "descriptor_delta")
+	require.NoError(t, b.Write(ctx, "metric/s-1/.postings/0", []byte("ij")))
+	require.NoError(t, backend.WriteDeferred(ctx, b, "metric/s-1/c/0", []byte("klm")))
+	require.EqualValues(t, 3, metrics.Counter("storage.backend.object_write_bytes", "kind", "column", "phase", "sample_merge", "result", "ok"))
+	require.EqualValues(t, 5, metrics.Counter("storage.backend.object_write_bytes", "kind", "column", "phase", "sample_merge", "result", "aborted"))
+	require.EqualValues(t, 2, metrics.Counter("storage.backend.object_write_bytes", "kind", "postings_spill", "phase", "descriptor_delta", "result", "ok"))
+	require.EqualValues(t, 3, metrics.Counter("storage.backend.object_write_bytes", "kind", "descriptor_ids", "phase", "descriptor_delta", "result", "ok"))
+}
 
 func TestMeteredReusableReader(t *testing.T) {
 	t.Parallel()

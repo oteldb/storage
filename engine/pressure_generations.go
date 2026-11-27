@@ -377,6 +377,9 @@ func (e *Engine) publishPressureGeneration(ctx context.Context, g *pressureGener
 	}
 	e.sortPressureParts(next)
 	err := e.commitIndexLocked(ctx, next, max(g.epoch, e.flushedEpoch), g.term, nil)
+	if err == nil {
+		e.cfg.Obs.Flush.HeadPhase(ctx, "frozen_to_published", time.Since(g.started))
+	}
 	if rememberPublished {
 		// Leave the old head attached while admitting writes during the cache update.
 		// Only a confirmed catalog can authorize descriptor references.

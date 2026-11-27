@@ -5,7 +5,15 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// Appends lack a caller context.
+var appendPhaseContext = context.Background()
+
+func (e *Engine) recordAppendPhase(phase string, elapsed time.Duration) {
+	e.cfg.Obs.Flush.HeadPhase(appendPhaseContext, phase, elapsed)
+}
 
 type pressureJob struct {
 	done   chan struct{}
@@ -48,7 +56,10 @@ func (e *Engine) pipelineResidentPressure() error {
 			return os.ErrClosed
 		}
 		if rotate {
-			if err := e.waitPressureRotation(job); err != nil {
+			start := time.Now()
+			err := e.waitPressureRotation(job)
+			e.recordAppendPhase("rotation_wait", time.Since(start))
+			if err != nil {
 				return err
 			}
 			continue
@@ -67,9 +78,12 @@ func (e *Engine) pipelineResidentPressure() error {
 		if !active || !blocked {
 			continue
 		}
+		start := time.Now()
 		select {
 		case <-changed:
+			e.recordAppendPhase("resident_wait", time.Since(start))
 		case <-job.done:
+			e.recordAppendPhase("resident_wait", time.Since(start))
 			if job.err != nil {
 				return job.err
 			}

@@ -12,6 +12,7 @@ import (
 	"github.com/oteldb/storage/backend/bucketindex"
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/internal/buildbudget"
+	"github.com/oteldb/storage/internal/obs"
 	"github.com/oteldb/storage/internal/partid"
 	"github.com/oteldb/storage/internal/seriestable"
 	"github.com/oteldb/storage/signal"
@@ -83,6 +84,7 @@ func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySna
 var errSeriesSnapshotChanged = errors.New("engine: shared series snapshot changed during planning")
 
 func (e *Engine) writeSeriesDelta(ctx context.Context, entries identitySnapshot, reserve func(int64) error) error {
+	ctx = obs.WithWritePhase(ctx, "descriptor_delta")
 	e.mu.RLock()
 	snapshot := e.seriesTable
 	snapshot.acquire()

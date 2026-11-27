@@ -76,6 +76,7 @@ type Flush struct {
 	verified         metric.Int64Counter
 	reservation      metric.Int64Histogram
 	reservationWait  metric.Float64Histogram
+	headPhase        metric.Float64Histogram
 	outputSeries     metric.Int64Histogram
 	generationStarts metric.Int64Counter
 	buildWorkers     metric.Int64Histogram
@@ -115,6 +116,11 @@ func (f *Flush) Reservation(ctx context.Context, phase string, reserved, target 
 	f.reservation.Record(ctx, reserved, phaseOpt, metric.WithAttributes(attribute.String("component", "reserved")))
 	f.reservation.Record(ctx, target, phaseOpt, metric.WithAttributes(attribute.String("component", "target")))
 	f.reservationWait.Record(ctx, wait.Seconds(), phaseOpt)
+}
+
+// HeadPhase records elapsed time for one bounded phase of metric head ingestion or publication.
+func (f *Flush) HeadPhase(ctx context.Context, phase string, elapsed time.Duration) {
+	f.headPhase.Record(ctx, elapsed.Seconds(), metric.WithAttributes(attribute.String("phase", phase)))
 }
 
 // OutputSeries records distinct series in each published flush candidate.
@@ -346,9 +352,10 @@ func (f *Fetch) Record(ctx context.Context, sig string, dur time.Duration, serie
 
 // Backend instruments the L1 object-store operations.
 type Backend struct {
-	ops     metric.Int64Counter
-	bytes   metric.Int64Counter
-	latency metric.Float64Histogram
+	ops         metric.Int64Counter
+	bytes       metric.Int64Counter
+	objectBytes metric.Int64Counter
+	latency     metric.Float64Histogram
 }
 
 // Record accounts one backend op (read/write/list/delete/cas) with its result (ok/not_found/error),
@@ -360,6 +367,14 @@ func (b *Backend) Record(ctx context.Context, op, result string, dur time.Durati
 
 	if bytes > 0 {
 		b.bytes.Add(ctx, bytes, opAttr)
+	}
+}
+
+// ObjectWrite adds object payload bytes by kind, owning phase, and outcome.
+func (b *Backend) ObjectWrite(ctx context.Context, kind, outcome string, bytes int64) {
+	if bytes > 0 {
+		b.objectBytes.Add(ctx, bytes, metric.WithAttributes(
+			attribute.String("kind", kind), attribute.String("phase", WritePhase(ctx)), attribute.String("result", outcome)))
 	}
 }
 
@@ -433,9 +448,10 @@ func newRPC(m metric.Meter) (*RPC, error) {
 func newBackend(m metric.Meter) (*Backend, error) {
 	b := &imb{m: m}
 	bk := &Backend{
-		ops:     b.counter("storage.backend.ops", "backend object-store operations", "{op}"),
-		bytes:   b.counter("storage.backend.bytes", "bytes read from / written to the backend", "By"),
-		latency: b.f64hist("storage.backend.latency", "backend operation wall time"),
+		ops:         b.counter("storage.backend.ops", "backend object-store operations", "{op}"),
+		objectBytes: b.counter("storage.backend.object_write_bytes", "object write payload bytes by kind, phase and outcome", "By"),
+		bytes:       b.counter("storage.backend.bytes", "bytes read from / written to the backend", "By"),
+		latency:     b.f64hist("storage.backend.latency", "backend operation wall time"),
 	}
 
 	return bk, b.err
@@ -638,6 +654,7 @@ func newEngineInstruments(m metric.Meter) (*Flush, *Merge, *Fetch, error) {
 			"generation build attempts started alone or overlapping, including admission waits", "{generation}"),
 		reservation: b.i64hist("storage.flush.reservation.bytes", "flush workspace reservation and part target", "By",
 			1<<20, 8<<20, 16<<20, 32<<20, 64<<20, 128<<20, 256<<20, 512<<20, 1<<30, 2<<30),
+		headPhase:       b.f64hist("storage.flush.head_phase", "metric head ingestion or publication phase duration"),
 		reservationWait: b.f64hist("storage.flush.reservation.wait", "flush workspace admission wait"),
 		outputSeries:    b.i64hist("storage.flush.output.series", "distinct series per completed flush candidate", "{series}"),
 		buildWorkers:    b.i64hist("storage.flush.build.workers", "admitted builders per flush attempt", "{worker}", 0, 1, 2),

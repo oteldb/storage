@@ -1734,7 +1734,7 @@ func (e *Engine) SeriesCount() int {
 }
 
 func (e *Engine) observeFlush(ctx context.Context, flush func(context.Context) (int, int64, error)) error {
-	ctx = e.cfg.Obs.Base(ctx)
+	ctx = obs.WithWritePhase(e.cfg.Obs.Base(ctx), "flush")
 	ctx, span := e.cfg.Obs.Tracer.Start(ctx, "engine.flush",
 		trace.WithAttributes(attribute.String("storage.prefix", e.cfg.Prefix)))
 	defer span.End()

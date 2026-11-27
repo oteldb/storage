@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/oteldb/storage/index/series"
 	"github.com/oteldb/storage/internal/buildbudget"
@@ -75,7 +76,10 @@ func (e *Engine) appendKnownPrepared(
 	if err != nil {
 		return AppendResult{}, preparedDone, err
 	}
+	admissionStart := time.Now()
 	ph.admission.Lock()
+	admissionWait := time.Since(admissionStart)
+	defer e.recordAppendPhase("admission_wait", admissionWait)
 	e.mu.RLock()
 	if e.cfg.DiskSeries && e.head.bytes > 0 && e.headPressureLocked(e.head.residentIdentityBytes()+e.head.inFlightBytes()+ph.pending.Load()) {
 		e.mu.RUnlock()
