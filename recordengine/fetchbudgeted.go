@@ -141,6 +141,11 @@ func (p *fetchPlan) readBudgetedPart(ctx context.Context, part *part) error {
 	if !matched {
 		return nil
 	}
+	if sparse, err := p.projectSparseHits(ctx, part, lz, blocks, reserve); err != nil {
+		return err
+	} else if sparse {
+		return p.gatherBudgetedHits(lz)
+	}
 
 	remaining := p.remainingProjection()
 	second, err := p.fetchDecodeBytes(part, remaining, false)
