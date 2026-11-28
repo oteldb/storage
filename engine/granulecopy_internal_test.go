@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	backendfile "github.com/oteldb/storage/backend/file"
+	"github.com/oteldb/storage/internal/mergestream"
 	"github.com/oteldb/storage/internal/timebucket"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -260,5 +261,34 @@ func assertGranuleStats(t *testing.T, e *Engine, rows []*fetch.Batch) {
 				require.Equal(t, math.Float64bits(pair[0]), math.Float64bits(pair[1]))
 			}
 		}
+	}
+}
+
+func TestShortMergeFragments(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name         string
+		inputs, rows int
+		pack         bool
+	}{
+		{name: "single input", inputs: 1, rows: 2},
+		{name: "singletons", inputs: 32, rows: 1},
+		{name: "short runs", inputs: 32, rows: 2, pack: true},
+		{name: "at cap", inputs: 16, rows: 4, pack: true},
+		{name: "over cap", inputs: 17, rows: 4},
+		{name: "long runs", inputs: 2, rows: 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			item := mergeIdentityItem{
+				positions: make([]mergestream.Position, tc.inputs),
+				ranges:    make([]rowRange, tc.inputs),
+			}
+			for i := range tc.inputs {
+				item.positions[i].Source = i
+				item.ranges[i] = rowRange{start: 10, end: 10 + tc.rows}
+			}
+			require.Equal(t, tc.pack, item.shortMergeFragments())
+		})
 	}
 }

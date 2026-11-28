@@ -2115,6 +2115,10 @@ shared-series merge of singleton-only parts uses codec-only framing up to an est
 1 Mi rows per output. Larger or denser merges use the compression ladder. Explicit cold
 recompression keeps trial selection and the configured compressor policy.
 
+A series with two to four rows per input and at most 64 rows total uses the bounded decoded
+path. One float stream replaces the short fragments, with the same timestamp and duplicate
+rules. Longer runs retain the encoded copy path.
+
 `Config.MetricFloatGroups` groups values by canonical series ID inside the existing fixed-row
 blocks. Flush and ordinary merge outputs use the same streaming encoder; buffered merge columns
 also pass through it without allocating another part-wide group index.

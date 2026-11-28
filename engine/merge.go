@@ -832,6 +832,9 @@ func (item *mergeIdentityItem) tryStreamSamples(
 	ctx context.Context, encoded *encodedMergePlan, windows *mergeSeriesWindows, streams []*partStream,
 	router *timebucket.Router[*partStreamWriter], start int64, plain bool, reached func(*partStreamWriter) bool,
 ) (bool, error) {
+	if plain && encoded.enabled && item.shortMergeFragments() {
+		return false, nil
+	}
 	copied, err := encoded.copySeries(item, streams, router, start, reached)
 	if err != nil || copied {
 		return copied, err

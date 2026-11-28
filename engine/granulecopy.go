@@ -77,6 +77,23 @@ func granuleReadBytes(p *part) int64 {
 	return buildbudget.Add(column(&ts), column(&values))
 }
 
+// Short runs can share a single value stream on the regular decoded path.
+func (item *mergeIdentityItem) shortMergeFragments() bool {
+	if len(item.positions) < 2 {
+		return false
+	}
+	rows := 0
+	for _, pos := range item.positions {
+		r := item.ranges[pos.Source]
+		n := r.end - r.start
+		if n < 2 || n > 4 {
+			return false
+		}
+		rows += n
+	}
+	return rows <= 64
+}
+
 func (p *encodedMergePlan) copySeries(item *mergeIdentityItem, streams []*partStream,
 	router *timebucket.Router[*partStreamWriter], start int64, reached func(*partStreamWriter) bool,
 ) (bool, error) {
