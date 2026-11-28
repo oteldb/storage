@@ -139,7 +139,8 @@ func (h *head) residentIdentityBytes() int64 {
 		}
 	}
 	if h.frozen != nil {
-		n += h.frozen.residentIdentityBytes()
+		// Pressure generations retain the ordinal pages until their sample parts publish.
+		n += h.frozen.residentIdentityBytes() + h.frozen.buffers.sizeBytes()
 	}
 	return n
 }

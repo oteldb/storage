@@ -94,6 +94,28 @@ func TestEncodedMergeFallbackResumesAfterCopiedSeries(t *testing.T) {
 	assertGranuleStats(t, e, want)
 }
 
+func TestEncodedMergeSingleSourceRanges(t *testing.T) {
+	t.Parallel()
+	e := granuleTestEngine(t, 4)
+	for generation := range 2 {
+		base := generation * 4
+		// Each input contains a full per-series granule and a packed singleton granule.
+		for i, points := range []int{4, 1, 1, 1} {
+			s := benchSeries(base + i)
+			for point := range points {
+				accepted, err := e.Append(s, int64(point+1), float64(base+i+point)/1000)
+				require.NoError(t, err)
+				require.True(t, accepted)
+			}
+		}
+		require.NoError(t, e.Flush(t.Context()))
+	}
+	want := granuleRows(t, e, 0)
+	require.NoError(t, e.MergeWith(t.Context(), MergeOptions{Force: true}))
+	assertGranuleRows(t, want, granuleRows(t, e, 0))
+	assertGranuleStats(t, e, want)
+}
+
 func TestEncodedMergeSmallerDestinationChunks(t *testing.T) {
 	t.Parallel()
 	e := granuleTestEngine(t, 4)

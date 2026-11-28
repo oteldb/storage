@@ -61,12 +61,13 @@ type partStreamWriter struct {
 	sampled bool
 	ones    []float64 // unit weights an unsampled series contributes to a declared weight column
 
-	rows         int
-	minT, maxT   int64
-	haveTime     bool
-	buffered     bool
-	mergeFinish  *mergeFinishBudget
-	buildScratch *block.StreamBuildScratch
+	rows          int
+	minT, maxT    int64
+	haveTime      bool
+	buffered      bool
+	mergeFinish   *mergeFinishBudget
+	mergeResident int64
+	buildScratch  *block.StreamBuildScratch
 
 	streamIdentities      bool
 	sharedIdentitiesReady bool

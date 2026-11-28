@@ -758,7 +758,7 @@ func (e *Engine) compactStreamWithInputs(
 
 			return nil
 		},
-		Resident: (*partStreamWriter).mergeResidentBytes,
+		Resident: func(w *partStreamWriter) int64 { return w.mergeResident },
 		Held: func() int64 {
 			return buildbudget.Add(buildbudget.Add(held, buildScratch.SizeBytes()), closedBloomBytes)
 		},
@@ -778,9 +778,10 @@ func (e *Engine) compactStreamWithInputs(
 	var windows mergeSeriesWindows
 	plain := plainMergeInputs(src, plan.tiers)
 	// Check encoded bytes for disk capacity and resident bytes for per-series sidecars.
-	// A series that exceeds a limit is split at the next run.
+	// Every successful append reaches this before the router checks growth and shedding.
 	reached := func(w *partStreamWriter) bool {
-		return budget.Reached(w.encodedBytes(), buildbudget.Add(held, w.mergeResidentBytes()))
+		w.mergeResident = w.mergeResidentBytes()
+		return budget.Reached(w.encodedBytes(), buildbudget.Add(held, w.mergeResident))
 	}
 	for {
 		ok, err := item.next(ctx, e, &keys, &identities, src, metadata)
@@ -797,7 +798,7 @@ func (e *Engine) compactStreamWithInputs(
 		if handled {
 			continue
 		}
-		if err := mergeStreamedSeries(&m, src, streams, scratch, item.ranges, start); err != nil {
+		if err := item.collectSamples(&m, src, streams, scratch, start); err != nil {
 			return nil, err
 		}
 
@@ -834,12 +835,28 @@ func (item *mergeIdentityItem) tryStreamSamples(
 	if err != nil || copied {
 		return copied, err
 	}
-	if !plain || !largeMergeSeries(item.ranges) {
+	lo, hi := item.sourceRange()
+	if !plain || !largeMergeSeries(item.ranges[lo:hi]) {
 		return false, nil
 	}
 	return true, windows.merge(ctx, streams, item.ranges, start, item.covered, func(ts []int64, values []float64, covered int64) error {
 		return item.routeSamples(router, ts, values, nil, covered, false, reached)
 	})
+}
+
+func (item *mergeIdentityItem) collectSamples(
+	m *sampleMerge, src []*part, streams []*partStream, scratch []rangeBuf, start int64,
+) error {
+	lo, hi := item.sourceRange()
+	return mergeStreamedSeries(m, src[lo:hi], streams[lo:hi], scratch[lo:hi], item.ranges[lo:hi], start)
+}
+
+func (item *mergeIdentityItem) sourceRange() (int, int) {
+	if len(item.positions) == 1 {
+		i := item.positions[0].Source
+		return i, i + 1
+	}
+	return 0, len(item.ranges)
 }
 
 func (item *mergeIdentityItem) routeSamples(

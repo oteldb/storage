@@ -16,20 +16,11 @@ func (b *headPartBuilder) reserveHeadShape(ctx context.Context, samples map[sign
 	}
 	denseBytes := order.view.DenseBudgetBytes(len(samples))
 	n := buildbudget.Add(buildbudget.Add(b.baseBytes(), denseBytes), buildbudget.Mul(order.view.EncodingWorkspace(), 2))
-	var sorting int64
-	err := walkIdentityOrder(ctx, order.view, order.runs, func(id signal.SeriesID, ref uint32) error {
-		buf := samples[id]
-		if buf == nil || len(buf.ts) == 0 {
-			return nil
-		}
-		n = buildbudget.Add(n, buildbudget.Add(512, buildbudget.Mul(order.view.EncodingBytes(int(ref)), 4)))
-		sorting = max(sorting, buildbudget.Mul(int64(len(buf.ts)), 48))
-		return nil
-	})
+	n, err := b.headShapeBytes(ctx, order, samples, n)
 	if err != nil {
 		return err
 	}
-	b.reservationFloor = min(b.target, buildbudget.Add(n, sorting))
+	b.reservationFloor = min(b.target, n)
 	need := max(b.reservationFloor, buildbudget.Add(b.baseBytes(), denseBytes))
 	if need > b.reserved {
 		if err := b.reservePhase(need, "shape"); err != nil {
@@ -40,4 +31,29 @@ func (b *headPartBuilder) reserveHeadShape(ctx context.Context, samples map[sign
 		b.identities.UseDenseSymbols(denseBytes)
 	}
 	return nil
+}
+
+func (b *headPartBuilder) headShapeBytes(ctx context.Context, order detachedIdentityOrder,
+	samples map[signal.SeriesID]*sampleBuf, base int64,
+) (int64, error) {
+	total, sorting := base, int64(0)
+	for _, run := range order.runs {
+		for i, ref := range run {
+			if buildbudget.Add(total, sorting) >= b.target {
+				return b.target, ctx.Err()
+			}
+			if i%4096 == 0 {
+				if err := ctx.Err(); err != nil {
+					return 0, err
+				}
+			}
+			buf := order.sampleBuffer(samples, ref)
+			if buf == nil || len(buf.ts) == 0 {
+				continue
+			}
+			total = buildbudget.Add(total, buildbudget.Add(512, buildbudget.Mul(order.view.EncodingBytes(int(ref)), 4)))
+			sorting = max(sorting, buildbudget.Mul(int64(len(buf.ts)), 48))
+		}
+	}
+	return buildbudget.Add(total, sorting), ctx.Err()
 }

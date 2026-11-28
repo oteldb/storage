@@ -83,7 +83,9 @@ func (p *encodedMergePlan) copySeries(item *mergeIdentityItem, streams []*partSt
 	if !p.enabled || !item.found && len(item.positions) == 0 {
 		return false, nil
 	}
-	ok, err := p.prepare(streams, item.ranges, start, p.maxRows)
+	lo, hi := item.sourceRange()
+	streams = streams[lo:hi]
+	ok, err := p.prepare(streams, item.ranges[lo:hi], start, p.maxRows)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -139,18 +141,29 @@ func encodedSourceRun(s *partStream, r rowRange, start int64, maxRows int) (enco
 	if s.pos != r.start {
 		return run, false, errNonContiguousDecode
 	}
+	single := r.end-r.start == 1
+	if single && r.start >= s.packedStart && r.start < s.packedEnd {
+		return run, false, nil
+	}
 	ts, values := s.decoders[0], s.decoders[1]
 	first, err := ts.BlockForRow(r.start)
 	if err != nil {
 		return run, false, err
 	}
-	last, err := ts.BlockForRow(r.end - 1)
-	if err != nil {
-		return run, false, err
+	last := first
+	if !single {
+		last, err = ts.BlockForRow(r.end - 1)
+		if err != nil {
+			return run, false, err
+		}
 	}
 	lo, _ := ts.BlockSpan(first)
 	_, hi := ts.BlockSpan(last)
 	if lo != r.start || hi != r.end {
+		// Additional single-row series in this granule also need the decode path.
+		if single {
+			s.packedStart, s.packedEnd = lo, hi
+		}
 		return run, false, nil
 	}
 	valueFirst, err := values.BlockForRow(r.start)
