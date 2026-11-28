@@ -79,14 +79,19 @@ func newMergePartStreamWriter(
 	ctx context.Context, e *Engine, comp compressProfile, precisionBits uint8, withSF, withStats bool,
 	rollup *block.Rollup, extra ...block.PartOption,
 ) (*partStreamWriter, error) {
-	if e.mergeNames == nil {
+	indexOnly := writePrimaryMetricIndex && e.cfg.DiskSeries && e.cfg.SeparateSeries
+	if e.mergeNames == nil && !indexOnly {
 		return newPartStreamWriter(ctx, e, comp, precisionBits, withSF, withStats, rollup, extra...)
 	}
-	prefix, err := e.newMergePartPrefix()
-	if err != nil {
-		return nil, err
+	var prefix string
+	if e.mergeNames != nil {
+		var err error
+		prefix, err = e.newMergePartPrefix()
+		if err != nil {
+			return nil, err
+		}
 	}
-	return newPartStreamWriterAt(ctx, e, prefix, comp, precisionBits, withSF, withStats, rollup, extra...)
+	return newPartStreamWriterMode(ctx, e, prefix, comp, precisionBits, withSF, withStats, rollup, indexOnly, extra...)
 }
 
 func mergeNamespaceCeiling(id partid.ID) (partid.ID, bool) {

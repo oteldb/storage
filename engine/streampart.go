@@ -10,17 +10,12 @@ import (
 	"github.com/oteldb/storage/block"
 	"github.com/oteldb/storage/encoding/chunk"
 	"github.com/oteldb/storage/index/series"
+	"github.com/oteldb/storage/internal/memsize"
 	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/signal"
 )
 
-// Column ordinals of a metric part, fixed by the order [newPartStreamWriter] declares them.
-const (
-	colSeriesIdx = iota
-	colTsIdx
-	colValueIdx
-	colSFIdx
-)
+const colSeriesIdx = 0
 
 // partStreamWriter writes one output part of a merge a series at a time: a [block.StreamWriter] for
 // the columns, plus the part's sidecars built from the same per-series calls, so they cost
@@ -34,9 +29,11 @@ type partStreamWriter struct {
 	w             *block.StreamWriter
 	prefix        string
 
-	// runs is the series column's run-length form: one entry per series, feeding both the id column
-	// and the series-index sidecar.
-	runs []chunk.U128Run
+	// Each run feeds the series index. A writer with a fallback column borrows its run list.
+	runs                                []chunk.U128Run
+	indexOnly                           bool
+	indexCRC                            [4]byte
+	tsColumn, valueColumn, weightColumn int
 
 	stats []SeriesAgg
 
@@ -97,6 +94,13 @@ func newPartStreamWriterAt(
 	ctx context.Context, e *Engine, prefix string, comp compressProfile, precisionBits uint8, withSF, withStats bool,
 	rollup *block.Rollup, extra ...block.PartOption,
 ) (*partStreamWriter, error) {
+	return newPartStreamWriterMode(ctx, e, prefix, comp, precisionBits, withSF, withStats, rollup, false, extra...)
+}
+
+func newPartStreamWriterMode(
+	ctx context.Context, e *Engine, prefix string, comp compressProfile, precisionBits uint8, withSF, withStats bool,
+	rollup *block.Rollup, indexOnly bool, extra ...block.PartOption,
+) (*partStreamWriter, error) {
 	blockRows := e.cfg.MetricBlockRows
 	if blockRows <= 0 {
 		blockRows = DefaultMetricBlockRows
@@ -111,8 +115,12 @@ func newPartStreamWriterAt(
 	}
 	w := block.NewStreamWriterTo(ctx, e.cfg.Backend, prefix, opts...)
 
-	if err := w.AddColumn(block.Column{Name: colSeries, Kind: block.KindInt128}); err != nil {
-		return nil, err
+	tsColumn := 0
+	if !indexOnly {
+		if err := w.AddColumn(block.Column{Name: colSeries, Kind: block.KindInt128}); err != nil {
+			return nil, err
+		}
+		tsColumn++
 	}
 
 	tsCodec := e.tsCodec
@@ -158,6 +166,7 @@ func newPartStreamWriterAt(
 	}
 	out := &partStreamWriter{
 		e: e, w: w, prefix: prefix, withSF: withSF, withStats: withStats,
+		indexOnly: indexOnly, tsColumn: tsColumn, valueColumn: tsColumn + 1, weightColumn: tsColumn + 2,
 		buffered:         !backend.StreamsWrites(e.cfg.Backend),
 		floatGroups:      grouped,
 		seriesChunks:     e.cfg.MetricSeriesChunks,
@@ -200,27 +209,26 @@ func (p *partStreamWriter) appendNumericRun(id chunk.U128, ts []int64, values, s
 		return err
 	}
 
-	p.runs, err = p.w.AppendU128RunView(colSeriesIdx, id, len(ts))
-	if err != nil {
+	if err := p.appendIDRun(id, len(ts)); err != nil {
 		return err
 	}
 
-	if err := p.w.AppendInt64(colTsIdx, ts); err != nil {
+	if err := p.w.AppendInt64(p.tsColumn, ts); err != nil {
 		return err
 	}
 
 	var valueErr error
 	if p.floatGroups {
-		valueErr = p.w.AppendFloat64Group(colValueIdx, values, begin)
+		valueErr = p.w.AppendFloat64Group(p.valueColumn, values, begin)
 	} else {
-		valueErr = p.w.AppendFloat64(colValueIdx, values)
+		valueErr = p.w.AppendFloat64(p.valueColumn, values)
 	}
 	if valueErr != nil {
 		return valueErr
 	}
 
 	if p.withSF {
-		if err := p.w.AppendFloat64(colSFIdx, p.weights(sf, len(ts))); err != nil {
+		if err := p.w.AppendFloat64(p.weightColumn, p.weights(sf, len(ts))); err != nil {
 			return err
 		}
 	}
@@ -257,6 +265,20 @@ func (p *partStreamWriter) appendNumericRun(id chunk.U128, ts []int64, values, s
 
 func (p *partStreamWriter) encodedBytes() int64 { return p.w.EncodedBytes() }
 
+func (p *partStreamWriter) appendIDRun(id chunk.U128, rows int) error {
+	if !p.indexOnly {
+		var err error
+		p.runs, err = p.w.AppendU128RunView(colSeriesIdx, id, rows)
+		return err
+	}
+	if n := len(p.runs); n > 0 && p.runs[n-1].Value == id {
+		p.runs[n-1].Count += rows
+	} else {
+		p.runs = append(p.runs, chunk.U128Run{Value: id, Count: rows})
+	}
+	return nil
+}
+
 func (p *partStreamWriter) reserveSeries(n int) error {
 	sidecars := n
 	if p.ordinal != nil {
@@ -267,6 +289,10 @@ func (p *partStreamWriter) reserveSeries(n int) error {
 	p.covered = slices.Grow(p.covered, max(sidecars-len(p.covered), 0))
 	if p.withStats {
 		p.stats = slices.Grow(p.stats, max(sidecars-len(p.stats), 0))
+	}
+	if p.indexOnly {
+		p.runs = slices.Grow(p.runs, max(n-len(p.runs), 0))
+		return nil
 	}
 	if err := p.w.ReserveU128Runs(colSeriesIdx, n); err != nil {
 		return err
@@ -286,6 +312,9 @@ func (p *partStreamWriter) residentBytes() int64 {
 	)
 
 	total := p.w.ResidentBytes()
+	if p.indexOnly {
+		total += memsize.Slice(p.runs)
+	}
 	if p.seriesBuilder != nil {
 		total += p.seriesBuilder.Bytes() + partIDBloomBytes(p.seriesBuilder.Count())
 		if p.buffered {
@@ -379,7 +408,7 @@ func (p *partStreamWriter) finishWithIdentities(ctx context.Context, identities 
 		return nil, err
 	}
 	if p.e.cfg.SeparateSeries {
-		if err := writeSeriesReference(ctx, p.e, prefix); err != nil {
+		if err := p.writeSeriesReference(ctx); err != nil {
 			return nil, err
 		}
 	} else if p.e.cfg.DiskSeries {

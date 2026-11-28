@@ -20,13 +20,24 @@ import (
 
 func seriesReferenceKey(prefix string) string { return prefix + "/series-ref" }
 
-// writeSeriesReference binds the numeric-only marker to the immutable sample manifest.
-func writeSeriesReference(ctx context.Context, e *Engine, prefix string) error {
-	digest, err := block.BindManifest(ctx, e.cfg.Backend, prefix)
+// writeSeriesReference binds the numeric-only marker to the sample manifest and any required index.
+func (p *partStreamWriter) writeSeriesReference(ctx context.Context) error {
+	be := p.e.cfg.Backend
+	digest, err := block.BindManifest(ctx, be, p.prefix)
 	if err != nil {
 		return err
 	}
-	return backend.WriteDeferred(ctx, e.cfg.Backend, seriesReferenceKey(prefix), encodeSeriesReference(digest))
+	if p.indexOnly {
+		crc := p.indexCRC
+		if p.ordinal == nil {
+			crc, err = p.writtenSeriesIndexCRC(ctx)
+			if err != nil {
+				return err
+			}
+		}
+		digest = bindOrdinalMetadata(digest, crc)
+	}
+	return backend.WriteDeferred(ctx, be, seriesReferenceKey(p.prefix), encodeSeriesReference(digest))
 }
 
 // attachSharedSeries pins the current snapshot for a private part built off-lock.
@@ -54,19 +65,28 @@ func attachSharedSeriesFrom(p *part, s *seriesSnapshot) error {
 }
 
 func (e *Engine) prepareSharedPart(ctx context.Context, p *part) error {
-	raw, err := backend.ReadUncached(p.reader.ReaderContext(ctx), p.be, seriesReferenceKey(p.prefix))
-	if err != nil {
-		return errors.Wrap(err, "read numeric series reference")
-	}
-	digest := p.reader.ManifestDigest()
-	if !validSeriesReference(raw, digest) {
-		return errors.New("engine: invalid numeric series reference")
+	// openPart validates a required primary index before exposing its lookup data.
+	if _, hasFallback := p.reader.ColumnDescByName(colSeries); hasFallback {
+		if err := readSeriesReference(ctx, p.reader, p.be, p.prefix, p.reader.ManifestDigest()); err != nil {
+			return err
+		}
 	}
 
 	if err := e.attachSharedSeries(p); err != nil {
 		return err
 	}
 	return p.validateDiskSeriesIDs(ctx)
+}
+
+func readSeriesReference(ctx context.Context, r *block.PartReader, be backend.Backend, prefix string, digest [32]byte) error {
+	raw, err := backend.ReadUncached(r.ReaderContext(ctx), be, seriesReferenceKey(prefix))
+	if err != nil {
+		return errors.Wrap(err, "read numeric series reference")
+	}
+	if !validSeriesReference(raw, digest) {
+		return errors.Wrap(block.ErrCorrupt, "invalid numeric series reference")
+	}
+	return nil
 }
 
 func (e *Engine) ensureSeriesIdentities(ctx context.Context, entries identitySnapshot, reserve func(int64) error) error {

@@ -78,18 +78,12 @@ func (p *partStreamWriter) finishOrdinalMetadata(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var header [2 * binary.MaxVarintLen64]byte
-	raw := binary.AppendUvarint(header[:0], uint64(len(p.runs)))
-	raw = binary.AppendUvarint(raw, uint64(p.rows))
-	offset := int64(5+len(raw)) + int64(len(p.runs))*sidxEntryW
-	crc, err := backend.ReadAt(ctx, p.e.cfg.Backend, sidxKey(p.prefix), offset, 4)
+	crc, err := p.writtenSeriesIndexCRC(ctx)
 	if err != nil {
 		return err
 	}
-	if len(crc) != 4 {
-		return errors.Wrap(errSidxCorrupt, "missing ordinal binding")
-	}
-	binding = bindOrdinalMetadata(binding, [4]byte(crc))
+	p.indexCRC = crc
+	binding = bindOrdinalMetadata(binding, crc)
 	if err := p.ordinal.covered.Commit(ctx, binding, len(p.runs)); err != nil {
 		return err
 	}
@@ -97,6 +91,22 @@ func (p *partStreamWriter) finishOrdinalMetadata(ctx context.Context) error {
 		return p.ordinal.stats.Commit(ctx, binding, len(p.runs))
 	}
 	return nil
+}
+
+func (p *partStreamWriter) writtenSeriesIndexCRC(ctx context.Context) ([4]byte, error) {
+	var header [2 * binary.MaxVarintLen64]byte
+	raw := binary.AppendUvarint(header[:0], uint64(len(p.runs)))
+	raw = binary.AppendUvarint(raw, uint64(p.rows))
+	_, width := p.outputSeriesIndexShape()
+	offset := int64(5+len(raw)) + int64(len(p.runs))*int64(width)
+	crc, err := backend.ReadAt(ctx, p.e.cfg.Backend, sidxKey(p.prefix), offset, 4)
+	if err != nil {
+		return [4]byte{}, err
+	}
+	if len(crc) != 4 {
+		return [4]byte{}, errors.Wrap(errSidxCorrupt, "missing index binding")
+	}
+	return [4]byte(crc), nil
 }
 
 func (p *part) decodePartStats(ctx context.Context, raw []byte) (map[signal.SeriesID]SeriesAgg, error) {

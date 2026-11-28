@@ -184,6 +184,7 @@ func TestSeriesIndexParseRejectsCorrupt(t *testing.T) {
 func FuzzSeriesIndexParse(f *testing.F) {
 	f.Add(encodeSeriesIndex(sidxColumn([]int{2, 1, 3})))
 	f.Add(encodeSeriesIndex(nil))
+	f.Add(singletonIndexFixture(3))
 	f.Add([]byte("OTSI garbage"))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
@@ -192,7 +193,13 @@ func FuzzSeriesIndexParse(f *testing.F) {
 			return
 		}
 
-		if len(ents) != n*sidxEntryW {
+		width := sidxEntryW
+		singletons := data[4] == sidxSingletonVersion
+		if singletons {
+			width = sidxIDBytes
+			require.Equal(t, total, n)
+		}
+		if len(ents) != n*width {
 			t.Fatalf("entries region %d bytes for %d entries", len(ents), n)
 		}
 
@@ -204,8 +211,12 @@ func FuzzSeriesIndexParse(f *testing.F) {
 				require.Positive(t, maxRows)
 			}
 			for k := range n {
-				_ = sidxEntryID(ents, k)
-				if s := sidxEntryStart(ents, k); s < 0 || s >= total {
+				_ = sidxIDAt(ents, k, width)
+				start := k
+				if !singletons {
+					start = sidxEntryStart(ents, k)
+				}
+				if s := start; s < 0 || s >= total {
 					t.Fatalf("validated start %d out of [0,%d)", s, total)
 				}
 			}

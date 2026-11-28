@@ -310,11 +310,10 @@ func (p *partStreamWriter) appendEncodedGranule(item *mergeIdentityItem, ts bloc
 	if v.Rows != ts.Rows || seen != ts.Rows {
 		return errors.Wrap(block.ErrCorrupt, "copied granule row mismatch")
 	}
-	p.runs, err = p.w.AppendU128RunView(colSeriesIdx, idToU128(item.id), ts.Rows)
-	if err != nil {
+	if err := p.appendIDRun(idToU128(item.id), ts.Rows); err != nil {
 		return err
 	}
-	if err := p.w.AppendEncodedRun(colTsIdx, colValueIdx, ts, v, v.FloatStats()); err != nil {
+	if err := p.w.AppendEncodedRun(p.tsColumn, p.valueColumn, ts, v, v.FloatStats()); err != nil {
 		return err
 	}
 	if sameSeries {

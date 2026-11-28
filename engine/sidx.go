@@ -31,9 +31,11 @@ import (
 // resident index from the series column — so it carries no format-migration burden; it is still
 // golden-tested against accidental byte drift.
 const (
-	sidxMagic   uint32 = 0x4F545349 // "OTSI"
-	sidxVersion byte   = 1
-	sidxEntryW         = 20 // 16-byte id + 4-byte start row
+	sidxMagic            uint32 = 0x4F545349 // "OTSI"
+	sidxVersion          byte   = 1
+	sidxSingletonVersion byte   = 2
+	sidxIDBytes                 = 16
+	sidxEntryW                  = 20 // 16-byte id + 4-byte start row
 )
 
 var sidxCRC = crc32.MakeTable(crc32.Castagnoli)
@@ -127,7 +129,7 @@ func parseSeriesIndex(data []byte, checkCRC bool) (entries []byte, numSeries, to
 		return nil, 0, 0, errors.Wrap(errSidxCorrupt, "magic")
 	}
 
-	if body[4] != sidxVersion {
+	if body[4] != sidxVersion && body[4] != sidxSingletonVersion {
 		return nil, 0, 0, errors.Wrap(errSidxCorrupt, "version")
 	}
 
@@ -147,11 +149,18 @@ func parseSeriesIndex(data []byte, checkCRC bool) (entries []byte, numSeries, to
 
 	rest = rest[m:]
 
-	if n > uint64(len(rest))/sidxEntryW || total > uint64(maxInt) {
+	width := uint64(sidxEntryW)
+	if body[4] == sidxSingletonVersion {
+		if n != total || n == 0 {
+			return nil, 0, 0, errors.Wrap(errSidxCorrupt, "invalid singleton counts")
+		}
+		width = sidxIDBytes
+	}
+	if n > uint64(len(rest))/width || total > uint64(maxInt) {
 		return nil, 0, 0, errors.Wrap(errSidxCorrupt, "entry count")
 	}
 
-	if uint64(len(rest)) != n*sidxEntryW {
+	if uint64(len(rest)) != n*width {
 		return nil, 0, 0, errors.Wrap(errSidxCorrupt, "entry region size")
 	}
 
@@ -162,9 +171,12 @@ const maxInt = int(^uint(0) >> 1)
 
 // sidxEntryID returns entry k's series id from a validated entries view.
 func sidxEntryID(entries []byte, k int) signal.SeriesID {
-	e := entries[k*sidxEntryW:]
+	return sidxIDAt(entries, k, sidxEntryW)
+}
 
-	return signal.SeriesID{Hi: binary.BigEndian.Uint64(e), Lo: binary.BigEndian.Uint64(e[8:])}
+func sidxIDAt(entries []byte, k, width int) signal.SeriesID {
+	e := (*[sidxIDBytes]byte)(entries[k*width:])
+	return signal.SeriesID{Hi: binary.BigEndian.Uint64(e[:8]), Lo: binary.BigEndian.Uint64(e[8:])}
 }
 
 // sidxEntryStart returns entry k's run-start row from a validated entries view.
@@ -196,6 +208,7 @@ type pagedIndex struct {
 	fences      []signal.SeriesID
 	first, last signal.SeriesID
 	bounded     bool
+	singletons  bool
 
 	view atomic.Pointer[[]byte] // validated entries region; nil ⇒ load on next use
 }
@@ -222,7 +235,7 @@ func (p *pagedIndex) entries(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 
-	if n != p.n || total != p.total || [4]byte(data[len(data)-4:]) != p.crc {
+	if n != p.n || total != p.total || (data[4] == sidxSingletonVersion) != p.singletons || [4]byte(data[len(data)-4:]) != p.crc {
 		return nil, errors.Wrap(errSidxCorrupt, "reload mismatch")
 	}
 
@@ -242,9 +255,10 @@ func (p *pagedIndex) drop() {
 // search returns the entry index of id, or (0, false).
 func (p *pagedIndex) search(entries []byte, id signal.SeriesID) (int, bool) {
 	lo, hi := 0, p.n
+	width := p.entryWidth()
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
-		entry := (*[sidxEntryW]byte)(entries[mid*sidxEntryW:])
+		entry := (*[sidxIDBytes]byte)(entries[mid*width:])
 		high := binary.BigEndian.Uint64(entry[:8])
 		switch {
 		case high < id.Hi:
@@ -266,9 +280,19 @@ func (p *pagedIndex) search(entries []byte, id signal.SeriesID) (int, bool) {
 	return 0, false
 }
 
+func (p *pagedIndex) entryWidth() int {
+	if p.singletons {
+		return sidxIDBytes
+	}
+	return sidxEntryW
+}
+
 // rangeAt returns entry k's row range: [start(k), start(k+1)), with the last run ending at the
 // part's row total.
 func (p *pagedIndex) rangeAt(entries []byte, k int) rowRange {
+	if p.singletons {
+		return rowRange{start: k, end: k + 1}
+	}
 	end := p.total
 	if k+1 < p.n {
 		end = sidxEntryStart(entries, k+1)
@@ -291,6 +315,20 @@ func sidxRunBounds(entries []byte, n, total int) (maxRows int, valid bool) {
 		return 0, total == 0
 	}
 
+	if len(entries)/n == sidxIDBytes {
+		if n != total {
+			return 0, false
+		}
+		previous := sidxIDAt(entries, 0, sidxIDBytes)
+		for k := 1; k < n; k++ {
+			id := sidxIDAt(entries, k, sidxIDBytes)
+			if previous.Compare(id) >= 0 {
+				return 0, false
+			}
+			previous = id
+		}
+		return 1, true
+	}
 	if sidxEntryStart(entries, 0) != 0 {
 		return 0, false
 	}
@@ -345,17 +383,18 @@ func openPagedIndex(
 
 	p := &pagedIndex{
 		be: b, key: key, n: n, maxRows: maxRows, total: total, keep: !viewer,
-		crc: [4]byte(data[len(data)-4:]), offset: int64(len(data) - 4 - len(ents)),
+		singletons: data[4] == sidxSingletonVersion,
+		crc:        [4]byte(data[len(data)-4:]), offset: int64(len(data) - 4 - len(ents)),
 	}
 	if n > 0 {
-		p.first, p.last = sidxEntryID(ents, 0), sidxEntryID(ents, n-1)
+		p.first, p.last = sidxIDAt(ents, 0, p.entryWidth()), sidxIDAt(ents, n-1, p.entryWidth())
 		p.bounded = true
 	}
 	if n >= indexPageEntries*2 && backend.RangesNatively(ctx, b, p.key) {
 		p.keep = false
 		p.fences = make([]signal.SeriesID, (n+sparseIndexPageEntries-1)/sparseIndexPageEntries)
 		for i := range p.fences {
-			p.fences[i] = sidxEntryID(ents, i*sparseIndexPageEntries)
+			p.fences[i] = sidxIDAt(ents, i*sparseIndexPageEntries, p.entryWidth())
 		}
 	}
 	if len(p.fences) == 0 {

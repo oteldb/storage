@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/binary"
 	"math"
 	"slices"
 
@@ -401,21 +400,21 @@ func (p *diskPartIDs) Next() bool {
 		return false
 	}
 	p.pos++
-	if p.data == nil || p.pos >= p.base+len(p.data)/sidxEntryW {
+	width := p.index.entryWidth()
+	if p.data == nil || p.pos >= p.base+len(p.data)/width {
 		p.base = p.pos
 		n := min(indexPageEntries, p.index.n-p.pos)
-		offset := p.index.offset + int64(p.pos*sidxEntryW)
-		p.data, p.err = backend.ReadAtAppend(p.ctx, p.index.be, p.data[:0], p.index.key, offset, int64(n*sidxEntryW))
+		offset := p.index.offset + int64(p.pos*width)
+		p.data, p.err = backend.ReadAtAppend(p.ctx, p.index.be, p.data[:0], p.index.key, offset, int64(n*width))
 		if p.err != nil {
 			return false
 		}
-		if len(p.data) != n*sidxEntryW {
+		if len(p.data) != n*width {
 			p.err = errors.Wrap(errSidxCorrupt, "short identity ID page")
 			return false
 		}
 	}
-	off := (p.pos - p.base) * sidxEntryW
-	p.id = signal.SeriesID{Hi: binary.BigEndian.Uint64(p.data[off:]), Lo: binary.BigEndian.Uint64(p.data[off+8:])}
+	p.id = sidxIDAt(p.data, p.pos-p.base, width)
 	return true
 }
 func (p *diskPartIDs) Seek(id signal.SeriesID) bool {

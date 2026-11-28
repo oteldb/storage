@@ -61,16 +61,22 @@ func (p *pagedIndex) lookupPositionCursor(
 	}
 	n := min(pageEntries, p.n-start)
 	// One extra entry supplies the last run's end when the page is not the final one.
-	readN := min(n+1, p.n-start)
+	readN := n
+	if !p.singletons {
+		readN = min(n+1, p.n-start)
+	}
 	data, err := p.positionPage(ctx, start, readN, cursor)
 	if err != nil {
 		return 0, rowRange{}, false, err
 	}
 
-	local := pagedIndex{n: n, total: p.total}
+	local := pagedIndex{n: n, total: p.total, singletons: p.singletons}
 	k, ok := local.search(data, id)
 	if !ok {
 		return 0, rowRange{}, false, nil
+	}
+	if p.singletons {
+		return start + k, rowRange{start: start + k, end: start + k + 1}, true, nil
 	}
 	end := p.total
 	if k+1 < readN {
@@ -117,17 +123,18 @@ func (c *sidxPositionCursor) position(ctx context.Context, idx partIndex, id sig
 }
 
 func (p *pagedIndex) positionPage(ctx context.Context, start, readN int, c *sidxPositionCursor) ([]byte, error) {
-	if c != nil && c.index == p && c.start == start && len(c.data) == readN*sidxEntryW {
+	width := p.entryWidth()
+	if c != nil && c.index == p && c.start == start && len(c.data) == readN*width {
 		return c.data, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	data, err := backend.ReadPageView(ctx, p.be, p.key, p.offset+int64(start*sidxEntryW), int64(readN*sidxEntryW))
+	data, err := backend.ReadPageView(ctx, p.be, p.key, p.offset+int64(start*width), int64(readN*width))
 	if err != nil {
 		return nil, err
 	}
-	if len(data) != readN*sidxEntryW {
+	if len(data) != readN*width {
 		return nil, errors.Wrap(errSidxCorrupt, "short index page")
 	}
 	if c != nil {
