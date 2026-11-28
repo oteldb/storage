@@ -160,6 +160,15 @@ func (r *Index) mark(data []byte, last uint32, selected []uint64, set bool) erro
 		return errors.Wrap(ErrCorrupt, "postings count")
 	}
 	data = data[size:]
+	// A contiguous chunk's checked deltas can update whole words at once.
+	if n >= 8 && uint64(last) < uint64(r.count) && uint64(last)+1 >= n {
+		first, used := binary.Uvarint(data)
+		if used > 0 && first == uint64(last)+1-n && len(data)-used == int(n)-1 &&
+			bytes.Count(data[used:], []byte{1}) == int(n)-1 {
+			markRefRange(selected, uint32(first), last, set)
+			return nil
+		}
+	}
 	ref := uint64(0)
 	for i := range n {
 		delta, k := binary.Uvarint(data)
@@ -179,6 +188,32 @@ func (r *Index) mark(data []byte, last uint32, selected []uint64, set bool) erro
 		return errors.Wrap(ErrCorrupt, "postings last reference")
 	}
 	return nil
+}
+
+func markRefRange(words []uint64, first, last uint32, set bool) {
+	lo, hi := first>>6, last>>6
+	firstMask := ^uint64(0) << (first & 63)
+	lastMask := ^uint64(0) >> (63 - (last & 63))
+	if lo == hi {
+		if set {
+			words[lo] |= firstMask & lastMask
+		} else {
+			words[lo] &^= firstMask & lastMask
+		}
+		return
+	}
+	interior := words[lo+1 : hi]
+	if set {
+		words[lo] |= firstMask
+		for i := range interior {
+			interior[i] = ^uint64(0)
+		}
+		words[hi] |= lastMask
+	} else {
+		words[lo] &^= firstMask
+		clear(interior)
+		words[hi] &^= lastMask
+	}
 }
 
 type refRange struct {
