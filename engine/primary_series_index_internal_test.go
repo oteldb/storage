@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/binary"
 	"hash/crc32"
 	"testing"
@@ -33,6 +34,7 @@ func TestPrimarySeriesIndexBindsRows(t *testing.T) {
 	out, err := w.finishWithIdentities(ctx, identitySnapshot{view: registry.View(), refs: []uint32{ref}})
 	require.NoError(t, err)
 	out.closeReaders()
+	require.True(t, out.reader.Manifest().RequiresSeriesIndex())
 	_, duplicate := out.reader.ColumnDescByName(colSeries)
 	require.False(t, duplicate)
 	reopened, err := openPart(ctx, be, out.prefix, nil)
@@ -52,6 +54,89 @@ func TestPrimarySeriesIndexBindsRows(t *testing.T) {
 	require.NoError(t, be.Write(ctx, sidxKey(out.prefix), raw))
 	_, err = openPart(ctx, be, out.prefix, nil)
 	require.ErrorIs(t, err, block.ErrCorrupt)
+}
+
+func TestPrimarySeriesIndexDefaultMerge(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"newer-version", "temporary-index-read"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			testPrimarySeriesIndexLoadFailure(t, name)
+		})
+	}
+}
+
+func testPrimarySeriesIndexLoadFailure(t *testing.T, failure string) {
+	t.Helper()
+	ctx := t.Context()
+	be, err := file.New(t.TempDir())
+	require.NoError(t, err)
+	cfg := Config{Backend: be, Prefix: "required-index", DiskSeries: true, SeparateSeries: true, MetricSeriesChunks: true}
+	writer := New(cfg)
+	t.Cleanup(func() { require.NoError(t, writer.Close(context.Background())) })
+	for i := range 2 {
+		ok, err := writer.Append(benchSeries(1), int64(10+i), float64(i))
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.NoError(t, writer.Flush(ctx))
+	}
+	for _, p := range writer.parts {
+		require.False(t, p.reader.Manifest().RequiresSeriesIndex())
+	}
+	ok, err := writer.MergeSamplesStep(ctx, MergeOptions{Force: true})
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Len(t, writer.parts, 1)
+	merged := writer.parts[0]
+	m := merged.reader.Manifest()
+	require.EqualValues(t, 4, m.Version)
+	require.True(t, m.RequiresSeriesIndex())
+	_, hasSeries := merged.reader.ColumnDescByName(colSeries)
+	require.False(t, hasSeries)
+
+	catalog, catalogVersion, err := be.ReadVersioned(ctx, writer.indexKey())
+	require.NoError(t, err)
+	check := New(cfg)
+	require.NoError(t, check.LoadPartsReadOnly(ctx))
+	require.Len(t, check.parts, 1)
+	require.Equal(t, 2, check.parts[0].rows())
+	require.NoError(t, check.Close(ctx))
+
+	var expected error
+	switch failure {
+	case "newer-version":
+		m.Version++
+		require.NoError(t, be.Write(ctx, merged.prefix+"/manifest", m.Encode(nil)))
+		expected = block.ErrUnsupportedVersion
+	case "temporary-index-read":
+		expected = context.DeadlineExceeded
+		cfg.Backend = unreadablePrimaryIndex{File: be, key: sidxKey(merged.prefix)}
+	}
+	reader := New(cfg)
+	t.Cleanup(func() { require.NoError(t, reader.Close(context.Background())) })
+	for range corruptLoadsBeforeWant + 2 {
+		require.ErrorIs(t, reader.LoadPartsReadOnly(ctx), expected)
+		require.True(t, reader.IndexFenced())
+		require.False(t, reader.HasWants())
+		require.Empty(t, reader.corruptLoads)
+	}
+	after, afterVersion, err := be.ReadVersioned(ctx, writer.indexKey())
+	require.NoError(t, err)
+	require.Equal(t, catalog, after)
+	require.Equal(t, catalogVersion, afterVersion)
+}
+
+type unreadablePrimaryIndex struct {
+	*file.File
+
+	key string
+}
+
+func (b unreadablePrimaryIndex) Read(ctx context.Context, key string) ([]byte, error) {
+	if key == b.key {
+		return nil, context.DeadlineExceeded
+	}
+	return b.File.Read(ctx, key)
 }
 
 func TestSingletonIndexLookup(t *testing.T) {

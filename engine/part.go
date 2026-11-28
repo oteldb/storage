@@ -531,30 +531,45 @@ func openSamplePartIndex(
 	ctx context.Context, b backend.Backend, prefix string, r *block.PartReader, corrupt *obs.Corruption,
 ) (partIndex, error) {
 	_, hasSeriesColumn := r.ColumnDescByName(colSeries)
-	paged, ok := openPagedIndex(r.ReaderContext(ctx), b, prefix, r.RowCount(), corrupt)
-	if !ok {
-		if !hasSeriesColumn {
-			return partIndex{}, errors.Wrap(block.ErrCorrupt, "numeric part missing its primary series index")
-		}
-		col, err := r.Column(ctx, colSeries)
-		if err != nil {
-			return partIndex{}, err
-		}
-		ids, err := col.ID128(nil)
-		if err != nil {
-			return partIndex{}, err
-		}
-		return buildPartIndex(ids), nil
+	requiresIndex := r.Manifest().RequiresSeriesIndex()
+	if hasSeriesColumn == requiresIndex {
+		return partIndex{}, errors.Wrap(block.ErrCorrupt, "manifest version and series column disagree")
 	}
-	if readerpool.Supported(b) {
-		paged.readContext = r.ReaderContext
+
+	if requiresIndex {
+		return openPrimarySeriesIndex(ctx, b, prefix, r)
 	}
-	if hasSeriesColumn {
+	if paged, ok := openPagedIndex(r.ReaderContext(ctx), b, prefix, r.RowCount(), corrupt); ok {
+		if readerpool.Supported(b) {
+			paged.readContext = r.ReaderContext
+		}
 		return partIndex{paged: paged}, nil
+	}
+	col, err := r.Column(ctx, colSeries)
+	if err != nil {
+		return partIndex{}, err
+	}
+	ids, err := col.ID128(nil)
+	if err != nil {
+		return partIndex{}, err
+	}
+	return buildPartIndex(ids), nil
+}
+
+func openPrimarySeriesIndex(ctx context.Context, b backend.Backend, prefix string, r *block.PartReader) (partIndex, error) {
+	paged, err := loadPagedIndex(r.ReaderContext(ctx), b, prefix, r.RowCount())
+	if errors.Is(err, errSidxCorrupt) {
+		return partIndex{}, errors.Wrapf(block.ErrCorrupt, "primary series index: %v", err)
+	}
+	if err != nil {
+		return partIndex{}, err
 	}
 	digest := bindOrdinalMetadata(r.ManifestDigest(), paged.crc)
 	if err := readSeriesReference(ctx, r, b, prefix, digest); err != nil {
 		return partIndex{}, err
+	}
+	if readerpool.Supported(b) {
+		paged.readContext = r.ReaderContext
 	}
 	return partIndex{paged: paged}, nil
 }

@@ -51,13 +51,8 @@ func (k Kind) valid() bool { return k <= KindInt128 }
 // (the commit point) and is the entry point a reader parses first.
 const (
 	manifestMagic uint32 = 0x4F54504D // "OTPM" (OTel Part Manifest)
-	// manifestVersion is what the writer emits. Version 2 added the at-rest checksums over column
-	// data ([ColumnDesc.Checked]); version 1 parts carry none and are still read, unverified.
-	//
-	// The version, rather than a per-column flag, carries it because all eight flag bits are spent
-	// and because a checksum is not a per-column choice: within one part either every column object
-	// is checked or none is.
-	manifestVersion uint32 = 3
+	// manifestVersion is the newest version this reader accepts.
+	manifestVersion uint32 = manifestVersionPrimarySeriesIndex
 	// manifestVersionMin is the oldest version this reader accepts.
 	manifestVersionMin uint32 = 1
 	// manifestVersionChecked is the first version whose column objects carry checksums.
@@ -65,6 +60,8 @@ const (
 	// manifestVersionExt is the first version whose column descriptors carry an xflags byte. A
 	// writer emits it only for a part that sets some xflags bit and version 2 otherwise.
 	manifestVersionExt uint32 = 3
+	// Version 4 uses an authoritative series index outside the column set.
+	manifestVersionPrimarySeriesIndex uint32 = 4
 
 	// maxPartRows is the defensive ceiling on a decoded row count; a count above it is a corrupt
 	// manifest. It is not 1<<31: merges write metric parts past that (3.3 B rows seen), which then
@@ -277,6 +274,11 @@ type Manifest struct {
 	Rollup *Rollup
 	// BindingNonce distinguishes immutable part instances with otherwise identical descriptors.
 	BindingNonce [16]byte
+}
+
+// RequiresSeriesIndex reports whether a primary series index supplies the part's series row ranges.
+func (m Manifest) RequiresSeriesIndex() bool {
+	return m.Version == manifestVersionPrimarySeriesIndex
 }
 
 // Rollup is the downsampling layout a part was last written under. No tiers means none was

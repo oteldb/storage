@@ -1786,11 +1786,12 @@ Fine and coarse cache keys can overlap and remain resident together; both consum
 budget, and a cached coarse page does not automatically satisfy a fine-page request.
 
 A missing or corrupt sidecar rebuilds the resident index from the series column in a legacy part.
-The `oteldb_experimental_primary_metric_index` build tag enables one authoritative index in new
-shared-series merge outputs. Its series reference binds the manifest and the validated SIDX CRC.
-Reopening requires both objects. Singleton-only outputs use SIDX v2 with one sorted 128-bit ID per
-entry. Its ordinal identifies the row directly. Backends without
-native ranged reads retain the whole-object path. The serialized sidecar format is unchanged.
+New shared-series merge outputs omit that column and require the sample index under manifest
+version 4. The series reference binds the manifest and the checked SIDX CRC. Older readers
+reject the manifest with `ErrUnsupportedVersion` and fence the engine. Streaming singleton outputs
+use SIDX v2, where the ordinal of each sorted 128-bit ID gives its row directly. Other layouts keep
+32-bit row offsets. Merges whose input row total exceeds that width use the legacy writer.
+Backends without native ranged reads retain the whole-object path.
 
 **Block slicing + decode cache** (`Config.DecodeCacheBytes`) — column blocks are sliced from a
 byte-bounded sharded LRU keyed by `(part, column, block)` and added to the merge as **views**, never

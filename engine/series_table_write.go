@@ -66,7 +66,7 @@ func attachSharedSeriesFrom(p *part, s *seriesSnapshot) error {
 
 func (e *Engine) prepareSharedPart(ctx context.Context, p *part) error {
 	// openPart validates a required primary index before exposing its lookup data.
-	if _, hasFallback := p.reader.ColumnDescByName(colSeries); hasFallback {
+	if !p.reader.Manifest().RequiresSeriesIndex() {
 		if err := readSeriesReference(ctx, p.reader, p.be, p.prefix, p.reader.ManifestDigest()); err != nil {
 			return err
 		}

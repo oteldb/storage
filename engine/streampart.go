@@ -107,6 +107,9 @@ func newPartStreamWriterMode(
 	}
 
 	opts := append(partOptions(blockRows, comp, rollup), extra...)
+	if indexOnly {
+		opts = append(opts, block.WithPrimarySeriesIndex())
+	}
 	if e.cfg.MetricSeriesChunks {
 		opts = append(opts, block.WithIndependentGroups(), block.WithSharedRowGroups())
 	}

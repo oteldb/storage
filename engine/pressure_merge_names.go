@@ -77,9 +77,8 @@ func (e *Engine) pressureMergeOutputs(selected, outputs []*part) ([]*part, error
 
 func newMergePartStreamWriter(
 	ctx context.Context, e *Engine, comp compressProfile, precisionBits uint8, withSF, withStats bool,
-	rollup *block.Rollup, extra ...block.PartOption,
+	rollup *block.Rollup, indexOnly bool, extra ...block.PartOption,
 ) (*partStreamWriter, error) {
-	indexOnly := writePrimaryMetricIndex && e.cfg.DiskSeries && e.cfg.SeparateSeries
 	if e.mergeNames == nil && !indexOnly {
 		return newPartStreamWriter(ctx, e, comp, precisionBits, withSF, withStats, rollup, extra...)
 	}

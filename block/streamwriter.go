@@ -462,7 +462,7 @@ func (w *StreamWriter) buildInto(scratch *StreamBuildScratch) (builtPart, error)
 	}
 
 	m := Manifest{
-		Version:     writerVersion(descs),
+		Version:     w.manifestVersion(descs),
 		RowCount:    rows,
 		GranuleSize: w.granuleSize,
 		Columns:     descs,

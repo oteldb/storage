@@ -35,17 +35,18 @@ func columnKey(prefix string, i int) string {
 // [PartWriter] and the incremental [StreamWriter] so both accept the same options and lay a part
 // out identically.
 type partConfig struct {
-	sortKey           string
-	granuleSize       int
-	compressBytes     int
-	defaultComp       compress.Algorithm
-	level             compress.Level
-	dictCap           int64
-	sizing            bool
-	independentGroups bool
-	sharedRows        bool
-	rawFloatGroupRows int
-	rollup            *Rollup
+	sortKey            string
+	granuleSize        int
+	compressBytes      int
+	defaultComp        compress.Algorithm
+	level              compress.Level
+	dictCap            int64
+	sizing             bool
+	independentGroups  bool
+	sharedRows         bool
+	rawFloatGroupRows  int
+	primarySeriesIndex bool
+	rollup             *Rollup
 
 	// given are compressors the caller hands in to share across writers; comps is what this writer
 	// compresses through, per algorithm. givenFrames are the ones a [StreamWriter] compresses its
@@ -82,6 +83,18 @@ type PartWriter struct {
 
 // PartOption configures a [PartWriter] or a [StreamWriter].
 type PartOption func(*partConfig)
+
+// WithPrimarySeriesIndex uses a manifest version that requires a separate series index.
+func WithPrimarySeriesIndex() PartOption {
+	return func(c *partConfig) { c.primarySeriesIndex = true }
+}
+
+func (c *partConfig) manifestVersion(cols []ColumnDesc) uint32 {
+	if c.primarySeriesIndex {
+		return manifestVersionPrimarySeriesIndex
+	}
+	return writerVersion(cols)
+}
 
 // WithIndependentGroups makes streaming numeric groups independently readable.
 // Call [StreamWriter.EndGroup] between groups.
@@ -297,7 +310,7 @@ func (w *PartWriter) build() (builtPart, error) {
 	}
 
 	m := Manifest{
-		Version:     writerVersion(descs),
+		Version:     w.manifestVersion(descs),
 		RowCount:    w.rows,
 		GranuleSize: w.granuleSize,
 		Columns:     descs,

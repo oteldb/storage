@@ -736,10 +736,11 @@ func (e *Engine) compactStreamWithInputs(
 	var buildScratch block.StreamBuildScratch
 	var closedBloomBytes int64
 	seriesReservation := newMergeSeriesReservation(src, allowance, held)
+	indexOnly := e.primaryMergeIndexFits(src)
 
 	router := timebucket.Router[*partStreamWriter]{
 		Open: func(int64) (*partStreamWriter, error) {
-			w, err := newMergePartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker, writerOptions...)
+			w, err := newMergePartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker, indexOnly, writerOptions...)
 			if err != nil {
 				return nil, err
 			}
@@ -826,6 +827,22 @@ func (e *Engine) compactStreamWithInputs(
 
 	completed = true
 	return newParts, nil
+}
+
+func (e *Engine) primaryMergeIndexFits(inputs []*part) bool {
+	if !e.cfg.DiskSeries || !e.cfg.SeparateSeries {
+		return false
+	}
+	// Required SIDX entries store row offsets in four bytes. Larger jobs can use legacy
+	// outputs even when the compactor ultimately splits them below this bound.
+	var rows uint64
+	for _, p := range inputs {
+		rows += uint64(p.rows())
+		if rows > math.MaxUint32 {
+			return false
+		}
+	}
+	return true
 }
 
 func (item *mergeIdentityItem) tryStreamSamples(

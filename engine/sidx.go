@@ -355,6 +355,15 @@ func sidxRunBounds(entries []byte, n, total int) (maxRows int, valid bool) {
 func openPagedIndex(
 	ctx context.Context, b backend.Backend, prefix string, manifestRows int, corrupt *obs.Corruption,
 ) (*pagedIndex, bool) {
+	index, err := loadPagedIndex(ctx, b, prefix, manifestRows)
+	if errors.Is(err, errSidxCorrupt) {
+		corrupt.Detected(ctx, "series_index", obs.CorruptTolerated)
+	}
+	return index, err == nil
+}
+
+// loadPagedIndex preserves backend errors for parts that require the index.
+func loadPagedIndex(ctx context.Context, b backend.Backend, prefix string, manifestRows int) (*pagedIndex, error) {
 	key := sidxKey(prefix)
 	var data []byte
 	var err error
@@ -364,19 +373,19 @@ func openPagedIndex(
 		data, err = backend.ReadView(ctx, b, key)
 	}
 	if err != nil {
-		return nil, false // absent (or unreadable) ⇒ resident fallback
+		return nil, errors.Wrap(err, "read series index")
 	}
 
 	ents, n, total, err := parseSeriesIndex(data, true)
-	if err != nil || total != manifestRows {
-		corrupt.Detected(ctx, "series_index", obs.CorruptTolerated)
-		return nil, false
+	if err != nil {
+		return nil, err
+	}
+	if total != manifestRows {
+		return nil, errors.Wrap(errSidxCorrupt, "row count differs from manifest")
 	}
 	maxRows, valid := sidxRunBounds(ents, n, total)
 	if !valid {
-		corrupt.Detected(ctx, "series_index", obs.CorruptTolerated)
-
-		return nil, false
+		return nil, errors.Wrap(errSidxCorrupt, "invalid series runs")
 	}
 
 	_, viewer := b.(backend.Viewer)
@@ -401,5 +410,5 @@ func openPagedIndex(
 		p.view.Store(&ents)
 	}
 
-	return p, true
+	return p, nil
 }

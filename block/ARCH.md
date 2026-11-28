@@ -463,12 +463,10 @@ place decoded rows at wrong offsets with every frame checksum still passing.
 It is not a per-column flag: all eight descriptor flag bits are spent, and a checksum is not a
 per-column choice. The **manifest version** carries it. Version 2 and later mean "every column object
 is checked"; version 1 parts carry no column checksums and are read unverified, so no migration is
-forced. The reader accepts the range 1..3 and rejects anything outside it, so an older binary refuses
-a newer part outright with `unsupported version N` wrapping `ErrCorrupt`, rather than misreading it. A
-version above the reader's range wraps `ErrUnsupportedVersion`, itself an `ErrCorrupt`: callers that
-only fail keep failing, and the engines can tell an intact part written by a newer release from a
-damaged one, which they hand to repair after repeated loads (`engine/ARCH.md`) and must never do for
-a newer one.
+forced. The reader accepts the range 1..4 and rejects anything outside it, so an older binary refuses
+a newer part with `ErrUnsupportedVersion`, which wraps `ErrCorrupt`. The engines use this sentinel
+to fence readers of newer parts. Persistent damage follows the separate repair path documented
+in `engine/ARCH.md`.
 
 Cost: 4 bytes per compression frame (0.006% of a 64 KiB frame), 4 per column directory, 4 per
 unblocked object. The hashing itself is hardware CRC32C on both paths and did not move any `block/`
@@ -556,6 +554,9 @@ slack); `compress.DecodeWorkspace` rounds it to 512 KiB.
   manifest bytes, preventing another valid part with identical column descriptors from supplying
   its coverage or aggregate stats. Older readers ignore this additive trailer; replication and
   renames copy it unchanged. The engine catalog remains the publication boundary for all sidecars.
+- **Version 4** requires the metric engine's separate series index. It keeps the version 3
+  descriptor layout. Only writers that omit the duplicate series ID column emit version 4, so
+  older readers reject these parts before loading sidecars.
 - **Version 3** adds a per-column `xflags` byte after `flags`; an unknown bit is
   `ErrUnsupportedVersion`, since each gates fields a reader must parse. A writer emits version 3
   only when some column sets a bit and version 2 otherwise, so metric parts stay readable by a
