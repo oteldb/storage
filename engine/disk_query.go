@@ -98,14 +98,11 @@ func (e *Engine) captureDiskHead(
 		e.mu.RUnlock()
 		return nil, err
 	}
-	// Head matcher iterators and the growing result slice are transient metadata workspace.
-	workspace := e.head.matcherWorkspace(r.Matchers)
-	if err := budget.Reserve(workspace); err != nil {
+	ids, workspace, err := e.resolveDiskHead(r, budget)
+	if err != nil {
 		e.mu.RUnlock()
 		return nil, err
 	}
-	// Only the bounded active/frozen head is resident. Capture it and the parts in one lock interval.
-	ids := e.head.resolve(r.Matchers)
 	n := e.diskHeadSelectionBytes(ids, withIdentity, countOnly)
 	budget.Release(workspace)
 	if err := budget.Reserve(n); err != nil {
@@ -119,7 +116,6 @@ func (e *Engine) captureDiskHead(
 		p = e.planFetch(ids, r)
 	}
 	p.selectionBudget, p.selectionBytes = budget, n
-	var err error
 	if snapshot != nil {
 		err = snapshot(p)
 	}
@@ -129,6 +125,28 @@ func (e *Engine) captureDiskHead(
 		return nil, err
 	}
 	return p, nil
+}
+
+func (e *Engine) resolveDiskHead(r fetch.Request, budget *readbudget.Budget) ([]signal.SeriesID, int64, error) {
+	if e.diskHeadStartsAfter(r.End) {
+		return nil, 0, nil
+	}
+	// Head matcher iterators and the growing result slice are transient metadata workspace.
+	workspace := e.head.matcherWorkspace(r.Matchers)
+	if err := budget.Reserve(workspace); err != nil {
+		return nil, 0, err
+	}
+	return e.head.resolve(r.Matchers), workspace, nil
+}
+
+// diskHeadStartsAfter uses conservative lower bounds for the inclusive query window.
+// The state read lock keeps those bounds and the part snapshot consistent.
+func (e *Engine) diskHeadStartsAfter(end int64) bool {
+	h := e.head
+	active := len(h.samples) == 0 || h.bufferedKnown && end < h.bufferedMin
+	frozen := len(e.flushing) == 0 && len(e.flushingNext) == 0 || h.detachedKnown && end < h.detachedMin
+	// Recent buffers preserve arrival order, so recentMin is not a safe pruning bound.
+	return active && frozen && len(e.recent) == 0
 }
 
 func (e *Engine) diskHeadSelectionBytes(ids []signal.SeriesID, withIdentity, countOnly bool) int64 {

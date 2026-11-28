@@ -77,16 +77,20 @@ func (e *Engine) pressureMergeOutputs(selected, outputs []*part) ([]*part, error
 
 func newMergePartStreamWriter(
 	ctx context.Context, e *Engine, comp compressProfile, precisionBits uint8, withSF, withStats bool,
-	rollup *block.Rollup, extra ...block.PartOption,
+	rollup *block.Rollup, indexOnly bool, extra ...block.PartOption,
 ) (*partStreamWriter, error) {
-	if e.mergeNames == nil {
+	if e.mergeNames == nil && !indexOnly {
 		return newPartStreamWriter(ctx, e, comp, precisionBits, withSF, withStats, rollup, extra...)
 	}
-	prefix, err := e.newMergePartPrefix()
-	if err != nil {
-		return nil, err
+	var prefix string
+	if e.mergeNames != nil {
+		var err error
+		prefix, err = e.newMergePartPrefix()
+		if err != nil {
+			return nil, err
+		}
 	}
-	return newPartStreamWriterAt(ctx, e, prefix, comp, precisionBits, withSF, withStats, rollup, extra...)
+	return newPartStreamWriterMode(ctx, e, prefix, comp, precisionBits, withSF, withStats, rollup, indexOnly, extra...)
 }
 
 func mergeNamespaceCeiling(id partid.ID) (partid.ID, bool) {

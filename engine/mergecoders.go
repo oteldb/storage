@@ -27,6 +27,9 @@ func (c metricMergeCoders) workspace() int64 {
 	return buildbudget.Add(c.frames.EncodeWorkspace(), c.objects.EncodeWorkspace())
 }
 
-func (c metricMergeCoders) options() []block.PartOption {
-	return []block.PartOption{block.WithCompressors(c.objects), block.WithFrameCompressors(c.frames)}
+func (c metricMergeCoders) options(rawGroupRows int) []block.PartOption {
+	return []block.PartOption{
+		block.WithCompressors(c.objects), block.WithFrameCompressors(c.frames),
+		block.WithRawFloatGroupSelection(rawGroupRows),
+	}
 }

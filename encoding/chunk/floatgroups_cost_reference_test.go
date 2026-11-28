@@ -93,7 +93,11 @@ func TestFloatGroupCostSelectionMatchesReference(t *testing.T) {
 				oldOutput, err = referenceFloatGroupCost(reference, append(oldOutput[:0], prefix...), values, costOld)
 				require.NoError(t, err)
 				require.Equal(t, oldOutput, newOutput)
-				require.Equal(t, oldCalls, newCalls)
+				if oldCalls == 1 {
+					require.Zero(t, newCalls, "a sole lossless candidate needs no trial")
+				} else {
+					require.Equal(t, oldCalls, newCalls)
+				}
 				decoded, used, err := DecodeFloatGroups(nil, newOutput[len(prefix):])
 				require.NoError(t, err)
 				require.Equal(t, len(newOutput)-len(prefix), used)

@@ -717,6 +717,7 @@ func (e *Engine) compactStreamWithInputs(
 	scratch := make([]rangeBuf, len(src))
 	comp, precision, withSF := mergeEncoding(src, capBytes, opts, plan.tiers)
 	coders := newMetricMergeCoders(src, comp)
+	writerOptions := coders.options(rawMergeFloatGroupRows(src, opts.Recompress))
 	budget := mergestream.Budget{DiskBytes: capBytes, ResidentBytes: allowance}
 	held := buildbudget.Add(buildbudget.Add(inputBytes, coders.workspace()), mergeRangeBatchBytes(len(src)))
 	if e.cfg.MetricSeriesChunks {
@@ -735,10 +736,11 @@ func (e *Engine) compactStreamWithInputs(
 	var buildScratch block.StreamBuildScratch
 	var closedBloomBytes int64
 	seriesReservation := newMergeSeriesReservation(src, allowance, held)
+	indexOnly := e.primaryMergeIndexFits(src)
 
 	router := timebucket.Router[*partStreamWriter]{
 		Open: func(int64) (*partStreamWriter, error) {
-			w, err := newMergePartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker, coders.options()...)
+			w, err := newMergePartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker, indexOnly, writerOptions...)
 			if err != nil {
 				return nil, err
 			}
@@ -758,7 +760,7 @@ func (e *Engine) compactStreamWithInputs(
 
 			return nil
 		},
-		Resident: (*partStreamWriter).mergeResidentBytes,
+		Resident: func(w *partStreamWriter) int64 { return w.mergeResident },
 		Held: func() int64 {
 			return buildbudget.Add(buildbudget.Add(held, buildScratch.SizeBytes()), closedBloomBytes)
 		},
@@ -778,9 +780,10 @@ func (e *Engine) compactStreamWithInputs(
 	var windows mergeSeriesWindows
 	plain := plainMergeInputs(src, plan.tiers)
 	// Check encoded bytes for disk capacity and resident bytes for per-series sidecars.
-	// A series that exceeds a limit is split at the next run.
+	// Every successful append reaches this before the router checks growth and shedding.
 	reached := func(w *partStreamWriter) bool {
-		return budget.Reached(w.encodedBytes(), buildbudget.Add(held, w.mergeResidentBytes()))
+		w.mergeResident = w.mergeResidentBytes()
+		return budget.Reached(w.encodedBytes(), buildbudget.Add(held, w.mergeResident))
 	}
 	for {
 		ok, err := item.next(ctx, e, &keys, &identities, src, metadata)
@@ -797,7 +800,7 @@ func (e *Engine) compactStreamWithInputs(
 		if handled {
 			continue
 		}
-		if err := mergeStreamedSeries(&m, src, streams, scratch, item.ranges, start); err != nil {
+		if err := item.collectSamples(&m, src, streams, scratch, start); err != nil {
 			return nil, err
 		}
 
@@ -826,20 +829,55 @@ func (e *Engine) compactStreamWithInputs(
 	return newParts, nil
 }
 
+func (e *Engine) primaryMergeIndexFits(inputs []*part) bool {
+	if !e.cfg.DiskSeries || !e.cfg.SeparateSeries {
+		return false
+	}
+	// Required SIDX entries store row offsets in four bytes. Larger jobs can use legacy
+	// outputs even when the compactor ultimately splits them below this bound.
+	var rows uint64
+	for _, p := range inputs {
+		rows += uint64(p.rows())
+		if rows > math.MaxUint32 {
+			return false
+		}
+	}
+	return true
+}
+
 func (item *mergeIdentityItem) tryStreamSamples(
 	ctx context.Context, encoded *encodedMergePlan, windows *mergeSeriesWindows, streams []*partStream,
 	router *timebucket.Router[*partStreamWriter], start int64, plain bool, reached func(*partStreamWriter) bool,
 ) (bool, error) {
+	if plain && encoded.enabled && item.shortMergeFragments() {
+		return false, nil
+	}
 	copied, err := encoded.copySeries(item, streams, router, start, reached)
 	if err != nil || copied {
 		return copied, err
 	}
-	if !plain || !largeMergeSeries(item.ranges) {
+	lo, hi := item.sourceRange()
+	if !plain || !largeMergeSeries(item.ranges[lo:hi]) {
 		return false, nil
 	}
 	return true, windows.merge(ctx, streams, item.ranges, start, item.covered, func(ts []int64, values []float64, covered int64) error {
 		return item.routeSamples(router, ts, values, nil, covered, false, reached)
 	})
+}
+
+func (item *mergeIdentityItem) collectSamples(
+	m *sampleMerge, src []*part, streams []*partStream, scratch []rangeBuf, start int64,
+) error {
+	lo, hi := item.sourceRange()
+	return mergeStreamedSeries(m, src[lo:hi], streams[lo:hi], scratch[lo:hi], item.ranges[lo:hi], start)
+}
+
+func (item *mergeIdentityItem) sourceRange() (int, int) {
+	if len(item.positions) == 1 {
+		i := item.positions[0].Source
+		return i, i + 1
+	}
+	return 0, len(item.ranges)
 }
 
 func (item *mergeIdentityItem) routeSamples(
@@ -879,11 +917,13 @@ func mergeEncoding(src []*part, capBytes int64, opts MergeOptions, tiers []Downs
 		withSF   bool
 	)
 
+	sparseShared := len(src) > 1
 	for _, p := range src {
 		maxT = max(maxT, p.maxTime)
 		rows += p.rows()
 		srcBytes += p.sizeBytes()
 		withSF = withSF || p.hasSF || hasAvgTier(p.rollup)
+		sparseShared = sparseShared && p.sharedSeries != nil && p.rows() == p.index.seriesCount()
 	}
 
 	withSF = withSF || hasAvgTier(tiers)
@@ -892,7 +932,7 @@ func mergeEncoding(src []*part, capBytes int64, opts MergeOptions, tiers []Downs
 		rows = int(int64(rows) * capBytes / srcBytes)
 	}
 
-	return mergeProfile(opts.Recompress, maxT, rows), pickPrecision(opts.Precision, maxT), withSF
+	return sampleMergeProfile(opts.Recompress, maxT, rows, sparseShared), pickPrecision(opts.Precision, maxT), withSF
 }
 
 func hasAvgTier(tiers []DownsampleTier) bool {

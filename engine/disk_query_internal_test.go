@@ -75,7 +75,7 @@ func TestDiskQueryWithoutResidentHistory(t *testing.T) {
 				{{Name: []byte("host"), Match: func(v signal.Value) bool { return string(v.AppendText(nil)) == "1" }, StringValues: [][]byte{[]byte("1")}}},
 			}
 			for _, m := range matchers {
-				for _, bounds := range [][2]int64{{0, 100}, {15, 48}, {21, 39}, {100, 200}} {
+				for _, bounds := range [][2]int64{{0, 100}, {15, 48}, {21, 39}, {0, 69}, {0, 70}, {100, 200}} {
 					r := fetch.Request{Start: bounds[0], End: bounds[1], Matchers: m}
 					wantCount, err := ref.Count(ctx, r)
 					require.NoError(t, err)

@@ -9,7 +9,7 @@ import (
 func (e *Engine) writeGroupedColumns(
 	ctx context.Context, cols *flushColumns, comp compressProfile, precision uint8, rollup *block.Rollup,
 ) (*part, error) {
-	writer, err := newMergePartStreamWriter(ctx, e, comp, precision, cols.sf != nil, e.cfg.AggregateStats, rollup)
+	writer, err := newMergePartStreamWriter(ctx, e, comp, precision, cols.sf != nil, e.cfg.AggregateStats, rollup, false)
 	if err != nil {
 		return nil, err
 	}

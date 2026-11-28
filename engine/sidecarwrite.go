@@ -50,16 +50,19 @@ func (p *partStreamWriter) writeSeriesSidecars(ctx context.Context) error {
 	}
 	var scratch [32]byte
 	header := binary.BigEndian.AppendUint32(scratch[:0], sidxMagic)
-	header = append(header, sidxVersion)
+	version, width := p.outputSeriesIndexShape()
+	header = append(header, version)
 	header = binary.AppendUvarint(header, uint64(len(p.runs)))
 	header = binary.AppendUvarint(header, uint64(p.rows))
 	start := 0
-	if err := sidecar.Write(ctx, p.e.cfg.Backend, sidxKey(p.prefix), header, len(p.runs), sidxEntryW, func(dst []byte, i int) []byte {
+	if err := sidecar.Write(ctx, p.e.cfg.Backend, sidxKey(p.prefix), header, len(p.runs), width, func(dst []byte, i int) []byte {
 		r := p.runs[i]
 		dst = binary.BigEndian.AppendUint64(dst, r.Value.Hi)
 		dst = binary.BigEndian.AppendUint64(dst, r.Value.Lo)
-		dst = binary.BigEndian.AppendUint32(dst, uint32(start))
-		start += r.Count
+		if width == sidxEntryW {
+			dst = binary.BigEndian.AppendUint32(dst, uint32(start))
+			start += r.Count
+		}
 		return dst
 	}); err != nil {
 		return err
@@ -82,6 +85,13 @@ func (p *partStreamWriter) writeSeriesSidecars(ctx context.Context) error {
 			})
 	}
 	return nil
+}
+
+func (p *partStreamWriter) outputSeriesIndexShape() (version byte, width int) {
+	if p.indexOnly && p.sidecarWriterBytes > 0 && len(p.runs) == p.rows {
+		return sidxSingletonVersion, sidxIDBytes
+	}
+	return sidxVersion, sidxEntryW
 }
 
 func (p *partStreamWriter) writeSpoolSidecars(ctx context.Context, scratch []byte) error {

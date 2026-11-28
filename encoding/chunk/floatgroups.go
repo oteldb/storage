@@ -17,6 +17,7 @@ type FloatGroupEncoder struct {
 	candidate        []byte
 	decoded          []float64
 	decimalWork      decimalScratch
+	decimalRejected  bool
 }
 
 // Encode appends grouped floats. ends contains positive, increasing group ends, ending at len(vals).
@@ -71,24 +72,18 @@ func (e *FloatGroupEncoder) EncodeGroupWithCost(dst []byte, values []float64, co
 	if group.codec == CodecNone {
 		return out, nil
 	}
-	// Encode retained both nonconstant candidates in the reusable scratch.
-	best := cost(out[start:])
-	if group.codec != CodecGorilla {
-		e.candidate = singleFloatGroup(e.candidate[:0], len(values), CodecGorilla, e.gorilla)
-		if n := cost(e.candidate); n < best {
-			out = append(out[:start], e.candidate...)
-			best = n
+	// Score only when both candidates can reproduce the input bits.
+	otherCodec, other := CodecGorilla, e.gorilla
+	if group.codec == CodecGorilla {
+		if e.decimalRejected || !e.decimalIsExact(values) {
+			return out, nil
 		}
+		otherCodec, other = CodecDecimal, e.decimal
 	}
-	if group.codec != CodecDecimal {
-		var used int
-		e.decoded, used, err = DecodeFloatsDecimal(e.decoded[:0], e.decimal)
-		if err == nil && used == len(e.decimal) && equalFloatBits(values, e.decoded) {
-			e.candidate = singleFloatGroup(e.candidate[:0], len(values), CodecDecimal, e.decimal)
-			if n := cost(e.candidate); n < best {
-				out = append(out[:start], e.candidate...)
-			}
-		}
+	best := cost(out[start:])
+	e.candidate = singleFloatGroup(e.candidate[:0], len(values), otherCodec, other)
+	if n := cost(e.candidate); n < best {
+		out = append(out[:start], e.candidate...)
 	}
 	return out, nil
 }
@@ -99,6 +94,7 @@ func (e *FloatGroupEncoder) ResidentBytes() int64 {
 }
 
 func (e *FloatGroupEncoder) appendGroup(dst []byte, group []float64) []byte {
+	e.decimalRejected = false
 	bits := math.Float64bits(group[0])
 	constant := true
 	for _, v := range group[1:] {
@@ -119,14 +115,11 @@ func (e *FloatGroupEncoder) appendGroup(dst []byte, group []float64) []byte {
 	codec := CodecGorilla
 	e.decimal = encodeFloatsDecimal(e.decimal[:0], group, 64, &e.decimalWork)
 	if len(e.decimal) < len(payload) {
-		var n int
-		var err error
-		e.decoded, n, err = DecodeFloatsDecimal(e.decoded[:0], e.decimal)
-		exact := err == nil && n == len(e.decimal) && len(e.decoded) == len(group)
-		exact = exact && equalFloatBits(e.decoded, group)
-		if exact {
+		if e.decimalIsExact(group) {
 			payload = e.decimal
 			codec = CodecDecimal
+		} else {
+			e.decimalRejected = true
 		}
 	}
 	dst = append(dst, byte(codec))
@@ -134,6 +127,13 @@ func (e *FloatGroupEncoder) appendGroup(dst []byte, group []float64) []byte {
 	dst = binary.AppendUvarint(dst, uint64(len(payload)))
 	dst = append(dst, payload...)
 	return dst
+}
+
+func (e *FloatGroupEncoder) decimalIsExact(values []float64) bool {
+	var used int
+	var err error
+	e.decoded, used, err = DecodeFloatsDecimal(e.decoded[:0], e.decimal)
+	return err == nil && used == len(e.decimal) && equalFloatBits(values, e.decoded)
 }
 
 func equalFloatBits(a, b []float64) bool {

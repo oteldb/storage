@@ -99,6 +99,7 @@ type headBufferPage [headSlotSize]*sampleBuf
 
 type headBuffers struct {
 	pages []*headBufferPage
+	used  int
 }
 
 func (s *headBuffers) get(ref uint32) *sampleBuf {
@@ -119,18 +120,13 @@ func (s *headBuffers) set(ref uint32, buf *sampleBuf) {
 			return
 		}
 		s.pages[p] = &headBufferPage{}
+		s.used++
 	}
 	s.pages[p][ref&(headSlotSize-1)] = buf
 }
 
 func (s *headBuffers) sizeBytes() int64 {
-	n := memsize.Slice(s.pages)
-	for _, p := range s.pages {
-		if p != nil {
-			n += memsize.Of[headBufferPage]()
-		}
-	}
-	return n
+	return memsize.Slice(s.pages) + int64(s.used)*memsize.Of[headBufferPage]()
 }
 
 type headSeriesState struct {

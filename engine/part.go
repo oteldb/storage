@@ -162,7 +162,7 @@ func (idx partIndex) forEachID(ctx context.Context, fn func(signal.SeriesID)) er
 		}
 
 		for k := range p.n {
-			fn(sidxEntryID(ents, k))
+			fn(sidxIDAt(ents, k, p.entryWidth()))
 		}
 
 		return nil
@@ -188,19 +188,18 @@ func (idx partIndex) idSource(ctx context.Context) (partSeriesSource, error) {
 		return nil, err
 	}
 
-	return sidxIDs{ents: ents, n: p.n, total: p.total}, nil
+	return sidxIDs{ents: ents, n: p.n, total: p.total, width: p.entryWidth()}, nil
 }
 
 // sidxIDs reads ids straight out of the on-disk sidecar's fixed-width entries, so a merge over a
 // paged part materializes no id slice.
 type sidxIDs struct {
-	ents  []byte
-	n     int
-	total int
+	ents            []byte
+	n, total, width int
 }
 
 func (s sidxIDs) Len() int                 { return s.n }
-func (s sidxIDs) At(i int) signal.SeriesID { return sidxEntryID(s.ents, i) }
+func (s sidxIDs) At(i int) signal.SeriesID { return sidxIDAt(s.ents, i, s.width) }
 
 type partSeriesSource interface {
 	mergestream.Source
@@ -219,6 +218,9 @@ func (s residentSeriesSource) RangeAt(i int) rowRange {
 }
 
 func (s sidxIDs) RangeAt(i int) rowRange {
+	if s.width == sidxIDBytes {
+		return rowRange{start: i, end: i + 1}
+	}
 	end := s.total
 	if i+1 < s.n {
 		end = sidxEntryStart(s.ents, i+1)
@@ -235,7 +237,7 @@ func (idx partIndex) forEachRange(ctx context.Context, fn func(signal.SeriesID, 
 		}
 
 		for k := range p.n {
-			fn(sidxEntryID(ents, k), p.rangeAt(ents, k))
+			fn(sidxIDAt(ents, k, p.entryWidth()), p.rangeAt(ents, k))
 		}
 
 		return nil
@@ -274,7 +276,7 @@ func (idx partIndex) intersectMark(ctx context.Context, ids []signal.SeriesID, a
 
 		i, j := 0, 0
 		for i < len(ids) && j < p.n {
-			switch c := ids[i].Compare(sidxEntryID(ents, j)); {
+			switch c := ids[i].Compare(sidxIDAt(ents, j, p.entryWidth())); {
 			case c < 0:
 				i++
 			case c > 0:
@@ -490,25 +492,10 @@ func openPart(
 		return nil, err
 	}
 
-	var idx partIndex
-
-	if paged, ok := openPagedIndex(r.ReaderContext(ctx), b, prefix, r.RowCount(), corrupt); ok {
-		if readerpool.Supported(b) {
-			paged.readContext = r.ReaderContext
-		}
-		idx = partIndex{paged: paged}
-	} else {
-		col, err := r.Column(ctx, colSeries)
-		if err != nil {
-			return nil, err
-		}
-
-		ids, err := col.ID128(nil)
-		if err != nil {
-			return nil, err
-		}
-
-		idx = buildPartIndex(ids)
+	idx, err := openSamplePartIndex(ctx, b, prefix, r, corrupt)
+	if err != nil {
+		_ = r.Close()
+		return nil, err
 	}
 
 	rollup, rollupKnown := appliedRollup(r.Manifest().Rollup)
@@ -538,6 +525,53 @@ func openPart(
 		}
 	}
 	return p, nil
+}
+
+func openSamplePartIndex(
+	ctx context.Context, b backend.Backend, prefix string, r *block.PartReader, corrupt *obs.Corruption,
+) (partIndex, error) {
+	_, hasSeriesColumn := r.ColumnDescByName(colSeries)
+	requiresIndex := r.Manifest().RequiresSeriesIndex()
+	if hasSeriesColumn == requiresIndex {
+		return partIndex{}, errors.Wrap(block.ErrCorrupt, "manifest version and series column disagree")
+	}
+
+	if requiresIndex {
+		return openPrimarySeriesIndex(ctx, b, prefix, r)
+	}
+	if paged, ok := openPagedIndex(r.ReaderContext(ctx), b, prefix, r.RowCount(), corrupt); ok {
+		if readerpool.Supported(b) {
+			paged.readContext = r.ReaderContext
+		}
+		return partIndex{paged: paged}, nil
+	}
+	col, err := r.Column(ctx, colSeries)
+	if err != nil {
+		return partIndex{}, err
+	}
+	ids, err := col.ID128(nil)
+	if err != nil {
+		return partIndex{}, err
+	}
+	return buildPartIndex(ids), nil
+}
+
+func openPrimarySeriesIndex(ctx context.Context, b backend.Backend, prefix string, r *block.PartReader) (partIndex, error) {
+	paged, err := loadPagedIndex(r.ReaderContext(ctx), b, prefix, r.RowCount())
+	if errors.Is(err, errSidxCorrupt) {
+		return partIndex{}, errors.Wrapf(block.ErrCorrupt, "primary series index: %v", err)
+	}
+	if err != nil {
+		return partIndex{}, err
+	}
+	digest := bindOrdinalMetadata(r.ManifestDigest(), paged.crc)
+	if err := readSeriesReference(ctx, r, b, prefix, digest); err != nil {
+		return partIndex{}, err
+	}
+	if readerpool.Supported(b) {
+		paged.readContext = r.ReaderContext
+	}
+	return partIndex{paged: paged}, nil
 }
 
 // seriesStat returns id's precomputed aggregate from the part's stats sidecar, lazily loading it.

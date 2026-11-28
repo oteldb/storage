@@ -164,7 +164,13 @@ func (e *Engine) streamHeadParallel(
 		return nil, 0, err
 	}
 	if err := walkIdentityOrder(ctx, order.view, order.runs, func(id signal.SeriesID, ref uint32) error {
-		if buf := samples[id]; buf != nil && len(buf.ts) > 0 {
+		var buf *sampleBuf
+		if order.frozen != nil {
+			buf = order.frozen.buffers.get(order.frozen.stateRefs[ref])
+		} else {
+			buf = samples[id]
+		}
+		if buf != nil && len(buf.ts) > 0 {
 			return b.add(ref, buf)
 		}
 		return nil

@@ -176,6 +176,14 @@ type detachedIdentityOrder struct {
 	view      series.View
 	runs      [][]uint32
 	workspace int64
+	frozen    *head
+}
+
+func (o detachedIdentityOrder) sampleBuffer(samples map[signal.SeriesID]*sampleBuf, ref uint32) *sampleBuf {
+	if o.frozen != nil {
+		return o.frozen.buffers.get(o.frozen.stateRefs[ref])
+	}
+	return samples[o.view.ID(int(ref))]
 }
 
 func (e *Engine) prepareDetachedOrder(ctx context.Context, selected map[signal.SeriesID]*sampleBuf,
@@ -193,7 +201,9 @@ func (e *Engine) prepareDetachedOrder(ctx context.Context, selected map[signal.S
 		}); err != nil {
 			return detachedIdentityOrder{}, err
 		}
-		return detachedIdentityOrder{view: view, runs: order.runs, workspace: order.bytes.Load()}, ctx.Err()
+		return detachedIdentityOrder{
+			view: view, runs: order.runs, workspace: order.bytes.Load(), frozen: input[0].frozen,
+		}, ctx.Err()
 	}
 	e.mu.RLock()
 	index := e.flushIdentityIndex()

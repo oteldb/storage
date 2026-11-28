@@ -187,9 +187,6 @@ func TestSharedSeriesQueryResolvesPredicatesOnce(t *testing.T) {
 				return v.Equal(signal.StringValue([]byte("0")))
 			}}}}
 			require.NoError(t, e.seriesTable.visit(t.Context(), r.Matchers, func(signal.SeriesID, []byte) error { return nil }))
-			e.mu.RLock()
-			e.head.resolve(r.Matchers)
-			e.mu.RUnlock()
 			once := calls
 			calls = 0
 			plan, err := e.planDiskQuery(t.Context(), r, tc.withIdentity, tc.countOnly, tc.needStats)

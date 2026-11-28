@@ -13,6 +13,43 @@ import (
 	"github.com/oteldb/storage/signal"
 )
 
+func TestHeadShapeStopsAtReservationTarget(t *testing.T) {
+	t.Parallel()
+	h := newHead()
+	for i, rows := range []int{2, 0, 3} {
+		s := benchSeries(i)
+		id := s.Hash()
+		h.registerSeries(s)
+		if rows > 0 {
+			h.bufFor(id).ts = make([]int64, rows)
+		}
+	}
+	order := detachedIdentityOrder{view: h.series.View(), runs: [][]uint32{{2, 1}, {0}}}
+	const base = 128
+	full := base + 2*512 + 4*(order.view.EncodingBytes(0)+order.view.EncodingBytes(2)) + 3*48
+	for _, tc := range []struct {
+		name   string
+		target int64
+		want   int64
+	}{
+		{name: "base meets target", target: base, want: base},
+		{name: "target reached before last run", target: 512, want: 512},
+		{name: "full estimate required", target: full + 1, want: full},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			b := headPartBuilder{target: tc.target}
+			for _, frozen := range []*head{nil, h} {
+				order := order
+				order.frozen = frozen
+				got, err := b.headShapeBytes(t.Context(), order, h.samples, base)
+				require.NoError(t, err)
+				require.Equal(t, tc.want, got)
+			}
+		})
+	}
+}
+
 func TestHeadJobsUseAggregateReservation(t *testing.T) {
 	t.Parallel()
 	const mib = 1 << 20

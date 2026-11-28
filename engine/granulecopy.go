@@ -77,13 +77,32 @@ func granuleReadBytes(p *part) int64 {
 	return buildbudget.Add(column(&ts), column(&values))
 }
 
+// Short runs can share a single value stream on the regular decoded path.
+func (item *mergeIdentityItem) shortMergeFragments() bool {
+	if len(item.positions) < 2 {
+		return false
+	}
+	rows := 0
+	for _, pos := range item.positions {
+		r := item.ranges[pos.Source]
+		n := r.end - r.start
+		if n < 2 || n > 4 {
+			return false
+		}
+		rows += n
+	}
+	return rows <= 64
+}
+
 func (p *encodedMergePlan) copySeries(item *mergeIdentityItem, streams []*partStream,
 	router *timebucket.Router[*partStreamWriter], start int64, reached func(*partStreamWriter) bool,
 ) (bool, error) {
 	if !p.enabled || !item.found && len(item.positions) == 0 {
 		return false, nil
 	}
-	ok, err := p.prepare(streams, item.ranges, start, p.maxRows)
+	lo, hi := item.sourceRange()
+	streams = streams[lo:hi]
+	ok, err := p.prepare(streams, item.ranges[lo:hi], start, p.maxRows)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -139,18 +158,29 @@ func encodedSourceRun(s *partStream, r rowRange, start int64, maxRows int) (enco
 	if s.pos != r.start {
 		return run, false, errNonContiguousDecode
 	}
+	single := r.end-r.start == 1
+	if single && r.start >= s.packedStart && r.start < s.packedEnd {
+		return run, false, nil
+	}
 	ts, values := s.decoders[0], s.decoders[1]
 	first, err := ts.BlockForRow(r.start)
 	if err != nil {
 		return run, false, err
 	}
-	last, err := ts.BlockForRow(r.end - 1)
-	if err != nil {
-		return run, false, err
+	last := first
+	if !single {
+		last, err = ts.BlockForRow(r.end - 1)
+		if err != nil {
+			return run, false, err
+		}
 	}
 	lo, _ := ts.BlockSpan(first)
 	_, hi := ts.BlockSpan(last)
 	if lo != r.start || hi != r.end {
+		// Additional single-row series in this granule also need the decode path.
+		if single {
+			s.packedStart, s.packedEnd = lo, hi
+		}
 		return run, false, nil
 	}
 	valueFirst, err := values.BlockForRow(r.start)
@@ -280,11 +310,10 @@ func (p *partStreamWriter) appendEncodedGranule(item *mergeIdentityItem, ts bloc
 	if v.Rows != ts.Rows || seen != ts.Rows {
 		return errors.Wrap(block.ErrCorrupt, "copied granule row mismatch")
 	}
-	p.runs, err = p.w.AppendU128RunView(colSeriesIdx, idToU128(item.id), ts.Rows)
-	if err != nil {
+	if err := p.appendIDRun(idToU128(item.id), ts.Rows); err != nil {
 		return err
 	}
-	if err := p.w.AppendEncodedRun(colTsIdx, colValueIdx, ts, v, v.FloatStats()); err != nil {
+	if err := p.w.AppendEncodedRun(p.tsColumn, p.valueColumn, ts, v, v.FloatStats()); err != nil {
 		return err
 	}
 	if sameSeries {

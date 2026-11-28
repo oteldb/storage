@@ -24,12 +24,14 @@ const defaultMergeReadWindow = 1 << 20
 // ranges are contiguous and the cursors move monotonically — each column is read and decoded exactly
 // once across the merge, one read-ahead window at a time.
 type partStream struct {
-	ts       chunk.TsCursor
-	val      chunk.FloatDecoder
-	sf       chunk.FloatDecoder // nil when the part has no scale-factor column
-	pos      int                // next undecoded row; a requested range's start must equal pos
-	decoders [3]*block.Decoder
-	copyable bool
+	ts  chunk.TsCursor
+	val chunk.FloatDecoder
+	sf  chunk.FloatDecoder // nil when the part has no scale-factor column
+	pos int                // next undecoded row; a requested range's start must equal pos
+	// Last timestamp granule known to span more than one row.
+	packedStart, packedEnd int
+	decoders               [3]*block.Decoder
+	copyable               bool
 }
 
 // newPartStream opens forward cursors over p's ts/value(/sf) columns, each reading window bytes of

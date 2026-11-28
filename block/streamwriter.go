@@ -156,10 +156,11 @@ func (w *StreamWriter) AddColumn(c Column) error {
 		blocked: c.Block,
 		allSame: true,
 
-		granuleSize: w.granuleSize,
-		variable:    w.independentGroups,
-		sharedRows:  w.sharedRows,
-		timeBounds:  w.independentGroups && c.Kind == KindInt64 && c.Name == w.sortKey,
+		granuleSize:       w.granuleSize,
+		variable:          w.independentGroups,
+		sharedRows:        w.sharedRows,
+		timeBounds:        w.independentGroups && c.Kind == KindInt64 && c.Name == w.sortKey,
+		rawFloatGroupRows: w.rawFloatGroupRows,
 	}
 
 	switch c.Kind {
@@ -461,7 +462,7 @@ func (w *StreamWriter) buildInto(scratch *StreamBuildScratch) (builtPart, error)
 	}
 
 	m := Manifest{
-		Version:     writerVersion(descs),
+		Version:     w.manifestVersion(descs),
 		RowCount:    rows,
 		GranuleSize: w.granuleSize,
 		Columns:     descs,
@@ -605,6 +606,7 @@ type streamColumn struct {
 	groupStarts, groupEnds []int
 	groupEncoder           chunk.FloatGroupEncoder
 	groupCostBuf           []byte
+	rawFloatGroupRows      int
 
 	runs     []chunk.U128Run // KindInt128 only
 	bytes    *streamBytes    // KindBytes only
@@ -767,6 +769,9 @@ func (c *streamColumn) flushGranuleFloat64(vals []float64, offset int) error {
 		}
 		c.groupEnds = append(c.groupEnds, len(vals))
 		if err := c.blk.addGranule(func(dst []byte) ([]byte, error) {
+			if c.variable && len(vals) <= c.rawFloatGroupRows {
+				return c.groupEncoder.EncodeGroupWithCost(dst, vals, nil)
+			}
 			if c.variable && c.comp.Algorithm() != compress.AlgorithmNone {
 				return c.groupEncoder.EncodeGroupWithCost(dst, vals, c.groupCost)
 			}

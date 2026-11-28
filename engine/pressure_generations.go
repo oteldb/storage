@@ -15,6 +15,7 @@ import (
 type headBuildInput struct {
 	names  *partid.Sequence
 	index  *series.Index
+	frozen *head
 	proofs descriptorProofs
 	retain func([]*part)
 }
@@ -96,7 +97,7 @@ func (e *Engine) freezePressureGenerationLocked(ctx context.Context) error {
 	h := e.head
 	frozen := newHeadWithContexts(e.cfg.SeriesContexts, e.cfg.SeriesTemplates)
 	h.swapGenerationIdentity(frozen)
-	frozen.samples, frozen.memory = h.samples, h.memory
+	frozen.samples, frozen.memory, frozen.buffers = h.samples, h.memory, h.buffers
 	frozen.bytes, frozen.since = h.bytes, h.since
 	frozen.bufferedMin, frozen.bufferedKnown, frozen.newest = h.bufferedMin, h.bufferedKnown, h.newest
 	frozen.frozen, h.frozen = h.frozen, frozen
@@ -482,11 +483,14 @@ func (e *Engine) buildFrozenGeneration(ctx context.Context, g *pressureGeneratio
 	active := e.pressure.generationBuilds.Add(1)
 	defer e.pressure.generationBuilds.Add(-1)
 	e.cfg.Obs.Flush.GenerationStarted(ctx, metricSignal, active > 1)
-	input := &headBuildInput{names: g.names, index: g.head.series, proofs: g.head.descriptorProofs, retain: func(parts []*part) {
-		e.mu.LockState()
-		g.head.buildRetained = generationPartBytes(parts)
-		e.mu.UnlockState()
-	}}
+	input := &headBuildInput{
+		names: g.names, index: g.head.series, frozen: g.head, proofs: g.head.descriptorProofs,
+		retain: func(parts []*part) {
+			e.mu.LockState()
+			g.head.buildRetained = generationPartBytes(parts)
+			e.mu.UnlockState()
+		},
+	}
 	parts, rows, err := e.streamHead(ctx, g.head.samples, input)
 	return generationResult{generation: g, parts: parts, rows: rows, err: err}
 }
