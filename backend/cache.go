@@ -41,18 +41,26 @@ import (
 //   - Hits scale with cores instead of serializing on one mutex and a list splice (16 cores: ~4.6
 //     ns/op versus ~90 ns/op).
 func Cached(inner Backend, maxBytes int64) Backend {
+	return CachedWithPostings(inner, maxBytes, 0)
+}
+
+// CachedWithPostings reserves part of the backend read cache for immutable postings.
+func CachedWithPostings(inner Backend, maxBytes, postingBytes int64) Backend {
 	if maxBytes <= 0 {
 		return inner
 	}
 
+	postingBytes = min(max(postingBytes, 0), maxBytes-1)
 	c := &cachedBackend{
 		inner:    inner,
-		maxBytes: maxBytes,
+		maxBytes: maxBytes - postingBytes,
 		stats:    stats.NewCounter(),
 	}
-
+	if postingBytes > 0 {
+		c.postings = newPostingCache(postingBytes)
+	}
 	c.values = otter.Must(&otter.Options[readCacheKey, []byte]{
-		MaximumWeight: uint64(maxBytes),
+		MaximumWeight: uint64(c.maxBytes),
 		Weigher:       weighCacheEntry,
 		StatsRecorder: c.stats,
 	})
@@ -123,10 +131,12 @@ type cachedBackend struct {
 	inner    Backend
 	maxBytes int64
 
-	values *otter.Cache[readCacheKey, []byte]
-	load   otter.Loader[readCacheKey, []byte]
-	pages  sync.Map
-	stats  *stats.Counter
+	values       *otter.Cache[readCacheKey, []byte]
+	load         otter.Loader[readCacheKey, []byte]
+	pages        sync.Map
+	stats        *stats.Counter
+	postings     *postingCache
+	postingStats postingCounters
 }
 
 func (c *cachedBackend) IsEphemeral() bool { return c.inner.IsEphemeral() }

@@ -4,6 +4,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/oteldb/storage/backend"
+
 	"github.com/oteldb/storage/engine"
 	"github.com/oteldb/storage/recordengine"
 	"github.com/oteldb/storage/signal"
@@ -252,6 +254,8 @@ type RebalanceMove struct {
 
 // CacheStats aggregates the read-path caches.
 type CacheStats struct {
+	// Postings measures shared exact posting bitmap reuse.
+	Postings backend.PostingCacheStats
 	// Decode is the decoded-column cache, summed across metric engines (zero when unconfigured).
 	Decode engine.DecodeCacheStats
 	// ProfileSymbols is the decoded profile symbol cache ([Options.ProfileSymbolCacheBytes]); Items
@@ -348,6 +352,11 @@ func (s *Storage) Inspect() StoreStats {
 
 	// Attach per-tenant admission and order each tenant's signals deterministically.
 	out := StoreStats{Caches: CacheStats{Decode: decode, ProfileSymbols: s.profileSymbols.Stats()}}
+	if p, ok := s.backend.(interface {
+		PostingStats() backend.PostingCacheStats
+	}); ok {
+		out.Caches.Postings = p.PostingStats()
+	}
 
 	for tid, ts := range byTenant {
 		ts.Admission = s.AdmissionStats(tid)

@@ -81,6 +81,8 @@ taking only a brief per-engine read lock to copy counters — safe to poll at da
   same four fields, `Items` counting cached **parts** and `Bytes` their estimated decoded size. Misses
   climbing with every flamegraph query mean the queried windows' parts do not fit the budget; it is
   all zeros when the cache is disabled.
+  `Caches.Postings` reports exact posting bitmap builds, reuse, skipped entries, posting chunks
+  visited and avoided, and current weighted occupancy.
 - `StoreStats.Maintenance` — the background maintenance loop: cumulative full `Cycles` (the loop-
   liveness probe), `LastCycleStartUnixNano` / `LastCycleDurationNano` (the full cycle's duration,
   excluding merge-only catch-up), `LastCycleTasks` (engine tasks dispatched in the most
