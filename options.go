@@ -108,6 +108,10 @@ type Options struct {
 	// backend, which is already RAM. See [backend.Cached].
 	ReadCacheBytes int64
 
+	// PostingCacheBytes reserves bytes from ReadCacheBytes for broad exact posting bitmaps.
+	// Zero leaves bitmap caching disabled.
+	PostingCacheBytes int64
+
 	// DecodeCacheBytes enables a per-tenant LRU cache of *decoded* part columns, sized to this many
 	// bytes. It eliminates the column re-decode that the read cache cannot — a hit returns the
 	// already-decoded arrays — so it helps every backend (a decode is CPU even when the read is
@@ -444,6 +448,11 @@ func WithProfileSymbolCache(maxBytes int64) Option {
 // WithReadCache enables an in-memory object cache over the backend, sized to maxBytes (the
 // object-store read cache for the cold tier). Skipped for an ephemeral backend. See [Options.ReadCacheBytes].
 func WithReadCache(maxBytes int64) Option { return func(o *Options) { o.ReadCacheBytes = maxBytes } }
+
+// WithPostingCache reserves part of the backend read budget for exact posting bitmaps.
+func WithPostingCache(maxBytes int64) Option {
+	return func(o *Options) { o.PostingCacheBytes = maxBytes }
+}
 
 // WithDecodeCache enables a per-tenant LRU cache of decoded part columns, sized to maxBytes, plus
 // concurrent prefetch of a fetch's parts. See [Options.DecodeCacheBytes].

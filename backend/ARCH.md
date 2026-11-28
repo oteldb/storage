@@ -137,6 +137,11 @@ a demonstration.
   and pages share one total byte budget and loading-cache miss coalescing. Object generations
   isolate cached ranges across writes/deletes; existing borrowed views remain valid. Ranged misses
   call the backend's native `ReadAt`, without loading or copying the whole object.
+- **`backend.CachedWithPostings`** — reserves part of the backend cache for decoded exact-match
+  posting bitmaps. Keys include the immutable object's generation and reader scope because
+  bitmap positions are local to an index. Concurrent misses share one synchronous build. The
+  caller owns its cursor and borrows the bitmap as read-only. Sparse and oversized results can
+  serve current readers without using residency.
 - **`backend.ReadDecodedPage`** — optional immutable decoded-page views sharing the byte cache
   with raw ranges and whole objects. A stable format string separates representations; object
   invalidation tokens and operation generations separate replacements. The synchronous loader

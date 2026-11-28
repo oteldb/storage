@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-faster/errors"
 
+	"github.com/oteldb/storage/backend"
 	"github.com/oteldb/storage/index/postings"
 	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
@@ -56,6 +57,9 @@ func (r *Index) selectMatcher(ctx context.Context, m fetch.Matcher) (postings.Po
 		return nil, errors.Wrap(ErrCorrupt, "label kind flags")
 	}
 	nonString := c.Value()[0] != 0
+	if view, ok := r.table.b.(backend.PostingCacheViewer); ok && !nonString && !absent && m.Spec != nil && view.PostingCacheEnabled() {
+		return r.cachedExactMatcher(ctx, view, key, m)
+	}
 	selected := make([]uint64, (uint64(r.count)+63)/64)
 	if absent {
 		for i := range selected {
@@ -91,17 +95,45 @@ func (r *Index) selectMatcher(ctx context.Context, m fetch.Matcher) (postings.Po
 	return &refBitmap{words: selected, n: r.count, at: -1}, nil
 }
 
+func (r *Index) cachedExactMatcher(
+	ctx context.Context, view backend.PostingCacheViewer, key []byte, m fetch.Matcher,
+) (postings.Postings, error) {
+	value := signal.StringValue([]byte(m.Spec.Value))
+	if !m.Match(value) {
+		return postings.Empty(), nil
+	}
+	key[0] = 'p'
+	var valueScratch [128]byte
+	prefix := appendEscaped(key, signal.AppendValue(valueScratch[:0], value))
+	words, err := view.ReadPostingBitmap(ctx, r.table.key, prefix, func() ([]uint64, int, error) {
+		words := make([]uint64, (uint64(r.count)+63)/64)
+		chunks, err := r.markPrefixChunks(ctx, prefix, words, true)
+		return words, chunks, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &refBitmap{words: words, n: r.count, at: -1}, nil
+}
+
 func (r *Index) markPrefix(ctx context.Context, prefix []byte, selected []uint64, set bool) error {
+	_, err := r.markPrefixChunks(ctx, prefix, selected, set)
+	return err
+}
+
+func (r *Index) markPrefixChunks(ctx context.Context, prefix []byte, selected []uint64, set bool) (int, error) {
 	c := r.table.Cursor(ctx)
+	count := 0
 	for ok := c.Seek(prefix); ok && bytes.HasPrefix(c.Key(), prefix); ok = c.Next() {
 		if len(c.Key()) != len(prefix)+4 {
-			return errors.Wrap(ErrCorrupt, "postings key")
+			return 0, errors.Wrap(ErrCorrupt, "postings key")
 		}
 		if err := r.mark(c.Value(), binary.BigEndian.Uint32(c.Key()[len(prefix):]), selected, set); err != nil {
-			return err
+			return 0, err
 		}
+		count++
 	}
-	return c.Err()
+	return count, c.Err()
 }
 
 func prefixEnd(prefix []byte) []byte {
