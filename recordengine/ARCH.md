@@ -176,8 +176,10 @@ volume includes scratch that becomes garbage and is distinct from peak resident 
 
 Budgeted fetches use the same two-phase dictionary read seam as filtered reads: first timestamps
 and condition columns, then the remaining selected columns only for a part with surviving rows.
-No decoded byte-column expansion is needed to gather selected cells. Unbudgeted fetches retain the
-bulk decode path.
+Sparse filtered reads compact their projected columns to the matched rows. Sized fixed-row frames
+open through a bounded ranged decoder and only the granules containing hits are decoded. Byte cells
+borrowed from a frame are copied before the decoder advances. Unsized and unframed columns use bulk
+decode. Unbudgeted reads and dense results retain the existing decode path.
 
 The plan charges its owned/adopted part references and per-stream metadata before allocating them.
 Head and flushing rows are snapshotted under the read lock, with only in-window selected cells
