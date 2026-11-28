@@ -44,6 +44,7 @@ type partConfig struct {
 	sizing            bool
 	independentGroups bool
 	sharedRows        bool
+	rawFloatGroupRows int
 	rollup            *Rollup
 
 	// given are compressors the caller hands in to share across writers; comps is what this writer
@@ -91,6 +92,12 @@ func WithIndependentGroups() PartOption {
 // WithSharedRowGroups marks variable numeric chunks as covering multiple logical row groups.
 func WithSharedRowGroups() PartOption {
 	return func(c *partConfig) { c.sharedRows = true }
+}
+
+// WithRawFloatGroupSelection uses raw encoded sizes for independent float groups
+// up to rows. Each candidate still has to preserve the input float bits.
+func WithRawFloatGroupSelection(rows int) PartOption {
+	return func(c *partConfig) { c.rawFloatGroupRows = rows }
 }
 
 // WithGranuleSize sets the sparse-index granularity in rows (default 8192).

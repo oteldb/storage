@@ -717,6 +717,7 @@ func (e *Engine) compactStreamWithInputs(
 	scratch := make([]rangeBuf, len(src))
 	comp, precision, withSF := mergeEncoding(src, capBytes, opts, plan.tiers)
 	coders := newMetricMergeCoders(src, comp)
+	writerOptions := coders.options(rawMergeFloatGroupRows(src, opts.Recompress))
 	budget := mergestream.Budget{DiskBytes: capBytes, ResidentBytes: allowance}
 	held := buildbudget.Add(buildbudget.Add(inputBytes, coders.workspace()), mergeRangeBatchBytes(len(src)))
 	if e.cfg.MetricSeriesChunks {
@@ -738,7 +739,7 @@ func (e *Engine) compactStreamWithInputs(
 
 	router := timebucket.Router[*partStreamWriter]{
 		Open: func(int64) (*partStreamWriter, error) {
-			w, err := newMergePartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker, coders.options()...)
+			w, err := newMergePartStreamWriter(ctx, e, comp, precision, withSF, e.cfg.AggregateStats, plan.marker, writerOptions...)
 			if err != nil {
 				return nil, err
 			}
@@ -896,11 +897,13 @@ func mergeEncoding(src []*part, capBytes int64, opts MergeOptions, tiers []Downs
 		withSF   bool
 	)
 
+	sparseShared := len(src) > 1
 	for _, p := range src {
 		maxT = max(maxT, p.maxTime)
 		rows += p.rows()
 		srcBytes += p.sizeBytes()
 		withSF = withSF || p.hasSF || hasAvgTier(p.rollup)
+		sparseShared = sparseShared && p.sharedSeries != nil && p.rows() == p.index.seriesCount()
 	}
 
 	withSF = withSF || hasAvgTier(tiers)
@@ -909,7 +912,7 @@ func mergeEncoding(src []*part, capBytes int64, opts MergeOptions, tiers []Downs
 		rows = int(int64(rows) * capBytes / srcBytes)
 	}
 
-	return mergeProfile(opts.Recompress, maxT, rows), pickPrecision(opts.Precision, maxT), withSF
+	return sampleMergeProfile(opts.Recompress, maxT, rows, sparseShared), pickPrecision(opts.Precision, maxT), withSF
 }
 
 func hasAvgTier(tiers []DownsampleTier) bool {

@@ -2110,6 +2110,11 @@ routing, fan-out, gap and scale wrappers conservatively return `fetch.ErrTryUnsu
 
 ## Opt-in grouped metric values
 
+Ordinary numeric merges skip compression trials for float groups of up to 32 rows. A
+shared-series merge of singleton-only parts uses codec-only framing up to an estimated
+1 Mi rows per output. Larger or denser merges use the compression ladder. Explicit cold
+recompression keeps trial selection and the configured compressor policy.
+
 `Config.MetricFloatGroups` groups values by canonical series ID inside the existing fixed-row
 blocks. Flush and ordinary merge outputs use the same streaming encoder; buffered merge columns
 also pass through it without allocating another part-wide group index.

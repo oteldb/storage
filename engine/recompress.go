@@ -61,6 +61,27 @@ func mergeProfile(spec *RecompressSpec, maxTime int64, rows int) compressProfile
 	return p
 }
 
+// A small merge of singleton-only numeric parts gains little from compressing
+// the outer frames. Dense, large, and explicitly cold rewrites keep the ladder.
+func sampleMergeProfile(spec *RecompressSpec, maxTime int64, rows int, sparseShared bool) compressProfile {
+	if sparseShared && rows <= ladderRowsMedium && (spec == nil || maxTime >= spec.Before) {
+		return compressProfile{}
+	}
+	return mergeProfile(spec, maxTime, rows)
+}
+
+func rawMergeFloatGroupRows(src []*part, spec *RecompressSpec) int {
+	if spec == nil {
+		return sparseMetricChunkRows
+	}
+	for _, p := range src {
+		if p.maxTime >= spec.Before {
+			return sparseMetricChunkRows
+		}
+	}
+	return 0
+}
+
 // recompressApplies reports whether a (single) part should be rewritten to apply recompression: it
 // is fully cold and is not already at the target algorithm and level. That comparison is the fixed
 // point that stops a lone cold part from being rewritten on every merge tick — it is why the level

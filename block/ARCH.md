@@ -600,6 +600,9 @@ Group boundary and candidate buffers contribute to streaming writer residency. C
 still collapse into their manifest value and leave no column object. All reader paths accept
 this codec independently of writer configuration.
 
+`WithRawFloatGroupSelection` selects a lossless encoding by raw size for independent groups
+up to its row limit. The writer compresses the selected group only when sealing its frame.
+
 ## Independently readable numeric groups
 
 `WithIndependentGroups` makes a `StreamWriter` end numeric chunks at `EndGroup` boundaries and
