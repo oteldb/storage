@@ -5,9 +5,12 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/oteldb/storage/backend"
+	"github.com/oteldb/storage/backend/backendtest"
 	"github.com/oteldb/storage/backend/bucketindex"
+	"github.com/oteldb/storage/backend/file"
 	"github.com/oteldb/storage/index/postings"
 	"github.com/oteldb/storage/internal/seriesindex"
 	"github.com/oteldb/storage/internal/seriestable"
@@ -207,5 +210,41 @@ func TestSharedSeriesQueryResolvesPredicatesOnce(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSharedAggregateWithoutStatsSkipsWatermarks(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	files, err := file.New(t.TempDir())
+	require.NoError(t, err)
+	counter := backendtest.NewSizedByteCounter(files)
+	e := New(Config{Backend: counter, Prefix: "aggregate-raw", DiskSeries: true, SeparateSeries: true, MetricSeriesChunks: true})
+	t.Cleanup(func() { require.NoError(t, e.Close(ctx)) })
+	id := benchSeries(0)
+	for i := range 2 {
+		ok, err := e.Append(id, int64(10+i), float64(i+4))
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.NoError(t, e.Flush(ctx))
+	}
+	counter.Reset()
+	var group errgroup.Group
+	var got [4]map[signal.SeriesID]SeriesAgg
+	for i := range got {
+		group.Go(func() error {
+			result, err := e.AggregateRange(ctx, fetch.Request{Start: 10, End: 11})
+			got[i] = result
+			return err
+		})
+	}
+	require.NoError(t, group.Wait())
+	for _, result := range got {
+		require.Len(t, result, 1)
+		require.EqualValues(t, 2, result[id.Hash()].Rows)
+		require.InDelta(t, 9, result[id.Hash()].Sum, 0)
+	}
+	for _, p := range e.parts {
+		require.NotContains(t, counter.Report(), watermark.Key(p.prefix))
 	}
 }
