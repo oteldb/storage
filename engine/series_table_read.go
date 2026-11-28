@@ -153,6 +153,10 @@ func (p *enginePlan) selectSharedNumericMetadata(ctx context.Context, pt *part, 
 	if err != nil {
 		return err
 	}
+	// Without usable stats, the aggregate reads samples and has no coverage lookup.
+	if len(stats) == 0 {
+		return nil
+	}
 	if err := p.reserveSelection(2 * memsize.MapBase); err != nil {
 		return err
 	}
